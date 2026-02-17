@@ -1,0 +1,33 @@
+{
+  "mode": "demo",
+  "maxTradeAmount": 10,
+  "maxDailyTrades": 20,
+  "maxDailyLoss": 50,
+  "sources": {
+    "hdd": {
+      "enabled": true,
+      "urls": ["https://www.hitsdailydouble.com/news", "https://www.hitsdailydouble.com/news/charts"],
+      "sanityProject": "8aky18h3",
+      "chartSlugs": ["hits-top-50", "midweek-20"],
+      "intervalMinutes": 15,
+      "keywords": ["first week", "sales", "units", "projected", "building"]
+    },
+    "boxoffice": {
+      "enabled": true,
+      "urls": ["https://www.boxofficemojo.com/", "https://www.the-numbers.com/"],
+      "intervalMinutes": 30,
+      "activeDays": ["Friday", "Saturday", "Sunday", "Monday"]
+    },
+    "nws": {
+      "enabled": true,
+      "stations": {
+        "MIA": "KMIA",
+        "LAX": "KLAX",
+        "PHIL": "KPHL",
+        "NYC": "KJFK",
+        "CHI": "KORD"
+      },
+      "intervalMinutes": 10
+    }
+  }
+}
