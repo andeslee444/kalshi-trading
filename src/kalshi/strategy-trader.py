@@ -3,85 +3,58 @@
 Strategies: Longshot bias selling, maker-only limit orders, info arbitrage near settlement.
 """
 
-import json, time, base64, datetime, os, sys, math
+import json, time, datetime, os, sys, math
 import requests
 from pathlib import Path
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.backends import default_backend
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR
 
-sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
+setup_unbuffered()
+log = setup_logging("strategy")
+setup_signal_handlers()
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
-KEY_PATH = PROJECT_DIR / "config" / "keys" / "kalshi-demo.pem"
 DATA_DIR = PROJECT_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-API_KEY = "64b1b6ff-eac2-4977-919a-fd1b9865f0aa"
-BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
-MAX_BET = 500  # cents ($5)
-BANKROLL = 49600  # cents (~$496 from logs)
+BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
+_bots_cfg = json.loads(BOTS_CONFIG_PATH.read_text())["strategy"]
+MAX_BET = _bots_cfg["maxBetCents"]
 
-with open(KEY_PATH, "rb") as f:
-    private_key = serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
+client = KalshiClient()
 
-def get_headers(method, path):
-    ts = str(int(time.time() * 1000))
-    msg = f"{ts}{method}{path.split('?')[0]}"
-    sig = private_key.sign(msg.encode(), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
-    return {"KALSHI-ACCESS-KEY": API_KEY, "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(), "KALSHI-ACCESS-TIMESTAMP": ts, "Content-Type": "application/json"}
+def half_kelly(edge, price_cents, bankroll):
+    """Half-Kelly sizing for selling YES (buying NO).
 
-def api(method, path, body=None):
-    url = BASE_URL + path
-    h = get_headers(method, "/trade-api/v2" + path)
-    if method == "GET":
-        r = requests.get(url, headers=h, timeout=15)
-    else:
-        r = requests.post(url, headers=h, json=body, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    When selling YES at price p:
+    - We get p cents now
+    - We lose (100 - p) cents if the event occurs
+    - True prob of event = market_implied_prob - edge
 
-def get_all_markets():
-    all_m = []
-    cursor = None
-    for _ in range(50):
-        path = "/markets?status=open&limit=1000"
-        if cursor: path += f"&cursor={cursor}"
-        try:
-            data = api("GET", path)
-        except Exception as e:
-            print(f"  Page error: {e}")
-            break
-        batch = data.get("markets", [])
-        all_m.extend(batch)
-        cursor = data.get("cursor")
-        if not cursor or not batch: break
-    return all_m
-
-def half_kelly(edge, price_cents):
-    """Half-Kelly sizing. Returns number of contracts (capped at MAX_BET risk)."""
+    Returns number of contracts (0 if Kelly says don't bet).
+    """
     if edge <= 0 or price_cents <= 0 or price_cents >= 100:
         return 0
-    p_true = (price_cents / 100.0) - edge  # true prob of event (we're selling, so lower)
-    # For selling YES at price p: we risk (100-p) to win p
-    # Kelly f = (edge * 100) / (100 - price_cents) ... simplified
-    # Actually: selling YES at price p means we get p cents now, risk paying 100 if event happens
-    # EV of sell YES = p * (1 - p_event) - (100 - p) * p_event ... but we want kelly fraction
-    # Simpler: treat as a bet where we win `price_cents` with prob (1-p_true) and lose (100-price_cents) with prob p_true
+    # Market implied prob of event
+    implied_prob = price_cents / 100.0
+    # Our estimated true probability (lower than market thinks)
+    p_true = max(0.001, implied_prob - edge)
+    # Selling YES: win p cents with prob (1-p_true), lose (100-p) cents with prob p_true
     win_prob = 1 - p_true
-    b = price_cents / (100 - price_cents)  # odds ratio
+    win_amount = price_cents
+    loss_amount = 100 - price_cents
+    # Kelly: f = (p*b - q) / b where b = win/loss odds ratio, p = win prob, q = 1-p
+    b = win_amount / loss_amount
     kelly_f = (b * win_prob - (1 - win_prob)) / b
     half_f = kelly_f / 2
     if half_f <= 0:
         return 0
-    # Max risk per contract when selling YES = (100 - price_cents) cents
     risk_per = 100 - price_cents
-    max_contracts_kelly = max(1, int((half_f * BANKROLL) / risk_per))
-    max_contracts_cap = max(1, MAX_BET // risk_per)
-    return min(max_contracts_kelly, max_contracts_cap)
+    max_contracts_kelly = int((half_f * bankroll) / risk_per)
+    max_contracts_cap = MAX_BET // risk_per
+    result = min(max_contracts_kelly, max_contracts_cap)
+    return max(0, result)  # Don't force minimum 1 — respect Kelly
 
-def find_longshot_sells(markets):
-    """Find contracts priced <10¢ YES to SELL (exploit longshot bias)."""
+def find_longshot_sells(markets, bankroll):
+    """Find contracts priced <10c YES to SELL (exploit longshot bias)."""
     now = datetime.datetime.now(datetime.timezone.utc)
     candidates = []
     for m in markets:
@@ -89,41 +62,39 @@ def find_longshot_sells(markets):
         yes_ask = m.get("yes_ask", 0)
         volume = m.get("volume", 0)
         ticker = m.get("ticker", "")
-        
-        # We want to SELL YES on longshots. We need yes_bid > 0 to sell into, or place a limit sell.
-        # Longshot = yes_ask < 10 cents (market thinks <10% chance)
-        # We'll place a limit order to sell YES at the ask or slightly above bid
+
         if yes_ask <= 0 or yes_ask > 15:
             continue
-        
-        # Calculate hours to close
+
         close_str = m.get("close_time", "")
         try:
             close_time = datetime.datetime.fromisoformat(close_str.replace("Z", "+00:00"))
             hours = (close_time - now).total_seconds() / 3600
-        except:
+        except (ValueError, TypeError):
             hours = 999
-        
-        if hours < 0.5:  # too close to settlement, risky
+
+        if hours < 0.5:
             continue
-        
-        # Estimated edge: from Becker 2025, 1¢ contracts have ~57% mispricing,
-        # scaling down: at 5¢ ~30%, at 10¢ ~15%
+
+        # Becker (2025) "Favourite-Longshot Bias in Prediction Markets":
+        #   1-cent contracts are overpriced by ~57% (win rate 0.43% vs 1% implied).
+        #   Mispricing decays exponentially with price: edge ≈ 0.57 * e^(-0.15 * price).
+        #   At 5c, edge ≈ 27%; at 10c, edge ≈ 13%; at 15c, edge ≈ 6%.
         est_edge = max(0, 0.57 * math.exp(-0.15 * yes_ask))
-        
+
         if est_edge < 0.03:
             continue
-            
+
         sell_price = max(yes_bid, yes_ask - 1) if yes_bid > 0 else yes_ask
         if sell_price <= 1:
             continue
-            
-        contracts = half_kelly(est_edge, sell_price)
+
+        contracts = half_kelly(est_edge, sell_price, bankroll)
         if contracts <= 0:
             continue
-        
+
         risk = contracts * (100 - sell_price)
-        
+
         candidates.append({
             "ticker": ticker,
             "title": m.get("title", "")[:80],
@@ -138,10 +109,9 @@ def find_longshot_sells(markets):
             "risk_cents": risk,
             "hours_to_close": hours,
             "volume": volume,
-            "reasoning": f"Longshot bias: YES@{sell_price}¢ implies {sell_price}% prob, Becker model est true prob ~{sell_price - est_edge*100:.1f}%. Sell YES (buy NO@{100-sell_price}¢) for ~{est_edge*100:.1f}% edge."
+            "reasoning": f"Longshot bias: YES@{sell_price}c implies {sell_price}% prob, Becker model est true prob ~{sell_price - est_edge*100:.1f}%. Sell YES (buy NO@{100-sell_price}c) for ~{est_edge*100:.1f}% edge."
         })
-    
-    # Sort by edge * volume (prefer liquid + high edge)
+
     candidates.sort(key=lambda x: -x["est_edge"] * max(1, x["volume"]))
     return candidates
 
@@ -154,23 +124,21 @@ def find_near_settlement(markets):
         try:
             close_time = datetime.datetime.fromisoformat(close_str.replace("Z", "+00:00"))
             hours = (close_time - now).total_seconds() / 3600
-        except:
+        except (ValueError, TypeError):
             continue
-        
+
         if hours < 0.5 or hours > 6:
             continue
-        
+
         yes_ask = m.get("yes_ask", 0)
         yes_bid = m.get("yes_bid", 0)
         if yes_ask <= 0:
             continue
-        
+
         spread = yes_ask - yes_bid if yes_bid > 0 else 100
-        if spread > 20:  # too wide, no real price discovery
+        if spread > 20:
             continue
-        
-        # Near settlement with decent spread = potential info arb
-        # We can't evaluate the actual info here, but flag them
+
         candidates.append({
             "ticker": m.get("ticker", ""),
             "title": m.get("title", "")[:80],
@@ -181,111 +149,105 @@ def find_near_settlement(markets):
             "hours_to_close": hours,
             "volume": m.get("volume", 0),
         })
-    
+
     candidates.sort(key=lambda x: x["hours_to_close"])
     return candidates
 
 def check_settled_trades():
     """Check if any previous trades have settled."""
-    log_path = DATA_DIR / "kalshi-trade-performance.md"
     settled = []
     try:
-        positions = api("GET", "/portfolio/positions")
+        positions = client.get("/portfolio/positions")
         for p in positions.get("market_positions", []):
             if p.get("settlement_status") == "settled":
                 settled.append(p)
-        
-        # Also check portfolio settlements
+
         try:
-            settlements = api("GET", "/portfolio/settlements")
+            settlements = client.get("/portfolio/settlements")
             return settlements.get("settlements", [])
-        except:
+        except Exception:
             pass
     except Exception as e:
-        print(f"  Error checking settlements: {e}")
+        log.error(f"  Error checking settlements: {e}")
     return settled
 
 def main():
-    print("=" * 70)
-    print("🎯 KALSHI STRATEGY TRADER")
-    print(f"   {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 70)
-    
+    log.info("=" * 70)
+    log.info("KALSHI STRATEGY TRADER")
+    log.info(f"   {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info("=" * 70)
+
     # Balance
-    bal = api("GET", "/portfolio/balance")
-    balance = bal.get("balance", 0)
-    avail = bal.get("available_balance", balance)
-    print(f"\n💰 Balance: ${balance/100:.2f} | Available: ${avail/100:.2f}")
-    
+    balance, avail = client.get_balance()
+    log.info(f"\nBalance: ${balance/100:.2f} | Available: ${avail/100:.2f}")
+
     if avail < 100:
-        print("⚠️  Low available balance — existing positions may be tying up capital")
-    
+        log.warning("Warning: Low available balance -- existing positions may be tying up capital")
+
     # Existing positions
-    print("\n📊 Current Positions:")
+    log.info("\nCurrent Positions:")
     try:
-        pos = api("GET", "/portfolio/positions")
+        pos = client.get("/portfolio/positions")
         positions = pos.get("market_positions", [])
         if positions:
             for p in positions[:10]:
                 t = p.get("ticker", "")
                 yes_q = p.get("position", 0)
                 cost = p.get("market_exposure", 0)
-                print(f"  • {t}: {yes_q} contracts, exposure: {cost}¢")
+                log.info(f"  {t}: {yes_q} contracts, exposure: {cost}c")
         else:
-            print("  (none)")
+            log.info("  (none)")
     except Exception as e:
-        print(f"  Error: {e}")
-    
+        log.error(f"  Error: {e}")
+
     # Check settlements
-    print("\n📜 Checking Settled Trades:")
+    log.info("\nChecking Settled Trades:")
     settled = check_settled_trades()
     if settled:
         for s in settled[:5]:
-            print(f"  • {s}")
+            log.info(f"  {s}")
     else:
-        print("  No settled trades found")
-    
+        log.info("  No settled trades found")
+
     # Fetch markets
-    print("\n🔍 Scanning all open markets...")
-    markets = get_all_markets()
-    print(f"  Found {len(markets)} open markets")
-    
+    log.info("\nScanning all open markets...")
+    markets = client.get_all_markets()
+    log.info(f"  Found {len(markets)} open markets")
+
     # Strategy 1: Longshot bias selling
-    print("\n" + "=" * 70)
-    print("📈 STRATEGY 1: Longshot Bias Exploitation (Sell YES on low-prob events)")
-    print("=" * 70)
-    longshots = find_longshot_sells(markets)
-    print(f"  Found {len(longshots)} longshot sell candidates")
+    log.info("\n" + "=" * 70)
+    log.info("STRATEGY 1: Longshot Bias Exploitation (Sell YES on low-prob events)")
+    log.info("=" * 70)
+    longshots = find_longshot_sells(markets, avail)
+    log.info(f"  Found {len(longshots)} longshot sell candidates")
     for i, c in enumerate(longshots[:10]):
-        print(f"\n  {i+1}. {c['ticker']}")
-        print(f"     {c['title']}")
-        if c['subtitle']: print(f"     {c['subtitle']}")
-        print(f"     YES@{c['yes_price']}¢ | Edge: {c['est_edge']*100:.1f}% | Contracts: {c['contracts']} | Risk: ${c['risk_cents']/100:.2f}")
-        print(f"     Closes in {c['hours_to_close']:.1f}h | Vol: {c['volume']}")
-    
+        log.info(f"\n  {i+1}. {c['ticker']}")
+        log.info(f"     {c['title']}")
+        if c['subtitle']: log.info(f"     {c['subtitle']}")
+        log.info(f"     YES@{c['yes_price']}c | Edge: {c['est_edge']*100:.1f}% | Contracts: {c['contracts']} | Risk: ${c['risk_cents']/100:.2f}")
+        log.info(f"     Closes in {c['hours_to_close']:.1f}h | Vol: {c['volume']}")
+
     # Strategy 2: Near-settlement info arb candidates
-    print("\n" + "=" * 70)
-    print("📈 STRATEGY 2: Near-Settlement Markets (Info Arbitrage Candidates)")
-    print("=" * 70)
+    log.info("\n" + "=" * 70)
+    log.info("STRATEGY 2: Near-Settlement Markets (Info Arbitrage Candidates)")
+    log.info("=" * 70)
     near_settle = find_near_settlement(markets)
-    print(f"  Found {len(near_settle)} markets settling within 6h with reasonable spreads")
+    log.info(f"  Found {len(near_settle)} markets settling within 6h with reasonable spreads")
     for i, c in enumerate(near_settle[:10]):
-        print(f"  {i+1}. {c['ticker']} — {c['title']}")
-        print(f"     Bid: {c['yes_bid']}¢ / Ask: {c['yes_ask']}¢ | Spread: {c['spread']}¢ | Close: {c['hours_to_close']:.1f}h")
-    
+        log.info(f"  {i+1}. {c['ticker']} -- {c['title']}")
+        log.info(f"     Bid: {c['yes_bid']}c / Ask: {c['yes_ask']}c | Spread: {c['spread']}c | Close: {c['hours_to_close']:.1f}h")
+
     # Place trades — top 5 longshot sells
-    print("\n" + "=" * 70)
-    print("💰 PLACING TRADES (Top 5 Longshot Sells)")
-    print("=" * 70)
-    
+    log.info("\n" + "=" * 70)
+    log.info("PLACING TRADES (Top 5 Longshot Sells)")
+    log.info("=" * 70)
+
     trades_executed = []
     for c in longshots[:5]:
         ticker = c["ticker"]
-        # Buy NO = equivalent to selling YES
-        # NO price = 100 - YES price
         no_price = 100 - c["yes_price"]
         contracts = c["contracts"]
-        
+
         body = {
             "ticker": ticker,
             "action": "buy",
@@ -294,24 +256,24 @@ def main():
             "count": contracts,
             "no_price": no_price,
         }
-        
-        print(f"\n  📤 BUY {contracts}x NO @ {no_price}¢ on {ticker}")
-        print(f"     ({c['reasoning']})")
-        
+
+        log.info(f"\n  BUY {contracts}x NO @ {no_price}c on {ticker}")
+        log.info(f"     ({c['reasoning']})")
+
         try:
-            result = api("POST", "/portfolio/orders", body)
+            result = client.post("/portfolio/orders", body=body)
             order = result.get("order", {})
             status = order.get("status", "unknown")
             oid = order.get("order_id", "?")
-            print(f"  ✅ Order {oid}: {status}")
-            
+            log.info(f"  Order {oid}: {status}")
+
             trades_executed.append({
                 "timestamp": datetime.datetime.now().isoformat(),
                 "ticker": ticker,
                 "title": c["title"],
                 "subtitle": c.get("subtitle", ""),
                 "strategy": "longshot_sell",
-                "direction": f"BUY NO (= SELL YES)",
+                "direction": "BUY NO (= SELL YES)",
                 "no_price": no_price,
                 "yes_price_at_entry": c["yes_price"],
                 "contracts": contracts,
@@ -323,66 +285,68 @@ def main():
             })
         except requests.exceptions.HTTPError as e:
             err = e.response.text[:300] if hasattr(e, 'response') else str(e)
-            print(f"  ❌ Failed: {err}")
+            log.error(f"  Failed: {err}")
             trades_executed.append({
                 "timestamp": datetime.datetime.now().isoformat(),
                 "ticker": ticker,
                 "title": c["title"],
                 "strategy": "longshot_sell",
-                "direction": f"BUY NO @ {no_price}¢",
+                "direction": f"BUY NO @ {no_price}c",
                 "status": f"FAILED: {err[:100]}",
             })
         except Exception as e:
-            print(f"  ❌ Failed: {e}")
-    
+            log.error(f"  Failed: {e}")
+
     # Final balance
-    bal = api("GET", "/portfolio/balance")
-    print(f"\n💰 Final Balance: ${bal.get('balance', 0)/100:.2f} | Available: ${bal.get('available_balance', 0)/100:.2f}")
-    
+    balance, avail = client.get_balance()
+    log.info(f"\nFinal Balance: ${balance/100:.2f} | Available: ${avail/100:.2f}")
+
     # Write performance log
-    print("\n📝 Writing trade log...")
+    log.info("\nWriting trade log...")
     log_path = DATA_DIR / "kalshi-trade-performance.md"
-    
+
     existing = ""
     if log_path.exists():
         existing = log_path.read_text()
-    
+
     new_section = f"\n\n## Trade Session: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-    new_section += f"**Balance**: ${bal.get('balance', 0)/100:.2f} | **Available**: ${bal.get('available_balance', 0)/100:.2f}\n\n"
+    new_section += f"**Balance**: ${balance/100:.2f} | **Available**: ${avail/100:.2f}\n\n"
     new_section += f"**Markets Scanned**: {len(markets)} | **Longshot Candidates**: {len(longshots)} | **Near-Settlement**: {len(near_settle)}\n\n"
-    
+
     if trades_executed:
         new_section += "### Trades Placed\n\n"
         new_section += "| # | Ticker | Direction | Price | Qty | Edge | Risk | Status | Reasoning |\n"
         new_section += "|---|--------|-----------|-------|-----|------|------|--------|----------|\n"
         for i, t in enumerate(trades_executed):
-            new_section += f"| {i+1} | `{t['ticker'][:25]}` | {t['direction'][:20]} | {t.get('no_price', '?')}¢ | {t.get('contracts', '?')} | {t.get('est_edge', '?')} | ${t.get('risk_cents', 0)/100:.2f} | {t['status']} | {t.get('reasoning', '')[:60]} |\n"
+            new_section += f"| {i+1} | `{t['ticker'][:25]}` | {t['direction'][:20]} | {t.get('no_price', '?')}c | {t.get('contracts', '?')} | {t.get('est_edge', '?')} | ${t.get('risk_cents', 0)/100:.2f} | {t['status']} | {t.get('reasoning', '')[:60]} |\n"
     else:
         new_section += "### No trades placed this session\n"
-    
+
     if settled:
         new_section += "\n### Settled Trades\n\n"
         for s in settled:
             new_section += f"- {s}\n"
-    
+
     if not existing:
         existing = "# Kalshi Trade Performance Log\n\nAutomated trading performance tracking.\n"
-    
+
     log_path.write_text(existing + new_section)
-    print(f"  ✅ Logged to {log_path}")
-    
+    log.info(f"  Logged to {log_path}")
+
     # Also save raw JSON
     json_path = DATA_DIR / "kalshi-strategy-trades.json"
     json_data = []
     if json_path.exists():
-        try: json_data = json.loads(json_path.read_text())
-        except: pass
+        try:
+            json_data = json.loads(json_path.read_text())
+        except (json.JSONDecodeError, ValueError):
+            pass
     json_data.extend(trades_executed)
     json_path.write_text(json.dumps(json_data, indent=2))
-    
-    print(f"\n{'='*70}")
-    print(f"✅ STRATEGY TRADER COMPLETE — {len(trades_executed)} trades placed")
-    print(f"{'='*70}")
+
+    log.info(f"\n{'='*70}")
+    log.info(f"STRATEGY TRADER COMPLETE -- {len(trades_executed)} trades placed")
+    log.info(f"{'='*70}")
 
 if __name__ == "__main__":
     main()

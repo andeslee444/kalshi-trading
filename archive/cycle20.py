@@ -1,31 +1,22 @@
 #!/usr/bin/env python3
-"""Cycle 20 — check settlements, balance, positions, trade."""
-import json, time, base64, datetime, os, sys, re, requests
+"""Cycle 20 — check settlements, balance, positions, trade.
+
+ARCHIVED: This is a historical iteration kept for reference.
+Refactored to use shared KalshiClient instead of hardcoded credentials.
+"""
+import json, datetime, re, sys, requests
 from pathlib import Path
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.backends import default_backend
 
-PROJECT_DIR = Path(__file__).resolve().parent
-KEY_PATH = PROJECT_DIR / "config" / "keys" / "kalshi-demo.pem"
-API_KEY = "64b1b6ff-eac2-4977-919a-fd1b9865f0aa"
-BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
+# Use shared auth module
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"))
+from kalshi_auth import KalshiClient, PROJECT_DIR
 
-with open(KEY_PATH, "rb") as f:
-    private_key = serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
-
-def get_headers(method, path):
-    ts = str(int(time.time() * 1000))
-    msg = f"{ts}{method}{path.split('?')[0]}"
-    sig = private_key.sign(msg.encode(), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
-    return {"KALSHI-ACCESS-KEY": API_KEY, "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(), "KALSHI-ACCESS-TIMESTAMP": ts, "Content-Type": "application/json"}
+client = KalshiClient()
 
 def api(method, path, body=None):
-    url = BASE_URL + path
-    h = get_headers(method, "/trade-api/v2" + path)
-    r = (requests.get if method == "GET" else requests.post)(url, headers=h, json=body if method != "GET" else None, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    if method == "GET":
+        return client.get(path)
+    return client.post(path, body=body)
 
 print("=" * 60)
 print("CYCLE 20 — Feb 17 2026 ~noon ET")

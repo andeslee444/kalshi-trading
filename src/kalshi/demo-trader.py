@@ -3,58 +3,20 @@
 Authenticates, lists markets, places test trades, verifies positions.
 """
 
-import json, time, base64, datetime, os, sys, uuid
+import json, time, datetime, os, sys, uuid
 import requests
 from pathlib import Path
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.backends import default_backend
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR
 
-sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
+setup_unbuffered()
+setup_signal_handlers()
+log = setup_logging("demo-trader")
 
 # === Config ===
-PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
-KEY_PATH = PROJECT_DIR / "config" / "keys" / "kalshi-demo.pem"
 DATA_DIR = PROJECT_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-API_KEY = "64b1b6ff-eac2-4977-919a-fd1b9865f0aa"
-BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
-
-# === Auth ===
-with open(KEY_PATH, "rb") as f:
-    private_key = serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
-
-def get_headers(method: str, path: str) -> dict:
-    ts = str(int(time.time() * 1000))
-    path_clean = path.split("?")[0]
-    msg = f"{ts}{method}{path_clean}"
-    sig = private_key.sign(
-        msg.encode("utf-8"),
-        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
-        hashes.SHA256(),
-    )
-    return {
-        "KALSHI-ACCESS-KEY": API_KEY,
-        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode("utf-8"),
-        "KALSHI-ACCESS-TIMESTAMP": ts,
-        "Content-Type": "application/json",
-    }
-
-def api(method, path, body=None):
-    url = BASE_URL + path
-    full_path = "/trade-api/v2" + path
-    headers = get_headers(method, full_path)
-    if method == "GET":
-        r = requests.get(url, headers=headers, timeout=15)
-    elif method == "POST":
-        r = requests.post(url, headers=headers, json=body, timeout=15)
-    elif method == "DELETE":
-        r = requests.delete(url, headers=headers, timeout=15)
-    else:
-        raise ValueError(f"Unknown method: {method}")
-    r.raise_for_status()
-    return r.json()
+client = KalshiClient()
 
 # === Market Discovery ===
 def get_all_markets(limit=200):
@@ -65,7 +27,7 @@ def get_all_markets(limit=200):
         path = f"/markets?status=open&limit={min(limit, 1000)}"
         if cursor:
             path += f"&cursor={cursor}"
-        data = api("GET", path)
+        data = client.get(path)
         markets = data.get("markets", [])
         all_markets.extend(markets)
         cursor = data.get("cursor")
@@ -80,7 +42,7 @@ def categorize_markets(markets):
         ticker = m.get("ticker", "")
         cat = m.get("category", "unknown")
         series = m.get("series_ticker", "")
-        
+
         # Infer category from ticker prefix
         if "KXHIGH" in ticker or "KXLOW" in ticker:
             cat = "weather"
@@ -96,18 +58,18 @@ def categorize_markets(markets):
             cat = "politics"
         elif "KXIPO" in ticker:
             cat = "companies"
-        
+
         if cat not in categories:
             categories[cat] = []
         categories[cat].append(m)
-    
+
     return categories
 
 def find_tradeable_markets(markets, max_results=10):
     """Find markets with liquidity that are settling soon."""
     tradeable = []
     now = datetime.datetime.now(datetime.timezone.utc)
-    
+
     for m in markets:
         ticker = m.get("ticker", "")
         yes_ask = m.get("yes_ask", 0)
@@ -115,25 +77,25 @@ def find_tradeable_markets(markets, max_results=10):
         no_ask = m.get("no_ask", 0)
         no_bid = m.get("no_bid", 0)
         volume = m.get("volume", 0)
-        
+
         # Need at least one side with prices
         has_liquidity = (yes_ask > 0 and yes_ask < 99) or (no_ask > 0 and no_ask < 99)
         if not has_liquidity:
             continue
-        
+
         # Parse close time
         close_time_str = m.get("close_time", "")
         if close_time_str:
             try:
                 close_time = datetime.datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
                 hours_to_close = (close_time - now).total_seconds() / 3600
-            except:
+            except (ValueError, TypeError):
                 hours_to_close = 999
         else:
             hours_to_close = 999
-        
+
         spread = (yes_ask - yes_bid) if (yes_ask and yes_bid) else 100
-        
+
         tradeable.append({
             "ticker": ticker,
             "title": m.get("title", ""),
@@ -148,7 +110,7 @@ def find_tradeable_markets(markets, max_results=10):
             "category": m.get("category", ""),
             "market": m,
         })
-    
+
     # Sort by hours to close, prefer ones closing soon with decent volume
     tradeable.sort(key=lambda x: (x["hours_to_close"], -x["volume"]))
     return tradeable[:max_results]
@@ -167,68 +129,68 @@ def place_trade(ticker, side="yes", action="buy", count=1, price=None):
         body["yes_price"] = price
     elif side == "no" and price:
         body["no_price"] = price
-    
-    print(f"\n  📤 Placing order: {action} {count}x {side} @ {price}¢ on {ticker}")
-    result = api("POST", "/portfolio/orders", body)
+
+    log.info("Placing order: %s %dx %s @ %sc on %s", action, count, side, price, ticker)
+    result = client.post("/portfolio/orders", body=body)
     order = result.get("order", {})
-    print(f"  ✅ Order ID: {order.get('order_id', '?')}, Status: {order.get('status', '?')}")
+    log.info("Order ID: %s, Status: %s", order.get('order_id', '?'), order.get('status', '?'))
     return result
 
 def get_positions():
     """Get current positions."""
-    data = api("GET", "/portfolio/positions")
+    data = client.get("/portfolio/positions")
     return data.get("market_positions", [])
 
 def get_orders():
     """Get current orders."""
-    data = api("GET", "/portfolio/orders")
+    data = client.get("/portfolio/orders")
     return data.get("orders", [])
 
 def get_balance():
     """Get account balance."""
-    return api("GET", "/portfolio/balance")
+    return client.get("/portfolio/balance")
 
 # === Main ===
 def main():
-    print("=" * 70)
-    print("🎯 KALSHI DEMO TRADER — Testing Full Trading Flow")
-    print(f"   Time: {datetime.datetime.now().isoformat()}")
-    print(f"   API: {BASE_URL}")
-    print("=" * 70)
-    
+    log.info("=" * 70)
+    log.info("KALSHI DEMO TRADER — Testing Full Trading Flow")
+    log.info("Time: %s", datetime.datetime.now().isoformat())
+    log.info("API: %s", client.base_url)
+    log.info("=" * 70)
+
     # Step 1: Auth & Balance
-    print("\n📊 Step 1: Verify Authentication & Balance")
+    log.info("Step 1: Verify Authentication & Balance")
     try:
         bal = get_balance()
         balance_cents = bal.get("balance", 0)
-        print(f"  ✅ Auth OK! Balance: ${balance_cents/100:.2f}")
+        log.info("Auth OK! Balance: $%.2f", balance_cents / 100)
     except Exception as e:
-        print(f"  ❌ Auth failed: {e}")
+        log.error("Auth failed: %s", e)
         sys.exit(1)
-    
+
     # Step 2: List all markets
-    print("\n📋 Step 2: Fetching All Open Markets...")
+    log.info("Step 2: Fetching All Open Markets...")
     try:
         markets = get_all_markets(limit=2000)
-        print(f"  Found {len(markets)} open markets total")
+        log.info("Found %d open markets total", len(markets))
     except Exception as e:
-        print(f"  ❌ Market fetch failed: {e}")
+        log.error("Market fetch failed: %s", e)
         import traceback; traceback.print_exc()
         sys.exit(1)
-    
+
     # Step 3: Categorize
-    print("\n📂 Step 3: Categorizing Markets...")
+    log.info("Step 3: Categorizing Markets...")
     categories = categorize_markets(markets)
     for cat, cat_markets in sorted(categories.items(), key=lambda x: -len(x[1])):
-        print(f"  {cat}: {len(cat_markets)} markets")
+        log.info("  %s: %d markets", cat, len(cat_markets))
         # Show a few examples
         for m in cat_markets[:3]:
             ticker = m.get("ticker", "")
             title = m.get("title", "")[:60]
             yes_ask = m.get("yes_ask", 0)
             vol = m.get("volume", 0)
-            print(f"    • {ticker} — {title} (ask:{yes_ask}¢, vol:{vol})")
-    
+            log.info("    %s — %s (ask:%sc, vol:%s)", ticker, title, yes_ask, vol)
+
     # Save full market data
     market_data_path = DATA_DIR / "all-open-markets.json"
     with open(market_data_path, "w") as f:
@@ -238,36 +200,37 @@ def main():
             "categories": {k: len(v) for k, v in categories.items()},
             "markets": markets,
         }, f, indent=2)
-    print(f"\n  💾 Saved market data to {market_data_path}")
-    
+    log.info("Saved market data to %s", market_data_path)
+
     # Step 4: Find tradeable markets
-    print("\n🔍 Step 4: Finding Tradeable Markets (closing soon, has liquidity)...")
+    log.info("Step 4: Finding Tradeable Markets (closing soon, has liquidity)...")
     tradeable = find_tradeable_markets(markets, max_results=20)
-    print(f"  Found {len(tradeable)} tradeable markets:")
+    log.info("Found %d tradeable markets:", len(tradeable))
     for i, t in enumerate(tradeable):
         hrs = t["hours_to_close"]
         hrs_str = f"{hrs:.1f}h" if hrs < 999 else "n/a"
-        print(f"  {i+1}. [{t['category']}] {t['ticker']}")
-        print(f"     {t['title'][:70]}")
-        print(f"     Ask: {t['yes_ask']}¢ YES / {t['no_ask']}¢ NO | Vol: {t['volume']} | Close: {hrs_str} | Spread: {t['spread']}¢")
-    
+        log.info("  %d. [%s] %s", i + 1, t['category'], t['ticker'])
+        log.info("     %s", t['title'][:70])
+        log.info("     Ask: %sc YES / %sc NO | Vol: %s | Close: %s | Spread: %sc",
+                 t['yes_ask'], t['no_ask'], t['volume'], hrs_str, t['spread'])
+
     # Step 5: Place demo trades
-    print("\n💰 Step 5: Placing Demo Trades...")
+    log.info("Step 5: Placing Demo Trades...")
     trades_placed = []
-    
+
     if not tradeable:
-        print("  ⚠️ No tradeable markets found! Trying to place on any market with an ask...")
+        log.warning("No tradeable markets found! Trying to place on any market with an ask...")
         # Fall back to any market with prices
         for m in markets:
             if m.get("yes_ask", 0) > 0 and m.get("yes_ask", 0) < 95:
                 tradeable = [{"ticker": m["ticker"], "yes_ask": m["yes_ask"], "no_ask": m.get("no_ask", 0), "title": m.get("title", ""), "market": m}]
                 break
-    
+
     for t in tradeable[:3]:  # Place up to 3 test trades
         ticker = t["ticker"]
         yes_ask = t.get("yes_ask", 0)
         no_ask = t.get("no_ask", 0)
-        
+
         # Choose the cheaper side (more upside)
         if yes_ask > 0 and yes_ask <= 50:
             side = "yes"
@@ -282,9 +245,9 @@ def main():
             side = "no"
             price = no_ask
         else:
-            print(f"  ⏭️ Skipping {ticker} — no good price")
+            log.info("Skipping %s — no good price", ticker)
             continue
-        
+
         try:
             result = place_trade(ticker, side=side, action="buy", count=1, price=price)
             trades_placed.append({
@@ -295,38 +258,42 @@ def main():
                 "title": t.get("title", ""),
             })
         except requests.exceptions.HTTPError as e:
-            print(f"  ❌ Trade failed: {e.response.status_code} — {e.response.text[:200]}")
+            log.error("Trade failed: %s — %s", e.response.status_code, e.response.text[:200])
         except Exception as e:
-            print(f"  ❌ Trade failed: {e}")
-    
+            log.error("Trade failed: %s", e)
+
     # Step 6: Check positions and orders
-    print("\n📊 Step 6: Checking Positions & Orders...")
+    log.info("Step 6: Checking Positions & Orders...")
     try:
         positions = get_positions()
-        print(f"  Positions: {len(positions)}")
+        log.info("Positions: %d", len(positions))
         for p in positions[:10]:
             ticker = p.get("ticker", "")
             qty = p.get("total_traded", 0)
-            print(f"    • {ticker}: {qty} contracts")
+            log.info("    %s: %d contracts", ticker, qty)
     except Exception as e:
-        print(f"  ❌ Position fetch error: {e}")
-    
+        log.error("Position fetch error: %s", e)
+
     try:
         orders = get_orders()
-        print(f"  Open Orders: {len(orders)}")
+        log.info("Open Orders: %d", len(orders))
         for o in orders[:10]:
-            print(f"    • {o.get('ticker', '')}: {o.get('side', '')} {o.get('remaining_count', 0)}x @ {o.get('yes_price', o.get('no_price', '?'))}¢ — {o.get('status', '?')}")
+            log.info("    %s: %s %sx @ %sc — %s",
+                     o.get('ticker', ''), o.get('side', ''),
+                     o.get('remaining_count', 0),
+                     o.get('yes_price', o.get('no_price', '?')),
+                     o.get('status', '?'))
     except Exception as e:
-        print(f"  ❌ Orders fetch error: {e}")
-    
+        log.error("Orders fetch error: %s", e)
+
     # Step 7: Final balance
-    print("\n💵 Step 7: Final Balance Check...")
+    log.info("Step 7: Final Balance Check...")
     try:
         bal = get_balance()
-        print(f"  Balance: ${bal.get('balance', 0)/100:.2f}")
+        log.info("Balance: $%.2f", bal.get('balance', 0) / 100)
     except Exception as e:
-        print(f"  ❌ Balance error: {e}")
-    
+        log.error("Balance error: %s", e)
+
     # Save trade log
     trade_log = {
         "timestamp": datetime.datetime.now().isoformat(),
@@ -343,11 +310,11 @@ def main():
     log_path = DATA_DIR / "demo-trades-log.json"
     with open(log_path, "w") as f:
         json.dump(trade_log, f, indent=2)
-    print(f"\n  💾 Trade log saved to {log_path}")
-    
-    print("\n" + "=" * 70)
-    print(f"✅ DEMO TRADING COMPLETE — {len(trades_placed)} trades placed")
-    print("=" * 70)
+    log.info("Trade log saved to %s", log_path)
+
+    log.info("=" * 70)
+    log.info("DEMO TRADING COMPLETE — %d trades placed", len(trades_placed))
+    log.info("=" * 70)
 
 if __name__ == "__main__":
     main()

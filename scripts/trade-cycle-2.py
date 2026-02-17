@@ -1,49 +1,37 @@
 #!/usr/bin/env python3
 """Kalshi Demo Trade Cycle #2 — Check settlements, scan opportunities, place trades."""
 
-import json, time, base64, datetime, os, sys, re
+import json, datetime, sys
 import requests
 from pathlib import Path
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.backends import default_backend
 
-PROJECT_DIR = Path("/Users/andeslee/Documents/cursor-projects/class-sniper")
-KEY_PATH = PROJECT_DIR / "config" / "keys" / "kalshi-demo.pem"
+# ─── Shared auth module ───
+# The project is not an installable package, so we add src/kalshi/ to
+# sys.path directly so that ``from kalshi_auth import ...`` works.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"))
+from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_logging, PROJECT_DIR
+
+setup_unbuffered()
+
 TRADES_JSON = PROJECT_DIR / "data" / "kalshi-strategy-trades.json"
 PERF_MD = PROJECT_DIR / "data" / "kalshi-trade-performance.md"
-API_KEY = "64b1b6ff-eac2-4977-919a-fd1b9865f0aa"
-BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
 
-with open(KEY_PATH, "rb") as f:
-    private_key = serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
-
-def get_headers(method, path):
-    ts = str(int(time.time() * 1000))
-    msg = f"{ts}{method}{path.split('?')[0]}"
-    sig = private_key.sign(msg.encode(), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
-    return {"KALSHI-ACCESS-KEY": API_KEY, "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(), "KALSHI-ACCESS-TIMESTAMP": ts, "Content-Type": "application/json"}
-
-def api(method, path, body=None):
-    url = BASE_URL + path
-    h = get_headers(method, "/trade-api/v2" + path)
-    r = requests.request(method, url, headers=h, json=body if method != "GET" else None, timeout=15)
-    r.raise_for_status()
-    return r.json()
+client = KalshiClient()
 
 # ─── 1. Check balance ───
+now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M EST")
 print("=" * 60)
-print("KALSHI DEMO TRADE CYCLE #2 — 2026-02-16 15:51 EST")
+print(f"KALSHI DEMO TRADE CYCLE #2 — {now_str}")
 print("=" * 60)
 
-bal = api("GET", "/portfolio/balance")
+bal = client.get("/portfolio/balance")
 balance_cents = bal.get("balance", 0)
 print(f"\n💰 Balance: ${balance_cents/100:.2f}")
 
 # ─── 2. Check positions ───
 print("\n📊 Current Positions:")
 try:
-    pos = api("GET", "/portfolio/positions")
+    pos = client.get("/portfolio/positions")
     positions = pos.get("market_positions", [])
     for p in positions:
         ticker = p.get("ticker", "?")
@@ -60,7 +48,7 @@ except Exception as e:
 # ─── 3. Check settlements ───
 print("\n🏁 Recent Settlements:")
 try:
-    sett = api("GET", "/portfolio/settlements?limit=20")
+    sett = client.get("/portfolio/settlements?limit=20")
     settlements = sett.get("settlements", [])
     if settlements:
         for s in settlements:
@@ -91,7 +79,12 @@ SEARCH_CATEGORIES = [
     ("economics", "KXCPI"),
 ]
 
-# Scan all open markets for longshots (YES ≤ 5¢) and near-settlement
+# Dynamic date check: today and tomorrow
+today = datetime.date.today()
+tomorrow = today + datetime.timedelta(days=1)
+near_dates = {today.isoformat(), tomorrow.isoformat()}
+
+# Scan all open markets for longshots (YES <= 5c) and near-settlement
 all_longshots = []
 near_settlement = []
 cursor = None
@@ -102,13 +95,13 @@ for page in range(80):
     if cursor:
         path += f"&cursor={cursor}"
     try:
-        data = api("GET", path)
+        data = client.get(path)
     except Exception as e:
         print(f"  Page {page} error: {e}")
         break
     batch = data.get("markets", [])
     total_scanned += len(batch)
-    
+
     for m in batch:
         ticker = m.get("ticker", "")
         yes_ask = m.get("yes_ask", 0)
@@ -117,22 +110,22 @@ for page in range(80):
         close_time = m.get("close_time", "")
         title = m.get("title", "")
         subtitle = m.get("subtitle", "")
-        
-        # Longshots: YES ≤ 5¢ with asks available
+
+        # Longshots: YES <= 5c with asks available
         if yes_ask and 1 <= yes_ask <= 5:
             all_longshots.append(m)
-        
-        # Near settlement: closes today (2026-02-16) or tomorrow
-        if close_time and close_time[:10] in ("2026-02-16", "2026-02-17"):
+
+        # Near settlement: closes today or tomorrow
+        if close_time and close_time[:10] in near_dates:
             if yes_ask and yes_ask > 0:
                 near_settlement.append(m)
-    
+
     cursor = data.get("cursor")
     if not cursor or not batch:
         break
 
 print(f"  Scanned {total_scanned} markets across {page+1} pages")
-print(f"  Found {len(all_longshots)} longshot opportunities (YES ≤ 5¢)")
+print(f"  Found {len(all_longshots)} longshot opportunities (YES <= 5c)")
 print(f"  Found {len(near_settlement)} near-settlement markets")
 
 # ─── 5. Score and select best trades ───
@@ -142,10 +135,10 @@ print(f"  Found {len(near_settlement)} near-settlement markets")
 # Existing tickers to avoid duplicates
 existing_tickers = set()
 try:
-    existing = json.loads(TRADES_JSON.read_text())
+    existing = load_trades(TRADES_JSON)
     for t in existing:
         existing_tickers.add(t.get("ticker", ""))
-except:
+except (json.JSONDecodeError, ValueError):
     existing = []
 
 # Score longshots — prefer sports/entertainment (strongest bias per Becker)
@@ -199,27 +192,27 @@ for m in all_longshots:
     ticker = m.get("ticker", "")
     if ticker in existing_tickers:
         continue
-    
+
     yes_ask = m.get("yes_ask", 0)
     no_ask = m.get("no_ask", 0)
     title = m.get("title", "")
     subtitle = m.get("subtitle", "")
-    
+
     if not no_ask or no_ask > 99 or no_ask < 90:
         continue
-    
+
     # Buy NO at no_ask — risk = no_ask per contract, profit = 100 - no_ask if longshot loses
-    # Max $5 → contracts = min(floor(500/no_ask), 5)
+    # Max $5 -> contracts = min(floor(500/no_ask), 5)
     contracts = min(500 // no_ask, 5)
     if contracts < 1:
         continue
-    
+
     # Becker model edge estimate
     implied_prob = yes_ask / 100
-    # Longshots at ≤5¢ historically win ~40-60% less than implied
-    est_true_prob = max(0.001, implied_prob * 0.43)  # Becker: 1¢ contracts win 0.43% vs 1% implied
+    # Longshots at <=5c historically win ~40-60% less than implied
+    est_true_prob = max(0.001, implied_prob * 0.43)  # Becker: 1c contracts win 0.43% vs 1% implied
     edge = (1 - est_true_prob) - (no_ask / 100)
-    
+
     order = {
         "ticker": ticker,
         "action": "buy",
@@ -228,15 +221,15 @@ for m in all_longshots:
         "count": contracts,
         "no_price": no_ask,
     }
-    
+
     try:
-        result = api("POST", "/portfolio/orders", order)
+        result = client.post("/portfolio/orders", body=order)
         oi = result.get("order", {})
         status = oi.get("status", "unknown")
         oid = oi.get("order_id", "unknown")
         print(f"  ✅ #{trade_count+1} SELL LONGSHOT: {ticker} — BUY {contracts}x NO@{no_ask}¢ — {title}")
         print(f"     Order {oid}: {status} | Risk: ${contracts*no_ask/100:.2f} | Edge: {edge*100:.1f}%")
-        
+
         new_trades.append({
             "timestamp": datetime.datetime.now().isoformat(),
             "ticker": ticker,
@@ -268,12 +261,12 @@ for m in near_settlement:
     ticker = m.get("ticker", "")
     if ticker in existing_tickers:
         continue
-    
+
     yes_ask = m.get("yes_ask", 0)
     no_ask = m.get("no_ask", 0)
     title = m.get("title", "")
     subtitle = m.get("subtitle", "")
-    
+
     # Only trade if there's a clear lean (YES very cheap or very expensive)
     if yes_ask and 1 <= yes_ask <= 10 and no_ask and no_ask >= 90:
         # Likely NO outcome — buy NO
@@ -282,7 +275,7 @@ for m in near_settlement:
             continue
         order = {"ticker": ticker, "action": "buy", "side": "no", "type": "limit", "count": contracts, "no_price": no_ask}
         try:
-            result = api("POST", "/portfolio/orders", order)
+            result = client.post("/portfolio/orders", body=order)
             oi = result.get("order", {})
             status = oi.get("status", "unknown")
             oid = oi.get("order_id", "unknown")
@@ -305,7 +298,7 @@ for m in near_settlement:
             print(f"  ❌ Failed {ticker}: {e.response.status_code} {e.response.text[:200]}")
         except Exception as e:
             print(f"  ❌ Failed {ticker}: {e}")
-    
+
     elif yes_ask and 90 <= yes_ask <= 99 and no_ask and 1 <= no_ask <= 10:
         # Likely YES outcome — buy YES
         contracts = min(500 // yes_ask, 5)
@@ -313,7 +306,7 @@ for m in near_settlement:
             continue
         order = {"ticker": ticker, "action": "buy", "side": "yes", "type": "limit", "count": contracts, "yes_price": yes_ask}
         try:
-            result = api("POST", "/portfolio/orders", order)
+            result = client.post("/portfolio/orders", body=order)
             oi = result.get("order", {})
             status = oi.get("status", "unknown")
             oid = oi.get("order_id", "unknown")
@@ -341,17 +334,18 @@ print(f"\n📊 Summary: Placed {trade_count} new trades")
 
 # ─── 7. Update trades JSON ───
 all_trades = existing + new_trades
+TRADES_JSON.parent.mkdir(parents=True, exist_ok=True)
 TRADES_JSON.write_text(json.dumps(all_trades, indent=2))
 print(f"✅ Updated {TRADES_JSON} ({len(all_trades)} total trades)")
 
 # ─── 8. Update performance markdown ───
 # Re-check balance after trades
-bal2 = api("GET", "/portfolio/balance")
+bal2 = client.get("/portfolio/balance")
 new_balance = bal2.get("balance", 0)
 
 perf_entry = f"""
 
-## Trade Session: 2026-02-16 15:51 (Cycle #2)
+## Trade Session: {now_str} (Cycle #2)
 
 **Balance Before**: ${balance_cents/100:.2f} | **Balance After**: ${new_balance/100:.2f}
 
@@ -379,6 +373,7 @@ if not new_trades:
     perf_entry += "| — | No new trades placed | — | — | — | — | — | — | — |\n"
 
 # Append to performance file
+PERF_MD.parent.mkdir(parents=True, exist_ok=True)
 with open(PERF_MD, "a") as f:
     f.write(perf_entry)
 print(f"✅ Updated {PERF_MD}")
