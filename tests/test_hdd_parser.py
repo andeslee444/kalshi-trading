@@ -24,6 +24,24 @@ def _load_hdd_scraper():
     fake_auth.PROJECT_DIR = Path("/tmp/fake_project")
     fake_auth.load_trades = lambda *a, **kw: []
     fake_auth.save_trade = lambda *a, **kw: None
+    fake_auth.fetch_parallel = lambda *a, **kw: {}
+    fake_auth.retry_request = lambda *a, **kw: None
+    fake_auth.RecentTradeTracker = type("RecentTradeTracker", (), {
+        "__init__": lambda self, *a, **kw: None,
+        "is_recent": lambda self, t: False,
+        "record": lambda self, t: None,
+    })
+    fake_auth.TradeManager = type("TradeManager", (), {
+        "__init__": lambda self, *a, **kw: None,
+        "place_order": lambda self, *a, **kw: None,
+    })
+    fake_auth.CircuitBreaker = type("CircuitBreaker", (), {
+        "__init__": lambda self, *a, **kw: None,
+    })
+    fake_auth.check_kill_switch = lambda *a, **kw: False
+    fake_auth.validate_trade_config = lambda *a, **kw: None
+    fake_auth.trim_trade_log = lambda *a, **kw: None
+    fake_auth._atomic_write_json = lambda *a, **kw: None
     sys.modules["kalshi_auth"] = fake_auth
 
     # Create directories the module expects at import time

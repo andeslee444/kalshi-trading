@@ -6,7 +6,8 @@ Scans KXHIGH temperature markets, compares to Open-Meteo forecasts, and places t
 import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR
+from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log
+from probability import weather_probability, half_kelly
 
 setup_unbuffered()
 log = setup_logging("weather")
@@ -21,12 +22,17 @@ config = json.loads(CONFIG_PATH.read_text())
 CITIES = config["cities"]
 
 client = KalshiClient()
+trade_manager = TradeManager(client, TRADES_PATH, {
+    "maxTradeAmount": config["maxTradeAmount"],
+    "maxDailyTrades": config.get("maxDailyTrades", 10),
+    "maxDailyLoss": config.get("maxDailyLoss", 10),
+}, logger=log)
+trim_trade_log(TRADES_PATH)
 
 # === Weather Forecast ===
 def get_forecast(lat, lon):
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max&temperature_unit=fahrenheit&timezone=America%2FNew_York&forecast_days=7"
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
+    r = retry_request("GET", url, timeout=10)
     d = r.json()["daily"]
     return dict(zip(d["time"], d["temperature_2m_max"]))
 
@@ -53,43 +59,17 @@ def parse_ticker(ticker):
     }
 
 # === Trading ===
-session_trades = 0
 
-def compute_probability(forecast_temp, threshold, direction):
+def compute_probability(forecast_temp, threshold, direction, days_out=0, city=None):
     """Estimate probability that YES resolves true.
 
-    Step-function approximation based on Open-Meteo forecast error distribution.
-    NWS forecast error for daily highs is typically ±3°F (68% CI), ±6°F (95% CI).
-    The probability bins map forecast-vs-threshold difference to YES probability:
-      T (above): >6°F→95%, >3°F→85%, >1°F→65%, >-1°F→45%, etc.
-      B (bracket): within 1°F of center→30%, decaying with distance.
+    CDF-based model using weather_probability() from shared probability module.
+    sigma scales with forecast horizon: sigma = 2.5 + 0.5 * days_out.
+    If city is provided and calibration data exists, uses calibrated sigma.
     """
-    diff = forecast_temp - threshold
-    if direction == "T":
-        # YES = temp > threshold.
-        # Bins derived from NWS daily-high forecast error CDF:
-        #   P(error < 3°F) ≈ 68%, P(error < 6°F) ≈ 95% (normal, σ ≈ 3°F).
-        # Each bin = P(actual > threshold) given forecast diff.
-        if diff > 6: return 0.95    # forecast well above → ~95% CI confirms
-        elif diff > 3: return 0.85  # forecast 1σ above → high confidence
-        elif diff > 1: return 0.65  # slight edge, within noise
-        elif diff > -1: return 0.45 # near coin-flip, forecast ≈ threshold
-        elif diff > -3: return 0.25 # forecast 1σ below → unlikely
-        elif diff > -6: return 0.10 # forecast well below → ~5th percentile
-        else: return 0.03           # forecast >6°F below → extreme tail
-    else:  # B = bracket (temp in range, typically 1°F wide)
-        bracket_center = threshold + 0.5
-        dist = abs(forecast_temp - bracket_center)
-        # Bracket P ≈ PDF of error distribution × bracket width.
-        # Peak ~30% for 1°F bracket when forecast is centered (σ ≈ 3°F).
-        if dist < 1: return 0.30    # forecast centered on bracket
-        elif dist < 2: return 0.20  # near edge of bracket
-        elif dist < 3: return 0.12  # ~1σ away → density dropping
-        elif dist < 5: return 0.06  # ~1.5σ away → low density
-        else: return 0.02           # >5°F away → deep tail
+    return weather_probability(forecast_temp, threshold, direction, days_out, city=city)
 
 def scan_and_trade():
-    global session_trades
     now = datetime.datetime.now()
     log.info(f"\n{'='*60}")
     log.info(f"[{now.isoformat()}] Market scan starting...")
@@ -102,9 +82,9 @@ def scan_and_trade():
         log.error(f"Balance error: {e}")
         return
 
-    # Get weather markets
+    # Get weather markets (5-min cache — markets don't change that fast)
     try:
-        markets = client.get_all_markets(prefix="KXHIGH")
+        markets = client.get_all_markets(prefix="KXHIGH", cache_ttl=300)
         log.info(f"Found {len(markets)} KXHIGH markets")
     except Exception as e:
         log.error(f"Market fetch error: {e}")
@@ -143,7 +123,12 @@ def scan_and_trade():
             continue
 
         forecast_temp = forecasts[city][date_str]
-        our_prob = compute_probability(forecast_temp, parsed["threshold"], parsed["direction"])
+        try:
+            market_date = datetime.date.fromisoformat(date_str)
+            days_out = max(0, (market_date - datetime.date.today()).days)
+        except (ValueError, TypeError):
+            days_out = 0
+        our_prob = compute_probability(forecast_temp, parsed["threshold"], parsed["direction"], days_out, city=city)
 
         yes_ask = m.get("yes_ask", 0)
         yes_bid = m.get("yes_bid", 0)
@@ -182,10 +167,6 @@ def scan_and_trade():
     log.info(f"Found {len(opportunities)} opportunities with edge >= {config['edgeThreshold']*100:.0f}%")
 
     for opp in opportunities:
-        if session_trades >= config.get("maxDailyTrades", 10):
-            log.info(f"Session trade limit ({config.get('maxDailyTrades', 10)}) reached.")
-            break
-
         ticker = opp["ticker"]
         edge = opp["edge"]
         forecast = opp["forecast"]
@@ -204,42 +185,17 @@ def scan_and_trade():
             continue
 
         max_cost = config["maxTradeAmount"] * 100
-        count = max(1, min(max_cost // price, 10))
+        count, risk = half_kelly(abs(edge), price, max_cost)
+        if count < 1:
+            count = 1
 
         log.info(f"\n-> TRADE: {reasoning}")
         log.info(f"  Placing: {count}x {side} @ {price}c")
 
-        try:
-            order_body = {
-                "ticker": ticker,
-                "action": "buy",
-                "side": side,
-                "type": "limit",
-                "count": count,
-            }
-            if side == "yes":
-                order_body["yes_price"] = price
-            else:
-                order_body["no_price"] = price
-
-            result = client.post("/portfolio/orders", body=order_body)
-            order_info = result.get("order", {})
-            log.info(f"  Order placed! ID: {order_info.get('order_id', 'unknown')}, status: {order_info.get('status', '?')}")
-            session_trades += 1
-
-            save_trade(TRADES_PATH, {
-                "timestamp": now.isoformat(),
-                "ticker": ticker, "side": side, "price": price,
-                "count": count, "reasoning": reasoning,
-                "forecast_temp": forecast, "threshold": threshold,
-                "edge": round(edge, 4),
-                "order_id": order_info.get("order_id"),
-                "status": order_info.get("status"),
-            })
-        except requests.exceptions.HTTPError as e:
-            log.error(f"  Order failed: {e.response.status_code} {e.response.text[:200]}")
-        except Exception as e:
-            log.error(f"  Order failed: {e}")
+        trade_manager.place_order(
+            ticker, side, price, count, reasoning,
+            forecast_temp=forecast, threshold=threshold, edge=round(edge, 4)
+        )
 
 def main():
     log.info("=" * 60)

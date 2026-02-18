@@ -6,7 +6,8 @@ Strategies: Longshot bias selling, maker-only limit orders, info arbitrage near 
 import json, time, datetime, os, sys, math
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log, _atomic_write_json
+from probability import half_kelly_sell
 
 setup_unbuffered()
 log = setup_logging("strategy")
@@ -21,37 +22,13 @@ MAX_BET = _bots_cfg["maxBetCents"]
 
 client = KalshiClient()
 
-def half_kelly(edge, price_cents, bankroll):
-    """Half-Kelly sizing for selling YES (buying NO).
-
-    When selling YES at price p:
-    - We get p cents now
-    - We lose (100 - p) cents if the event occurs
-    - True prob of event = market_implied_prob - edge
-
-    Returns number of contracts (0 if Kelly says don't bet).
-    """
-    if edge <= 0 or price_cents <= 0 or price_cents >= 100:
-        return 0
-    # Market implied prob of event
-    implied_prob = price_cents / 100.0
-    # Our estimated true probability (lower than market thinks)
-    p_true = max(0.001, implied_prob - edge)
-    # Selling YES: win p cents with prob (1-p_true), lose (100-p) cents with prob p_true
-    win_prob = 1 - p_true
-    win_amount = price_cents
-    loss_amount = 100 - price_cents
-    # Kelly: f = (p*b - q) / b where b = win/loss odds ratio, p = win prob, q = 1-p
-    b = win_amount / loss_amount
-    kelly_f = (b * win_prob - (1 - win_prob)) / b
-    half_f = kelly_f / 2
-    if half_f <= 0:
-        return 0
-    risk_per = 100 - price_cents
-    max_contracts_kelly = int((half_f * bankroll) / risk_per)
-    max_contracts_cap = MAX_BET // risk_per
-    result = min(max_contracts_kelly, max_contracts_cap)
-    return max(0, result)  # Don't force minimum 1 — respect Kelly
+TRADES_JSON_PATH = DATA_DIR / "kalshi-strategy-trades.json"
+trade_manager = TradeManager(client, TRADES_JSON_PATH, {
+    "maxTradeAmount": MAX_BET / 100,
+    "maxDailyTrades": _bots_cfg.get("maxDailyTrades", 20),
+    "maxDailyLoss": _bots_cfg.get("maxDailyLoss", 50),
+}, logger=log)
+trim_trade_log(TRADES_JSON_PATH)
 
 def find_longshot_sells(markets, bankroll):
     """Find contracts priced <10c YES to SELL (exploit longshot bias)."""
@@ -80,7 +57,9 @@ def find_longshot_sells(markets, bankroll):
         #   1-cent contracts are overpriced by ~57% (win rate 0.43% vs 1% implied).
         #   Mispricing decays exponentially with price: edge ≈ 0.57 * e^(-0.15 * price).
         #   At 5c, edge ≈ 27%; at 10c, edge ≈ 13%; at 15c, edge ≈ 6%.
-        est_edge = max(0, 0.57 * math.exp(-0.15 * yes_ask))
+        # Time-decay: full edge only if >24h to close, decay to 50% at 1h
+        time_factor = min(1.0, 0.5 + 0.5 * min(hours, 24) / 24)
+        est_edge = max(0, 0.57 * math.exp(-0.15 * yes_ask) * time_factor)
 
         if est_edge < 0.03:
             continue
@@ -89,11 +68,9 @@ def find_longshot_sells(markets, bankroll):
         if sell_price <= 1:
             continue
 
-        contracts = half_kelly(est_edge, sell_price, bankroll)
+        contracts, risk = half_kelly_sell(est_edge, sell_price, MAX_BET, bankroll_cents=bankroll)
         if contracts <= 0:
             continue
-
-        risk = contracts * (100 - sell_price)
 
         candidates.append({
             "ticker": ticker,
@@ -112,7 +89,7 @@ def find_longshot_sells(markets, bankroll):
             "reasoning": f"Longshot bias: YES@{sell_price}c implies {sell_price}% prob, Becker model est true prob ~{sell_price - est_edge*100:.1f}%. Sell YES (buy NO@{100-sell_price}c) for ~{est_edge*100:.1f}% edge."
         })
 
-    candidates.sort(key=lambda x: -x["est_edge"] * max(1, x["volume"]))
+    candidates.sort(key=lambda x: -x["est_edge"] * math.log1p(x["volume"]))
     return candidates
 
 def find_near_settlement(markets):
@@ -248,54 +225,39 @@ def main():
         no_price = 100 - c["yes_price"]
         contracts = c["contracts"]
 
-        body = {
-            "ticker": ticker,
-            "action": "buy",
-            "side": "no",
-            "type": "limit",
-            "count": contracts,
-            "no_price": no_price,
-        }
-
         log.info(f"\n  BUY {contracts}x NO @ {no_price}c on {ticker}")
         log.info(f"     ({c['reasoning']})")
 
-        try:
-            result = client.post("/portfolio/orders", body=body)
-            order = result.get("order", {})
-            status = order.get("status", "unknown")
-            oid = order.get("order_id", "?")
-            log.info(f"  Order {oid}: {status}")
-
+        result = trade_manager.place_order(
+            ticker, "no", no_price, contracts, c["reasoning"],
+            strategy="longshot_sell", est_edge=f"{c['est_edge']*100:.1f}%",
+            risk_cents=c["risk_cents"], title=c["title"],
+            subtitle=c.get("subtitle", ""),
+            yes_price_at_entry=c["yes_price"],
+        )
+        if result:
             trades_executed.append({
-                "timestamp": datetime.datetime.now().isoformat(),
                 "ticker": ticker,
                 "title": c["title"],
                 "subtitle": c.get("subtitle", ""),
                 "strategy": "longshot_sell",
                 "direction": "BUY NO (= SELL YES)",
                 "no_price": no_price,
-                "yes_price_at_entry": c["yes_price"],
                 "contracts": contracts,
                 "risk_cents": c["risk_cents"],
                 "est_edge": f"{c['est_edge']*100:.1f}%",
                 "reasoning": c["reasoning"],
-                "order_id": oid,
-                "status": status,
+                "order_id": result.get("order_id", "?"),
+                "status": result.get("status", "?"),
             })
-        except requests.exceptions.HTTPError as e:
-            err = e.response.text[:300] if hasattr(e, 'response') else str(e)
-            log.error(f"  Failed: {err}")
+        else:
             trades_executed.append({
-                "timestamp": datetime.datetime.now().isoformat(),
                 "ticker": ticker,
                 "title": c["title"],
                 "strategy": "longshot_sell",
                 "direction": f"BUY NO @ {no_price}c",
-                "status": f"FAILED: {err[:100]}",
+                "status": "BLOCKED/FAILED",
             })
-        except Exception as e:
-            log.error(f"  Failed: {e}")
 
     # Final balance
     balance, avail = client.get_balance()
@@ -333,16 +295,16 @@ def main():
     log_path.write_text(existing + new_section)
     log.info(f"  Logged to {log_path}")
 
-    # Also save raw JSON
-    json_path = DATA_DIR / "kalshi-strategy-trades.json"
-    json_data = []
-    if json_path.exists():
+    # Trade data already saved by TradeManager; save performance summary
+    perf_json_path = DATA_DIR / "kalshi-strategy-performance.json"
+    perf_data = []
+    if perf_json_path.exists():
         try:
-            json_data = json.loads(json_path.read_text())
+            perf_data = json.loads(perf_json_path.read_text())
         except (json.JSONDecodeError, ValueError):
             pass
-    json_data.extend(trades_executed)
-    json_path.write_text(json.dumps(json_data, indent=2))
+    perf_data.extend(trades_executed)
+    _atomic_write_json(perf_json_path, perf_data)
 
     log.info(f"\n{'='*70}")
     log.info(f"STRATEGY TRADER COMPLETE -- {len(trades_executed)} trades placed")

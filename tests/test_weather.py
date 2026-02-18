@@ -27,22 +27,40 @@ def _load_weather_bot():
     fake_auth.PROJECT_DIR = Path("/tmp/fake_project")
     fake_auth.load_trades = lambda *a, **kw: []
     fake_auth.save_trade = lambda *a, **kw: None
+    fake_auth.fetch_parallel = lambda *a, **kw: {}
+    fake_auth.retry_request = lambda *a, **kw: None
+    fake_auth.RecentTradeTracker = type("RecentTradeTracker", (), {
+        "__init__": lambda self, *a, **kw: None,
+        "is_recent": lambda self, t: False,
+        "record": lambda self, t: None,
+    })
+    fake_auth.TradeManager = type("TradeManager", (), {
+        "__init__": lambda self, *a, **kw: None,
+        "place_order": lambda self, *a, **kw: None,
+    })
+    fake_auth.CircuitBreaker = type("CircuitBreaker", (), {
+        "__init__": lambda self, *a, **kw: None,
+    })
+    fake_auth.check_kill_switch = lambda *a, **kw: False
+    fake_auth.validate_trade_config = lambda *a, **kw: None
+    fake_auth.trim_trade_log = lambda *a, **kw: None
+    fake_auth._atomic_write_json = lambda *a, **kw: None
     sys.modules["kalshi_auth"] = fake_auth
 
     # The module reads config at import time -- provide a minimal stub file.
     config_dir = Path("/tmp/fake_project/config")
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / "kalshi-config.json"
-    if not config_path.exists():
-        import json
-        config_path.write_text(json.dumps({
-            "cities": {},
-            "mode": "demo",
-            "maxTradeAmount": 1,
-            "edgeThreshold": 0.10,
-            "scanIntervalMinutes": 60,
-            "maxDailyTrades": 10,
-        }))
+    import json
+    config_path.write_text(json.dumps({
+        "cities": {},
+        "mode": "demo",
+        "maxTradeAmount": 1,
+        "edgeThreshold": 0.10,
+        "scanIntervalMinutes": 60,
+        "maxDailyTrades": 10,
+        "maxDailyLoss": 10,
+    }))
     # Also create the data directory the module expects
     data_dir = Path("/tmp/fake_project/data")
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -150,10 +168,11 @@ class TestComputeProbability:
     # --- direction = "B" (bracket) ---
 
     def test_bracket_forecast_at_center(self):
-        """Forecast right at bracket center -> ~0.30."""
+        """Forecast right at bracket center -> peak bracket probability.
+        CDF model: 1F bracket at sigma=2.5F gives ~0.16 (PDF peak * width)."""
         # Bracket center for threshold 85 is 85.5
         prob = compute_probability(85.5, 85, "B")
-        assert abs(prob - 0.30) < 0.05
+        assert 0.10 < prob < 0.25
 
     def test_bracket_forecast_far_from_center(self):
         """Forecast 10 degrees from bracket center -> very low probability."""

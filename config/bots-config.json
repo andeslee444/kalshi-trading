@@ -2,6 +2,7 @@
   "entertainment": {
     "maxTradeAmount": 5,
     "maxDailyTrades": 10,
+    "maxDailyLoss": 25,
     "confidenceThreshold": 0.85,
     "scanIntervalMinutes": 15,
     "tickers": ["ALBUM", "BOX", "MOVIE", "STREAM", "MUSIC", "BILLBOARD", "OSCAR", "GRAMMY", "SPOTIFY", "FILM", "ENTERTAIN"]
@@ -9,12 +10,17 @@
   "beatrelease": {
     "checkIntervalHours": 4,
     "maxTradeCents": 500,
+    "maxDailyTrades": 10,
+    "maxDailyLoss": 25,
+    "notificationPhone": "+14255336828",
     "blogUrls": [
       "https://www.beatrelease.com/blog/categories/kalshi-predictions",
       "https://www.beatrelease.com/blog"
     ]
   },
   "strategy": {
-    "maxBetCents": 500
+    "maxBetCents": 500,
+    "maxDailyTrades": 20,
+    "maxDailyLoss": 50
   }
 }

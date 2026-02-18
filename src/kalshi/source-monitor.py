@@ -12,7 +12,8 @@ Sources:
 import json, time, datetime, os, sys, re, hashlib, traceback
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR
+from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log
+from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, half_kelly
 
 setup_unbuffered()
 log = setup_logging("source-monitor")
@@ -31,22 +32,12 @@ SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 config = json.loads(CONFIG_PATH.read_text())
 
 client = KalshiClient()
-
-# === Trade tracking ===
-daily_trades = 0
-daily_loss = 0
-daily_date = None
-
-def reset_daily_if_needed():
-    global daily_trades, daily_loss, daily_date
-    today = datetime.date.today().isoformat()
-    if daily_date != today:
-        daily_trades = 0
-        daily_loss = 0
-        daily_date = today
-
-def save_trade(trade):
-    _save_trade(TRADES_PATH, trade)
+trade_manager = TradeManager(client, TRADES_PATH, {
+    "maxTradeAmount": config["maxTradeAmount"],
+    "maxDailyTrades": config["maxDailyTrades"],
+    "maxDailyLoss": config["maxDailyLoss"],
+}, logger=log)
+trim_trade_log(TRADES_PATH)
 
 def save_snapshot(source_name, content, ext="html"):
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -59,66 +50,11 @@ def get_markets_by_prefix(prefix, status="open"):
     """Get all open markets matching a ticker prefix."""
     return client.get_all_markets(prefix=prefix, status=status)
 
-def place_trade(ticker, side, price_cents, count, reasoning):
-    """Place a limit order. Returns order info or None."""
-    global daily_trades, daily_loss
-    reset_daily_if_needed()
-
-    if daily_trades >= config["maxDailyTrades"]:
-        log.info(f"  Daily trade limit ({config['maxDailyTrades']}) reached, skipping")
-        return None
-
-    cost = price_cents * count
-    if cost > config["maxTradeAmount"] * 100:
-        count = max(1, (config["maxTradeAmount"] * 100) // price_cents)
-        cost = price_cents * count
-
-    order_body = {
-        "ticker": ticker,
-        "action": "buy",
-        "side": side,
-        "type": "limit",
-        "count": count,
-    }
-    if side == "yes":
-        order_body["yes_price"] = price_cents
-    else:
-        order_body["no_price"] = price_cents
-
-    try:
-        result = client.post("/portfolio/orders", body=order_body)
-        order_info = result.get("order", {})
-        daily_trades += 1
-
-        trade_record = {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "ticker": ticker,
-            "side": side,
-            "price_cents": price_cents,
-            "count": count,
-            "cost_cents": cost,
-            "reasoning": reasoning,
-            "order_id": order_info.get("order_id"),
-            "status": order_info.get("status"),
-        }
-        save_trade(trade_record)
-
-        log.info(f"  Order placed! {count}x {side} @ {price_cents}c = ${cost/100:.2f}")
-        log.info(f"     Order ID: {order_info.get('order_id', '?')}, Status: {order_info.get('status', '?')}")
-        return order_info
-    except requests.exceptions.HTTPError as e:
-        log.error(f"  Order failed: {e.response.status_code} {e.response.text[:300]}")
-        return None
-    except Exception as e:
-        log.error(f"  Order failed: {e}")
-        return None
-
-
 # ============================================================
 # SOURCE 1: HITS Daily Double (Album Sales)
 # ============================================================
 
-def check_hdd():
+def check_hdd(prefetched_markets=None):
     """Scrape HITS Daily Double for album sales data."""
     log.info(f"\n[HDD] Checking HITS Daily Double...")
 
@@ -127,8 +63,7 @@ def check_hdd():
     for url in config["sources"]["hdd"]["urls"]:
         try:
             headers = {"User-Agent": user_agent}
-            r = requests.get(url, headers=headers, timeout=20)
-            r.raise_for_status()
+            r = retry_request("GET", url, headers=headers, timeout=20)
             html = r.text
             save_snapshot("hdd", html)
 
@@ -165,7 +100,7 @@ def check_hdd():
 
             if found_data:
                 log.info(f"  Found album sales data: {found_data}")
-                match_hdd_to_markets(found_data)
+                match_hdd_to_markets(found_data, prefetched_markets=prefetched_markets)
             else:
                 log.info(f"  Keywords found but no structured sales data parsed")
 
@@ -175,7 +110,7 @@ def check_hdd():
     # Also try the building chart
     try:
         building_url = "https://hitsdd.section101.com/building_album_chart"
-        r = requests.get(building_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        r = retry_request("GET", building_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
         if r.status_code == 200:
             save_snapshot("hdd_building", r.text)
             log.info(f"  Building chart fetched ({len(r.text)} bytes)")
@@ -200,12 +135,15 @@ def parse_building_chart(html):
         for f in found[:5]:
             log.info(f"    -> {f}")
 
-def match_hdd_to_markets(sales_data):
+def match_hdd_to_markets(sales_data, prefetched_markets=None):
     """Match parsed album sales data to open Kalshi markets."""
     try:
-        markets = get_markets_by_prefix("KXALBUMSALES")
-        if not markets:
-            markets = get_markets_by_prefix("KXALBUM")
+        if prefetched_markets is not None:
+            markets = prefetched_markets.get("album", [])
+        else:
+            markets = get_markets_by_prefix("KXALBUMSALES")
+            if not markets:
+                markets = get_markets_by_prefix("KXALBUM")
 
         if not markets:
             log.info(f"  No open album sales markets found on Kalshi")
@@ -247,45 +185,53 @@ def evaluate_album_trade(market, sale):
     if threshold < 1000:
         threshold *= 1000
 
-    if units > threshold * 1.05:
+    sigma = album_data_sigma(datetime.datetime.now().weekday())
+    confidence = info_arb_probability(units, threshold, sigma)
+
+    if confidence > 0.5:
         outcome = "yes"
-        confidence = min(0.95, 0.7 + (units - threshold) / threshold * 0.5)
-    elif units < threshold * 0.95:
-        outcome = "no"
-        confidence = min(0.95, 0.7 + (threshold - units) / threshold * 0.5)
     else:
-        log.info(f"  {artist}: {units} units too close to threshold {threshold}, skipping")
+        outcome = "no"
+        confidence = 1.0 - confidence
+
+    if confidence < 0.60:
+        log.info(f"  {artist}: {units} units vs {threshold} threshold, confidence {confidence*100:.0f}% too low")
         return
 
     yes_ask = market.get("yes_ask", 0)
     no_ask = market.get("no_ask", 0)
+    max_cost = config["maxTradeAmount"] * 100
 
-    if outcome == "yes" and yes_ask and yes_ask < confidence * 100:
+    if outcome == "yes" and yes_ask and yes_ask < 99:
         edge = confidence - yes_ask / 100
         if edge > 0.10:
-            count = max(1, min((config["maxTradeAmount"] * 100) // yes_ask, 20))
-            reasoning = f"HDD confirms {artist} sold {units/1000:.0f}K units > {threshold/1000:.0f}K threshold. YES at {yes_ask}c, confidence {confidence*100:.0f}%"
+            count, risk = half_kelly(edge, yes_ask, max_cost)
+            if count < 1:
+                count = 1
+            reasoning = f"HDD confirms {artist} sold {units/1000:.0f}K units vs {threshold/1000:.0f}K threshold. YES at {yes_ask}c, confidence {confidence*100:.0f}%"
             log.info(f"\nARBITRAGE FOUND: HITS Daily Double confirms {artist} sold {units/1000:.0f}K units")
             log.info(f"    Market: {ticker} YES at {yes_ask}c -> buying YES (confirmed outcome)")
             log.info(f"    Edge: ~{edge*100:.0f}% | Trade: {count} contracts @ {yes_ask}c = ${count*yes_ask/100:.2f}")
-            place_trade(ticker, "yes", yes_ask, count, reasoning)
+            trade_manager.place_order(ticker, "yes", yes_ask, count, reasoning)
 
-    elif outcome == "no" and no_ask and no_ask < confidence * 100:
+    elif outcome == "no" and no_ask and no_ask < 99:
         edge = confidence - no_ask / 100
         if edge > 0.10:
-            count = max(1, min((config["maxTradeAmount"] * 100) // no_ask, 20))
-            reasoning = f"HDD confirms {artist} sold {units/1000:.0f}K units < {threshold/1000:.0f}K threshold. NO at {no_ask}c, confidence {confidence*100:.0f}%"
+            count, risk = half_kelly(edge, no_ask, max_cost)
+            if count < 1:
+                count = 1
+            reasoning = f"HDD confirms {artist} sold {units/1000:.0f}K units vs {threshold/1000:.0f}K threshold. NO at {no_ask}c, confidence {confidence*100:.0f}%"
             log.info(f"\nARBITRAGE FOUND: HITS Daily Double confirms {artist} sold {units/1000:.0f}K units")
             log.info(f"    Market: {ticker} NO at {no_ask}c -> buying NO (confirmed under threshold)")
             log.info(f"    Edge: ~{edge*100:.0f}% | Trade: {count} contracts @ {no_ask}c = ${count*no_ask/100:.2f}")
-            place_trade(ticker, "no", no_ask, count, reasoning)
+            trade_manager.place_order(ticker, "no", no_ask, count, reasoning)
 
 
 # ============================================================
 # SOURCE 2: Box Office Data
 # ============================================================
 
-def check_boxoffice():
+def check_boxoffice(prefetched_markets=None):
     """Check box office data from Box Office Mojo and The Numbers."""
     now = datetime.datetime.now()
     day_name = now.strftime("%A")
@@ -303,8 +249,7 @@ def check_boxoffice():
     # Check The Numbers
     try:
         url = "https://www.the-numbers.com/market/"
-        r = requests.get(url, headers={"User-Agent": user_agent}, timeout=20)
-        r.raise_for_status()
+        r = retry_request("GET", url, headers={"User-Agent": user_agent}, timeout=20)
         save_snapshot("boxoffice_thenumbers", r.text)
 
         gross_pattern = r'(?:>)([^<]{3,50})</a>\s*</td>\s*<td[^>]*>\s*\$?([\d,]+)'
@@ -326,8 +271,7 @@ def check_boxoffice():
     # Check Box Office Mojo
     try:
         url = "https://www.boxofficemojo.com/"
-        r = requests.get(url, headers={"User-Agent": user_agent}, timeout=20)
-        r.raise_for_status()
+        r = retry_request("GET", url, headers={"User-Agent": user_agent}, timeout=20)
         save_snapshot("boxoffice_mojo", r.text)
 
         movies = re.findall(r'(?:>)([^<]{3,50})</a>.*?\$([\d,.]+)\s*[MmBb]?', r.text, re.DOTALL)
@@ -351,14 +295,17 @@ def check_boxoffice():
         log.error(f"  Box Office Mojo check failed: {e}")
 
     if box_office_data:
-        match_boxoffice_to_markets(box_office_data)
+        match_boxoffice_to_markets(box_office_data, prefetched_markets=prefetched_markets)
 
-def match_boxoffice_to_markets(box_data):
+def match_boxoffice_to_markets(box_data, prefetched_markets=None):
     """Match box office data to Kalshi markets."""
     try:
-        markets = []
-        for prefix in ["KXBOXOFFICE", "KXBOX", "KXMOVIE", "KXFILM"]:
-            markets.extend(get_markets_by_prefix(prefix))
+        if prefetched_markets is not None:
+            markets = prefetched_markets.get("boxoffice", [])
+        else:
+            markets = []
+            for prefix in ["KXBOXOFFICE", "KXBOX", "KXMOVIE", "KXFILM"]:
+                markets.extend(get_markets_by_prefix(prefix))
 
         if not markets:
             log.info(f"  No open box office markets found on Kalshi")
@@ -390,33 +337,43 @@ def evaluate_boxoffice_trade(market, movie):
 
     threshold = float(threshold_match.group(1)) * 1_000_000
 
-    if gross > threshold * 1.10:
+    sigma = boxoffice_data_sigma(datetime.datetime.now().weekday())
+    confidence = info_arb_probability(gross, threshold, sigma)
+
+    if confidence > 0.5:
         outcome = "yes"
-    elif gross < threshold * 0.90:
-        outcome = "no"
     else:
+        outcome = "no"
+        confidence = 1.0 - confidence
+
+    if confidence < 0.60:
         return
 
     yes_ask = market.get("yes_ask", 0)
     no_ask = market.get("no_ask", 0)
+    max_cost = config["maxTradeAmount"] * 100
 
-    if outcome == "yes" and yes_ask and yes_ask < 85:
-        edge = 0.90 - yes_ask / 100
+    if outcome == "yes" and yes_ask and yes_ask < 99:
+        edge = confidence - yes_ask / 100
         if edge > 0.10:
-            count = max(1, (config["maxTradeAmount"] * 100) // yes_ask)
-            reasoning = f"Box office data shows {movie_title} at ${gross/1e6:.1f}M > ${threshold/1e6:.0f}M threshold"
+            count, risk = half_kelly(edge, yes_ask, max_cost)
+            if count < 1:
+                count = 1
+            reasoning = f"Box office data shows {movie_title} at ${gross/1e6:.1f}M vs ${threshold/1e6:.0f}M threshold (conf {confidence*100:.0f}%)"
             log.info(f"\nARBITRAGE FOUND: {movie_title} box office ${gross/1e6:.1f}M > ${threshold/1e6:.0f}M")
-            log.info(f"    Market: {ticker} YES at {yes_ask}c")
-            place_trade(ticker, "yes", yes_ask, count, reasoning)
+            log.info(f"    Market: {ticker} YES at {yes_ask}c | conf={confidence*100:.0f}%")
+            trade_manager.place_order(ticker, "yes", yes_ask, count, reasoning)
 
-    elif outcome == "no" and no_ask and no_ask < 85:
-        edge = 0.90 - no_ask / 100
+    elif outcome == "no" and no_ask and no_ask < 99:
+        edge = confidence - no_ask / 100
         if edge > 0.10:
-            count = max(1, (config["maxTradeAmount"] * 100) // no_ask)
-            reasoning = f"Box office data shows {movie_title} at ${gross/1e6:.1f}M < ${threshold/1e6:.0f}M threshold"
+            count, risk = half_kelly(edge, no_ask, max_cost)
+            if count < 1:
+                count = 1
+            reasoning = f"Box office data shows {movie_title} at ${gross/1e6:.1f}M vs ${threshold/1e6:.0f}M threshold (conf {confidence*100:.0f}%)"
             log.info(f"\nARBITRAGE FOUND: {movie_title} box office ${gross/1e6:.1f}M < ${threshold/1e6:.0f}M")
-            log.info(f"    Market: {ticker} NO at {no_ask}c")
-            place_trade(ticker, "no", no_ask, count, reasoning)
+            log.info(f"    Market: {ticker} NO at {no_ask}c | conf={confidence*100:.0f}%")
+            trade_manager.place_order(ticker, "no", no_ask, count, reasoning)
 
 
 # ============================================================
@@ -444,23 +401,34 @@ def parse_temp_ticker(ticker):
         "threshold": threshold,
     }
 
-def check_nws():
-    """Check NWS actual temperature observations for all stations."""
+def check_nws(prefetched_markets=None):
+    """Check NWS actual temperature observations for all stations (parallel fetch)."""
     log.info(f"\n[NWS] Checking actual temperatures...")
 
     stations = config["sources"]["nws"]["stations"]
-    today = datetime.date.today().isoformat()
 
     actual_temps = {}
 
+    # Build all URLs for parallel fetch (latest observation per station)
+    nws_headers = {
+        "User-Agent": "(KalshiMonitor, contact@example.com)",
+        "Accept": "application/geo+json"
+    }
+    url_to_city = {}
+    urls = []
     for city_code, station_id in stations.items():
+        url = f"https://api.weather.gov/stations/{station_id}/observations/latest"
+        urls.append(url)
+        url_to_city[url] = (city_code, station_id)
+
+    responses = fetch_parallel(urls, headers=nws_headers, timeout=15)
+
+    for url, r in responses.items():
+        city_code, station_id = url_to_city[url]
+        if r is None or r.status_code != 200:
+            log.error(f"  NWS check failed for {city_code} ({station_id}): HTTP {r.status_code if r else 'no response'}")
+            continue
         try:
-            url = f"https://api.weather.gov/stations/{station_id}/observations/latest"
-            r = requests.get(url, headers={
-                "User-Agent": "(KalshiMonitor, contact@example.com)",
-                "Accept": "application/geo+json"
-            }, timeout=15)
-            r.raise_for_status()
             data = r.json()
             save_snapshot(f"nws_{station_id}", json.dumps(data), ext="json")
 
@@ -478,50 +446,62 @@ def check_nws():
                 log.info(f"  {city_code} ({station_id}): {temp_f:.1f}F ({temp_c:.1f}C) @ {props.get('timestamp', '?')}")
             else:
                 log.info(f"  {city_code} ({station_id}): No temperature data available")
-
         except Exception as e:
-            log.error(f"  NWS check failed for {city_code} ({station_id}): {e}")
+            log.error(f"  NWS parse failed for {city_code} ({station_id}): {e}")
 
     if actual_temps:
         check_nws_daily_highs(actual_temps)
-        match_nws_to_markets(actual_temps)
+        match_nws_to_markets(actual_temps, prefetched_markets=prefetched_markets)
 
 def check_nws_daily_highs(current_temps):
-    """Check for daily high temperature observations."""
+    """Check for daily high temperature observations (parallel fetch)."""
     stations = config["sources"]["nws"]["stations"]
+    nws_headers = {
+        "User-Agent": "(KalshiMonitor, contact@example.com)",
+        "Accept": "application/geo+json"
+    }
 
+    today = datetime.date.today()
+    start = today.isoformat() + "T00:00:00Z"
+
+    url_to_city = {}
+    urls = []
     for city_code, station_id in stations.items():
+        url = f"https://api.weather.gov/stations/{station_id}/observations?start={start}&limit=100"
+        urls.append(url)
+        url_to_city[url] = (city_code, station_id)
+
+    responses = fetch_parallel(urls, headers=nws_headers, timeout=15)
+
+    for url, r in responses.items():
+        city_code, station_id = url_to_city[url]
         try:
-            today = datetime.date.today()
-            start = today.isoformat() + "T00:00:00Z"
-            url = f"https://api.weather.gov/stations/{station_id}/observations?start={start}&limit=100"
-            r = requests.get(url, headers={
-                "User-Agent": "(KalshiMonitor, contact@example.com)",
-                "Accept": "application/geo+json"
-            }, timeout=15)
+            if r is None or r.status_code != 200:
+                continue
+            data = r.json()
+            features = data.get("features", [])
+            temps = []
+            for f in features:
+                t = f.get("properties", {}).get("temperature", {}).get("value")
+                if t is not None:
+                    temps.append(t * 9/5 + 32)
 
-            if r.status_code == 200:
-                data = r.json()
-                features = data.get("features", [])
-                temps = []
-                for f in features:
-                    t = f.get("properties", {}).get("temperature", {}).get("value")
-                    if t is not None:
-                        temps.append(t * 9/5 + 32)
-
-                if temps:
-                    running_high = max(temps)
-                    if city_code in current_temps:
-                        current_temps[city_code]["running_high_f"] = round(running_high, 1)
-                        current_temps[city_code]["obs_count"] = len(temps)
-                    log.info(f"  {city_code} running high today: {running_high:.1f}F ({len(temps)} observations)")
+            if temps:
+                running_high = max(temps)
+                if city_code in current_temps:
+                    current_temps[city_code]["running_high_f"] = round(running_high, 1)
+                    current_temps[city_code]["obs_count"] = len(temps)
+                log.info(f"  {city_code} running high today: {running_high:.1f}F ({len(temps)} observations)")
         except Exception as e:
             log.error(f"  Daily high check failed for {city_code}: {e}")
 
-def match_nws_to_markets(temp_data):
+def match_nws_to_markets(temp_data, prefetched_markets=None):
     """Match actual NWS temperature data to open Kalshi temperature markets."""
     try:
-        markets = get_markets_by_prefix("KXHIGH")
+        if prefetched_markets is not None:
+            markets = prefetched_markets.get("weather", [])
+        else:
+            markets = get_markets_by_prefix("KXHIGH")
         if not markets:
             log.info(f"  No open KXHIGH markets found")
             return
@@ -561,36 +541,71 @@ def match_nws_to_markets(temp_data):
             threshold = parsed["threshold"]
             direction = parsed["direction"]
             ticker = m.get("ticker", "")
+            max_cost = config["maxTradeAmount"] * 100
+
+            prob = nws_probability(running_high, threshold, direction, now.hour)
 
             if direction == "T":
                 margin = running_high - threshold
 
-                if margin > 3:
+                if prob > 0.5:
+                    # Likely YES
                     yes_ask = m.get("yes_ask", 0)
-                    if yes_ask and yes_ask < 85:
-                        edge = 0.92 - yes_ask / 100
+                    if yes_ask and yes_ask < 99:
+                        edge = prob - yes_ask / 100
                         if edge > 0.10:
-                            count = max(1, (config["maxTradeAmount"] * 100) // yes_ask)
-                            reasoning = f"NWS {city} running high {running_high:.1f}F > {threshold}F threshold by {margin:.1f}F (after 3PM)"
+                            count, risk = half_kelly(edge, yes_ask, max_cost)
+                            if count < 1:
+                                count = 1
+                            reasoning = f"NWS {city} running high {running_high:.1f}F > {threshold}F by {margin:.1f}F, prob {prob*100:.0f}% (hour {now.hour})"
                             log.info(f"\nARBITRAGE FOUND: NWS actual temp confirms {city} high {running_high:.1f}F > {threshold}F")
                             log.info(f"    Market: {ticker} YES at {yes_ask}c -> buying YES")
-                            log.info(f"    Edge: ~{edge*100:.0f}% | Margin: {margin:.1f}F")
-                            place_trade(ticker, "yes", yes_ask, count, reasoning)
-
-                elif margin < -3:
+                            log.info(f"    Edge: ~{edge*100:.0f}% | Prob: {prob*100:.0f}% | Margin: {margin:.1f}F")
+                            trade_manager.place_order(ticker, "yes", yes_ask, count, reasoning)
+                else:
+                    # Likely NO
                     no_ask = m.get("no_ask", 0)
-                    if no_ask and no_ask < 85:
-                        edge = 0.92 - no_ask / 100
+                    if no_ask and no_ask < 99:
+                        edge = (1.0 - prob) - no_ask / 100
                         if edge > 0.10:
-                            count = max(1, (config["maxTradeAmount"] * 100) // no_ask)
-                            reasoning = f"NWS {city} running high {running_high:.1f}F < {threshold}F threshold by {abs(margin):.1f}F (after 3PM)"
+                            count, risk = half_kelly(edge, no_ask, max_cost)
+                            if count < 1:
+                                count = 1
+                            reasoning = f"NWS {city} running high {running_high:.1f}F < {threshold}F by {abs(margin):.1f}F, prob NO {(1-prob)*100:.0f}% (hour {now.hour})"
                             log.info(f"\nARBITRAGE FOUND: NWS actual temp confirms {city} high {running_high:.1f}F < {threshold}F")
                             log.info(f"    Market: {ticker} NO at {no_ask}c -> buying NO")
-                            log.info(f"    Edge: ~{edge*100:.0f}% | Margin: {abs(margin):.1f}F")
-                            place_trade(ticker, "no", no_ask, count, reasoning)
+                            log.info(f"    Edge: ~{edge*100:.0f}% | Prob NO: {(1-prob)*100:.0f}% | Margin: {abs(margin):.1f}F")
+                            trade_manager.place_order(ticker, "no", no_ask, count, reasoning)
 
+            elif direction == "B":
+                # Bracket market: P(threshold <= actual < threshold+1)
+                if prob > 0.5:
+                    # Bracket likely to hit — buy YES
+                    yes_ask = m.get("yes_ask", 0)
+                    if yes_ask and yes_ask < 99:
+                        edge = prob - yes_ask / 100
+                        if edge > 0.10:
+                            count, risk = half_kelly(edge, yes_ask, max_cost)
+                            if count < 1:
+                                count = 1
+                            reasoning = f"NWS {city} running high {running_high:.1f}F in bracket [{threshold}, {threshold+1})F, prob {prob*100:.0f}%"
+                            log.info(f"\nARBITRAGE FOUND: NWS confirms {city} high {running_high:.1f}F in bracket {threshold}-{threshold+1}F")
+                            log.info(f"    Market: {ticker} YES at {yes_ask}c | Prob: {prob*100:.0f}%")
+                            trade_manager.place_order(ticker, "yes", yes_ask, count, reasoning)
                 else:
-                    log.info(f"  {ticker}: running high {running_high:.1f}F vs {threshold}F -- too close (margin {margin:.1f}F)")
+                    # Bracket unlikely — buy NO
+                    no_prob = 1.0 - prob
+                    no_ask = m.get("no_ask", 0)
+                    if no_ask and no_ask < 99:
+                        edge = no_prob - no_ask / 100
+                        if edge > 0.10:
+                            count, risk = half_kelly(edge, no_ask, max_cost)
+                            if count < 1:
+                                count = 1
+                            reasoning = f"NWS {city} running high {running_high:.1f}F outside bracket [{threshold}, {threshold+1})F, prob NO {no_prob*100:.0f}%"
+                            log.info(f"\nARBITRAGE FOUND: NWS confirms {city} high {running_high:.1f}F outside bracket {threshold}-{threshold+1}F")
+                            log.info(f"    Market: {ticker} NO at {no_ask}c | Prob NO: {no_prob*100:.0f}%")
+                            trade_manager.place_order(ticker, "no", no_ask, count, reasoning)
 
     except Exception as e:
         log.error(f"  NWS market matching failed: {e}")
@@ -631,28 +646,50 @@ def main():
 
     while True:
         now = time.time()
-        reset_daily_if_needed()
 
         try:
-            if config["sources"]["hdd"]["enabled"] and (now - last_hdd) >= hdd_interval:
+            # Determine which sources need checking this cycle
+            need_hdd = config["sources"]["hdd"]["enabled"] and (now - last_hdd) >= hdd_interval
+            need_box = config["sources"]["boxoffice"]["enabled"] and (now - last_boxoffice) >= box_interval
+            need_nws = config["sources"]["nws"]["enabled"] and (now - last_nws) >= nws_interval
+
+            # Prefetch all needed markets once (with 5-min cache) instead of
+            # fetching per-source which made 3 separate paginated API calls
+            prefetched = None
+            if need_hdd or need_box or need_nws:
+                prefetched = {}
+                if need_hdd:
+                    album_markets = get_markets_by_prefix("KXALBUMSALES")
+                    if not album_markets:
+                        album_markets = get_markets_by_prefix("KXALBUM")
+                    prefetched["album"] = album_markets
+                if need_box:
+                    box_markets = []
+                    for prefix in ["KXBOXOFFICE", "KXBOX", "KXMOVIE", "KXFILM"]:
+                        box_markets.extend(get_markets_by_prefix(prefix))
+                    prefetched["boxoffice"] = box_markets
+                if need_nws:
+                    prefetched["weather"] = get_markets_by_prefix("KXHIGH")
+
+            if need_hdd:
                 try:
-                    check_hdd()
+                    check_hdd(prefetched_markets=prefetched)
                 except Exception as e:
                     log.error(f"HDD source error: {e}")
                     traceback.print_exc()
                 last_hdd = now
 
-            if config["sources"]["boxoffice"]["enabled"] and (now - last_boxoffice) >= box_interval:
+            if need_box:
                 try:
-                    check_boxoffice()
+                    check_boxoffice(prefetched_markets=prefetched)
                 except Exception as e:
                     log.error(f"Box office source error: {e}")
                     traceback.print_exc()
                 last_boxoffice = now
 
-            if config["sources"]["nws"]["enabled"] and (now - last_nws) >= nws_interval:
+            if need_nws:
                 try:
-                    check_nws()
+                    check_nws(prefetched_markets=prefetched)
                 except Exception as e:
                     log.error(f"NWS source error: {e}")
                     traceback.print_exc()

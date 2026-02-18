@@ -9,7 +9,9 @@
     "strategy": "python3 src/kalshi/strategy-trader.py",
     "hdd": "python3 src/kalshi/hdd-scraper.py",
     "monitor": "python3 src/kalshi/source-monitor.py",
-    "cycle": "python3 scripts/trade-cycle-2.py"
+    "cycle": "python3 scripts/trade-cycle-2.py",
+    "calibrate": "python3 scripts/calibrate-sigma.py",
+    "backtest": "python3 scripts/backtest.py"
   },
   "dependencies": {},
   "devDependencies": {}

@@ -14,7 +14,7 @@ import requests
 from pathlib import Path
 from bs4 import BeautifulSoup
 
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log
 
 # Unbuffered output
 setup_unbuffered()
@@ -39,6 +39,12 @@ STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # === Kalshi Client ===
 client = KalshiClient()
+trade_manager = TradeManager(client, TRADES_PATH, {
+    "maxTradeAmount": MAX_TRADE_CENTS / 100,
+    "maxDailyTrades": _bots_cfg.get("maxDailyTrades", 10),
+    "maxDailyLoss": _bots_cfg.get("maxDailyLoss", 25),
+}, logger=log)
+trim_trade_log(TRADES_PATH)
 
 
 # === PID Management ===
@@ -113,7 +119,7 @@ Blog post from {post_url}:
 """
 
     try:
-        r = requests.post(DEEPSEEK_URL, headers={
+        r = retry_request("POST", DEEPSEEK_URL, headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }, json={
@@ -122,7 +128,6 @@ Blog post from {post_url}:
             "temperature": 0.3,
             "max_tokens": 2000,
         }, timeout=60)
-        r.raise_for_status()
 
         content = r.json()["choices"][0]["message"]["content"].strip()
         # Extract JSON from response (handle markdown code blocks)
@@ -161,16 +166,19 @@ Blog post from {post_url}:
 
 # === Blog Scraping ===
 def fetch_blog_posts():
-    """Fetch both BeatRelease URLs and return list of (url, title) tuples."""
+    """Fetch both BeatRelease URLs and return list of (url, title) tuples (parallel fetch)."""
     posts = []
     seen = set()
 
+    blog_headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+    responses = fetch_parallel(BLOG_URLS, headers=blog_headers, timeout=20)
+
     for blog_url in BLOG_URLS:
+        r = responses.get(blog_url)
+        if r is None or r.status_code != 200:
+            log.error(f"  Error fetching {blog_url}: HTTP {r.status_code if r else 'no response'}")
+            continue
         try:
-            r = requests.get(blog_url, timeout=20, headers={
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-            })
-            r.raise_for_status()
             soup = BeautifulSoup(r.text, "html.parser")
 
             # Find blog post links — BeatRelease uses various patterns
@@ -200,7 +208,7 @@ def fetch_blog_posts():
             log.info(f"  Fetched {blog_url} — found {len(seen)} unique posts so far")
 
         except Exception as e:
-            log.error(f"  Error fetching {blog_url}: {e}")
+            log.error(f"  Error parsing {blog_url}: {e}")
 
     return posts
 
@@ -208,10 +216,9 @@ def fetch_blog_posts():
 def fetch_post_text(url):
     """Fetch full text of a blog post."""
     try:
-        r = requests.get(url, timeout=20, headers={
+        r = retry_request("GET", url, timeout=20, headers={
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
         })
-        r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
 
         # Remove scripts, styles, nav
@@ -229,44 +236,6 @@ def fetch_post_text(url):
         return ""
 
 
-# === Trade Placement ===
-def place_trade(ticker, direction, price_cents, quantity, reasoning=""):
-    """Place a limit order on Kalshi demo."""
-    side = "yes" if direction.upper() == "YES" else "no"
-    price_key = "yes_price" if side == "yes" else "no_price"
-
-    body = {
-        "ticker": ticker,
-        "action": "buy",
-        "side": side,
-        "type": "limit",
-        "count": quantity,
-        price_key: price_cents,
-    }
-
-    try:
-        result = client.post("/portfolio/orders", body=body)
-        order = result.get("order", {})
-        log.info(f"  Order {order.get('order_id','?')}: {quantity}x {direction} {ticker} @ {price_cents}c — {order.get('status','?')}")
-        return {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "source_url": "",
-            "ticker": ticker,
-            "side": side,
-            "price": price_cents,
-            "quantity": quantity,
-            "reasoning": reasoning,
-            "order_id": order.get("order_id"),
-            "status": order.get("status"),
-        }
-    except requests.exceptions.HTTPError as e:
-        log.error(f"  Order failed {ticker}: {e.response.status_code} {e.response.text[:200]}")
-        return None
-    except Exception as e:
-        log.error(f"  Order failed {ticker}: {e}")
-        return None
-
-
 # === Notification ===
 def notify_whatsapp(message):
     """Try to send WhatsApp notification via openclaw CLI."""
@@ -275,8 +244,12 @@ def notify_whatsapp(message):
         # Write message to temp file to handle special chars
         tmp = PROJECT_DIR / "data" / "beatrelease-msg.txt"
         tmp.write_text(message)
+        phone = _bots_cfg.get("notificationPhone", "")
+        if not phone:
+            log.warning("  No notificationPhone configured — notification logged only")
+            return
         result = subprocess.run(
-            ["openclaw", "message", "send", "--to", "+14255336828", "--message", message, "--channel", "whatsapp"],
+            ["openclaw", "message", "send", "--to", phone, "--message", message, "--channel", "whatsapp"],
             capture_output=True, text=True, timeout=30
         )
         if result.returncode == 0:
@@ -315,7 +288,11 @@ def scan_cycle():
         save_state(state)
         return
 
-    # 3. Process each new post
+    # 3. Prefetch all new post texts in parallel
+    new_post_urls = [url for url, title in new_posts]
+    blog_headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+    post_responses = fetch_parallel(new_post_urls, headers=blog_headers, timeout=20)
+
     all_new_trades = []
     notification_lines = [f"BeatRelease: {len(new_posts)} new post(s) found\n"]
 
@@ -323,10 +300,26 @@ def scan_cycle():
         log.info(f"\nNew post: {title}")
         log.info(f"   {url}")
 
-        # Fetch full text
-        text = fetch_post_text(url)
-        if not text:
+        # Parse prefetched response
+        r = post_responses.get(url)
+        if r is None or r.status_code != 200:
             log.warning("  Could not fetch post text")
+            seen_urls.add(url)
+            continue
+
+        try:
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag in soup.find_all(["script", "style", "nav", "header", "footer"]):
+                tag.decompose()
+            content = soup.find("article") or soup.find("main") or soup.find(class_=re.compile(r"post|content|blog|article", re.I))
+            text = content.get_text(separator="\n", strip=True) if content else soup.get_text(separator="\n", strip=True)
+        except Exception as e:
+            log.warning(f"  Error parsing post {url}: {e}")
+            seen_urls.add(url)
+            continue
+
+        if not text:
+            log.warning("  Could not extract post text")
             seen_urls.add(url)
             continue
 
@@ -348,38 +341,51 @@ def scan_cycle():
             seen_urls.add(url)
             continue
 
-        # Place trades
+        # Place trades (with market price validation)
         placed = []
         for t in trades:
-            result = place_trade(
-                t["ticker"], t["direction"], t["price_cents"], t["quantity"],
-                t.get("reasoning", "")
+            side = "yes" if t["direction"].upper() == "YES" else "no"
+            ticker = t["ticker"]
+
+            # Validate LLM price against actual market
+            try:
+                market = client.get(f"/markets/{ticker}")
+                if market:
+                    market_data = market.get("market", market)
+                    if side == "yes":
+                        current_ask = market_data.get("yes_ask", 0)
+                    else:
+                        current_ask = market_data.get("no_ask", 0)
+                    if current_ask > 0:
+                        if abs(t["price_cents"] - current_ask) > 10:
+                            log.warning(f"  LLM price {t['price_cents']}c vs market {current_ask}c for {ticker} — skipping stale recommendation")
+                            continue
+                        # Use current market price, not LLM's price
+                        t["price_cents"] = current_ask
+            except Exception as e:
+                log.warning(f"  Could not validate market price for {ticker}: {e}")
+
+            result = trade_manager.place_order(
+                ticker, side, t["price_cents"], t["quantity"],
+                t.get("reasoning", ""), source_url=url
             )
             if result:
-                result["source_url"] = url
-                placed.append(result)
+                placed.append({
+                    "ticker": ticker,
+                    "side": side,
+                    "price": t["price_cents"],
+                    "quantity": t["quantity"],
+                })
             time.sleep(0.5)  # Rate limit
 
         all_new_trades.extend(placed)
         notification_lines.append(f"* {title} — {len(placed)}/{len(trades)} trades placed")
         for p in placed:
-            notification_lines.append(f"  {p['side'].upper()} {p['ticker']} @ {p['price']}c x{p['quantity']}")
+            notification_lines.append(f"  {p['side'].upper()} {p['ticker']} @ {p['price']}c x{p.get('quantity', '?')}")
 
         seen_urls.add(url)
 
-    # 4. Save trades
-    if all_new_trades:
-        existing = []
-        if TRADES_PATH.exists():
-            try:
-                existing = json.loads(TRADES_PATH.read_text())
-            except (json.JSONDecodeError, ValueError):
-                pass
-        existing.extend(all_new_trades)
-        TRADES_PATH.write_text(json.dumps(existing, indent=2))
-        log.info(f"\n{len(all_new_trades)} trades saved ({len(existing)} total)")
-
-    # 5. Update state
+    # 4. Update state (trade saving handled by TradeManager)
     state["seen_urls"] = list(seen_urls)
     save_state(state)
 

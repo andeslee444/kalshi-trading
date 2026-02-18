@@ -11,15 +11,19 @@ Usage:
     client.post("/portfolio/orders", body={...})
 """
 
-import json, time, base64, os, sys, signal, logging
+import json, time, base64, os, sys, signal, logging, datetime, tempfile
+from logging.handlers import RotatingFileHandler
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from pathlib import Path
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
+from dotenv import load_dotenv
 
 # === Constants ===
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
+load_dotenv(PROJECT_DIR / ".env")
 DEFAULT_KEY_PATH = PROJECT_DIR / "config" / "keys" / "kalshi-demo.pem"
 
 DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
@@ -27,6 +31,8 @@ PROD_BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 1.0  # seconds
+
+KILL_SWITCH_PATH = PROJECT_DIR / "data" / "HALT_TRADING"
 
 _log = logging.getLogger("kalshi_auth")
 
@@ -56,7 +62,7 @@ def setup_logging(name, log_file=None):
     sh.setFormatter(fmt)
     logger.addHandler(sh)
     if log_file:
-        fh = logging.FileHandler(log_file)
+        fh = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=3)
         fh.setFormatter(fmt)
         logger.addHandler(fh)
     return logger
@@ -110,9 +116,21 @@ class KalshiClient:
 
         self.mode = mode or os.environ.get("KALSHI_MODE", "demo")
         if self.mode == "production":
+            if os.environ.get("KALSHI_CONFIRM_PRODUCTION") != "yes":
+                raise ValueError(
+                    "Production mode requires KALSHI_CONFIRM_PRODUCTION=yes env var. "
+                    "Set this explicitly to confirm you intend to trade with real money."
+                )
+            _log.warning("PRODUCTION MODE ACTIVE — trading with real money")
             self.base_url = PROD_BASE_URL
         else:
             self.base_url = DEMO_BASE_URL
+
+        # Persistent HTTP session for connection reuse (saves ~200-400ms per call)
+        self.session = requests.Session()
+
+        # Market cache: {cache_key: (timestamp, data)}
+        self._market_cache = {}
 
     def _sign(self, method: str, path: str) -> dict:
         """Generate authentication headers for a request."""
@@ -143,14 +161,7 @@ class KalshiClient:
         last_err = None
         for attempt in range(MAX_RETRIES):
             try:
-                if method == "GET":
-                    r = requests.get(url, headers=headers, timeout=timeout)
-                elif method == "POST":
-                    r = requests.post(url, headers=headers, json=body, timeout=timeout)
-                elif method == "DELETE":
-                    r = requests.delete(url, headers=headers, timeout=timeout)
-                else:
-                    r = requests.request(method, url, headers=headers, json=body, timeout=timeout)
+                r = self.session.request(method, url, headers=headers, json=body, timeout=timeout)
 
                 # Don't retry client errors (4xx) except 429
                 if r.status_code == 429:
@@ -194,8 +205,24 @@ class KalshiClient:
         """Make an authenticated DELETE request."""
         return self._request("DELETE", path, **kwargs)
 
-    def get_all_markets(self, prefix=None, status="open", max_pages=50):
-        """Paginate through all open markets, optionally filtering by ticker prefix."""
+    def get_all_markets(self, prefix=None, status="open", max_pages=50, cache_ttl=0):
+        """Paginate through all open markets, optionally filtering by ticker prefix.
+
+        Args:
+            prefix: Only return markets whose ticker starts with this string.
+            status: Market status filter (default "open").
+            max_pages: Maximum pagination pages to fetch.
+            cache_ttl: When >0, return cached results if they are younger than
+                       this many seconds. Daemon bots can pass e.g. 300 (5 min)
+                       to avoid refetching identical market data every scan.
+        """
+        cache_key = f"{prefix or ''}:{status}"
+        if cache_ttl > 0 and cache_key in self._market_cache:
+            cached_time, cached_data = self._market_cache[cache_key]
+            if time.time() - cached_time < cache_ttl:
+                _log.debug("Market cache hit for %s (%d markets)", cache_key, len(cached_data))
+                return cached_data
+
         all_markets = []
         cursor = None
         for _ in range(max_pages):
@@ -217,6 +244,16 @@ class KalshiClient:
             cursor = data.get("cursor")
             if not cursor or not batch:
                 break
+
+        if cursor and batch:
+            _log.warning(
+                "get_all_markets pagination may be truncated after %d pages (%d markets). "
+                "Increase max_pages if needed.", max_pages, len(all_markets)
+            )
+
+        if cache_ttl > 0:
+            self._market_cache[cache_key] = (time.time(), all_markets)
+
         return all_markets
 
     def get_balance(self):
@@ -238,9 +275,409 @@ def load_trades(trades_path: Path) -> list:
     return []
 
 
+def _atomic_write_json(path: Path, data):
+    """Write JSON data to a file atomically using a temp file + os.replace()."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def save_trade(trades_path: Path, trade: dict):
-    """Append a trade to a JSON trades file."""
+    """Append a trade to a JSON trades file (atomic write)."""
     trades = load_trades(trades_path)
     trades.append(trade)
-    trades_path.parent.mkdir(parents=True, exist_ok=True)
-    trades_path.write_text(json.dumps(trades, indent=2))
+    _atomic_write_json(trades_path, trades)
+
+
+# === Concurrent fetch utility ===
+
+def fetch_parallel(urls, headers=None, timeout=20, max_workers=5):
+    """Fetch multiple URLs concurrently using a thread pool.
+
+    Returns a dict mapping each URL to its Response object, or None on failure.
+    """
+    results = {}
+
+    def _fetch_one(url):
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+            return url, r
+        except Exception as e:
+            _log.warning("Parallel fetch failed for %s: %s", url, e)
+            return url, None
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_fetch_one, u): u for u in urls}
+        for future in as_completed(futures):
+            url, response = future.result()
+            results[url] = response
+
+    return results
+
+
+# === Retry utility for external (non-Kalshi) API calls ===
+
+def retry_request(method, url, max_retries=3, backoff_base=1.0, **kwargs):
+    """Make an HTTP request with retries on transient errors.
+
+    Retries on ConnectionError, Timeout, and 429. Does NOT retry other 4xx.
+    kwargs are forwarded to requests.request().
+    """
+    kwargs.setdefault("timeout", 20)
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            r = requests.request(method, url, **kwargs)
+            if r.status_code == 429:
+                wait = backoff_base * (2 ** attempt)
+                _log.warning("Rate limited (429) on %s, retrying in %.1fs...", url, wait)
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_err = e
+            wait = backoff_base * (2 ** attempt)
+            _log.warning("Transient error on %s, retrying in %.1fs... (%s)", url, wait, e)
+            time.sleep(wait)
+        except requests.exceptions.HTTPError:
+            raise
+        except Exception:
+            raise
+    raise last_err or Exception(f"Max retries exceeded for {url}")
+
+
+# === Trade deduplication tracker ===
+
+class RecentTradeTracker:
+    """Track recently traded tickers to prevent duplicate trades across scan cycles.
+
+    Args:
+        trades_path: Path to the bot's JSON trade log file.
+        cooldown_hours: Ignore tickers traded within this window (default 6h).
+    """
+
+    def __init__(self, trades_path: Path, cooldown_hours=6):
+        self.trades_path = trades_path
+        self.cooldown_hours = cooldown_hours
+        self._recent = {}  # ticker -> last trade datetime
+        self._load()
+
+    def _load(self):
+        """Load recent tickers from the trade file."""
+        trades = load_trades(self.trades_path)
+        cutoff = datetime.datetime.now() - datetime.timedelta(hours=self.cooldown_hours)
+        for t in trades:
+            ts_str = t.get("timestamp", "")
+            ticker = t.get("ticker", "")
+            if not ts_str or not ticker:
+                continue
+            try:
+                ts = datetime.datetime.fromisoformat(ts_str)
+                if ts > cutoff:
+                    existing = self._recent.get(ticker)
+                    if not existing or ts > existing:
+                        self._recent[ticker] = ts
+            except (ValueError, TypeError):
+                pass
+
+    def is_recent(self, ticker):
+        """Return True if this ticker was traded within the cooldown window."""
+        ts = self._recent.get(ticker)
+        if not ts:
+            return False
+        cutoff = datetime.datetime.now() - datetime.timedelta(hours=self.cooldown_hours)
+        return ts > cutoff
+
+    def record(self, ticker):
+        """Record a trade on this ticker."""
+        self._recent[ticker] = datetime.datetime.now()
+
+
+# === Kill switch ===
+
+def check_kill_switch(path=None):
+    """Return True if the kill switch file exists (trading should halt)."""
+    p = Path(path) if path else KILL_SWITCH_PATH
+    return p.exists()
+
+
+# === Circuit breaker ===
+
+class CircuitBreaker:
+    """Tracks consecutive API failures and opens after a threshold.
+
+    When open, callers should skip trading until the breaker auto-resets.
+
+    Args:
+        max_failures: Consecutive failures before opening (default 5).
+        reset_seconds: Seconds to wait before auto-resetting (default 300).
+    """
+
+    def __init__(self, max_failures=5, reset_seconds=300):
+        self.max_failures = max_failures
+        self.reset_seconds = reset_seconds
+        self._failures = 0
+        self._opened_at = None
+
+    def record_success(self):
+        """Record a successful operation — resets the failure counter."""
+        self._failures = 0
+        self._opened_at = None
+
+    def record_failure(self):
+        """Record a failed operation — may open the breaker."""
+        self._failures += 1
+        if self._failures >= self.max_failures and self._opened_at is None:
+            self._opened_at = time.time()
+
+    def is_open(self):
+        """Return True if the breaker is open (callers should back off)."""
+        if self._failures < self.max_failures:
+            return False
+        if self._opened_at and (time.time() - self._opened_at) >= self.reset_seconds:
+            # Auto-reset after timeout
+            self._failures = 0
+            self._opened_at = None
+            return False
+        return True
+
+
+# === Config validation ===
+
+def validate_trade_config(config, bot_name=""):
+    """Validate trade-related config values. Raises ValueError on bad config."""
+    prefix = f"[{bot_name}] " if bot_name else ""
+
+    amt = config.get("maxTradeAmount")
+    if amt is None or amt <= 0:
+        raise ValueError(f"{prefix}maxTradeAmount must be positive, got {amt}")
+    if amt > 100:
+        raise ValueError(f"{prefix}maxTradeAmount={amt} exceeds $100 safety cap")
+
+    trades = config.get("maxDailyTrades")
+    if trades is None or not isinstance(trades, int) or trades <= 0:
+        raise ValueError(f"{prefix}maxDailyTrades must be a positive integer, got {trades}")
+    if trades > 100:
+        raise ValueError(f"{prefix}maxDailyTrades={trades} exceeds 100 safety cap")
+
+    loss = config.get("maxDailyLoss")
+    if loss is None or loss <= 0:
+        raise ValueError(f"{prefix}maxDailyLoss must be positive, got {loss}")
+    if loss > 500:
+        raise ValueError(f"{prefix}maxDailyLoss={loss} exceeds $500 safety cap")
+
+
+# === Trade log trimming ===
+
+def trim_trade_log(trades_path, max_age_days=90, max_entries=5000):
+    """Remove old entries from a trade log file.
+
+    Keeps only entries newer than max_age_days and limits total to max_entries.
+    """
+    trades = load_trades(trades_path)
+    if not trades:
+        return
+
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=max_age_days)
+    filtered = []
+    for t in trades:
+        ts_str = t.get("timestamp", "")
+        if ts_str:
+            try:
+                ts = datetime.datetime.fromisoformat(ts_str)
+                if ts < cutoff:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        filtered.append(t)
+
+    # Also limit by count (keep most recent)
+    if len(filtered) > max_entries:
+        filtered = filtered[-max_entries:]
+
+    if len(filtered) != len(trades):
+        _log.info("Trimmed trade log %s: %d -> %d entries", trades_path.name, len(trades), len(filtered))
+        _atomic_write_json(trades_path, filtered)
+
+
+# === TradeManager ===
+
+class TradeManager:
+    """Consolidated trade placement with all safety guardrails.
+
+    Replaces per-bot place_trade() functions with a single implementation
+    that enforces: kill switch, circuit breaker, daily trade limit,
+    daily loss limit, dedup, cost cap, balance check, and stale data check.
+
+    Args:
+        client: KalshiClient instance.
+        trades_path: Path to the bot's JSON trade log file.
+        config: Dict with keys: maxTradeAmount (dollars), maxDailyTrades (int),
+                maxDailyLoss (dollars).
+        logger: Optional logger; defaults to module logger.
+        kill_switch_path: Path to kill switch file (default: data/HALT_TRADING).
+        cooldown_hours: Hours to suppress duplicate trades on same ticker (default 6).
+    """
+
+    def __init__(self, client, trades_path, config, logger=None,
+                 kill_switch_path=None, cooldown_hours=6):
+        validate_trade_config(config)
+        self.client = client
+        self.trades_path = Path(trades_path)
+        self.config = config
+        self.log = logger or _log
+        self.kill_switch_path = kill_switch_path or KILL_SWITCH_PATH
+        self.tracker = RecentTradeTracker(self.trades_path, cooldown_hours=cooldown_hours)
+        self.breaker = CircuitBreaker()
+
+        # Daily counters
+        self._daily_trades = 0
+        self._daily_spend_cents = 0
+        self._daily_date = None
+
+    def _reset_daily_if_needed(self):
+        today = datetime.date.today().isoformat()
+        if self._daily_date != today:
+            self._daily_trades = 0
+            self._daily_spend_cents = 0
+            self._daily_date = today
+
+    def place_order(self, ticker, side, price_cents, count, reasoning,
+                    available_balance_cents=None, market_data_age_seconds=None,
+                    **extra_fields):
+        """Place a limit order with full safety checks.
+
+        Args:
+            ticker: Market ticker string.
+            side: "yes" or "no".
+            price_cents: Limit price in cents (1-99).
+            count: Number of contracts.
+            reasoning: Human-readable trade rationale.
+            available_balance_cents: Optional balance for pre-trade check.
+            market_data_age_seconds: Optional age of market data for staleness check.
+            **extra_fields: Additional fields to store in the trade record.
+
+        Returns:
+            Order info dict from API on success, or None if blocked/failed.
+        """
+        self._reset_daily_if_needed()
+
+        if side not in ("yes", "no"):
+            self.log.error("Invalid side '%s' — must be 'yes' or 'no'", side)
+            return None
+
+        # 1. Kill switch
+        if check_kill_switch(self.kill_switch_path):
+            self.log.warning("KILL SWITCH ACTIVE — refusing trade on %s", ticker)
+            return None
+
+        # 2. Circuit breaker
+        if self.breaker.is_open():
+            self.log.warning("Circuit breaker OPEN — skipping trade on %s", ticker)
+            return None
+
+        # 3. Daily trade limit
+        max_daily = self.config["maxDailyTrades"]
+        if self._daily_trades >= max_daily:
+            self.log.warning("Daily trade limit (%d) reached — skipping %s", max_daily, ticker)
+            return None
+
+        # 4. Daily loss/spend limit
+        max_loss_cents = int(self.config["maxDailyLoss"] * 100)
+        cost_cents = price_cents * count
+        if self._daily_spend_cents + cost_cents > max_loss_cents:
+            self.log.warning(
+                "Daily loss limit ($%.2f) would be exceeded — spent $%.2f + $%.2f > $%.2f. Skipping %s",
+                self.config["maxDailyLoss"],
+                self._daily_spend_cents / 100, cost_cents / 100,
+                max_loss_cents / 100, ticker
+            )
+            return None
+
+        # 5. Dedup
+        if self.tracker.is_recent(ticker):
+            self.log.info("Skipping %s — traded recently (dedup)", ticker)
+            return None
+
+        # 6. Cost cap (adjust count down if needed)
+        max_cost_cents = int(self.config["maxTradeAmount"] * 100)
+        if price_cents * count > max_cost_cents:
+            count = max(1, max_cost_cents // price_cents)
+
+        # 7. Balance check (optional)
+        cost_cents = price_cents * count
+        if available_balance_cents is not None and cost_cents > available_balance_cents:
+            self.log.warning(
+                "Insufficient balance: need %dc but only %dc available. Skipping %s",
+                cost_cents, available_balance_cents, ticker
+            )
+            return None
+
+        # 8. Stale data check (optional)
+        if market_data_age_seconds is not None and market_data_age_seconds > 600:
+            self.log.warning(
+                "Market data is %.0fs old (>600s stale threshold). Skipping %s",
+                market_data_age_seconds, ticker
+            )
+            return None
+
+        # 9. Build and place order
+        order_body = {
+            "ticker": ticker,
+            "action": "buy",
+            "side": side,
+            "type": "limit",
+            "count": count,
+        }
+        if side == "yes":
+            order_body["yes_price"] = price_cents
+        else:
+            order_body["no_price"] = price_cents
+
+        try:
+            result = self.client.post("/portfolio/orders", body=order_body)
+            order_info = result.get("order", {})
+            self.breaker.record_success()
+        except requests.exceptions.HTTPError as e:
+            self.breaker.record_failure()
+            self.log.error("Order failed for %s: %s %s", ticker,
+                           e.response.status_code, e.response.text[:300])
+            return None
+        except Exception as e:
+            self.breaker.record_failure()
+            self.log.error("Order failed for %s: %s", ticker, e)
+            return None
+
+        # 10. Update counters and save trade
+        self._daily_trades += 1
+        self._daily_spend_cents += cost_cents
+
+        trade_record = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "ticker": ticker,
+            "side": side,
+            "price_cents": price_cents,
+            "count": count,
+            "cost_cents": cost_cents,
+            "reasoning": reasoning,
+            "order_id": order_info.get("order_id"),
+            "status": order_info.get("status"),
+        }
+        trade_record.update(extra_fields)
+        save_trade(self.trades_path, trade_record)
+        self.tracker.record(ticker)
+
+        self.log.info("Order placed: %dx %s @ %dc on %s (ID: %s, Status: %s)",
+                       count, side, price_cents, ticker,
+                       order_info.get("order_id"), order_info.get("status"))
+        return order_info

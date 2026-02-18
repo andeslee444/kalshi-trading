@@ -10,8 +10,10 @@ Automated prediction market trading system for Kalshi. Python bots execute weath
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env  # Fill in KALSHI_API_KEY
+cp .env.example .env  # Fill in KALSHI_API_KEY, KALSHI_KEY_FILE, KALSHI_MODE
 ```
+
+RSA private keys go in `config/keys/` (gitignored): `kalshi-demo.pem`, `kalshi-live.pem`. For beatrelease scanner, add DeepSeek API key to `config/keys/deepseek.txt` or set `DEEPSEEK_API_KEY` env var.
 
 ## Running Bots
 
@@ -31,28 +33,42 @@ Or run Python directly: `python3 src/kalshi/weather-bot.py`
 
 The beatrelease scanner runs as a daemon: `python3 src/kalshi/beatrelease-scanner.py` (loops every 4h) or with `--once` for single scan.
 
+The HDD scraper has subcommands:
+```bash
+python3 src/kalshi/hdd-scraper.py scan                   # One-shot scan
+python3 src/kalshi/hdd-scraper.py charts                  # Fetch charts only
+python3 src/kalshi/hdd-scraper.py articles                # Fetch articles only
+python3 src/kalshi/hdd-scraper.py monitor --interval 15   # Loop every 15 min
+```
+
+Utility scripts: `python3 src/kalshi/check-settlements.py` (portfolio diagnostics).
+
 ## Testing
 
 ```bash
-pytest tests/           # Run all tests
-pytest tests/ -v        # Verbose output
-pytest tests/test_kelly.py  # Run specific test file
+pytest tests/                      # Run all tests (~79 tests)
+pytest tests/ -v                   # Verbose output
+pytest tests/test_kelly.py         # Run specific test file
+pytest tests/test_kelly.py -k "test_returns_zero"  # Run matching tests
 ```
 
-Tests cover pure functions: Kelly sizing, weather probability calculations, ticker parsing, HDD chart parsing, and trade file I/O. No API calls required.
+Tests cover pure functions: Kelly sizing, weather probability calculations, ticker parsing, HDD chart parsing, and trade file I/O. No API calls or credentials required.
+
+**Test import pattern**: Source files use hyphens (`strategy-trader.py`), so Python can't import them directly. Tests use `importlib.util.spec_from_file_location` to load them. `conftest.py` adds `src/kalshi/` to `sys.path`. Bots instantiate `KalshiClient` and read config at module-level import time, so tests must stub `kalshi_auth` in `sys.modules` before importing bot modules (see `test_kelly.py:_load_strategy_trader()` for the pattern).
 
 ## Performance Analysis
 
 ```bash
-python3 scripts/analyze-performance.py          # Summary report
-python3 scripts/analyze-performance.py --json   # JSON output
+python3 scripts/analyze-performance.py              # Summary report (local trade logs only)
+python3 scripts/analyze-performance.py --json        # JSON output
+python3 scripts/analyze-performance.py --reconcile   # With API reconciliation (win rate, P&L, Sharpe)
 ```
 
 ## Architecture
 
 ### Shared Auth Module (`src/kalshi/kalshi_auth.py`)
 
-All bots use the `KalshiClient` class from `kalshi_auth.py` for authentication and API calls:
+All bots use the `KalshiClient` class for authentication and API calls:
 
 ```python
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR
@@ -81,18 +97,18 @@ Each bot in `src/kalshi/` follows the same pattern:
 
 ### Key Bots
 
-| Bot | Markets | Data Source |
-|-----|---------|-------------|
-| `weather-bot.py` | KXHIGH temperature | Open-Meteo forecast API |
-| `entertainment-bot.py` | Album sales | HITS Daily Double (Sanity CMS) |
-| `strategy-trader.py` | Multiple | Longshot bias, near-settlement arbitrage |
-| `source-monitor.py` | Weather + entertainment | NWS, HDD, Box Office Mojo |
-| `beatrelease-scanner.py` | Music/entertainment | BeatRelease blog + DeepSeek LLM |
-| `hdd-scraper.py` | (data only) | HITS Daily Double Sanity CMS |
+| Bot | Markets | Data Source | Mode |
+|-----|---------|-------------|------|
+| `weather-bot.py` | KXHIGH temperature | Open-Meteo forecast API | Daemon (30 min) |
+| `entertainment-bot.py` | Album sales | HITS Daily Double (Sanity CMS) | Daemon (15 min) |
+| `source-monitor.py` | Weather + entertainment | NWS, HDD, Box Office Mojo | Daemon (10-30 min) |
+| `strategy-trader.py` | Multiple | Longshot bias, near-settlement arbitrage | One-shot |
+| `beatrelease-scanner.py` | Music/entertainment | BeatRelease blog + DeepSeek LLM | Daemon (4h) |
+| `hdd-scraper.py` | (data only) | HITS Daily Double Sanity CMS | One-shot / monitor |
 
 ### Archived Code
 
-`archive/` contains superseded files: predecessor beatrelease scripts, numbered cycle iteration scripts (`cycle3.py` through `cycle21.py`), and `cycle20.py`. These are historical iterations kept for reference.
+`archive/` contains superseded files: predecessor beatrelease scripts, numbered cycle iteration scripts (`cycle3.py` through `cycle21.py`). Historical iterations kept for reference.
 
 ## Configuration
 
@@ -100,7 +116,7 @@ Each bot in `src/kalshi/` follows the same pattern:
 - **`config/kalshi-config.json`** — Weather bot settings: cities, risk limits (maxTradeAmount, edgeThreshold, scanInterval)
 - **`config/kalshi-monitor-config.json`** — Source monitor: HDD/BoxOffice/NWS polling intervals and endpoints
 - **`config/bots-config.json`** — Entertainment, beatrelease, and strategy bot settings (trade limits, intervals, tickers)
-- **`config/keys/`** — RSA private keys (gitignored): `kalshi-demo.pem`, `kalshi-live.pem`, `deepseek.txt`
+- **`config/keys/`** — RSA private keys (gitignored)
 
 ## API Endpoints
 
@@ -110,11 +126,7 @@ Controlled by `KALSHI_MODE` env var:
 
 ## Data Storage
 
-Trade logs, state files, PID files, bot logs, and source snapshots are saved under `data/` (gitignored, `.gitkeep` preserves directory).
-
-## Python Dependencies
-
-Managed via `requirements.txt`: `requests`, `cryptography`, `beautifulsoup4`, `pytest`.
+Trade logs, state files, PID files, bot logs, and source snapshots are saved under `data/` (gitignored, `.gitkeep` preserves directory). Each bot writes to its own trade log file (e.g., `data/kalshi-trades.json`, `data/kalshi-strategy-trades.json`, `data/kalshi-entertainment-trades.json`, `data/beatrelease-trades.json`).
 
 ## Risk Controls
 

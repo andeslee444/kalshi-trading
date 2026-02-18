@@ -7,7 +7,8 @@ DEMO API ONLY — $5 max per trade.
 import json, time, datetime, os, sys, re, traceback
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR
+from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log
+from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, half_kelly
 
 setup_unbuffered()
 setup_signal_handlers()
@@ -38,90 +39,51 @@ ENTERTAINMENT_TICKERS = _bots_cfg["tickers"]
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 client = KalshiClient()
-
-# === Trade Management ===
-daily_trades = 0
-daily_date = None
-
-def reset_daily():
-    global daily_trades, daily_date
-    today = datetime.date.today().isoformat()
-    if daily_date != today:
-        daily_trades = 0
-        daily_date = today
-
-def place_trade(ticker, side, price_cents, count, reasoning, confidence):
-    global daily_trades
-    reset_daily()
-    if daily_trades >= MAX_DAILY_TRADES:
-        log.warning(f"Daily trade limit ({MAX_DAILY_TRADES}) reached")
-        return None
-
-    cost = price_cents * count
-    if cost > MAX_TRADE_AMOUNT * 100:
-        count = max(1, (MAX_TRADE_AMOUNT * 100) // price_cents)
-
-    order_body = {
-        "ticker": ticker,
-        "action": "buy",
-        "side": side,
-        "type": "limit",
-        "count": count,
-    }
-    if side == "yes":
-        order_body["yes_price"] = price_cents
-    else:
-        order_body["no_price"] = price_cents
-
-    try:
-        result = client.post("/portfolio/orders", body=order_body)
-        order_info = result.get("order", {})
-        daily_trades += 1
-        trade_record = {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "ticker": ticker, "side": side, "price_cents": price_cents,
-            "count": count, "cost_cents": price_cents * count,
-            "reasoning": reasoning, "confidence": confidence,
-            "order_id": order_info.get("order_id"),
-            "status": order_info.get("status"),
-        }
-        save_trade(TRADES_PATH, trade_record)
-        log.info(f"Order placed: {count}x {side} @ {price_cents}c on {ticker}")
-        log.info(f"   Order ID: {order_info.get('order_id')}, Status: {order_info.get('status')}")
-        return order_info
-    except requests.exceptions.HTTPError as e:
-        log.error(f"Order failed: {e.response.status_code} {e.response.text[:300]}")
-    except Exception as e:
-        log.error(f"Order failed: {e}")
-    return None
+trade_manager = TradeManager(client, TRADES_PATH, {
+    "maxTradeAmount": MAX_TRADE_AMOUNT,
+    "maxDailyTrades": MAX_DAILY_TRADES,
+    "maxDailyLoss": _bots_cfg.get("maxDailyLoss", 25),
+}, logger=log)
+trim_trade_log(TRADES_PATH)
 
 # === Market Discovery ===
 def find_entertainment_markets():
-    """Find all open entertainment-related markets."""
-    try:
-        all_markets = client.get_all_markets()
-    except Exception as e:
-        log.error(f"Market fetch error: {e}")
-        return []
+    """Find all open entertainment-related markets using prefix-filtered fetches."""
+    # Build unique ticker prefixes from keywords (e.g. "KXALBUMSALES" -> prefix "KXALBUMSALES")
+    prefixes = set()
+    keyword_list = []
+    for kw in ENTERTAINMENT_TICKERS:
+        kw_upper = kw.upper()
+        # Use the keyword as a prefix if it looks like a ticker prefix, else add "KX" + keyword
+        if kw_upper.startswith("KX"):
+            prefixes.add(kw_upper)
+        else:
+            prefixes.add(f"KX{kw_upper}")
+        keyword_list.append(kw.lower())
 
     markets = []
     seen_tickers = set()
-    for m in all_markets:
-        ticker = m.get("ticker", "")
-        title = m.get("title", "").lower()
-        subtitle = m.get("subtitle", "").lower()
-        combined = f"{ticker} {title} {subtitle}"
+    for prefix in prefixes:
+        try:
+            batch = client.get_all_markets(prefix=prefix, cache_ttl=300)
+            for m in batch:
+                ticker = m.get("ticker", "")
+                if ticker not in seen_tickers:
+                    markets.append(m)
+                    seen_tickers.add(ticker)
+        except Exception as e:
+            log.error(f"Market fetch error for prefix {prefix}: {e}")
 
-        if any(kw.lower() in combined.lower() for kw in ENTERTAINMENT_TICKERS):
-            if ticker not in seen_tickers:
-                markets.append(m)
-                seen_tickers.add(ticker)
+    # Also do a keyword-text match on markets we already fetched (no extra API call)
+    # This catches markets whose ticker doesn't start with "KX+keyword" but whose
+    # title/subtitle contains the keyword.  For that we'd need the full list, but
+    # to avoid the 50K fetch we skip this — prefix matching covers the vast majority.
 
     return markets
 
 # === Source: HITS Daily Double ===
 def scrape_hdd():
-    """Scrape HITS Daily Double for album sales data."""
+    """Scrape HITS Daily Double for album sales data (parallel fetch)."""
     log.info("Checking HITS Daily Double...")
 
     album_data = []
@@ -131,44 +93,33 @@ def scrape_hdd():
         "https://hitsdailydouble.com/news/charts",
         "https://hitsdailydouble.com/",
     ]
-
-    headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
-
-    for url in urls:
-        try:
-            r = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
-            if r.status_code != 200:
-                log.warning(f"  HDD {url}: HTTP {r.status_code}")
-                continue
-
-            html = r.text
-            log.info(f"  HDD {url}: {len(html)} bytes fetched")
-
-            parsed = parse_album_sales(html)
-            if parsed:
-                album_data.extend(parsed)
-                log.info(f"  Found {len(parsed)} album entries from {url}")
-
-        except requests.exceptions.ConnectionError:
-            log.warning(f"  HDD connection refused: {url}")
-        except Exception as e:
-            log.warning(f"  HDD error for {url}: {e}")
-
-    # Try building chart alternatives
     building_urls = [
         "https://hitsdailydouble.com/building_album_chart",
         "https://hitsdd.section101.com/building_album_chart",
     ]
-    for url in building_urls:
-        try:
-            r = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
-            if r.status_code == 200:
-                parsed = parse_album_sales(r.text)
-                if parsed:
-                    album_data.extend(parsed)
-                    log.info(f"  Building chart: {len(parsed)} entries from {url}")
-        except Exception as e:
-            log.debug(f"  Building chart failed ({url}): {e}")
+
+    headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
+
+    # Fetch all HDD URLs concurrently
+    all_urls = urls + building_urls
+    responses = fetch_parallel(all_urls, headers=headers, timeout=20)
+
+    for url in all_urls:
+        r = responses.get(url)
+        if r is None:
+            log.warning(f"  HDD fetch failed: {url}")
+            continue
+        if r.status_code != 200:
+            log.warning(f"  HDD {url}: HTTP {r.status_code}")
+            continue
+
+        html = r.text
+        log.info(f"  HDD {url}: {len(html)} bytes fetched")
+
+        parsed = parse_album_sales(html)
+        if parsed:
+            album_data.extend(parsed)
+            log.info(f"  Found {len(parsed)} album entries from {url}")
 
     return album_data
 
@@ -211,72 +162,67 @@ def parse_album_sales(html):
 
 # === Source: Box Office Mojo ===
 def scrape_box_office():
-    """Scrape Box Office Mojo and The Numbers for weekend estimates."""
+    """Scrape Box Office Mojo and The Numbers for weekend estimates (parallel fetch)."""
     log.info("Checking box office data...")
 
     box_data = []
 
+    box_urls = [
+        "https://www.boxofficemojo.com/",
+        "https://www.the-numbers.com/market/",
+        "https://www.boxofficemojo.com/weekend/",
+    ]
+    responses = fetch_parallel(box_urls, headers={"User-Agent": USER_AGENT}, timeout=20)
+
     # Box Office Mojo
-    try:
-        r = requests.get("https://www.boxofficemojo.com/", headers={"User-Agent": USER_AGENT}, timeout=20)
-        if r.status_code == 200:
-            html = r.text
-            log.info(f"  Box Office Mojo: {len(html)} bytes")
-
-            movies = re.findall(r'>([^<]{3,60})</a>.*?\$([\d,.]+)', html, re.DOTALL)
-            for title, gross in movies[:15]:
-                title = title.strip()
-                gross_clean = gross.replace(",", "")
-                try:
-                    val = float(gross_clean)
-                    if val < 1000:
-                        val *= 1_000_000
-                    if val > 50_000:
-                        box_data.append({"title": title, "gross": int(val), "source": "boxofficemojo"})
-                except (ValueError, TypeError):
-                    pass
-
-            if box_data:
-                log.info(f"  Box Office Mojo: {len(box_data)} movies found")
-    except Exception as e:
-        log.warning(f"  Box Office Mojo error: {e}")
+    r = responses.get("https://www.boxofficemojo.com/")
+    if r and r.status_code == 200:
+        html = r.text
+        log.info(f"  Box Office Mojo: {len(html)} bytes")
+        movies = re.findall(r'>([^<]{3,60})</a>.*?\$([\d,.]+)', html, re.DOTALL)
+        for title, gross in movies[:15]:
+            title = title.strip()
+            gross_clean = gross.replace(",", "")
+            try:
+                val = float(gross_clean)
+                if val < 1000:
+                    val *= 1_000_000
+                if val > 50_000:
+                    box_data.append({"title": title, "gross": int(val), "source": "boxofficemojo"})
+            except (ValueError, TypeError):
+                pass
+        if box_data:
+            log.info(f"  Box Office Mojo: {len(box_data)} movies found")
 
     # The Numbers
-    try:
-        r = requests.get("https://www.the-numbers.com/market/", headers={"User-Agent": USER_AGENT}, timeout=20)
-        if r.status_code == 200:
-            html = r.text
-            matches = re.findall(r'>([^<]{3,60})</a>\s*</td>\s*<td[^>]*>\s*\$?([\d,]+)', html)
-            for title, gross in matches[:15]:
-                title = title.strip()
-                gross_val = int(gross.replace(",", ""))
-                if gross_val > 50_000:
-                    box_data.append({"title": title, "gross": gross_val, "source": "the-numbers"})
-
-            if matches:
-                log.info(f"  The Numbers: {len(matches)} entries parsed")
-    except Exception as e:
-        log.warning(f"  The Numbers error: {e}")
+    r = responses.get("https://www.the-numbers.com/market/")
+    if r and r.status_code == 200:
+        html = r.text
+        matches = re.findall(r'>([^<]{3,60})</a>\s*</td>\s*<td[^>]*>\s*\$?([\d,]+)', html)
+        for title, gross in matches[:15]:
+            title = title.strip()
+            gross_val = int(gross.replace(",", ""))
+            if gross_val > 50_000:
+                box_data.append({"title": title, "gross": gross_val, "source": "the-numbers"})
+        if matches:
+            log.info(f"  The Numbers: {len(matches)} entries parsed")
 
     # Weekend estimates
-    try:
-        r = requests.get("https://www.boxofficemojo.com/weekend/", headers={"User-Agent": USER_AGENT}, timeout=20)
-        if r.status_code == 200:
-            html = r.text
-            movies = re.findall(r'>([^<]{3,60})</a>.*?\$([\d,.]+)', html, re.DOTALL)
-            for title, gross in movies[:15]:
-                title = title.strip()
-                gross_clean = gross.replace(",", "")
-                try:
-                    val = float(gross_clean)
-                    if val < 1000:
-                        val *= 1_000_000
-                    if val > 50_000 and not any(d["title"] == title for d in box_data):
-                        box_data.append({"title": title, "gross": int(val), "source": "boxofficemojo-weekend"})
-                except (ValueError, TypeError):
-                    pass
-    except Exception as e:
-        log.debug(f"  Weekend page error: {e}")
+    r = responses.get("https://www.boxofficemojo.com/weekend/")
+    if r and r.status_code == 200:
+        html = r.text
+        movies = re.findall(r'>([^<]{3,60})</a>.*?\$([\d,.]+)', html, re.DOTALL)
+        for title, gross in movies[:15]:
+            title = title.strip()
+            gross_clean = gross.replace(",", "")
+            try:
+                val = float(gross_clean)
+                if val < 1000:
+                    val *= 1_000_000
+                if val > 50_000 and not any(d["title"] == title for d in box_data):
+                    box_data.append({"title": title, "gross": int(val), "source": "boxofficemojo-weekend"})
+            except (ValueError, TypeError):
+                pass
 
     return box_data
 
@@ -361,16 +307,15 @@ def evaluate_album_opportunity(market, album, market_price):
         log.info(f"     Could not parse threshold from: {title}")
         return
 
-    ratio = units / threshold
-    if ratio > 1.10:
+    sigma = album_data_sigma(datetime.datetime.now().weekday())
+    confidence = info_arb_probability(units, threshold, sigma)
+
+    # Determine side: confidence > 0.5 means above threshold (YES), < 0.5 means below (NO)
+    if confidence > 0.5:
         side = "yes"
-        confidence = min(0.95, 0.75 + (ratio - 1.0) * 0.5)
-    elif ratio < 0.90:
-        side = "no"
-        confidence = min(0.95, 0.75 + (1.0 - ratio) * 0.5)
     else:
-        log.info(f"     Too close to threshold ({units/1000:.0f}K vs {threshold/1000:.0f}K), skipping")
-        return
+        side = "no"
+        confidence = 1.0 - confidence  # flip to confidence in NO direction
 
     if confidence < CONFIDENCE_THRESHOLD:
         log.info(f"     Confidence {confidence*100:.0f}% < {CONFIDENCE_THRESHOLD*100:.0f}% threshold, skipping")
@@ -378,24 +323,29 @@ def evaluate_album_opportunity(market, album, market_price):
 
     yes_ask = market.get("yes_ask", 0)
     no_ask = market.get("no_ask", 0)
+    max_cost = MAX_TRADE_AMOUNT * 100
 
-    if side == "yes" and yes_ask and yes_ask < confidence * 100:
+    if side == "yes" and yes_ask and yes_ask < 99:
         edge = confidence - yes_ask / 100
-        if edge > 0.05:
-            count = max(1, min((MAX_TRADE_AMOUNT * 100) // yes_ask, 20))
-            reasoning = f"HDD: {artist} at {units/1000:.0f}K > {threshold/1000:.0f}K threshold. YES@{yes_ask}c, conf={confidence*100:.0f}%"
+        if edge > 0:
+            count, risk = half_kelly(edge, yes_ask, max_cost)
+            if count < 1:
+                count = 1
+            reasoning = f"HDD: {artist} at {units/1000:.0f}K vs {threshold/1000:.0f}K threshold. YES@{yes_ask}c, conf={confidence*100:.0f}%"
             log.info(f"\nALBUM ARBITRAGE: {artist} {units/1000:.0f}K units > {threshold/1000:.0f}K")
             log.info(f"    {ticker} YES@{yes_ask}c | edge={edge*100:.1f}% | conf={confidence*100:.0f}%")
-            place_trade(ticker, "yes", yes_ask, count, reasoning, confidence)
+            trade_manager.place_order(ticker, "yes", yes_ask, count, reasoning, confidence=confidence)
 
-    elif side == "no" and no_ask and no_ask < confidence * 100:
+    elif side == "no" and no_ask and no_ask < 99:
         edge = confidence - no_ask / 100
-        if edge > 0.05:
-            count = max(1, min((MAX_TRADE_AMOUNT * 100) // no_ask, 20))
-            reasoning = f"HDD: {artist} at {units/1000:.0f}K < {threshold/1000:.0f}K threshold. NO@{no_ask}c, conf={confidence*100:.0f}%"
+        if edge > 0:
+            count, risk = half_kelly(edge, no_ask, max_cost)
+            if count < 1:
+                count = 1
+            reasoning = f"HDD: {artist} at {units/1000:.0f}K vs {threshold/1000:.0f}K threshold. NO@{no_ask}c, conf={confidence*100:.0f}%"
             log.info(f"\nALBUM ARBITRAGE: {artist} {units/1000:.0f}K units < {threshold/1000:.0f}K")
             log.info(f"    {ticker} NO@{no_ask}c | edge={edge*100:.1f}% | conf={confidence*100:.0f}%")
-            place_trade(ticker, "no", no_ask, count, reasoning, confidence)
+            trade_manager.place_order(ticker, "no", no_ask, count, reasoning, confidence=confidence)
 
 def evaluate_boxoffice_opportunity(market, movie, market_price):
     """Evaluate box office trade opportunity."""
@@ -416,37 +366,41 @@ def evaluate_boxoffice_opportunity(market, movie, market_price):
     if not threshold:
         return
 
-    ratio = gross / threshold
-    if ratio > 1.15:
+    sigma = boxoffice_data_sigma(datetime.datetime.now().weekday())
+    confidence = info_arb_probability(gross, threshold, sigma)
+
+    if confidence > 0.5:
         side = "yes"
-        confidence = min(0.95, 0.80 + (ratio - 1.0) * 0.3)
-    elif ratio < 0.85:
-        side = "no"
-        confidence = min(0.95, 0.80 + (1.0 - ratio) * 0.3)
     else:
-        return
+        side = "no"
+        confidence = 1.0 - confidence
 
     if confidence < CONFIDENCE_THRESHOLD:
         return
 
     yes_ask = market.get("yes_ask", 0)
     no_ask = market.get("no_ask", 0)
+    max_cost = MAX_TRADE_AMOUNT * 100
 
-    if side == "yes" and yes_ask and yes_ask < confidence * 100:
+    if side == "yes" and yes_ask and yes_ask < 99:
         edge = confidence - yes_ask / 100
-        if edge > 0.05:
-            count = max(1, min((MAX_TRADE_AMOUNT * 100) // yes_ask, 20))
-            reasoning = f"Box office: {movie_title} ${gross/1e6:.1f}M > ${threshold/1e6:.0f}M. YES@{yes_ask}c, conf={confidence*100:.0f}%"
+        if edge > 0:
+            count, risk = half_kelly(edge, yes_ask, max_cost)
+            if count < 1:
+                count = 1
+            reasoning = f"Box office: {movie_title} ${gross/1e6:.1f}M vs ${threshold/1e6:.0f}M. YES@{yes_ask}c, conf={confidence*100:.0f}%"
             log.info(f"\nBOX OFFICE ARBITRAGE: {movie_title} ${gross/1e6:.1f}M > ${threshold/1e6:.0f}M")
-            place_trade(ticker, "yes", yes_ask, count, reasoning, confidence)
+            trade_manager.place_order(ticker, "yes", yes_ask, count, reasoning, confidence=confidence)
 
-    elif side == "no" and no_ask and no_ask < confidence * 100:
+    elif side == "no" and no_ask and no_ask < 99:
         edge = confidence - no_ask / 100
-        if edge > 0.05:
-            count = max(1, min((MAX_TRADE_AMOUNT * 100) // no_ask, 20))
-            reasoning = f"Box office: {movie_title} ${gross/1e6:.1f}M < ${threshold/1e6:.0f}M. NO@{no_ask}c, conf={confidence*100:.0f}%"
+        if edge > 0:
+            count, risk = half_kelly(edge, no_ask, max_cost)
+            if count < 1:
+                count = 1
+            reasoning = f"Box office: {movie_title} ${gross/1e6:.1f}M vs ${threshold/1e6:.0f}M. NO@{no_ask}c, conf={confidence*100:.0f}%"
             log.info(f"\nBOX OFFICE ARBITRAGE: {movie_title} ${gross/1e6:.1f}M < ${threshold/1e6:.0f}M")
-            place_trade(ticker, "no", no_ask, count, reasoning, confidence)
+            trade_manager.place_order(ticker, "no", no_ask, count, reasoning, confidence=confidence)
 
 # === Main Loop ===
 def scan():
@@ -508,7 +462,6 @@ def main():
 
     while True:
         try:
-            reset_daily()
             scan()
         except Exception as e:
             log.error(f"Scan error: {e}")
