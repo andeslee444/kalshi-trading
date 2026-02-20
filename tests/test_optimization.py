@@ -66,6 +66,7 @@ def _temp_state_path():
 def _load_beatrelease_scanner():
     """Import beatrelease-scanner.py with stubbed-out side effects."""
     orig_auth = sys.modules.get("kalshi_auth")
+    orig_alloc = sys.modules.get("capital_allocator")
 
     fake_auth = types.ModuleType("kalshi_auth")
     fake_auth.KalshiClient = lambda *a, **kw: MagicMock()
@@ -82,6 +83,15 @@ def _load_beatrelease_scanner():
     fake_auth.trim_trade_log = lambda *a, **kw: None
     fake_auth.notify_whatsapp = lambda *a, **kw: False
     sys.modules["kalshi_auth"] = fake_auth
+
+    fake_alloc = types.ModuleType("capital_allocator")
+    _FakeBudget = type("BudgetResponse", (), {"approved": True, "reason": "", "max_cost_cents": 500, "bankroll_cents": 50000})
+    fake_alloc.PortfolioAllocator = type("PortfolioAllocator", (), {
+        "__init__": lambda self, *a, **kw: None,
+        "request_budget": lambda self, *a, **kw: _FakeBudget(),
+        "record_trade": lambda self, *a, **kw: None,
+    })
+    sys.modules["capital_allocator"] = fake_alloc
 
     # Create config/data dirs and a minimal bots-config.json
     config_dir = Path("/tmp/fake_beatrelease/config")
@@ -117,6 +127,11 @@ def _load_beatrelease_scanner():
         sys.modules["kalshi_auth"] = orig_auth
     else:
         del sys.modules["kalshi_auth"]
+
+    if orig_alloc is not None:
+        sys.modules["capital_allocator"] = orig_alloc
+    elif "capital_allocator" in sys.modules:
+        del sys.modules["capital_allocator"]
 
     return mod
 
@@ -364,10 +379,10 @@ class TestPortfolioAllocator:
         assert budget.bankroll_cents == 10000
 
     def test_global_dedup(self):
-        """Same ticker should be blocked for second bot."""
+        """Same ticker, same bot should be blocked (no self-supersede)."""
         alloc = self._make_allocator()
-        alloc.record_trade("weather", "TICK-1", 100)
-        budget = alloc.request_budget("entertainment", "TICK-1", edge=0.10)
+        alloc.record_trade("weather", "TICK-1", 100, edge=0.10)
+        budget = alloc.request_budget("weather", "TICK-1", edge=0.10)
         assert not budget.approved
         assert "already traded" in budget.reason
 
@@ -1250,18 +1265,22 @@ class TestKalshiFeeHelpers:
 # Kelly bankroll uses total balance (Tier 1.1)
 # ===================================================================
 
-class TestKellyBankrollUsesTotalBalance:
+class TestKellyBankrollUsesAvailableBalance:
 
-    def test_bankroll_cents_equals_total_not_available(self):
-        """BudgetResponse.bankroll_cents should use total balance for Kelly sizing."""
+    def test_bankroll_cents_equals_available_not_total(self):
+        """BudgetResponse.bankroll_cents should use available balance for Kelly sizing.
+
+        Fix C: locked capital shouldn't inflate Kelly sizing. If $12k is in
+        positions and only $8k is available, size based on $8k.
+        """
         client = MagicMock()
         # Total = 20000, Available = 8000 (positions lock 12000)
         client.get_balance.return_value = (20000, 8000)
         alloc = PortfolioAllocator(client=client, state_path=_temp_state_path())
         budget = alloc.request_budget("weather", "TICK-1", edge=0.10)
         assert budget.approved
-        # Kelly bankroll should be total equity (20000), not available (8000)
-        assert budget.bankroll_cents == 20000
+        # Kelly bankroll should be available (8000), not total (20000)
+        assert budget.bankroll_cents == 8000
 
     def test_risk_limits_use_available(self):
         """Risk limits (portfolio daily loss etc) should use available balance."""
@@ -1285,11 +1304,12 @@ class TestHighConfCityLimitFix:
     def test_high_conf_respects_city_limit(self):
         """High-confidence override should NOT bypass city exposure limit."""
         client = MagicMock()
-        client.get_balance.return_value = (100000, 100000)
+        # Use 50000c balance so city limit = 10% = 5000c (below $100 absolute cap)
+        client.get_balance.return_value = (50000, 50000)
         alloc = PortfolioAllocator(client=client, state_path=_temp_state_path())
 
-        # City limit = 10% of 100000 = 10000c
-        alloc.record_trade("source-monitor", "KXHIGHHOU-26FEB16-B77", 10000)
+        # City limit = 10% of 50000 = 5000c
+        alloc.record_trade("source-monitor", "KXHIGHHOU-26FEB16-B77", 5000)
 
         # High-confidence trade on same city should be denied
         budget = alloc.request_budget(
@@ -1302,10 +1322,11 @@ class TestHighConfCityLimitFix:
     def test_high_conf_different_city_allowed(self):
         """High-confidence should work on a different city."""
         client = MagicMock()
-        client.get_balance.return_value = (100000, 100000)
+        # Use 50000c balance so city limit = 10% = 5000c (below $100 absolute cap)
+        client.get_balance.return_value = (50000, 50000)
         alloc = PortfolioAllocator(client=client, state_path=_temp_state_path())
 
-        alloc.record_trade("source-monitor", "KXHIGHHOU-26FEB16-B77", 10000)
+        alloc.record_trade("source-monitor", "KXHIGHHOU-26FEB16-B77", 5000)
 
         budget = alloc.request_budget(
             "source-monitor", "KXHIGHMIA-26FEB16-T86",
@@ -1788,6 +1809,24 @@ class TestSettlementAwareCleanup:
         })
         fake_auth.trim_trade_log = lambda *a, **kw: None
         fake_auth.load_trades = lambda *a, **kw: []
+        fake_auth.CITY_TIMEZONES = {
+            "MIA": "America/New_York", "LAX": "America/Los_Angeles",
+            "PHIL": "America/New_York", "NY": "America/New_York",
+            "CHI": "America/Chicago", "AUS": "America/Chicago",
+            "DEN": "America/Denver", "HOU": "America/Chicago",
+        }
+        fake_auth._local_today = lambda city_code="NY": "2026-02-20"
+        fake_auth.round_half_up = lambda v: int(__import__("decimal").Decimal(str(v)).quantize(
+            __import__("decimal").Decimal("1"), rounding=__import__("decimal").ROUND_HALF_UP))
+        fake_auth.retry_request = lambda *a, **kw: MagicMock()
+        fake_auth.fetch_parallel = lambda *a, **kw: []
+        fake_auth.HealthCheckMonitor = type("HealthCheckMonitor", (), {
+            "__init__": lambda self, *a, **kw: None,
+            "record_bot_heartbeat": lambda self, *a, **kw: None,
+            "record_source_success": lambda self, *a, **kw: None,
+            "record_source_error": lambda self, *a, **kw: None,
+            "check_health": lambda self, *a, **kw: [],
+        })
         sys.modules["kalshi_auth"] = fake_auth
 
         fake_prob = types.ModuleType("probability")
@@ -1797,6 +1836,7 @@ class TestSettlementAwareCleanup:
         fake_prob.weather_probability = lambda *a, **kw: 0.5
         fake_prob.nws_probability = lambda *a, **kw: 0.5
         fake_prob.edge_after_fees = lambda *a, **kw: 0.0
+        fake_prob.kalshi_fee_cents = lambda p: 0.07 * (p / 100) * (1 - p / 100) * 100
         sys.modules["probability"] = fake_prob
 
         fake_alloc = types.ModuleType("capital_allocator")
@@ -1901,12 +1941,12 @@ class TestSettlementAwareCleanup:
         mock_client.delete.assert_called_once_with("/portfolio/orders/ORD-3")
 
     def test_keeps_recent_order_without_close_time(self):
-        """age < 12h and no close_time → keep."""
+        """age < TTL (120 min) and no close_time → keep."""
         import datetime as dt
         mod, mock_client = self._load_position_monitor()
 
         now = dt.datetime.now(dt.timezone.utc)
-        recent = (now - dt.timedelta(hours=5)).isoformat()
+        recent = (now - dt.timedelta(minutes=90)).isoformat()
 
         mock_client.get.return_value = {
             "orders": [{

@@ -81,13 +81,32 @@ def fuzzy_match_score(text1, text2):
     return SequenceMatcher(None, norm1, norm2).ratio()
 
 
+MIN_MATCH_SCORE = 0.75
+
+
+def _extract_numbers(text):
+    """Extract all numbers from text for secondary validation."""
+    return set(re.findall(r'\d+\.?\d*', text))
+
+
+def validate_match(k_text, p_text, score):
+    """Require fuzzy score >= 0.75 AND matching numerical thresholds."""
+    if score < MIN_MATCH_SCORE:
+        return False
+    k_nums = _extract_numbers(k_text)
+    p_nums = _extract_numbers(p_text)
+    # If both have numbers, at least one must overlap
+    if k_nums and p_nums and not k_nums & p_nums:
+        return False
+    return True
+
+
 def match_markets(kalshi_markets, polymarket_markets):
     """Find matching markets between Kalshi and Polymarket.
 
     Returns list of (kalshi_market, polymarket_market, score) tuples
-    with score >= 0.6 (configurable threshold).
+    with score >= 0.75 AND matching numerical thresholds.
     """
-    MIN_MATCH_SCORE = 0.6
     matches = []
 
     for km in kalshi_markets:
@@ -107,7 +126,7 @@ def match_markets(kalshi_markets, polymarket_markets):
                 continue
 
             score = fuzzy_match_score(k_text, p_question)
-            if score > best_score and score >= MIN_MATCH_SCORE:
+            if score > best_score and validate_match(k_text, p_question, score):
                 best_score = score
                 best_match = pm
 
@@ -285,9 +304,11 @@ def scan_spreads():
                         f"net spread={spread['net_spread']*100:.1f}%"
                     )
                     result = trade_manager.place_order(k_ticker, "yes", price, count, reasoning,
-                                                        market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
+                                                        market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+                                                        model_prob=round(0.5 + edge, 4), raw_edge=round(edge, 4),
+                                                        fee_cents=round(kalshi_fee_cents(price), 2), sizing_method="half_kelly")
                     if result:
-                        allocator.record_trade("cross-platform-arb", k_ticker, risk)
+                        allocator.record_trade("cross-platform-arb", k_ticker, risk, edge=edge)
         else:
             if abs(spread["raw_spread"]) > 0.01:
                 log.info(f"  {k_ticker} vs PM: raw spread {spread['raw_spread']*100:.1f}% (below threshold after fees)")

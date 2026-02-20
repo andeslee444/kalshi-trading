@@ -15,6 +15,7 @@
     "DEN": { "lat": 39.74, "lon": -104.99, "name": "Denver" },
     "HOU": { "lat": 29.76, "lon": -95.37, "name": "Houston" }
   },
+  "disableWeatherYes": true,
   "ensemble": {
     "enabled": false,
     "models": ["gfs", "ecmwf", "icon"],

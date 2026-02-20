@@ -17,10 +17,11 @@ from pathlib import Path
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot,
+    HealthCheckMonitor,
 )
 from probability import (
     econ_nowcast_probability, cpi_nowcast_sigma, half_kelly, compute_limit_price,
-    edge_after_fees,
+    kalshi_fee_cents,
 )
 from capital_allocator import PortfolioAllocator
 
@@ -45,6 +46,7 @@ EDGE_THRESHOLD = econ_config.get("edgeThreshold", 0.08)
 
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
+health = HealthCheckMonitor(logger=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": MAX_TRADE,
     "maxDailyTrades": MAX_DAILY_TRADES,
@@ -218,7 +220,13 @@ def scan_and_trade():
     # Fetch nowcast data
     log.info("\nFetching economic data sources...")
     nowcast = fetch_cleveland_fed_nowcast()
+    if nowcast:
+        health.record_source_success("cleveland-fed")
+    else:
+        health.record_source_error("cleveland-fed", "empty nowcast")
     gas_price = fetch_gas_prices()
+    if gas_price:
+        health.record_source_success("aaa-gas")
 
     if not nowcast:
         log.info("No nowcast data available, skipping scan.")
@@ -278,9 +286,9 @@ def scan_and_trade():
         if not yes_ask or yes_ask >= 99:
             continue
 
-        # Determine trade direction
+        # Determine trade direction (raw edge, fees handled in Kelly)
         if prob > 0.5:
-            edge = edge_after_fees(prob - yes_ask / 100, yes_ask)
+            edge = prob - yes_ask / 100
             if edge > EDGE_THRESHOLD:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "yes",
@@ -295,7 +303,7 @@ def scan_and_trade():
                 )
         else:
             no_prob = 1.0 - prob
-            edge = edge_after_fees(no_prob - (no_ask / 100 if no_ask else 1.0), no_ask or 100)
+            edge = no_prob - (no_ask / 100 if no_ask else 1.0)
             if edge > EDGE_THRESHOLD:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "no",
@@ -331,7 +339,8 @@ def scan_and_trade():
         if not price or price <= 0:
             continue
 
-        count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+        fee = kalshi_fee_cents(price)
+        count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
             continue
 
@@ -345,9 +354,14 @@ def scan_and_trade():
         log.info(f"  Placing: {count}x {side} @ {price}c on {ticker}")
 
         result = trade_manager.place_order(ticker, side, price, count, reasoning,
-                                            market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
+                                            market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+                                            model_prob=round(opp["prob"], 4), raw_edge=round(edge, 4),
+                                            fee_cents=round(kalshi_fee_cents(price), 2), sizing_method="half_kelly",
+                                            market_close_time=m.get("close_time"),
+                                            kelly_fraction=kelly_details.get("kelly_fraction"),
+                                            bankroll_used=kelly_details.get("bankroll_used"))
         if result:
-            allocator.record_trade("economics", ticker, risk)
+            allocator.record_trade("economics", ticker, risk, edge=edge)
 
 
 # === Entry Point ===
@@ -379,6 +393,7 @@ def main():
     # Daemon loop
     while True:
         try:
+            health.record_bot_heartbeat("economics")
             scan_and_trade()
         except Exception as e:
             log.error(f"Scan error: {e}")

@@ -72,6 +72,28 @@ class TestHalfKelly:
         contracts, risk = half_kelly(0.20, 30, 1000)
         assert risk == contracts * 30
 
+    def test_fee_cents_reduces_contracts(self):
+        """Fix A: fee_cents > 0 should reduce contracts vs fee_cents=0.
+
+        When fee_cents is passed, the payout is reduced from 100 to (100-fee),
+        which lowers the Kelly fraction and thus the number of contracts.
+        Use a large enough max_cost so Kelly (not cost cap) is the binding constraint.
+        """
+        c_no_fee, _ = half_kelly(0.15, 50, 50000, bankroll_cents=50000, fee_cents=0)
+        c_with_fee, _ = half_kelly(0.15, 50, 50000, bankroll_cents=50000, fee_cents=1.75)
+        assert c_with_fee < c_no_fee
+
+    def test_fee_cents_reduces_payout_not_edge(self):
+        """Verify fee reduces win amount (100-fee-price), not edge probability."""
+        # With fee=0: win = 100 - 50 = 50c
+        # With fee=5: win = 100 - 5 - 50 = 45c (10% less payout)
+        c0, _ = half_kelly(0.10, 50, 10000, bankroll_cents=100000, fee_cents=0)
+        c5, _ = half_kelly(0.10, 50, 10000, bankroll_cents=100000, fee_cents=5)
+        # Fee should meaningfully reduce sizing
+        assert c5 < c0
+        # But shouldn't zero it out for 10% edge
+        assert c5 > 0
+
 
 # ---------------------------------------------------------------------------
 # Sell-side half_kelly_sell tests
@@ -143,6 +165,12 @@ class TestHalfKellySell:
         """An edge so small that half-Kelly rounds to 0."""
         contracts, risk = half_kelly_sell(0.001, 50, 1000, bankroll_cents=1000)
         assert contracts == 0
+
+    def test_fee_cents_reduces_sell_contracts(self):
+        """Fix A: fee_cents > 0 should reduce sell-side contracts too."""
+        c_no_fee, _ = half_kelly_sell(0.20, 5, 5000, bankroll_cents=50000, fee_cents=0)
+        c_with_fee, _ = half_kelly_sell(0.20, 5, 5000, bankroll_cents=50000, fee_cents=0.33)
+        assert c_with_fee <= c_no_fee
 
     def test_symmetry_at_50c(self):
         """At 50c, sell-side and buy-side should produce same sizing.

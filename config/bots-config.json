@@ -29,7 +29,7 @@
     "maxDailyLoss": 25,
     "scanIntervalMinutes": 5,
     "edgeThreshold": 0.06,
-    "settlementBufferMinutes": 2
+    "settlementBufferMinutes": 5
   },
   "economics": {
     "maxTradeAmount": 15,
@@ -51,7 +51,8 @@
     "takeProfitThreshold": 0.85,
     "stopLossThreshold": 0.20,
     "modelShiftThreshold": 0.25,
-    "maxDailyExits": 20
+    "maxDailyExits": 20,
+    "orderTtlMinutes": 120
   },
   "market_maker": {
     "enabled": false,

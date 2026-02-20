@@ -15,6 +15,7 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, notify_whatsapp
+from capital_allocator import PortfolioAllocator
 
 # Unbuffered output
 setup_unbuffered()
@@ -44,6 +45,7 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxDailyTrades": _bots_cfg.get("maxDailyTrades", 10),
     "maxDailyLoss": _bots_cfg.get("maxDailyLoss", 25),
 }, logger=log)
+allocator = PortfolioAllocator(client, logger=log)
 trim_trade_log(TRADES_PATH)
 
 
@@ -588,11 +590,20 @@ def scan_cycle():
             # Use the blog's recommended price as the limit price
             limit_price = t["price_cents"]
 
+            # Check allocator for global dedup (prevents cross-bot double exposure)
+            budget = allocator.request_budget("beatrelease", ticker, edge=0.10)
+            if not budget.approved:
+                log.info(f"  Allocator denied {ticker}: {budget.reason}")
+                continue
+
             result = trade_manager.place_order(
                 ticker, side, limit_price, t["quantity"],
-                t.get("reasoning", ""), source_url=url
+                t.get("reasoning", ""), source_url=url,
+                sizing_method="llm_recommended",
             )
             if result:
+                allocator.record_trade("beatrelease", ticker,
+                                       limit_price * t["quantity"], edge=0.10)
                 placed.append({
                     "ticker": ticker,
                     "side": side,

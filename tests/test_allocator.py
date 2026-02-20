@@ -1,0 +1,213 @@
+"""Tests for capital allocator signal quality scoring, supersede logic,
+and pending exits.
+
+Fix 3: Validates the "best signal wins" mechanism and backward compatibility.
+"""
+
+import datetime
+import json
+import tempfile
+import pytest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+from capital_allocator import (
+    PortfolioAllocator, compute_signal_quality, MODEL_QUALITY_FACTOR, BudgetResponse,
+)
+
+
+class TestSignalQuality:
+    """Test compute_signal_quality()."""
+
+    def test_source_monitor_highest(self):
+        """Source monitor with 10% edge should score highest."""
+        q_sm = compute_signal_quality("source-monitor", 0.10)
+        q_weather = compute_signal_quality("weather", 0.10)
+        assert q_sm > q_weather
+
+    def test_quality_scales_with_edge(self):
+        """Higher edge -> higher quality."""
+        q1 = compute_signal_quality("weather", 0.10)
+        q2 = compute_signal_quality("weather", 0.20)
+        assert q2 > q1
+
+    def test_quality_zero_edge(self):
+        assert compute_signal_quality("weather", 0.0) == 0.0
+
+    def test_unknown_bot_gets_default(self):
+        q = compute_signal_quality("unknown-bot", 0.10)
+        assert q == 0.10 * 0.2  # default factor is 0.2
+
+    def test_all_known_bots_have_factors(self):
+        for bot in ["source-monitor", "economics", "entertainment",
+                     "weather", "crypto", "strategy", "beatrelease"]:
+            assert bot in MODEL_QUALITY_FACTOR
+
+
+class TestSupersedeLogic:
+    """Test the 'best signal wins' dedup replacement."""
+
+    def _make_allocator(self, balance=50000):
+        mock_client = MagicMock()
+        mock_client.get_balance.return_value = (balance, balance)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            json.dump({}, f)
+            state_path = f.name
+        alloc = PortfolioAllocator(client=mock_client, state_path=state_path)
+        alloc._daily_date = datetime.date.today().isoformat()
+        return alloc
+
+    def test_same_bot_same_ticker_denied(self):
+        alloc = self._make_allocator()
+        alloc.record_trade("weather", "KXHIGHNY-26FEB16-T40", 100, edge=0.10)
+        result = alloc.request_budget("weather", "KXHIGHNY-26FEB16-T40", edge=0.10)
+        assert not result.approved
+        assert "already traded" in result.reason
+
+    def test_better_signal_supersedes(self):
+        alloc = self._make_allocator()
+        # Weather trades with 10% edge, quality = 0.10 * 0.5 = 0.05
+        alloc.record_trade("weather", "KXHIGHNY-26FEB16-T40", 100, edge=0.10)
+
+        # Source monitor with 20% edge, quality = 0.20 * 1.0 = 0.20
+        # 0.20 > 0.05 * 1.5 = 0.075 -> supersede
+        result = alloc.request_budget("source-monitor", "KXHIGHNY-26FEB16-T40", edge=0.20)
+        assert result.approved
+
+    def test_worse_signal_rejected(self):
+        alloc = self._make_allocator()
+        # Source monitor trades first with 20% edge, quality = 0.20 * 1.0 = 0.20
+        alloc.record_trade("source-monitor", "KXHIGHNY-26FEB16-T40", 100, edge=0.20)
+
+        # Weather tries with 10% edge, quality = 0.10 * 0.5 = 0.05
+        # 0.05 < 0.20 * 1.5 = 0.30 -> rejected
+        result = alloc.request_budget("weather", "KXHIGHNY-26FEB16-T40", edge=0.10)
+        assert not result.approved
+
+    def test_supersede_creates_pending_exit(self):
+        alloc = self._make_allocator()
+        alloc.record_trade("weather", "KXHIGHNY-26FEB16-T40", 100, edge=0.10)
+        alloc.request_budget("source-monitor", "KXHIGHNY-26FEB16-T40", edge=0.20)
+        exits = alloc.get_pending_exits()
+        assert "KXHIGHNY-26FEB16-T40" in exits
+
+    def test_get_pending_exits_clears(self):
+        alloc = self._make_allocator()
+        alloc.record_trade("weather", "KXHIGHNY-26FEB16-T40", 100, edge=0.10)
+        alloc.request_budget("source-monitor", "KXHIGHNY-26FEB16-T40", edge=0.20)
+        exits1 = alloc.get_pending_exits()
+        assert len(exits1) == 1
+        exits2 = alloc.get_pending_exits()
+        assert len(exits2) == 0
+
+
+class TestRecordTradeEdge:
+    """Test that record_trade stores signal quality."""
+
+    def _make_allocator(self):
+        mock_client = MagicMock()
+        mock_client.get_balance.return_value = (50000, 50000)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            json.dump({}, f)
+            state_path = f.name
+        alloc = PortfolioAllocator(client=mock_client, state_path=state_path)
+        alloc._daily_date = datetime.date.today().isoformat()
+        return alloc
+
+    def test_record_stores_signal_quality(self):
+        alloc = self._make_allocator()
+        alloc.record_trade("weather", "KXHIGHNY-26FEB16-T40", 100, edge=0.10)
+        entry = alloc._traded_tickers["KXHIGHNY-26FEB16-T40"]
+        assert isinstance(entry, dict)
+        assert entry["signal_quality"] == pytest.approx(0.05, abs=0.001)
+        assert entry["edge"] == 0.10
+        assert entry["bot"] == "weather"
+
+
+class TestBankrollUsesAvailable:
+    """Fix C: Kelly bankroll should use available_balance, not total_balance."""
+
+    def _make_allocator(self, total=10000, available=2000):
+        mock_client = MagicMock()
+        mock_client.get_balance.return_value = (total, available)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            json.dump({}, f)
+            state_path = f.name
+        alloc = PortfolioAllocator(client=mock_client, state_path=state_path)
+        alloc._daily_date = datetime.date.today().isoformat()
+        return alloc
+
+    def test_bankroll_equals_available(self):
+        """When total=10000, available=2000, bankroll should be 2000."""
+        alloc = self._make_allocator(total=10000, available=2000)
+        budget = alloc.request_budget("weather", "TICK-NEW", edge=0.10)
+        assert budget.approved
+        assert budget.bankroll_cents == 2000
+
+    def test_bankroll_not_total(self):
+        """Bankroll should NOT be total balance."""
+        alloc = self._make_allocator(total=50000, available=5000)
+        budget = alloc.request_budget("weather", "TICK-NEW2", edge=0.10)
+        assert budget.approved
+        assert budget.bankroll_cents == 5000
+        assert budget.bankroll_cents != 50000
+
+
+class TestAbsoluteDailyLossCap:
+    """Fix D: Absolute $100 daily risk cap."""
+
+    def _make_allocator(self, balance=200000):
+        mock_client = MagicMock()
+        mock_client.get_balance.return_value = (balance, balance)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            json.dump({}, f)
+            state_path = f.name
+        alloc = PortfolioAllocator(client=mock_client, state_path=state_path)
+        alloc._daily_date = datetime.date.today().isoformat()
+        return alloc
+
+    def test_cap_blocks_after_100_dollars(self):
+        """After $100 in risk today, next request should be rejected."""
+        alloc = self._make_allocator(balance=200000)
+        # Record trades summing to $100 (10000 cents) of risk
+        for i in range(10):
+            alloc.record_trade("weather", f"TICK-{i}", 1000, edge=0.10)
+        budget = alloc.request_budget("weather", "TICK-NEW", edge=0.15)
+        assert not budget.approved
+        assert "absolute daily risk cap" in budget.reason
+
+    def test_under_cap_allowed(self):
+        """Under $100 risk should still allow trading."""
+        alloc = self._make_allocator(balance=200000)
+        # Record $90 of risk (9000 cents)
+        for i in range(9):
+            alloc.record_trade("weather", f"TICK-{i}", 1000, edge=0.10)
+        budget = alloc.request_budget("weather", "TICK-NEW", edge=0.15)
+        assert budget.approved
+
+
+class TestBackwardCompat:
+    """Test backward compatibility with old state file format."""
+
+    def test_old_tuple_format_loads(self):
+        """Old format: traded_tickers = {ticker: [bot, timestamp]}"""
+        old_state = {
+            "traded_tickers": {
+                "KXHIGHNY-26FEB16-T40": ["weather", "2026-02-16T10:00:00"],
+            },
+            "bot_spend": {},
+            "city_risk": {},
+            "total_risk_cents": 0,
+            "daily_date": datetime.date.today().isoformat(),
+        }
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            json.dump(old_state, f)
+            state_path = f.name
+
+        alloc = PortfolioAllocator(client=MagicMock(), state_path=state_path)
+        alloc._load_state()
+
+        entry = alloc._traded_tickers["KXHIGHNY-26FEB16-T40"]
+        assert isinstance(entry, dict)
+        assert entry["bot"] == "weather"
+        assert entry["signal_quality"] == 0.0  # old format has no quality

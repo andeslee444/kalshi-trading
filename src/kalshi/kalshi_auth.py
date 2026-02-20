@@ -12,6 +12,8 @@ Usage:
 """
 
 import json, time, base64, os, sys, signal, logging, datetime, tempfile
+from decimal import Decimal, ROUND_HALF_UP
+from zoneinfo import ZoneInfo
 from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
@@ -33,6 +35,34 @@ MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 1.0  # seconds
 
 KILL_SWITCH_PATH = PROJECT_DIR / "data" / "HALT_TRADING"
+
+# City timezone mapping — shared by source-monitor, position-monitor, etc.
+CITY_TIMEZONES = {
+    "MIA": "America/New_York",
+    "LAX": "America/Los_Angeles",
+    "PHIL": "America/New_York",
+    "NY": "America/New_York",
+    "CHI": "America/Chicago",
+    "AUS": "America/Chicago",
+    "DEN": "America/Denver",
+    "HOU": "America/Chicago",
+}
+
+
+def _local_today(city_code):
+    """Return today's date (ISO string) in the local timezone for a city."""
+    tz = ZoneInfo(CITY_TIMEZONES.get(city_code, "America/New_York"))
+    return datetime.datetime.now(tz).date().isoformat()
+
+
+def round_half_up(value):
+    """Round a float using arithmetic rounding (0.5 rounds up).
+
+    Python's built-in round() uses banker's rounding. For C-to-F conversion
+    and running high comparisons, arithmetic rounding matches NWS behavior.
+    """
+    return int(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
 
 _log = logging.getLogger("kalshi_auth")
 
@@ -559,6 +589,76 @@ class TradeManager:
             self._daily_spend_cents = 0
             self._daily_date = today
 
+    @staticmethod
+    def _classify_limit_tier(edge):
+        """Classify edge into a limit price urgency tier.
+
+        Returns a string: "urgent", "balanced", or "patient".
+        """
+        if edge is None or edge >= 0.15:
+            return "urgent"
+        elif edge >= 0.08:
+            return "balanced"
+        return "patient"
+
+    def _build_golden_record(self, ticker, side, price_cents, count, cost_cents,
+                              reasoning, order_info, **extra_fields):
+        """Build the canonical trade record with full decision-time context.
+
+        Flattens market snapshot fields and adds settlement placeholders
+        for later reconciliation.
+        """
+        record = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "ticker": ticker,
+            "side": side,
+            "price_cents": price_cents,
+            "count": count,
+            "cost_cents": cost_cents,
+            "reasoning": reasoning,
+            "order_id": order_info.get("order_id"),
+            "status": order_info.get("status"),
+            "source_bot": self.log.name,
+        }
+        # Merge all extra fields (model_prob, raw_edge, fee_cents, sizing_method, etc.)
+        record.update(extra_fields)
+
+        # Flatten market_snapshot into top-level fields for easy querying
+        snapshot = extra_fields.get("market_snapshot", {})
+        if snapshot:
+            record["best_bid"] = snapshot.get("yes_bid")
+            record["best_ask"] = snapshot.get("yes_ask")
+            bid = snapshot.get("yes_bid", 0) or 0
+            ask = snapshot.get("yes_ask", 0) or 0
+            record["spread"] = ask - bid if bid and ask else None
+            if "volume" in snapshot:
+                record["volume"] = snapshot["volume"]
+
+        # Compute time_to_settle_minutes from market_close_time
+        close_time = extra_fields.get("market_close_time")
+        if close_time:
+            try:
+                close_dt = datetime.datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+                now = datetime.datetime.now(datetime.timezone.utc)
+                delta = close_dt - now
+                record["time_to_settle_minutes"] = max(0, int(delta.total_seconds() / 60))
+            except (ValueError, TypeError):
+                pass
+
+        # Classify limit price tier from edge
+        edge = extra_fields.get("raw_edge")
+        record["limit_price_rule"] = self._classify_limit_tier(edge)
+
+        # Caps applied tracking
+        record["caps_applied"] = extra_fields.get("caps_applied", [])
+
+        # Settlement placeholders (filled by reconcile script)
+        record.setdefault("settlement_result", None)
+        record.setdefault("settlement_revenue_cents", None)
+        record.setdefault("fill_price_cents", None)
+
+        return record
+
     def place_order(self, ticker, side, price_cents, count, reasoning,
                     available_balance_cents=None, market_data_age_seconds=None,
                     **extra_fields):
@@ -578,6 +678,7 @@ class TradeManager:
             Order info dict from API on success, or None if blocked/failed.
         """
         self._reset_daily_if_needed()
+        caps_applied = []
 
         if side not in ("yes", "no"):
             self.log.error("Invalid side '%s' — must be 'yes' or 'no'", side)
@@ -627,6 +728,7 @@ class TradeManager:
         cost_per_contract = price_cents
         if cost_per_contract * count > max_cost_cents:
             count = max(1, max_cost_cents // cost_per_contract)
+            caps_applied.append("cost_cap")
 
         # 7. Balance check (optional)
         cost_cents = cost_per_contract * count
@@ -679,19 +781,11 @@ class TradeManager:
         else:
             self._daily_spend_cents += cost_cents
 
-        trade_record = {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "ticker": ticker,
-            "side": side,
-            "price_cents": price_cents,
-            "count": count,
-            "cost_cents": cost_cents,
-            "reasoning": reasoning,
-            "order_id": order_info.get("order_id"),
-            "status": order_info.get("status"),
-            "source_bot": self.log.name,
-        }
-        trade_record.update(extra_fields)
+        extra_fields["caps_applied"] = caps_applied
+        trade_record = self._build_golden_record(
+            ticker, side, price_cents, count, cost_cents,
+            reasoning, order_info, **extra_fields
+        )
         save_trade(self.trades_path, trade_record)
         self.tracker.record(ticker)
 
@@ -759,20 +853,15 @@ class TradeManager:
             self.log.error("Sell order failed for %s: %s", ticker, e)
             return None
 
-        # Save exit record
-        trade_record = {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "ticker": ticker,
-            "action": "sell",
-            "side": side,
-            "price_cents": price_cents,
-            "count": count,
-            "reasoning": reasoning,
-            "order_id": order_info.get("order_id"),
-            "status": order_info.get("status"),
-            "source_bot": self.log.name,
-        }
-        trade_record.update(extra_fields)
+        # Save exit record via golden record builder
+        cost_cents = count * price_cents
+        trade_record = self._build_golden_record(
+            ticker, side, price_cents, count, cost_cents,
+            reasoning, {"order_id": order_info.get("order_id"),
+                        "status": order_info.get("status")},
+            **extra_fields,
+        )
+        trade_record["action"] = "sell"
         save_trade(self.trades_path, trade_record)
 
         self.log.info("EXIT placed: sell %dx %s @ %dc on %s (ID: %s, Status: %s)",
@@ -838,6 +927,113 @@ def save_decision(decisions_path: Path, decision: dict):
 
 
 # === Notification ===
+
+# === Health Check Monitor ===
+
+HEALTH_STATE_PATH = PROJECT_DIR / "data" / "health-state.json"
+
+
+class HealthCheckMonitor:
+    """Tracks data source health and bot liveness.
+
+    Records source successes/errors and bot heartbeats. Detects staleness
+    (no heartbeat for N minutes) and high error rates.
+
+    Args:
+        state_path: Path to persist health state. Default: data/health-state.json.
+        staleness_minutes: Minutes without heartbeat before flagging stale (default 60).
+        auto_halt: If True, creates HALT_TRADING file on critical failure (default False).
+        logger: Optional logger.
+    """
+
+    def __init__(self, state_path=None, staleness_minutes=60, auto_halt=False, logger=None):
+        self.state_path = Path(state_path) if state_path else HEALTH_STATE_PATH
+        self.staleness_minutes = staleness_minutes
+        self.auto_halt = auto_halt
+        self.log = logger or _log
+        self._state = {
+            "sources": {},      # source -> {"last_success": ts, "last_error": ts, "error_count": int}
+            "bots": {},         # bot -> {"last_heartbeat": ts}
+        }
+        self._load()
+
+    def _load(self):
+        if self.state_path.exists():
+            try:
+                self._state = json.loads(self.state_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    def _save(self):
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            _atomic_write_json(self.state_path, self._state)
+        except Exception as e:
+            self.log.warning("Failed to save health state: %s", e)
+
+    def record_source_success(self, source):
+        """Record a successful data source fetch."""
+        if source not in self._state["sources"]:
+            self._state["sources"][source] = {"last_success": None, "last_error": None, "error_count": 0}
+        self._state["sources"][source]["last_success"] = datetime.datetime.now().isoformat()
+        self._state["sources"][source]["error_count"] = 0
+        self._save()
+
+    def record_source_error(self, source, msg=""):
+        """Record a data source error."""
+        if source not in self._state["sources"]:
+            self._state["sources"][source] = {"last_success": None, "last_error": None, "error_count": 0}
+        self._state["sources"][source]["last_error"] = datetime.datetime.now().isoformat()
+        self._state["sources"][source]["error_count"] = self._state["sources"][source].get("error_count", 0) + 1
+        self._save()
+
+    def record_bot_heartbeat(self, bot):
+        """Record a bot heartbeat (proves the bot loop is running)."""
+        self._state["bots"][bot] = {"last_heartbeat": datetime.datetime.now().isoformat()}
+        self._save()
+
+    def check_health(self, staleness_minutes=None):
+        """Check for health issues. Returns list of issue strings.
+
+        Issues:
+          - Bot stale: no heartbeat for > staleness_minutes
+          - Source errors: consecutive error count > 5
+        """
+        stale_min = staleness_minutes or self.staleness_minutes
+        now = datetime.datetime.now()
+        issues = []
+
+        # Check bot staleness
+        for bot, info in self._state.get("bots", {}).items():
+            hb = info.get("last_heartbeat")
+            if hb:
+                try:
+                    hb_dt = datetime.datetime.fromisoformat(hb)
+                    age_min = (now - hb_dt).total_seconds() / 60
+                    if age_min > stale_min:
+                        issues.append(f"bot/{bot} stale: last heartbeat {age_min:.0f}min ago")
+                except (ValueError, TypeError):
+                    pass
+
+        # Check source errors
+        for source, info in self._state.get("sources", {}).items():
+            error_count = info.get("error_count", 0)
+            if error_count >= 5:
+                issues.append(f"source/{source} failing: {error_count} consecutive errors")
+
+        # Auto-halt on critical failure
+        if self.auto_halt and issues:
+            critical = [i for i in issues if "stale" in i or "failing" in i]
+            if len(critical) >= 2:
+                halt_path = KILL_SWITCH_PATH
+                if not halt_path.exists():
+                    halt_path.parent.mkdir(parents=True, exist_ok=True)
+                    halt_path.write_text(f"Auto-halted: {'; '.join(critical)}")
+                    self.log.warning("AUTO-HALT triggered: %s", "; ".join(critical))
+                    issues.append("AUTO-HALT: HALT_TRADING file created")
+
+        return issues
+
 
 def notify_whatsapp(message, phone=None, logger=None):
     """Send a WhatsApp notification via openclaw CLI.

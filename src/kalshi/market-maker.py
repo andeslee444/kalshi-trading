@@ -126,23 +126,42 @@ def compute_optimal_spread(sigma, time_to_settlement_hours, gamma=None, k=None):
 
 
 def estimate_market_sigma(market):
-    """Estimate price volatility for a market.
+    """Estimate price volatility independently of current spread.
 
-    Uses the bid-ask spread and recent price range as a proxy.
+    Uses weather model sigma for KXHIGH markets (converted to cents),
+    fixed defaults for crypto/other. This avoids circular logic where
+    sigma was derived FROM the spread and then used to compute the spread.
+
     Returns sigma in cents.
     """
-    yes_bid = market.get("yes_bid", 0)
-    yes_ask = market.get("yes_ask", 0)
-    last_price = market.get("last_price", 0)
+    ticker = market.get("ticker", "")
 
-    if yes_bid and yes_ask:
-        spread = yes_ask - yes_bid
-        # Rough estimate: sigma ≈ spread * 2 (markets with wider spreads are more volatile)
-        return max(2, spread * 2)
-    elif last_price:
-        # Very rough: 10% of price as sigma
-        return max(2, round(last_price * 0.1))
-    return 5  # default
+    # Weather markets: use calibrated sigma from probability model
+    if "KXHIGH" in ticker:
+        m = re.match(r"KXHIGH([A-Z]+)-(\d{2})([A-Z]{3})(\d{2})-", ticker)
+        if m:
+            MONTHS = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+                      "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+            city = m.group(1)
+            yr, mon_str, day = int(m.group(2)), m.group(3), int(m.group(4))
+            month = MONTHS.get(mon_str)
+            if month:
+                try:
+                    market_date = datetime.date(2000 + yr, month, day)
+                    days_out = max(0, (market_date - datetime.date.today()).days)
+                    # Weather sigma: intercept + slope * days_out (in degrees F)
+                    weather_sigma_f = 2.0 + 0.5 * days_out
+                    # Convert F uncertainty to price-cents uncertainty (~4 cents per degree F)
+                    return max(2, round(weather_sigma_f * 4))
+                except (ValueError, TypeError):
+                    pass
+        return 5  # weather fallback
+
+    # Crypto: higher default volatility
+    if any(x in ticker for x in ["KXBTC", "KXETH", "KXSOL", "KXCRYPTO"]):
+        return 8
+
+    return 5  # generic default
 
 
 def estimate_hours_to_settlement(market):
@@ -187,7 +206,7 @@ def place_quotes(ticker, bid_price, ask_price, size=1, yes_bid=None, yes_ask=Non
     if bid_price > 0 and bid_price < 99:
         reasoning = f"MM bid: {ticker} YES@{bid_price}c (size={size})"
         result = trade_manager.place_order(ticker, "yes", bid_price, size, reasoning,
-                                            market_snapshot=snapshot)
+                                            market_snapshot=snapshot, sizing_method="fixed_mm")
         if result:
             results.append(("bid", result))
 
@@ -197,7 +216,7 @@ def place_quotes(ticker, bid_price, ask_price, size=1, yes_bid=None, yes_ask=Non
         if no_price > 0:
             reasoning = f"MM ask: {ticker} NO@{no_price}c (equiv YES ask@{ask_price}c, size={size})"
             result = trade_manager.place_order(ticker, "no", no_price, size, reasoning,
-                                                market_snapshot=snapshot)
+                                                market_snapshot=snapshot, sizing_method="fixed_mm")
             if result:
                 results.append(("ask", result))
 
@@ -281,7 +300,7 @@ def scan_and_quote():
             if results:
                 quoted += 1
                 for side, result in results:
-                    allocator.record_trade("market-maker", ticker, 0)  # quotes don't consume allocation
+                    allocator.record_trade("market-maker", ticker, 0, edge=0.0)  # quotes don't consume allocation
         else:
             log.info(f"  {ticker}: our spread ({bid_price}-{ask_price}) doesn't improve market ({yes_bid}-{yes_ask}), skipping")
 

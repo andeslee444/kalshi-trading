@@ -19,10 +19,11 @@ from pathlib import Path
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot,
+    HealthCheckMonitor,
 )
 from probability import (
     crypto_price_probability, quarter_kelly, half_kelly, compute_limit_price,
-    edge_after_fees,
+    kalshi_fee_cents,
 )
 from capital_allocator import PortfolioAllocator
 
@@ -48,6 +49,7 @@ SETTLEMENT_BUFFER_MINUTES = crypto_config.get("settlementBufferMinutes", 2)
 
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
+health = HealthCheckMonitor(logger=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": MAX_TRADE,
     "maxDailyTrades": MAX_DAILY_TRADES,
@@ -89,18 +91,41 @@ def fetch_coinbase_spot(asset="BTC"):
 
 
 def fetch_deribit_iv(asset="BTC"):
-    """Fetch implied volatility from Deribit.
+    """Fetch implied volatility from Deribit DVOL index.
+
+    Uses the volatility_index_data endpoint which returns the DVOL
+    (Deribit Volatility Index) — a 30-day forward-looking IV measure.
 
     Returns annualized IV as decimal (e.g. 0.55 = 55%), or None on failure.
     """
     try:
         currency = asset.upper()
-        url = f"https://deribit.com/api/v2/public/get_index_price?index_name={currency.lower()}_usd"
+        if currency not in ("BTC", "ETH"):
+            return None
+        now_ms = int(time.time() * 1000)
+        # Fetch last 2 hours of hourly DVOL data
+        start_ms = now_ms - 2 * 3600 * 1000
+        url = (
+            f"https://deribit.com/api/v2/public/get_volatility_index_data"
+            f"?currency={currency}&start_timestamp={start_ms}"
+            f"&end_timestamp={now_ms}&resolution=3600"
+        )
         r = retry_request("GET", url, timeout=10)
-        # Deribit index price endpoint doesn't directly give IV,
-        # but we can use the volatility index if available
-        # For now, fall back to realized vol
-        return None
+        data = r.json()
+        result = data.get("result", {})
+        points = result.get("data", [])
+        if not points:
+            log.info(f"  Deribit DVOL: no data points for {asset}")
+            return None
+        # Each point: [timestamp, open, high, low, close]
+        latest_close = points[-1][4]
+        iv = latest_close / 100.0  # DVOL is in percentage, convert to decimal
+        # Sanity clamp: 10%-300%
+        if iv < 0.10 or iv > 3.0:
+            log.warning(f"  Deribit DVOL {asset} out of range: {iv*100:.1f}%, ignoring")
+            return None
+        log.info(f"  Deribit DVOL {asset}: {iv*100:.1f}%")
+        return iv
     except Exception as e:
         log.error(f"  Deribit IV fetch failed for {asset}: {e}")
         return None
@@ -228,6 +253,9 @@ def scan_and_trade():
         price = fetch_coinbase_spot(asset)
         if price:
             spot_prices[asset] = price
+            health.record_source_success("coinbase")
+        else:
+            health.record_source_error("coinbase", f"{asset} spot unavailable")
 
     if not spot_prices:
         log.info("No spot prices available, skipping scan.")
@@ -239,6 +267,7 @@ def scan_and_trade():
         iv = fetch_deribit_iv(asset)
         if iv:
             iv_data[asset] = iv
+            health.record_source_success("deribit")
 
     # Compute realized vol
     realized_vols = {}
@@ -286,17 +315,18 @@ def scan_and_trade():
         if minutes_to_settle < SETTLEMENT_BUFFER_MINUTES:
             continue
 
-        # Get volatility — blend realized with default when available
+        # Get volatility — IV is forward-looking so gets more weight
         iv = iv_data.get(asset)
         rv = realized_vols.get(asset)
         default_vol = DEFAULT_VOLS.get(asset, 0.50)
-        if rv is not None:
-            blended_vol = 0.3 * default_vol + 0.7 * rv
+        if iv is not None and rv is not None:
+            vol_to_use = 0.6 * iv + 0.4 * rv
+        elif iv is not None:
+            vol_to_use = iv
+        elif rv is not None:
+            vol_to_use = 0.3 * default_vol + 0.7 * rv
         else:
-            blended_vol = default_vol
-
-        # Compute probability (IV takes precedence over blended vol)
-        vol_to_use = iv if iv else blended_vol
+            vol_to_use = default_vol
         if direction == "T":
             prob = crypto_price_probability(
                 current_price, threshold, "above",
@@ -326,9 +356,9 @@ def scan_and_trade():
         if not yes_ask or yes_ask >= 99:
             continue
 
-        # Determine trade direction and edge
+        # Determine trade direction and edge (raw edge, fees handled in Kelly)
         if prob > 0.5 and yes_ask:
-            edge = edge_after_fees(prob - yes_ask / 100, yes_ask)
+            edge = prob - yes_ask / 100
             if edge > EDGE_THRESHOLD:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "yes",
@@ -344,7 +374,7 @@ def scan_and_trade():
                 )
         elif prob <= 0.5 and no_ask:
             no_prob = 1.0 - prob
-            edge = edge_after_fees(no_prob - no_ask / 100, no_ask)
+            edge = no_prob - no_ask / 100
             if edge > EDGE_THRESHOLD:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "no",
@@ -382,7 +412,8 @@ def scan_and_trade():
             continue
 
         # Use quarter-Kelly for crypto (high volatility uncertainty)
-        count, risk = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+        fee = kalshi_fee_cents(price)
+        count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
             continue
 
@@ -396,9 +427,14 @@ def scan_and_trade():
         log.info(f"  Placing: {count}x {side} @ {price}c on {ticker} (quarter-Kelly)")
 
         result = trade_manager.place_order(ticker, side, price, count, reasoning,
-                                            market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
+                                            market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+                                            model_prob=round(opp["prob"], 4), raw_edge=round(edge, 4),
+                                            fee_cents=round(kalshi_fee_cents(price), 2), sizing_method="quarter_kelly",
+                                            market_close_time=m.get("close_time"),
+                                            kelly_fraction=kelly_details.get("kelly_fraction"),
+                                            bankroll_used=kelly_details.get("bankroll_used"))
         if result:
-            allocator.record_trade("crypto", ticker, risk)
+            allocator.record_trade("crypto", ticker, risk, edge=edge)
 
 
 # === Entry Point ===
@@ -430,6 +466,7 @@ def main():
     # Daemon loop
     while True:
         try:
+            health.record_bot_heartbeat("crypto")
             scan_and_trade()
         except Exception as e:
             log.error(f"Scan error: {e}")

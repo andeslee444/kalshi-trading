@@ -12,8 +12,9 @@ Sources:
 import json, time, datetime, os, sys, re, hashlib, traceback
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot
-from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, half_kelly, compute_limit_price, edge_after_fees
+from zoneinfo import ZoneInfo
+from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor
+from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, half_kelly, compute_limit_price, kalshi_fee_cents
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -34,6 +35,7 @@ config = json.loads(CONFIG_PATH.read_text())
 
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
+health = HealthCheckMonitor(logger=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": config["maxTradeAmount"],
     "maxDailyTrades": config["maxDailyTrades"],
@@ -212,14 +214,15 @@ def evaluate_album_trade(market, sale):
     min_edge = 0.05 if sigma <= 0.05 else 0.10
 
     if outcome == "yes" and yes_ask and yes_ask < 99:
-        edge = edge_after_fees(confidence - yes_ask / 100, yes_ask)
+        edge = confidence - yes_ask / 100
         if edge > min_edge:
             budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence)
             if not budget.approved:
                 log.info(f"  Allocator denied {ticker}: {budget.reason}")
                 return
             price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
-            count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+            fee = kalshi_fee_cents(price)
+            count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
             if count <= 0:
                 return
             reasoning = f"HDD confirms {artist} sold {units/1000:.0f}K units vs {threshold/1000:.0f}K threshold. YES at {price}c, confidence {confidence*100:.0f}%"
@@ -227,19 +230,25 @@ def evaluate_album_trade(market, sale):
             log.info(f"    Market: {ticker} YES at {price}c -> buying YES (confirmed outcome)")
             log.info(f"    Edge: ~{edge*100:.0f}% | Trade: {count} contracts @ {price}c = ${count*price/100:.2f}")
             result = trade_manager.place_order(ticker, "yes", price, count, reasoning,
-                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
+                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+                                                model_prob=round(confidence, 4), raw_edge=round(edge, 4),
+                                                fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                                market_close_time=market.get("close_time"),
+                                                kelly_fraction=kelly_details.get("kelly_fraction"),
+                                                bankroll_used=kelly_details.get("bankroll_used"))
             if result:
-                allocator.record_trade("source-monitor", ticker, risk)
+                allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
     elif outcome == "no" and no_ask and no_ask < 99:
-        edge = edge_after_fees(confidence - no_ask / 100, no_ask)
+        edge = confidence - no_ask / 100
         if edge > min_edge:
             budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence)
             if not budget.approved:
                 log.info(f"  Allocator denied {ticker}: {budget.reason}")
                 return
             price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
-            count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+            fee = kalshi_fee_cents(price)
+            count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
             if count <= 0:
                 return
             reasoning = f"HDD confirms {artist} sold {units/1000:.0f}K units vs {threshold/1000:.0f}K threshold. NO at {price}c, confidence {confidence*100:.0f}%"
@@ -247,9 +256,14 @@ def evaluate_album_trade(market, sale):
             log.info(f"    Market: {ticker} NO at {price}c -> buying NO (confirmed under threshold)")
             log.info(f"    Edge: ~{edge*100:.0f}% | Trade: {count} contracts @ {price}c = ${count*price/100:.2f}")
             result = trade_manager.place_order(ticker, "no", price, count, reasoning,
-                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
+                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+                                                model_prob=round(confidence, 4), raw_edge=round(edge, 4),
+                                                fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                                market_close_time=market.get("close_time"),
+                                                kelly_fraction=kelly_details.get("kelly_fraction"),
+                                                bankroll_used=kelly_details.get("bankroll_used"))
             if result:
-                allocator.record_trade("source-monitor", ticker, risk)
+                allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
 
 # ============================================================
@@ -382,40 +396,52 @@ def evaluate_boxoffice_trade(market, movie):
     min_edge = 0.05 if sigma <= 0.05 else 0.10
 
     if outcome == "yes" and yes_ask and yes_ask < 99:
-        edge = edge_after_fees(confidence - yes_ask / 100, yes_ask)
+        edge = confidence - yes_ask / 100
         if edge > min_edge:
             budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence)
             if not budget.approved:
                 return
             price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
-            count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+            fee = kalshi_fee_cents(price)
+            count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
             if count <= 0:
                 return
             reasoning = f"Box office data shows {movie_title} at ${gross/1e6:.1f}M vs ${threshold/1e6:.0f}M threshold (conf {confidence*100:.0f}%)"
             log.info(f"\nARBITRAGE FOUND: {movie_title} box office ${gross/1e6:.1f}M > ${threshold/1e6:.0f}M")
             log.info(f"    Market: {ticker} YES at {price}c | conf={confidence*100:.0f}%")
             result = trade_manager.place_order(ticker, "yes", price, count, reasoning,
-                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
+                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+                                                model_prob=round(confidence, 4), raw_edge=round(edge, 4),
+                                                fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                                market_close_time=market.get("close_time"),
+                                                kelly_fraction=kelly_details.get("kelly_fraction"),
+                                                bankroll_used=kelly_details.get("bankroll_used"))
             if result:
-                allocator.record_trade("source-monitor", ticker, risk)
+                allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
     elif outcome == "no" and no_ask and no_ask < 99:
-        edge = edge_after_fees(confidence - no_ask / 100, no_ask)
+        edge = confidence - no_ask / 100
         if edge > min_edge:
             budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence)
             if not budget.approved:
                 return
             price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
-            count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+            fee = kalshi_fee_cents(price)
+            count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
             if count <= 0:
                 return
             reasoning = f"Box office data shows {movie_title} at ${gross/1e6:.1f}M vs ${threshold/1e6:.0f}M threshold (conf {confidence*100:.0f}%)"
             log.info(f"\nARBITRAGE FOUND: {movie_title} box office ${gross/1e6:.1f}M < ${threshold/1e6:.0f}M")
             log.info(f"    Market: {ticker} NO at {price}c | conf={confidence*100:.0f}%")
             result = trade_manager.place_order(ticker, "no", price, count, reasoning,
-                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
+                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+                                                model_prob=round(confidence, 4), raw_edge=round(edge, 4),
+                                                fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                                market_close_time=market.get("close_time"),
+                                                kelly_fraction=kelly_details.get("kelly_fraction"),
+                                                bankroll_used=kelly_details.get("bankroll_used"))
             if result:
-                allocator.record_trade("source-monitor", ticker, risk)
+                allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
 
 # ============================================================
@@ -480,7 +506,7 @@ def check_nws(prefetched_markets=None):
             if temp_c is not None:
                 temp_f = temp_c * 9/5 + 32
                 actual_temps[city_code] = {
-                    "temp_f": round(temp_f, 1),
+                    "temp_f": round_half_up(temp_f),
                     "temp_c": round(temp_c, 1),
                     "station": station_id,
                     "timestamp": props.get("timestamp", ""),
@@ -496,19 +522,27 @@ def check_nws(prefetched_markets=None):
         match_nws_to_markets(actual_temps, prefetched_markets=prefetched_markets)
 
 def check_nws_daily_highs(current_temps):
-    """Check for daily high temperature observations (parallel fetch)."""
+    """Check for daily high temperature observations (parallel fetch).
+
+    Uses per-city local midnight (via CITY_TIMEZONES) to compute the UTC
+    start time for each station's observation window. This fixes a bug
+    where using server-local date.today() + "T00:00:00Z" could include
+    yesterday's late-afternoon temps for western cities (e.g. LAX at UTC-8).
+    """
     stations = config["sources"]["nws"]["stations"]
     nws_headers = {
         "User-Agent": "(KalshiMonitor, contact@example.com)",
         "Accept": "application/geo+json"
     }
 
-    today = datetime.date.today()
-    start = today.isoformat() + "T00:00:00Z"
-
     url_to_city = {}
     urls = []
     for city_code, station_id in stations.items():
+        tz = ZoneInfo(CITY_TIMEZONES.get(city_code, "America/New_York"))
+        local_now = datetime.datetime.now(tz)
+        local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        utc_start = local_midnight.astimezone(datetime.timezone.utc)
+        start = utc_start.strftime("%Y-%m-%dT%H:%M:%SZ")
         url = f"https://api.weather.gov/stations/{station_id}/observations?start={start}&limit=100"
         urls.append(url)
         url_to_city[url] = (city_code, station_id)
@@ -526,14 +560,15 @@ def check_nws_daily_highs(current_temps):
             for f in features:
                 t = f.get("properties", {}).get("temperature", {}).get("value")
                 if t is not None:
-                    temps.append(t * 9/5 + 32)
+                    temp_f = t * 9/5 + 32
+                    temps.append(round_half_up(temp_f))
 
             if temps:
                 running_high = max(temps)
                 if city_code in current_temps:
-                    current_temps[city_code]["running_high_f"] = round(running_high, 1)
+                    current_temps[city_code]["running_high_f"] = running_high
                     current_temps[city_code]["obs_count"] = len(temps)
-                log.info(f"  {city_code} running high today: {running_high:.1f}F ({len(temps)} observations)")
+                log.info(f"  {city_code} running high today: {running_high}F ({len(temps)} observations)")
         except Exception as e:
             log.error(f"  Daily high check failed for {city_code}: {e}")
 
@@ -548,12 +583,15 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
             log.info(f"  No open KXHIGH markets found")
             return
 
-        today = datetime.date.today().isoformat()
         today_markets = []
 
         for m in markets:
             parsed = parse_temp_ticker(m.get("ticker", ""))
-            if parsed and parsed["date"] == today:
+            if not parsed:
+                continue
+            # Use per-city local date to determine "today"
+            city_today = _local_today(parsed["city"])
+            if parsed["date"] == city_today:
                 today_markets.append((m, parsed))
 
         if not today_markets:
@@ -589,8 +627,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                 margin = 0  # bracket
 
             if prob > 0.5 and yes_ask and yes_ask < 99:
-                # Buy YES
-                edge = edge_after_fees(prob - yes_ask / 100, yes_ask)
+                # Buy YES (raw edge, fees handled in Kelly)
+                edge = prob - yes_ask / 100
                 # Rec 1: Brackets need 2x edge threshold (20% for NWS)
                 base_min_edge = 0.20 if is_bracket else 0.10
                 # Lower threshold for high-confidence NWS (hour >= 17, non-bracket)
@@ -602,7 +640,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                     if not budget.approved:
                         continue
                     price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
-                    count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+                    fee = kalshi_fee_cents(price)
+                    count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
                     if count <= 0:
                         continue
                     if direction == "T":
@@ -612,14 +651,19 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                     log.info(f"\nARBITRAGE FOUND: NWS {city} high {running_high:.1f}F -> YES on {ticker}")
                     log.info(f"    YES at {price}c | Edge: ~{edge*100:.0f}% | Prob: {prob*100:.0f}%")
                     result = trade_manager.place_order(ticker, "yes", price, count, reasoning,
-                                                        market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
+                                                        market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+                                                        model_prob=round(prob, 4), raw_edge=round(edge, 4),
+                                                        fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                                        market_close_time=m.get("close_time"),
+                                                        kelly_fraction=kelly_details.get("kelly_fraction"),
+                                                        bankroll_used=kelly_details.get("bankroll_used"))
                     if result:
-                        allocator.record_trade("source-monitor", ticker, risk)
+                        allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
             elif prob <= 0.5 and no_ask and no_ask < 99:
-                # Buy NO
+                # Buy NO (raw edge, fees handled in Kelly)
                 no_prob = 1.0 - prob
-                edge = edge_after_fees(no_prob - no_ask / 100, no_ask)
+                edge = no_prob - no_ask / 100
                 # Rec 1: Brackets need 2x edge threshold (20% for NWS)
                 base_min_edge = 0.20 if is_bracket else 0.10
                 # Lower threshold for high-confidence NWS (hour >= 17, non-bracket)
@@ -629,7 +673,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                     if not budget.approved:
                         continue
                     price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
-                    count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+                    fee = kalshi_fee_cents(price)
+                    count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
                     if count <= 0:
                         continue
                     if direction == "T":
@@ -639,9 +684,14 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                     log.info(f"\nARBITRAGE FOUND: NWS {city} high {running_high:.1f}F -> NO on {ticker}")
                     log.info(f"    NO at {price}c | Edge: ~{edge*100:.0f}% | Prob NO: {no_prob*100:.0f}%")
                     result = trade_manager.place_order(ticker, "no", price, count, reasoning,
-                                                        market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
+                                                        market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+                                                        model_prob=round(no_prob, 4), raw_edge=round(edge, 4),
+                                                        fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                                        market_close_time=m.get("close_time"),
+                                                        kelly_fraction=kelly_details.get("kelly_fraction"),
+                                                        bankroll_used=kelly_details.get("bankroll_used"))
                     if result:
-                        allocator.record_trade("source-monitor", ticker, risk)
+                        allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
     except Exception as e:
         log.error(f"  NWS market matching failed: {e}")
@@ -682,6 +732,7 @@ def main():
 
     while True:
         now = time.time()
+        health.record_bot_heartbeat("source-monitor")
 
         try:
             # Determine which sources need checking this cycle
@@ -710,24 +761,30 @@ def main():
             if need_hdd:
                 try:
                     check_hdd(prefetched_markets=prefetched)
+                    health.record_source_success("hdd")
                 except Exception as e:
                     log.error(f"HDD source error: {e}")
+                    health.record_source_error("hdd", str(e))
                     traceback.print_exc()
                 last_hdd = now
 
             if need_box:
                 try:
                     check_boxoffice(prefetched_markets=prefetched)
+                    health.record_source_success("boxoffice")
                 except Exception as e:
                     log.error(f"Box office source error: {e}")
+                    health.record_source_error("boxoffice", str(e))
                     traceback.print_exc()
                 last_boxoffice = now
 
             if need_nws:
                 try:
                     check_nws(prefetched_markets=prefetched)
+                    health.record_source_success("nws")
                 except Exception as e:
                     log.error(f"NWS source error: {e}")
+                    health.record_source_error("nws", str(e))
                     traceback.print_exc()
                 last_nws = now
 

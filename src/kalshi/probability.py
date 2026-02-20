@@ -289,9 +289,14 @@ def kalshi_fee_cents(price_cents):
 
 
 def edge_after_fees(raw_edge, price_cents):
-    """Adjust edge for Kalshi fee drag.
+    """DEPRECATED: Do not use for new code. Fee should reduce the payout,
+    not the edge. Use raw edge + pass fee_cents to Kelly functions instead.
 
-    Returns effective edge after accounting for per-contract fee.
+    This function subtracts fee as a probability delta, but the mathematically
+    correct treatment is to reduce the payout (100 -> 100-fee) in the Kelly
+    formula. All bots now pass fee_cents directly to half_kelly/quarter_kelly.
+
+    Kept for backward compatibility with tests and any external callers.
     """
     fee = kalshi_fee_cents(price_cents)
     return raw_edge - fee / 100
@@ -425,10 +430,13 @@ def longshot_edge(yes_price_cents, ticker="", hours_to_close=999):
 
 # ─── Position sizing ───
 
-def half_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None):
+def half_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None, fee_cents=0,
+               return_details=False):
     """Generalized half-Kelly position sizing for binary contracts (buy side).
 
     Returns (contracts, risk_cents).
+    If return_details=True, returns (contracts, risk_cents, details_dict) where
+    details_dict contains {"kelly_fraction": float, "bankroll_used": int}.
 
     edge: our_prob - market_implied_prob (positive = trade, negative = skip)
     price_cents: price we'd pay (1-99)
@@ -436,16 +444,20 @@ def half_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None):
     bankroll_cents: total available balance for Kelly fraction calculation.
                     IMPORTANT: should always be passed for proper sizing.
                     Without it, sizing is purely cost-cap limited (not Kelly).
+    fee_cents: per-contract fee in cents (from kalshi_fee_cents()). When > 0,
+               reduces the payout (100 → 100-fee) rather than the probability,
+               which is the mathematically correct fee treatment for Kelly.
 
     When buying YES at price p:
-      win = 100 - p cents with prob our_prob
+      win = (100 - fee) - p cents with prob our_prob
       lose = p cents with prob (1 - our_prob)
 
     When buying NO at price (100-p):
       This is equivalent — just pass the NO price as price_cents.
     """
+    _zero = (0, 0, {"kelly_fraction": 0.0, "bankroll_used": bankroll_cents or 0}) if return_details else (0, 0)
     if edge <= 0 or price_cents <= 0 or price_cents >= 100:
-        return (0, 0)
+        return _zero
 
     implied_prob = price_cents / 100.0
     our_prob = implied_prob + edge
@@ -455,14 +467,17 @@ def half_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None):
 
     # Kelly fraction: f = (b*p - q) / b
     # where b = win/loss ratio, p = win prob, q = 1 - p
-    win_amount = 100 - price_cents
+    # Fee reduces the payout, not the probability
+    win_amount = (100 - fee_cents) - price_cents
+    if win_amount <= 0:
+        return _zero
     loss_amount = price_cents
     b = win_amount / loss_amount
     kelly_f = (b * our_prob - (1 - our_prob)) / b
     half_f = kelly_f / 2
 
     if half_f <= 0:
-        return (0, 0)
+        return _zero
 
     # Max contracts from Kelly fraction (if bankroll provided)
     if bankroll_cents and bankroll_cents > 0:
@@ -477,11 +492,15 @@ def half_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None):
     contracts = max(0, contracts)
 
     risk = contracts * price_cents
+    if return_details:
+        return (contracts, risk, {"kelly_fraction": round(half_f, 6), "bankroll_used": bankroll_cents or 0})
     return (contracts, risk)
 
 
-def half_kelly_sell(edge, sell_price_cents, max_cost_cents, bankroll_cents=None):
+def half_kelly_sell(edge, sell_price_cents, max_cost_cents, bankroll_cents=None, fee_cents=0,
+                    return_details=False):
     """Half-Kelly for selling YES (buying NO). Returns (contracts, risk_cents).
+    If return_details=True, returns (contracts, risk_cents, details_dict).
 
     edge: additive overpricing (implied_prob - true_prob, positive = sell signal).
           IMPORTANT: this must be an additive probability difference, NOT a
@@ -490,24 +509,29 @@ def half_kelly_sell(edge, sell_price_cents, max_cost_cents, bankroll_cents=None)
     max_cost_cents: max total risk (contracts * (100 - sell_price))
     bankroll_cents: total available balance for Kelly fraction calculation.
                     IMPORTANT: should always be passed for proper sizing.
+    fee_cents: per-contract fee in cents. When > 0, reduces the win amount
+               (sell proceeds) to reflect fee drag on the payout.
 
     When selling YES at price p:
-      - We receive p cents now
+      - We receive (p - fee) cents now
       - We lose (100 - p) cents if the event occurs
       - True prob of event = implied_prob - edge
     """
+    _zero = (0, 0, {"kelly_fraction": 0.0, "bankroll_used": bankroll_cents or 0}) if return_details else (0, 0)
     if edge <= 0 or sell_price_cents <= 0 or sell_price_cents >= 100:
-        return (0, 0)
+        return _zero
 
     # Market implied prob of event
     implied_prob = sell_price_cents / 100.0
     # Our estimated true probability (lower than market thinks)
     p_true = max(0.001, min(0.999, implied_prob - edge))
 
-    # Selling YES: win sell_price cents with prob (1-p_true),
+    # Selling YES: win (sell_price - fee) cents with prob (1-p_true),
     #              lose (100-sell_price) cents with prob p_true
     win_prob = 1 - p_true
-    win_amount = sell_price_cents
+    win_amount = sell_price_cents - fee_cents
+    if win_amount <= 0:
+        return _zero
     loss_amount = 100 - sell_price_cents
 
     # Kelly: f = (p*b - q) / b where b = win/loss odds ratio, p = win prob, q = 1-p
@@ -516,7 +540,7 @@ def half_kelly_sell(edge, sell_price_cents, max_cost_cents, bankroll_cents=None)
     half_f = kelly_f / 2
 
     if half_f <= 0:
-        return (0, 0)
+        return _zero
 
     risk_per = 100 - sell_price_cents
 
@@ -533,11 +557,13 @@ def half_kelly_sell(edge, sell_price_cents, max_cost_cents, bankroll_cents=None)
     contracts = max(0, contracts)
 
     risk_cents = contracts * risk_per
+    if return_details:
+        return (contracts, risk_cents, {"kelly_fraction": round(half_f, 6), "bankroll_used": bankroll_cents or 0})
     return (contracts, risk_cents)
 
 
 def quarter_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None,
-                   max_exposure_cents=None):
+                   max_exposure_cents=None, fee_cents=0, return_details=False):
     """Quarter-Kelly for bracket markets (higher model uncertainty).
 
     Bracket markets (1-degree windows) have much higher forecast sensitivity
@@ -546,33 +572,49 @@ def quarter_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None,
 
     max_exposure_cents: hard cap on total position cost.
                         Default scales with bankroll: max($5, 5% of bankroll).
+    fee_cents: per-contract fee in cents, passed through to half_kelly.
+    If return_details=True, returns (contracts, risk_cents, details_dict).
     """
     if max_exposure_cents is None:
         max_exposure_cents = max(500, int((bankroll_cents or 10000) * 0.05))
-    contracts, risk = half_kelly(edge, price_cents, max_cost_cents, bankroll_cents)
+    result = half_kelly(edge, price_cents, max_cost_cents, bankroll_cents,
+                        fee_cents=fee_cents, return_details=True)
+    contracts, _risk, details = result
     # Halve the half-Kelly position (= quarter-Kelly)
     contracts = contracts // 2
+    details["kelly_fraction"] = details["kelly_fraction"] / 2
     # Hard-cap bracket exposure
     if contracts * price_cents > max_exposure_cents:
         contracts = max_exposure_cents // price_cents
     risk = contracts * price_cents
+    if return_details:
+        return (contracts, risk, details)
     return (contracts, risk)
 
 
-def high_conviction_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None):
+def high_conviction_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None,
+                           fee_cents=0, return_details=False):
     """60% Kelly for high-conviction threshold-NO trades (>80% model prob).
 
     When the weather model strongly favors NO on a threshold market,
     historical data shows 76.4% ROI. Scale from half-Kelly (50%) to
     60%-Kelly to capture more value from the strongest signals.
+
+    fee_cents: per-contract fee in cents. When > 0, reduces the payout
+               (100 → 100-fee) for correct Kelly computation.
+    If return_details=True, returns (contracts, risk_cents, details_dict).
     """
+    _zero = (0, 0, {"kelly_fraction": 0.0, "bankroll_used": bankroll_cents or 0}) if return_details else (0, 0)
     if edge <= 0 or price_cents <= 0 or price_cents >= 100:
-        return (0, 0)
+        return _zero
 
     implied_prob = price_cents / 100.0
     our_prob = max(0.001, min(0.999, implied_prob + edge))
 
-    win_amount = 100 - price_cents
+    # Fee reduces the payout, not the probability
+    win_amount = (100 - fee_cents) - price_cents
+    if win_amount <= 0:
+        return _zero
     loss_amount = price_cents
     b = win_amount / loss_amount
     kelly_f = (b * our_prob - (1 - our_prob)) / b
@@ -584,7 +626,7 @@ def high_conviction_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None
         scaled_f = kelly_f * 0.6  # 60% Kelly for larger bankrolls
 
     if scaled_f <= 0:
-        return (0, 0)
+        return _zero
 
     if bankroll_cents and bankroll_cents > 0:
         max_kelly = int((scaled_f * bankroll_cents) / price_cents)
@@ -594,6 +636,8 @@ def high_conviction_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None
     max_cost = max_cost_cents // price_cents
     contracts = max(0, min(max_kelly, max_cost))
     risk = contracts * price_cents
+    if return_details:
+        return (contracts, risk, {"kelly_fraction": round(scaled_f, 6), "bankroll_used": bankroll_cents or 0})
     return (contracts, risk)
 
 

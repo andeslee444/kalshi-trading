@@ -7,8 +7,8 @@ DEMO API ONLY — $5 max per trade.
 import json, time, datetime, os, sys, re, traceback
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot
-from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, half_kelly, compute_limit_price, is_market_liquid, edge_after_fees
+from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor
+from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, half_kelly, compute_limit_price, is_market_liquid, kalshi_fee_cents
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -39,6 +39,7 @@ USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36
 
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
+health = HealthCheckMonitor(logger=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": MAX_TRADE_AMOUNT,
     "maxDailyTrades": MAX_DAILY_TRADES,
@@ -336,7 +337,7 @@ def evaluate_album_opportunity(market, album, market_price):
     yes_bid = market.get("yes_bid", 0)
 
     if side == "yes" and yes_ask and yes_ask < 99:
-        edge = edge_after_fees(confidence - yes_ask / 100, yes_ask)
+        edge = confidence - yes_ask / 100
         if edge > 0:
             # Request budget — info-arb with high confidence gets larger allocation
             budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence)
@@ -344,35 +345,47 @@ def evaluate_album_opportunity(market, album, market_price):
                 log.info(f"     Allocator denied {ticker}: {budget.reason}")
                 return
             price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
-            count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+            fee = kalshi_fee_cents(price)
+            count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
             if count <= 0:
                 return
             reasoning = f"HDD: {artist} at {units/1000:.0f}K vs {threshold/1000:.0f}K threshold. YES@{price}c, conf={confidence*100:.0f}%"
             log.info(f"\nALBUM ARBITRAGE: {artist} {units/1000:.0f}K units > {threshold/1000:.0f}K")
             log.info(f"    {ticker} YES@{price}c | edge={edge*100:.1f}% | conf={confidence*100:.0f}%")
             result = trade_manager.place_order(ticker, "yes", price, count, reasoning, confidence=confidence,
-                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
+                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+                                                model_prob=round(confidence, 4), raw_edge=round(edge, 4),
+                                                fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                                market_close_time=market.get("close_time"),
+                                                kelly_fraction=kelly_details.get("kelly_fraction"),
+                                                bankroll_used=kelly_details.get("bankroll_used"))
             if result:
-                allocator.record_trade("entertainment", ticker, risk)
+                allocator.record_trade("entertainment", ticker, risk, edge=edge)
 
     elif side == "no" and no_ask and no_ask < 99:
-        edge = edge_after_fees(confidence - no_ask / 100, no_ask)
+        edge = confidence - no_ask / 100
         if edge > 0:
             budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence)
             if not budget.approved:
                 log.info(f"     Allocator denied {ticker}: {budget.reason}")
                 return
             price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
-            count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+            fee = kalshi_fee_cents(price)
+            count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
             if count <= 0:
                 return
             reasoning = f"HDD: {artist} at {units/1000:.0f}K vs {threshold/1000:.0f}K threshold. NO@{price}c, conf={confidence*100:.0f}%"
             log.info(f"\nALBUM ARBITRAGE: {artist} {units/1000:.0f}K units < {threshold/1000:.0f}K")
             log.info(f"    {ticker} NO@{price}c | edge={edge*100:.1f}% | conf={confidence*100:.0f}%")
             result = trade_manager.place_order(ticker, "no", price, count, reasoning, confidence=confidence,
-                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
+                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+                                                model_prob=round(confidence, 4), raw_edge=round(edge, 4),
+                                                fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                                market_close_time=market.get("close_time"),
+                                                kelly_fraction=kelly_details.get("kelly_fraction"),
+                                                bankroll_used=kelly_details.get("bankroll_used"))
             if result:
-                allocator.record_trade("entertainment", ticker, risk)
+                allocator.record_trade("entertainment", ticker, risk, edge=edge)
 
 def evaluate_boxoffice_opportunity(market, movie, market_price):
     """Evaluate box office trade opportunity."""
@@ -412,38 +425,50 @@ def evaluate_boxoffice_opportunity(market, movie, market_price):
     yes_bid = market.get("yes_bid", 0)
 
     if side == "yes" and yes_ask and yes_ask < 99:
-        edge = edge_after_fees(confidence - yes_ask / 100, yes_ask)
+        edge = confidence - yes_ask / 100
         if edge > 0:
             budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence)
             if not budget.approved:
                 return
             price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
-            count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+            fee = kalshi_fee_cents(price)
+            count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
             if count <= 0:
                 return
             reasoning = f"Box office: {movie_title} ${gross/1e6:.1f}M vs ${threshold/1e6:.0f}M. YES@{price}c, conf={confidence*100:.0f}%"
             log.info(f"\nBOX OFFICE ARBITRAGE: {movie_title} ${gross/1e6:.1f}M > ${threshold/1e6:.0f}M")
             result = trade_manager.place_order(ticker, "yes", price, count, reasoning, confidence=confidence,
-                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
+                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+                                                model_prob=round(confidence, 4), raw_edge=round(edge, 4),
+                                                fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                                market_close_time=market.get("close_time"),
+                                                kelly_fraction=kelly_details.get("kelly_fraction"),
+                                                bankroll_used=kelly_details.get("bankroll_used"))
             if result:
-                allocator.record_trade("entertainment", ticker, risk)
+                allocator.record_trade("entertainment", ticker, risk, edge=edge)
 
     elif side == "no" and no_ask and no_ask < 99:
-        edge = edge_after_fees(confidence - no_ask / 100, no_ask)
+        edge = confidence - no_ask / 100
         if edge > 0:
             budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence)
             if not budget.approved:
                 return
             price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
-            count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+            fee = kalshi_fee_cents(price)
+            count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
             if count <= 0:
                 return
             reasoning = f"Box office: {movie_title} ${gross/1e6:.1f}M vs ${threshold/1e6:.0f}M. NO@{price}c, conf={confidence*100:.0f}%"
             log.info(f"\nBOX OFFICE ARBITRAGE: {movie_title} ${gross/1e6:.1f}M < ${threshold/1e6:.0f}M")
             result = trade_manager.place_order(ticker, "no", price, count, reasoning, confidence=confidence,
-                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
+                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+                                                model_prob=round(confidence, 4), raw_edge=round(edge, 4),
+                                                fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                                market_close_time=market.get("close_time"),
+                                                kelly_fraction=kelly_details.get("kelly_fraction"),
+                                                bankroll_used=kelly_details.get("bankroll_used"))
             if result:
-                allocator.record_trade("entertainment", ticker, risk)
+                allocator.record_trade("entertainment", ticker, risk, edge=edge)
 
 # === Main Loop ===
 def scan():
@@ -469,14 +494,18 @@ def scan():
 
     try:
         album_data = scrape_hdd()
+        health.record_source_success("hdd")
     except Exception as e:
         log.error(f"HDD scrape error: {e}")
+        health.record_source_error("hdd", str(e))
         traceback.print_exc()
 
     try:
         box_data = scrape_box_office()
+        health.record_source_success("boxoffice")
     except Exception as e:
         log.error(f"Box office scrape error: {e}")
+        health.record_source_error("boxoffice", str(e))
         traceback.print_exc()
 
     log.info(f"Source data: {len(album_data)} album entries, {len(box_data)} box office entries")
@@ -505,6 +534,7 @@ def main():
 
     while True:
         try:
+            health.record_bot_heartbeat("entertainment")
             scan()
         except Exception as e:
             log.error(f"Scan error: {e}")

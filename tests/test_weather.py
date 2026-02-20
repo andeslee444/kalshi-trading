@@ -46,6 +46,13 @@ def _load_weather_bot():
     fake_auth.trim_trade_log = lambda *a, **kw: None
     fake_auth._atomic_write_json = lambda *a, **kw: None
     fake_auth.build_market_snapshot = lambda **kw: {k: v for k, v in kw.items() if v is not None}
+    fake_auth.HealthCheckMonitor = type("HealthCheckMonitor", (), {
+        "__init__": lambda self, *a, **kw: None,
+        "record_bot_heartbeat": lambda self, *a, **kw: None,
+        "record_source_success": lambda self, *a, **kw: None,
+        "record_source_error": lambda self, *a, **kw: None,
+        "check_health": lambda self, *a, **kw: [],
+    })
     sys.modules["kalshi_auth"] = fake_auth
 
     # The module reads config at import time -- provide a minimal stub file.

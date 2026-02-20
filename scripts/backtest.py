@@ -354,6 +354,7 @@ def main():
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--bot", type=str, help="Filter by bot (weather, strategy, entertainment, beatrelease)")
     parser.add_argument("--no-api", action="store_true", help="Skip Kalshi API calls")
+    parser.add_argument("--save", action="store_true", help="Save results to data/backtest-results.json")
     args = parser.parse_args()
 
     # Load trades
@@ -439,6 +440,12 @@ def main():
         "threshold_sweep": sweep,
         "per_bot": per_bot,
     }
+
+    if args.save:
+        save_path = PROJECT_DIR / "data" / "backtest-results.json"
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        save_path.write_text(json.dumps(report, indent=2))
+        print(f"Results saved to {save_path}", file=sys.stderr)
 
     if args.json:
         print(json.dumps(report, indent=2))

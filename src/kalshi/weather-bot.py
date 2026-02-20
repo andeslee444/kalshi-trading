@@ -6,8 +6,8 @@ Scans KXHIGH temperature markets, compares to Open-Meteo forecasts, and places t
 import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot
-from probability import weather_probability, ensemble_weather_probability, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, edge_after_fees
+from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor
+from probability import weather_probability, ensemble_weather_probability, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -24,6 +24,7 @@ CITIES = config["cities"]
 
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
+health = HealthCheckMonitor(logger=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": config["maxTradeAmount"],
     "maxDailyTrades": config.get("maxDailyTrades", 10),
@@ -169,8 +170,10 @@ def scan_and_trade():
                 forecasts[code] = get_ensemble_forecast(info["lat"], info["lon"])
             else:
                 forecasts[code] = get_forecast(info["lat"], info["lon"])
+            health.record_source_success("open-meteo")
         except Exception as e:
             log.error(f"Forecast error for {info['name']}: {e}")
+            health.record_source_error("open-meteo", str(e))
 
     # Analyze markets
     opportunities = []
@@ -217,9 +220,9 @@ def scan_and_trade():
         city_name = CITIES[city]["name"]
 
         if our_prob > 0.5 and yes_ask and yes_ask < 99:
-            edge_yes = edge_after_fees(our_prob - (yes_ask / 100.0), yes_ask)
+            edge_yes = our_prob - (yes_ask / 100.0)
         elif our_prob <= 0.5 and no_ask and no_ask < 99:
-            edge_yes = -(edge_after_fees((1 - our_prob) - (no_ask / 100.0), no_ask))  # negative = NO signal
+            edge_yes = -((1 - our_prob) - (no_ask / 100.0))  # negative = NO signal
         else:
             skipped["no_price"] += 1
             continue
@@ -268,6 +271,11 @@ def scan_and_trade():
         actual_edge = abs(edge)
 
         if edge > 0 and yes_ask and yes_ask < 99:
+            # Config-level YES disable — if set, skip all weather YES trades
+            if config.get("disableWeatherYes", False):
+                trade_manager.log_decision(ticker, "yes", "skipped", "weather YES disabled by config",
+                                            edge=actual_edge, price_cents=yes_ask)
+                continue
             # Rec 2: NO-only weather constraint — skip YES unless edge >= 15%
             # YES side has 0% historical win rate; only trade with very high conviction
             if actual_edge < 0.15:
@@ -294,25 +302,26 @@ def scan_and_trade():
             continue
 
         # Position sizing based on market type and conviction
+        fee = kalshi_fee_cents(price)
         if is_bracket:
             # Rec 3+10: Quarter-Kelly for brackets (cap scales with bankroll)
-            count, risk = quarter_kelly(
+            count, risk, kelly_details = quarter_kelly(
                 abs(actual_edge), price, budget.max_cost_cents,
-                bankroll_cents=budget.bankroll_cents,
+                bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True,
             )
             sizing_label = "quarter-Kelly"
         elif side == "no" and (1 - opp["our_prob"]) > 0.80:
             # Rec 4: High-conviction threshold-NO → 60% Kelly
-            count, risk = high_conviction_kelly(
+            count, risk, kelly_details = high_conviction_kelly(
                 abs(actual_edge), price, budget.max_cost_cents,
-                bankroll_cents=budget.bankroll_cents,
+                bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True,
             )
             sizing_label = "60%-Kelly (high-conviction)"
         else:
             # Standard half-Kelly
-            count, risk = half_kelly(
+            count, risk, kelly_details = half_kelly(
                 abs(actual_edge), price, budget.max_cost_cents,
-                bankroll_cents=budget.bankroll_cents,
+                bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True,
             )
             sizing_label = "half-Kelly"
 
@@ -327,9 +336,16 @@ def scan_and_trade():
             ticker, side, price, count, reasoning,
             forecast_temp=forecast, threshold=threshold, edge=round(actual_edge, 4),
             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+            model_prob=round(opp["our_prob"], 4),
+            raw_edge=round(actual_edge, 4),
+            fee_cents=round(kalshi_fee_cents(price), 2),
+            sizing_method=sizing_label,
+            market_close_time=opp["market"].get("close_time"),
+            kelly_fraction=kelly_details.get("kelly_fraction"),
+            bankroll_used=kelly_details.get("bankroll_used"),
         )
         if result:
-            allocator.record_trade("weather", ticker, risk)
+            allocator.record_trade("weather", ticker, risk, edge=actual_edge)
 
 def main():
     log.info("=" * 60)
@@ -349,6 +365,7 @@ def main():
     # Main loop
     while True:
         try:
+            health.record_bot_heartbeat("weather")
             scan_and_trade()
         except Exception as e:
             log.error(f"Scan error: {e}")

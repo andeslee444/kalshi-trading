@@ -63,8 +63,36 @@ MAX_CITY_FRACTION = 0.10
 # Portfolio-wide daily loss cap as fraction of bankroll
 PORTFOLIO_DAILY_LOSS_FRACTION = 0.25
 
+# Absolute daily risk cap regardless of balance ($100 hard cap)
+ABSOLUTE_DAILY_LOSS_CAP_CENTS = 10000
+
 
 # ─── City key extraction ───
+
+# ─── Signal quality factors ───
+# Higher factor = more reliable signal. Multiplied by edge to get quality score.
+MODEL_QUALITY_FACTOR = {
+    "source-monitor": 1.0,    # direct data observation
+    "economics": 0.9,         # nowcast-based
+    "entertainment": 0.8,     # info-arb from HDD/box office
+    "weather": 0.5,           # model-based forecasting
+    "crypto": 0.4,            # high-vol model
+    "strategy": 0.3,          # statistical bias
+    "beatrelease": 0.3,       # copy-trading
+    "market-maker": 0.2,      # inventory management
+    "trade-cycle": 0.2,       # one-shot
+}
+
+
+def compute_signal_quality(bot_name, edge):
+    """Compute a signal quality score for dedup/supersede decisions.
+
+    Returns edge * quality_factor, so a 20% edge from source-monitor (1.0)
+    beats a 20% edge from weather (0.5).
+    """
+    factor = MODEL_QUALITY_FACTOR.get(bot_name, 0.2)
+    return abs(edge) * factor
+
 
 _CITY_KEY_RE = re.compile(r"KXHIGH([A-Z]+)-(\d{2}[A-Z]{3}\d{2})")
 
@@ -121,7 +149,9 @@ class PortfolioAllocator:
             self.state_path = DEFAULT_STATE_PATH
 
         # In-memory state (loaded from / saved to file)
-        self._traded_tickers = {}       # ticker -> (bot_name, timestamp)
+        # ticker -> {"bot": str, "timestamp": str, "signal_quality": float,
+        #            "edge": float, "risk_cents": int}
+        self._traded_tickers = {}
         self._bot_spend = {}            # bot_name -> cents risked today
         self._city_risk = {}            # city_key -> cents risked today
         self._total_risk_cents = 0      # portfolio-wide risk today
@@ -129,6 +159,7 @@ class PortfolioAllocator:
         self._cached_balance = None
         self._cached_available = None
         self._balance_fetched_at = 0
+        self._pending_exits = []        # tickers that should be exited (superseded)
 
     def _load_state(self):
         """Load shared state from disk with advisory file locking."""
@@ -141,11 +172,21 @@ class PortfolioAllocator:
                     data = json.load(f)
                 finally:
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            self._traded_tickers = data.get("traded_tickers", {})
-            # Convert lists back to tuples for traded_tickers values
-            for k, v in self._traded_tickers.items():
-                if isinstance(v, list):
-                    self._traded_tickers[k] = tuple(v)
+            raw_tickers = data.get("traded_tickers", {})
+            # Backward compat: convert old tuple/list format to new dict format
+            self._traded_tickers = {}
+            for k, v in raw_tickers.items():
+                if isinstance(v, dict):
+                    self._traded_tickers[k] = v
+                elif isinstance(v, (list, tuple)):
+                    # Old format: (bot_name, timestamp)
+                    self._traded_tickers[k] = {
+                        "bot": v[0] if len(v) > 0 else "",
+                        "timestamp": v[1] if len(v) > 1 else "",
+                        "signal_quality": 0.0,
+                        "edge": 0.0,
+                        "risk_cents": 0,
+                    }
             self._bot_spend = data.get("bot_spend", {})
             self._city_risk = data.get("city_risk", {})
             self._total_risk_cents = data.get("total_risk_cents", 0)
@@ -163,8 +204,7 @@ class PortfolioAllocator:
         if not self.state_path:
             return
         data = {
-            "traded_tickers": {k: list(v) if isinstance(v, tuple) else v
-                               for k, v in self._traded_tickers.items()},
+            "traded_tickers": self._traded_tickers,
             "bot_spend": self._bot_spend,
             "city_risk": self._city_risk,
             "total_risk_cents": self._total_risk_cents,
@@ -201,14 +241,14 @@ class PortfolioAllocator:
             self._city_risk = {}
             self._total_risk_cents = 0
             self._daily_date = today
+            self._pending_exits = []
             self._save_state()
 
     def _get_balance(self):
         """Get total and available balance, cached for 60 seconds.
 
         Returns (total_balance, available_balance) in cents.
-        Total balance is used for Kelly sizing (total equity = wealth).
-        Available balance is used for risk limit checks (can't spend locked funds).
+        Available balance is used for both Kelly sizing and risk limit checks.
         """
         now = time.time()
         if self._cached_balance is not None and (now - self._balance_fetched_at) < 60:
@@ -229,10 +269,24 @@ class PortfolioAllocator:
         self._reset_daily_if_needed()
         return ticker in self._traded_tickers
 
-    def record_trade(self, bot_name, ticker, risk_cents):
-        """Record that a trade was executed."""
+    def record_trade(self, bot_name, ticker, risk_cents, edge=0.0):
+        """Record that a trade was executed.
+
+        Args:
+            bot_name: Name of the bot that placed the trade.
+            ticker: Market ticker.
+            risk_cents: Risk in cents for this trade.
+            edge: The edge that was used for this trade (for signal quality).
+        """
         self._reset_daily_if_needed()
-        self._traded_tickers[ticker] = (bot_name, datetime.datetime.now().isoformat())
+        quality = compute_signal_quality(bot_name, edge)
+        self._traded_tickers[ticker] = {
+            "bot": bot_name,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "signal_quality": round(quality, 4),
+            "edge": round(abs(edge), 4),
+            "risk_cents": risk_cents,
+        }
         self._bot_spend[bot_name] = self._bot_spend.get(bot_name, 0) + risk_cents
         self._total_risk_cents += risk_cents
         # Track city-level exposure for weather tickers
@@ -240,6 +294,23 @@ class PortfolioAllocator:
         if city_key:
             self._city_risk[city_key] = self._city_risk.get(city_key, 0) + risk_cents
         self._save_state()
+
+    def _risk_today_cents(self):
+        """Sum risk_cents from all today's entries in traded tickers."""
+        today = datetime.date.today().isoformat()
+        return sum(
+            v.get("risk_cents", 0) for v in self._traded_tickers.values()
+            if isinstance(v, dict) and v.get("timestamp", "")[:10] == today
+        )
+
+    def get_pending_exits(self):
+        """Return and clear the list of tickers that should be exited.
+
+        These are tickers where a better signal superseded a previous trade.
+        """
+        exits = list(self._pending_exits)
+        self._pending_exits.clear()
+        return exits
 
     def request_budget(self, bot_name, ticker, edge=0.0, confidence=0.0,
                        bot_max_cost_cents=500):
@@ -257,25 +328,40 @@ class PortfolioAllocator:
         """
         self._reset_daily_if_needed()
 
-        # 1. Global dedup
+        # 1. Global dedup with "best signal wins" supersede logic
         if ticker in self._traded_tickers:
-            other_bot = self._traded_tickers[ticker][0]
-            return BudgetResponse(False, reason=f"already traded by {other_bot}")
+            existing = self._traded_tickers[ticker]
+            existing_quality = existing.get("signal_quality", 0.0)
+            new_quality = compute_signal_quality(bot_name, edge)
+            # Only supersede if new signal is 1.5x better
+            if new_quality > existing_quality * 1.5 and new_quality > 0:
+                self.log.info(
+                    "Signal supersede: %s (quality %.3f) replaces %s (quality %.3f) on %s",
+                    bot_name, new_quality, existing.get("bot", "?"), existing_quality, ticker
+                )
+                self._pending_exits.append(ticker)
+                # Allow the new trade to proceed (don't return denied)
+            else:
+                other_bot = existing.get("bot", "unknown")
+                return BudgetResponse(False, reason=f"already traded by {other_bot}")
 
-        # 2. Get balance — total for Kelly sizing, available for risk checks
+        # 2. Get balance — available for both Kelly sizing and risk checks
         total_balance, available_balance = self._get_balance()
         if available_balance <= 0:
             return BudgetResponse(False, reason="no balance available")
 
-        # Use total balance for Kelly bankroll (total equity = wealth)
-        # Use available balance for risk limit checks (can't spend locked funds)
-        bankroll = total_balance if total_balance > 0 else available_balance
+        # Use available balance for Kelly bankroll — can't size based on locked capital
+        bankroll = available_balance
 
         # 3. Portfolio-level daily loss check (based on available)
         max_portfolio_risk = int(available_balance * PORTFOLIO_DAILY_LOSS_FRACTION)
         remaining_portfolio = max_portfolio_risk - self._total_risk_cents
         if remaining_portfolio <= 0:
             return BudgetResponse(False, reason="portfolio daily loss limit reached")
+
+        # 3b. Absolute daily risk cap ($100 hard cap regardless of balance)
+        if self._risk_today_cents() >= ABSOLUTE_DAILY_LOSS_CAP_CENTS:
+            return BudgetResponse(False, reason="absolute daily risk cap ($100) reached")
 
         # 4. Per-bot daily spending check (based on available)
         priority = BOT_PRIORITY.get(bot_name, 0.2)

@@ -14,11 +14,13 @@ Usage:
 
 import json, time, datetime, os, sys, re, argparse, traceback
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
-    PROJECT_DIR, TradeManager, trim_trade_log,
+    PROJECT_DIR, TradeManager, trim_trade_log, CITY_TIMEZONES, _local_today,
+    round_half_up, retry_request, fetch_parallel, HealthCheckMonitor,
 )
-from probability import weather_probability, nws_probability, half_kelly
+from probability import weather_probability, nws_probability, half_kelly, kalshi_fee_cents
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -40,8 +42,19 @@ STOP_LOSS_THRESHOLD = pm_config.get("stopLossThreshold", 0.20)
 MODEL_SHIFT_THRESHOLD = pm_config.get("modelShiftThreshold", 0.25)
 MAX_DAILY_EXITS = pm_config.get("maxDailyExits", 20)
 SCAN_INTERVAL = pm_config.get("scanIntervalMinutes", 15)
+ORDER_TTL_MINUTES = pm_config.get("orderTtlMinutes", 120)
+
+# Load NWS station config for model-shift evaluation
+MONITOR_CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-monitor-config.json"
+try:
+    _monitor_cfg = json.loads(MONITOR_CONFIG_PATH.read_text())
+    NWS_STATIONS = _monitor_cfg.get("sources", {}).get("nws", {}).get("stations", {})
+except (FileNotFoundError, json.JSONDecodeError):
+    NWS_STATIONS = {}
 
 client = KalshiClient()
+allocator = PortfolioAllocator(client, logger=log)
+health = HealthCheckMonitor(logger=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": 50,  # exits can be larger
     "maxDailyTrades": MAX_DAILY_EXITS,
@@ -112,25 +125,31 @@ def evaluate_take_profit(position, market):
 
     take_profit_cents = int(TAKE_PROFIT_THRESHOLD * 100)
 
-    # Check YES position take-profit
-    if yes_count > 0 and yes_bid >= take_profit_cents:
-        return {
-            "action": "take_profit",
-            "side": "yes",
-            "count": yes_count,
-            "price": yes_bid,
-            "reasoning": f"Take profit: YES bid {yes_bid}c >= {take_profit_cents}c threshold",
-        }
+    # Check YES position take-profit (fee-aware: net proceeds must exceed threshold)
+    if yes_count > 0 and yes_bid > 0:
+        fee = kalshi_fee_cents(yes_bid)
+        net_proceeds = yes_bid - fee
+        if net_proceeds >= take_profit_cents:
+            return {
+                "action": "take_profit",
+                "side": "yes",
+                "count": yes_count,
+                "price": yes_bid,
+                "reasoning": f"Take profit: YES bid {yes_bid}c - fee {fee:.1f}c = net {net_proceeds:.0f}c >= {take_profit_cents}c threshold",
+            }
 
-    # Check NO position take-profit
-    if no_count > 0 and no_bid >= take_profit_cents:
-        return {
-            "action": "take_profit",
-            "side": "no",
-            "count": no_count,
-            "price": no_bid,
-            "reasoning": f"Take profit: NO bid {no_bid}c >= {take_profit_cents}c threshold",
-        }
+    # Check NO position take-profit (fee-aware)
+    if no_count > 0 and no_bid > 0:
+        fee = kalshi_fee_cents(no_bid)
+        net_proceeds = no_bid - fee
+        if net_proceeds >= take_profit_cents:
+            return {
+                "action": "take_profit",
+                "side": "no",
+                "count": no_count,
+                "price": no_bid,
+                "reasoning": f"Take profit: NO bid {no_bid}c - fee {fee:.1f}c = net {net_proceeds:.0f}c >= {take_profit_cents}c threshold",
+            }
 
     return None
 
@@ -173,12 +192,50 @@ def evaluate_stop_loss(position, market):
     return None
 
 
+def _fetch_nws_running_high(city_code):
+    """Fetch today's running high temperature from NWS for a city.
+
+    Uses CITY_TIMEZONES for timezone-correct observation window.
+    Returns running high in Fahrenheit (int), or None on failure.
+    """
+    station_id = NWS_STATIONS.get(city_code)
+    if not station_id:
+        return None
+
+    try:
+        tz = ZoneInfo(CITY_TIMEZONES.get(city_code, "America/New_York"))
+        local_now = datetime.datetime.now(tz)
+        local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        utc_start = local_midnight.astimezone(datetime.timezone.utc)
+        start = utc_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        url = f"https://api.weather.gov/stations/{station_id}/observations?start={start}&limit=100"
+        headers = {
+            "User-Agent": "(KalshiPositionMonitor, contact@example.com)",
+            "Accept": "application/geo+json",
+        }
+        r = retry_request("GET", url, headers=headers, timeout=15)
+        data = r.json()
+        features = data.get("features", [])
+        temps = []
+        for f in features:
+            t = f.get("properties", {}).get("temperature", {}).get("value")
+            if t is not None:
+                temps.append(round_half_up(t * 9/5 + 32))
+        if temps:
+            return max(temps)
+    except Exception as e:
+        log.error(f"  NWS fetch failed for {city_code}: {e}")
+    return None
+
+
 def evaluate_model_shift(position, market):
     """Check if our probability model now disagrees with our position.
 
-    For weather positions, recompute probability with latest forecast.
-    If model now gives <25% in our favor (i.e. we'd be on the wrong side),
-    exit the position.
+    For weather positions, fetches NWS running high and recomputes probability.
+    Exits when:
+      1. Fair value (model prob * 100) < bid - FEE_BUFFER_CENTS, AND
+      2. Model probability on our side < 0.35
     """
     ticker = position.get("ticker", "")
     yes_count = position.get("yes", 0)
@@ -188,16 +245,59 @@ def evaluate_model_shift(position, market):
     if not parsed:
         return None  # Can only model-shift weather markets for now
 
-    now = datetime.datetime.now()
-    today = datetime.date.today().isoformat()
+    city = parsed["city"]
+    city_today = _local_today(city)
 
     # Only evaluate model shift for today's markets
-    if parsed["date"] != today:
+    if parsed["date"] != city_today:
         return None
 
-    # Would need NWS data to evaluate — skip if we don't have it
-    # (The source-monitor handles NWS-based trading; here we just check
-    # if the model strongly disagrees with our position)
+    # Fetch NWS running high
+    running_high = _fetch_nws_running_high(city)
+    if running_high is None:
+        return None
+
+    threshold = parsed["threshold"]
+    direction = parsed["direction"]
+    now = datetime.datetime.now()
+
+    prob = nws_probability(running_high, threshold, direction, now.hour)
+    yes_bid = market.get("yes_bid", 0)
+    no_bid = market.get("no_bid", 0) if market.get("no_bid") else (100 - market.get("yes_ask", 100))
+
+    # Check YES position: model now says prob < 0.35 (against us)
+    if yes_count > 0 and prob < 0.35:
+        fair_value_cents = int(prob * 100)
+        fee = kalshi_fee_cents(yes_bid)
+        if fair_value_cents < yes_bid - fee:
+            return {
+                "action": "model_shift",
+                "side": "yes",
+                "count": yes_count,
+                "price": yes_bid,
+                "reasoning": (
+                    f"Model shift: NWS {city} high {running_high}F, "
+                    f"prob={prob*100:.0f}% < 35%, fair={fair_value_cents}c < bid={yes_bid}c - fee {fee:.1f}c"
+                ),
+            }
+
+    # Check NO position: model now says prob > 0.65 (YES prob > 65%, against our NO)
+    if no_count > 0 and prob > 0.65:
+        no_prob = 1.0 - prob
+        fair_no_cents = int(no_prob * 100)
+        fee = kalshi_fee_cents(no_bid)
+        if fair_no_cents < no_bid - fee:
+            return {
+                "action": "model_shift",
+                "side": "no",
+                "count": no_count,
+                "price": no_bid,
+                "reasoning": (
+                    f"Model shift: NWS {city} high {running_high}F, "
+                    f"NO prob={no_prob*100:.0f}% < 35%, fair={fair_no_cents}c < bid={no_bid}c - fee {fee:.1f}c"
+                ),
+            }
+
     return None
 
 
@@ -239,7 +339,20 @@ def cancel_stale_orders():
                 except (ValueError, TypeError):
                     pass
 
-            # Check 2: Order age — cancel if older than 12 hours
+            # Check 2: Order TTL — cancel if older than configured TTL (default 120 min)
+            if not should_cancel:
+                created = order.get("created_time", "")
+                if created:
+                    try:
+                        created_dt = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+                        age_minutes = (now - created_dt).total_seconds() / 60
+                        if age_minutes > ORDER_TTL_MINUTES:
+                            should_cancel = True
+                            reason = f"age {age_minutes:.0f}min > {ORDER_TTL_MINUTES}min TTL"
+                    except (ValueError, TypeError):
+                        pass
+
+            # Check 3: Fallback — cancel if older than 12 hours (safety net)
             if not should_cancel:
                 created = order.get("created_time", "")
                 if created:
@@ -334,9 +447,44 @@ def scan_positions():
                 exit_signal["count"],
                 exit_signal["reasoning"],
                 exit_type=exit_signal["action"],
+                sizing_method="position_exit",
             )
             if result:
                 exits_today += 1
+
+    # Process allocator pending exits (superseded by better signals)
+    pending = allocator.get_pending_exits()
+    if pending:
+        log.info(f"  Processing {len(pending)} pending exits from allocator supersede...")
+        for pending_ticker in pending:
+            # Find this ticker in our positions
+            for pos in positions:
+                if pos.get("ticker") == pending_ticker and exits_today < MAX_DAILY_EXITS:
+                    yes_count = pos.get("yes", 0)
+                    no_count = pos.get("no", 0)
+                    market = get_market_data(pending_ticker)
+                    if not market:
+                        continue
+                    if yes_count > 0:
+                        bid = market.get("yes_bid", 0)
+                        if bid > 0:
+                            result = trade_manager.sell_position(
+                                pending_ticker, "yes", bid, yes_count,
+                                f"Allocator supersede exit: better signal available",
+                                exit_type="allocator_supersede",
+                            )
+                            if result:
+                                exits_today += 1
+                    elif no_count > 0:
+                        no_bid = market.get("no_bid", 0) or (100 - market.get("yes_ask", 100))
+                        if no_bid > 0:
+                            result = trade_manager.sell_position(
+                                pending_ticker, "no", no_bid, no_count,
+                                f"Allocator supersede exit: better signal available",
+                                exit_type="allocator_supersede",
+                            )
+                            if result:
+                                exits_today += 1
 
     log.info(f"Scan complete. {exits_today} exit orders placed.")
 
@@ -371,6 +519,7 @@ def main():
     # Daemon loop
     while True:
         try:
+            health.record_bot_heartbeat("position-monitor")
             scan_positions()
         except Exception as e:
             log.error(f"Scan error: {e}")

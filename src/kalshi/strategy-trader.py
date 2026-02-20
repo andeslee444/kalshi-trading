@@ -89,9 +89,10 @@ def find_longshot_sells(markets, bankroll):
         if not budget.approved:
             continue
 
-        contracts, risk = half_kelly_sell(
+        contracts, risk, kelly_details = half_kelly_sell(
             est_edge, sell_price, budget.max_cost_cents,
-            bankroll_cents=budget.bankroll_cents,
+            bankroll_cents=budget.bankroll_cents, fee_cents=fee_per_contract,
+            return_details=True,
         )
         if contracts <= 0:
             continue
@@ -115,6 +116,9 @@ def find_longshot_sells(markets, bankroll):
             "volume": volume,
             "yes_bid": yes_bid,
             "yes_ask": yes_ask,
+            "close_time": m.get("close_time"),
+            "kelly_fraction": kelly_details.get("kelly_fraction"),
+            "bankroll_used": kelly_details.get("bankroll_used"),
             "reasoning": f"Longshot bias: YES@{sell_price}c implies {implied_prob*100:.1f}% prob, Becker model est true prob ~{true_prob*100:.2f}%. Sell YES (buy NO@{100-sell_price}c) for ~{est_edge*100:.2f}% edge."
         })
 
@@ -264,9 +268,16 @@ def main():
             subtitle=c.get("subtitle", ""),
             yes_price_at_entry=c["yes_price"],
             market_snapshot=build_market_snapshot(yes_bid=c.get("yes_bid", 0), yes_ask=c.get("yes_ask", 0)),
+            model_prob=round(c["yes_price"] / 100.0 - c["est_edge"], 4),
+            raw_edge=round(c["est_edge"], 4),
+            fee_cents=round(kalshi_fee_cents(c["yes_price"]), 2),
+            sizing_method="half_kelly_sell",
+            market_close_time=c.get("close_time"),
+            kelly_fraction=c.get("kelly_fraction"),
+            bankroll_used=c.get("bankroll_used"),
         )
         if result:
-            allocator.record_trade("strategy", ticker, c["risk_cents"])
+            allocator.record_trade("strategy", ticker, c["risk_cents"], edge=c.get("edge", 0))
             trades_executed.append({
                 "ticker": ticker,
                 "title": c["title"],
