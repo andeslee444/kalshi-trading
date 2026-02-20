@@ -6,6 +6,7 @@ Provides portfolio-level capital coordination across all bots:
   - Portfolio risk limits: single daily loss cap across the entire system
   - Concentration limits: prevents over-exposure to a single market type
   - City-level exposure limits: caps total risk on correlated weather brackets
+  - File-backed shared state: cross-process coordination via fcntl locking
 
 Usage:
     from capital_allocator import PortfolioAllocator
@@ -16,14 +17,20 @@ Usage:
         count, risk = half_kelly(edge, price, budget.max_cost_cents, budget.bankroll_cents)
 """
 
+import fcntl
 import json
+import os
 import re
+import tempfile
 import time
 import datetime
 import logging
 from pathlib import Path
 
 _log = logging.getLogger("capital_allocator")
+
+# Default path for shared state file (all bots converge here)
+DEFAULT_STATE_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "allocator-state.json"
 
 # ─── Budget priority tiers ───
 # Higher priority = larger share of available capital
@@ -95,21 +102,25 @@ class PortfolioAllocator:
     """Portfolio-level capital allocator across all bots.
 
     Tracks global state: which tickers have been traded today, how much
-    each bot has spent, and total portfolio risk. All bots should share
-    a single instance (or use the file-backed state for multi-process).
+    each bot has spent, and total portfolio risk. Uses file-backed shared
+    state with fcntl advisory locking for cross-process coordination.
 
     Args:
         client: KalshiClient for balance queries.
         state_path: Path to shared state file (for multi-process coordination).
+            Defaults to data/allocator-state.json.
         logger: Optional logger instance.
     """
 
     def __init__(self, client=None, state_path=None, logger=None):
         self.client = client
         self.log = logger or _log
-        self.state_path = Path(state_path) if state_path else None
+        if state_path is not None:
+            self.state_path = Path(state_path)
+        else:
+            self.state_path = DEFAULT_STATE_PATH
 
-        # In-memory state (single process)
+        # In-memory state (loaded from / saved to file)
         self._traded_tickers = {}       # ticker -> (bot_name, timestamp)
         self._bot_spend = {}            # bot_name -> cents risked today
         self._city_risk = {}            # city_key -> cents risked today
@@ -119,7 +130,70 @@ class PortfolioAllocator:
         self._cached_available = None
         self._balance_fetched_at = 0
 
+    def _load_state(self):
+        """Load shared state from disk with advisory file locking."""
+        if not self.state_path or not self.state_path.exists():
+            return
+        try:
+            with open(self.state_path, "r") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                try:
+                    data = json.load(f)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            self._traded_tickers = data.get("traded_tickers", {})
+            # Convert lists back to tuples for traded_tickers values
+            for k, v in self._traded_tickers.items():
+                if isinstance(v, list):
+                    self._traded_tickers[k] = tuple(v)
+            self._bot_spend = data.get("bot_spend", {})
+            self._city_risk = data.get("city_risk", {})
+            self._total_risk_cents = data.get("total_risk_cents", 0)
+            self._daily_date = data.get("daily_date")
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            self.log.warning("Corrupt state file, resetting: %s", e)
+            self._traded_tickers = {}
+            self._bot_spend = {}
+            self._city_risk = {}
+            self._total_risk_cents = 0
+            self._daily_date = None
+
+    def _save_state(self):
+        """Save shared state to disk atomically with exclusive locking."""
+        if not self.state_path:
+            return
+        data = {
+            "traded_tickers": {k: list(v) if isinstance(v, tuple) else v
+                               for k, v in self._traded_tickers.items()},
+            "bot_spend": self._bot_spend,
+            "city_risk": self._city_risk,
+            "total_risk_cents": self._total_risk_cents,
+            "daily_date": self._daily_date,
+        }
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(self.state_path.parent), suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    try:
+                        json.dump(data, f, indent=2)
+                    finally:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                os.replace(tmp_path, str(self.state_path))
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception as e:
+            self.log.warning("Failed to save allocator state: %s", e)
+
     def _reset_daily_if_needed(self):
+        self._load_state()
         today = datetime.date.today().isoformat()
         if self._daily_date != today:
             self._traded_tickers = {}
@@ -127,6 +201,7 @@ class PortfolioAllocator:
             self._city_risk = {}
             self._total_risk_cents = 0
             self._daily_date = today
+            self._save_state()
 
     def _get_balance(self):
         """Get total and available balance, cached for 60 seconds.
@@ -164,6 +239,7 @@ class PortfolioAllocator:
         city_key = _extract_city_key(ticker)
         if city_key:
             self._city_risk[city_key] = self._city_risk.get(city_key, 0) + risk_cents
+        self._save_state()
 
     def request_budget(self, bot_name, ticker, edge=0.0, confidence=0.0,
                        bot_max_cost_cents=500):

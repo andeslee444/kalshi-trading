@@ -7,7 +7,7 @@ DEMO API ONLY — $5 max per trade.
 import json, time, datetime, os, sys, re, traceback
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log
+from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, half_kelly, compute_limit_price, is_market_liquid, edge_after_fees
 from capital_allocator import PortfolioAllocator
 
@@ -15,18 +15,16 @@ setup_unbuffered()
 setup_signal_handlers()
 
 TRADES_PATH = PROJECT_DIR / "data" / "kalshi-entertainment-trades.json"
-LOG_PATH = PROJECT_DIR / "data" / "logs" / "kalshi-entertainment.log"
 PID_PATH = PROJECT_DIR / "data" / "pids" / "kalshi-entertainment.pid"
 
 TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
-Path(LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
 Path(PID_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 # Write PID
 Path(PID_PATH).write_text(str(os.getpid()))
 
-# Logging — shared setup
-log = setup_logging("entertainment", log_file=str(LOG_PATH))
+# Logging — auto file logging via setup_logging (writes to data/logs/entertainment.log)
+log = setup_logging("entertainment")
 
 # === Config from file ===
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
@@ -325,6 +323,10 @@ def evaluate_album_opportunity(market, album, market_price):
 
     if confidence < CONFIDENCE_THRESHOLD:
         log.info(f"     Confidence {confidence*100:.0f}% < {CONFIDENCE_THRESHOLD*100:.0f}% threshold, skipping")
+        trade_manager.log_decision(
+            ticker, side, "skipped", "confidence below threshold",
+            edge=confidence - 0.5, price_cents=market.get("yes_ask", 0),
+        )
         return
 
     yes_ask = market.get("yes_ask", 0)
@@ -341,14 +343,15 @@ def evaluate_album_opportunity(market, album, market_price):
             if not budget.approved:
                 log.info(f"     Allocator denied {ticker}: {budget.reason}")
                 return
-            price = compute_limit_price(yes_bid, yes_ask, "yes") or yes_ask
+            price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
             count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
             if count <= 0:
                 return
             reasoning = f"HDD: {artist} at {units/1000:.0f}K vs {threshold/1000:.0f}K threshold. YES@{price}c, conf={confidence*100:.0f}%"
             log.info(f"\nALBUM ARBITRAGE: {artist} {units/1000:.0f}K units > {threshold/1000:.0f}K")
             log.info(f"    {ticker} YES@{price}c | edge={edge*100:.1f}% | conf={confidence*100:.0f}%")
-            result = trade_manager.place_order(ticker, "yes", price, count, reasoning, confidence=confidence)
+            result = trade_manager.place_order(ticker, "yes", price, count, reasoning, confidence=confidence,
+                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
             if result:
                 allocator.record_trade("entertainment", ticker, risk)
 
@@ -359,14 +362,15 @@ def evaluate_album_opportunity(market, album, market_price):
             if not budget.approved:
                 log.info(f"     Allocator denied {ticker}: {budget.reason}")
                 return
-            price = compute_limit_price(yes_bid, yes_ask, "no") or no_ask
+            price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
             count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
             if count <= 0:
                 return
             reasoning = f"HDD: {artist} at {units/1000:.0f}K vs {threshold/1000:.0f}K threshold. NO@{price}c, conf={confidence*100:.0f}%"
             log.info(f"\nALBUM ARBITRAGE: {artist} {units/1000:.0f}K units < {threshold/1000:.0f}K")
             log.info(f"    {ticker} NO@{price}c | edge={edge*100:.1f}% | conf={confidence*100:.0f}%")
-            result = trade_manager.place_order(ticker, "no", price, count, reasoning, confidence=confidence)
+            result = trade_manager.place_order(ticker, "no", price, count, reasoning, confidence=confidence,
+                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
             if result:
                 allocator.record_trade("entertainment", ticker, risk)
 
@@ -413,13 +417,14 @@ def evaluate_boxoffice_opportunity(market, movie, market_price):
             budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence)
             if not budget.approved:
                 return
-            price = compute_limit_price(yes_bid, yes_ask, "yes") or yes_ask
+            price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
             count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
             if count <= 0:
                 return
             reasoning = f"Box office: {movie_title} ${gross/1e6:.1f}M vs ${threshold/1e6:.0f}M. YES@{price}c, conf={confidence*100:.0f}%"
             log.info(f"\nBOX OFFICE ARBITRAGE: {movie_title} ${gross/1e6:.1f}M > ${threshold/1e6:.0f}M")
-            result = trade_manager.place_order(ticker, "yes", price, count, reasoning, confidence=confidence)
+            result = trade_manager.place_order(ticker, "yes", price, count, reasoning, confidence=confidence,
+                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
             if result:
                 allocator.record_trade("entertainment", ticker, risk)
 
@@ -429,61 +434,22 @@ def evaluate_boxoffice_opportunity(market, movie, market_price):
             budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence)
             if not budget.approved:
                 return
-            price = compute_limit_price(yes_bid, yes_ask, "no") or no_ask
+            price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
             count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
             if count <= 0:
                 return
             reasoning = f"Box office: {movie_title} ${gross/1e6:.1f}M vs ${threshold/1e6:.0f}M. NO@{price}c, conf={confidence*100:.0f}%"
             log.info(f"\nBOX OFFICE ARBITRAGE: {movie_title} ${gross/1e6:.1f}M < ${threshold/1e6:.0f}M")
-            result = trade_manager.place_order(ticker, "no", price, count, reasoning, confidence=confidence)
+            result = trade_manager.place_order(ticker, "no", price, count, reasoning, confidence=confidence,
+                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
             if result:
                 allocator.record_trade("entertainment", ticker, risk)
-
-# === Stale Order Cleanup (Rec 7) ===
-def cancel_stale_orders(max_age_hours=24):
-    """Cancel resting orders older than max_age_hours.
-
-    Prevents dead capital sitting in illiquid markets where orders will never fill.
-    """
-    try:
-        data = client.get("/portfolio/orders?status=resting")
-        orders = data.get("orders", [])
-        if not orders:
-            return
-
-        now = datetime.datetime.now(datetime.timezone.utc)
-        canceled = 0
-        for order in orders:
-            created = order.get("created_time", "")
-            if not created:
-                continue
-            try:
-                created_dt = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
-                age_hours = (now - created_dt).total_seconds() / 3600
-                if age_hours > max_age_hours:
-                    order_id = order.get("order_id", "")
-                    ticker = order.get("ticker", "?")
-                    if order_id:
-                        client.delete(f"/portfolio/orders/{order_id}")
-                        log.info(f"  Canceled stale order {order_id} on {ticker} (age: {age_hours:.0f}h)")
-                        canceled += 1
-            except (ValueError, TypeError):
-                continue
-
-        if canceled:
-            log.info(f"  Canceled {canceled} stale resting orders")
-    except Exception as e:
-        log.error(f"  Stale order cleanup error: {e}")
-
 
 # === Main Loop ===
 def scan():
     """Single scan cycle."""
     log.info(f"\n{'='*60}")
     log.info(f"Entertainment market scan starting...")
-
-    # Rec 7: Cancel stale resting orders before scanning
-    cancel_stale_orders(max_age_hours=24)
 
     try:
         balance, _ = client.get_balance()

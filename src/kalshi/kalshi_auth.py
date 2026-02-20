@@ -47,8 +47,11 @@ def setup_unbuffered():
 def setup_logging(name, log_file=None):
     """Configure a logger with consistent format for a bot.
 
-    Returns a logging.Logger with stdout handler (and optional file handler).
-    Call once at bot startup: ``log = setup_logging("weather-bot")``
+    Returns a logging.Logger with stdout handler and file handler.
+    Auto-derives log file path from bot name if not explicitly provided:
+    ``data/logs/{name}.log`` with 5MB rotation and 3 backups.
+
+    Call once at bot startup: ``log = setup_logging("weather")``
     """
     logger = logging.getLogger(name)
     if logger.handlers:
@@ -61,7 +64,11 @@ def setup_logging(name, log_file=None):
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
     logger.addHandler(sh)
+    # Auto file logging — derive path from bot name if not explicitly provided
+    if log_file is None:
+        log_file = str(PROJECT_DIR / "data" / "logs" / f"{name}.log")
     if log_file:
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         fh = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=3)
         fh.setFormatter(fmt)
         logger.addHandler(fh)
@@ -682,6 +689,7 @@ class TradeManager:
             "reasoning": reasoning,
             "order_id": order_info.get("order_id"),
             "status": order_info.get("status"),
+            "source_bot": self.log.name,
         }
         trade_record.update(extra_fields)
         save_trade(self.trades_path, trade_record)
@@ -762,6 +770,7 @@ class TradeManager:
             "reasoning": reasoning,
             "order_id": order_info.get("order_id"),
             "status": order_info.get("status"),
+            "source_bot": self.log.name,
         }
         trade_record.update(extra_fields)
         save_trade(self.trades_path, trade_record)
@@ -770,3 +779,102 @@ class TradeManager:
                        count, side, price_cents, ticker,
                        order_info.get("order_id"), order_info.get("status"))
         return order_info
+
+    def log_decision(self, ticker, side, action, reason, edge=None, price_cents=None, **extra):
+        """Log a scan decision (trade placed, skipped, or rejected).
+
+        Args:
+            ticker: Market ticker.
+            side: "yes" or "no".
+            action: "placed", "skipped", or "rejected".
+            reason: Why this action was taken (e.g., "edge below threshold", "daily limit").
+            edge: Optional edge value.
+            price_cents: Optional market price.
+            **extra: Additional context fields.
+        """
+        decisions_path = self.trades_path.parent / f"{self.trades_path.stem}-decisions.json"
+        record = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "ticker": ticker,
+            "side": side,
+            "action": action,
+            "reason": reason,
+            "source_bot": self.log.name,
+        }
+        if edge is not None:
+            record["edge"] = round(edge, 4)
+        if price_cents is not None:
+            record["price_cents"] = price_cents
+        record.update(extra)
+        save_decision(decisions_path, record)
+
+
+# === Market snapshot helper ===
+
+def build_market_snapshot(yes_bid=None, yes_ask=None, volume=None, open_interest=None):
+    """Build a market snapshot dict for inclusion in trade records."""
+    snap = {}
+    if yes_bid is not None:
+        snap["yes_bid"] = yes_bid
+    if yes_ask is not None:
+        snap["yes_ask"] = yes_ask
+    if volume is not None:
+        snap["volume"] = volume
+    if open_interest is not None:
+        snap["open_interest"] = open_interest
+    return snap
+
+
+# === Scan decision log ===
+
+def save_decision(decisions_path: Path, decision: dict):
+    """Append a scan decision to the decisions log (atomic write)."""
+    decisions = load_trades(decisions_path)  # reuse same JSON array format
+    # Keep log bounded — retain last 500 decisions
+    if len(decisions) >= 500:
+        decisions = decisions[-400:]
+    decisions.append(decision)
+    _atomic_write_json(decisions_path, decisions)
+
+
+# === Notification ===
+
+def notify_whatsapp(message, phone=None, logger=None):
+    """Send a WhatsApp notification via openclaw CLI.
+
+    Args:
+        message: Text message to send.
+        phone: Phone number (E.164 format). If None, reads from bots-config.json.
+        logger: Optional logger instance.
+    """
+    import subprocess
+    _log = logger or logging.getLogger("notify")
+    if not phone:
+        try:
+            cfg_path = PROJECT_DIR / "config" / "bots-config.json"
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            phone = cfg.get("notificationPhone", "")
+        except Exception:
+            pass
+    if not phone:
+        _log.warning("No notificationPhone configured — notification logged only")
+        return False
+    try:
+        result = subprocess.run(
+            ["openclaw", "message", "send", "--to", phone,
+             "--message", message, "--channel", "whatsapp"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            _log.info("WhatsApp notification sent")
+            return True
+        else:
+            _log.warning("WhatsApp send failed: %s", result.stderr[:200])
+            return False
+    except FileNotFoundError:
+        _log.warning("openclaw CLI not found — notification logged only")
+        return False
+    except Exception as e:
+        _log.warning("WhatsApp error: %s", e)
+        return False

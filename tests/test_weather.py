@@ -45,6 +45,7 @@ def _load_weather_bot():
     fake_auth.validate_trade_config = lambda *a, **kw: None
     fake_auth.trim_trade_log = lambda *a, **kw: None
     fake_auth._atomic_write_json = lambda *a, **kw: None
+    fake_auth.build_market_snapshot = lambda **kw: {k: v for k, v in kw.items() if v is not None}
     sys.modules["kalshi_auth"] = fake_auth
 
     # The module reads config at import time -- provide a minimal stub file.

@@ -16,7 +16,8 @@
     "arb": "python3 src/kalshi/cross-platform-arb.py",
     "mm": "python3 src/kalshi/market-maker.py",
     "calibrate": "python3 scripts/calibrate-sigma.py",
-    "backtest": "python3 scripts/backtest.py"
+    "backtest": "python3 scripts/backtest.py",
+    "report": "python3 scripts/daily-report.py"
   },
   "dependencies": {},
   "devDependencies": {}

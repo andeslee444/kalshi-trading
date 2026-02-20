@@ -625,22 +625,37 @@ def is_market_liquid(market):
 
 # ─── Execution helpers ───
 
-def compute_limit_price(yes_bid, yes_ask, side):
-    """Compute a limit price within the spread instead of paying full ask.
+def compute_limit_price(yes_bid, yes_ask, side, edge=None):
+    """Compute a limit price within the spread, adapted to edge strength.
 
-    Places orders at midpoint + 1c (for buys) to improve execution cost
-    by ~40-50% of the spread on liquid markets. Falls back to ask if no bid.
+    Three tiers based on edge:
+      - High edge (>=15%) or edge=None: pay full ask (urgency, maximize fill rate)
+      - Medium edge (8%-15%): ask - 1c (balanced)
+      - Low edge (<8%): midpoint + 1c (patient, legacy behavior)
 
+    Falls back to ask if no bid or no spread.
     Returns price in cents, or 0 if no valid price available.
     """
     if side == "yes":
         if yes_bid and yes_ask and yes_ask > yes_bid:
-            # Place at midpoint + 1c (slightly above mid, still inside spread)
-            return min((yes_bid + yes_ask) // 2 + 1, yes_ask)
+            if edge is not None and edge < 0.08:
+                # Patient: midpoint + 1c (original behavior)
+                return min((yes_bid + yes_ask) // 2 + 1, yes_ask)
+            elif edge is not None and edge < 0.15:
+                # Balanced: ask - 1c
+                return max(yes_ask - 1, yes_bid + 1)
+            else:
+                # Urgent (high edge or no edge specified): full ask
+                return yes_ask
         return yes_ask or 0
     else:  # no
         no_bid = 100 - yes_ask if yes_ask else 0
         no_ask = 100 - yes_bid if yes_bid else 0
         if no_bid and no_ask and no_ask > no_bid:
-            return min((no_bid + no_ask) // 2 + 1, no_ask)
+            if edge is not None and edge < 0.08:
+                return min((no_bid + no_ask) // 2 + 1, no_ask)
+            elif edge is not None and edge < 0.15:
+                return max(no_ask - 1, no_bid + 1)
+            else:
+                return no_ask
         return no_ask or 0

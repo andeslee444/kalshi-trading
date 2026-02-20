@@ -18,7 +18,7 @@ import requests
 from pathlib import Path
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
-    PROJECT_DIR, retry_request, TradeManager, trim_trade_log,
+    PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot,
 )
 from probability import (
     crypto_price_probability, quarter_kelly, half_kelly, compute_limit_price,
@@ -337,6 +337,11 @@ def scan_and_trade():
                     "minutes_to_settle": minutes_to_settle,
                     "vol_used": vol_to_use,
                 })
+            else:
+                trade_manager.log_decision(
+                    ticker, "yes", "skipped", "edge below threshold",
+                    edge=edge, price_cents=yes_ask,
+                )
         elif prob <= 0.5 and no_ask:
             no_prob = 1.0 - prob
             edge = edge_after_fees(no_prob - no_ask / 100, no_ask)
@@ -348,6 +353,11 @@ def scan_and_trade():
                     "minutes_to_settle": minutes_to_settle,
                     "vol_used": vol_to_use,
                 })
+            else:
+                trade_manager.log_decision(
+                    ticker, "no", "skipped", "edge below threshold",
+                    edge=edge, price_cents=no_ask,
+                )
 
     # Sort by edge
     opportunities.sort(key=lambda x: x["edge"], reverse=True)
@@ -367,7 +377,7 @@ def scan_and_trade():
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             continue
 
-        price = compute_limit_price(yes_bid, yes_ask, side) or (yes_ask if side == "yes" else no_ask)
+        price = compute_limit_price(yes_bid, yes_ask, side, edge=edge) or (yes_ask if side == "yes" else no_ask)
         if not price or price <= 0:
             continue
 
@@ -385,7 +395,8 @@ def scan_and_trade():
         log.info(f"\n-> TRADE: {reasoning}")
         log.info(f"  Placing: {count}x {side} @ {price}c on {ticker} (quarter-Kelly)")
 
-        result = trade_manager.place_order(ticker, side, price, count, reasoning)
+        result = trade_manager.place_order(ticker, side, price, count, reasoning,
+                                            market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
         if result:
             allocator.record_trade("crypto", ticker, risk)
 

@@ -12,7 +12,7 @@ Sources:
 import json, time, datetime, os, sys, re, hashlib, traceback
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log
+from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, half_kelly, compute_limit_price, edge_after_fees
 from capital_allocator import PortfolioAllocator
 
@@ -198,6 +198,10 @@ def evaluate_album_trade(market, sale):
 
     if confidence < 0.60:
         log.info(f"  {artist}: {units} units vs {threshold} threshold, confidence {confidence*100:.0f}% too low")
+        trade_manager.log_decision(
+            ticker, outcome, "skipped", "confidence below 60%",
+            edge=confidence - 0.5, price_cents=market.get("yes_ask", 0),
+        )
         return
 
     yes_ask = market.get("yes_ask", 0)
@@ -214,7 +218,7 @@ def evaluate_album_trade(market, sale):
             if not budget.approved:
                 log.info(f"  Allocator denied {ticker}: {budget.reason}")
                 return
-            price = compute_limit_price(yes_bid, yes_ask, "yes") or yes_ask
+            price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
             count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
             if count <= 0:
                 return
@@ -222,7 +226,8 @@ def evaluate_album_trade(market, sale):
             log.info(f"\nARBITRAGE FOUND: HITS Daily Double confirms {artist} sold {units/1000:.0f}K units")
             log.info(f"    Market: {ticker} YES at {price}c -> buying YES (confirmed outcome)")
             log.info(f"    Edge: ~{edge*100:.0f}% | Trade: {count} contracts @ {price}c = ${count*price/100:.2f}")
-            result = trade_manager.place_order(ticker, "yes", price, count, reasoning)
+            result = trade_manager.place_order(ticker, "yes", price, count, reasoning,
+                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
             if result:
                 allocator.record_trade("source-monitor", ticker, risk)
 
@@ -233,7 +238,7 @@ def evaluate_album_trade(market, sale):
             if not budget.approved:
                 log.info(f"  Allocator denied {ticker}: {budget.reason}")
                 return
-            price = compute_limit_price(yes_bid, yes_ask, "no") or no_ask
+            price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
             count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
             if count <= 0:
                 return
@@ -241,7 +246,8 @@ def evaluate_album_trade(market, sale):
             log.info(f"\nARBITRAGE FOUND: HITS Daily Double confirms {artist} sold {units/1000:.0f}K units")
             log.info(f"    Market: {ticker} NO at {price}c -> buying NO (confirmed under threshold)")
             log.info(f"    Edge: ~{edge*100:.0f}% | Trade: {count} contracts @ {price}c = ${count*price/100:.2f}")
-            result = trade_manager.place_order(ticker, "no", price, count, reasoning)
+            result = trade_manager.place_order(ticker, "no", price, count, reasoning,
+                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
             if result:
                 allocator.record_trade("source-monitor", ticker, risk)
 
@@ -381,14 +387,15 @@ def evaluate_boxoffice_trade(market, movie):
             budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence)
             if not budget.approved:
                 return
-            price = compute_limit_price(yes_bid, yes_ask, "yes") or yes_ask
+            price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
             count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
             if count <= 0:
                 return
             reasoning = f"Box office data shows {movie_title} at ${gross/1e6:.1f}M vs ${threshold/1e6:.0f}M threshold (conf {confidence*100:.0f}%)"
             log.info(f"\nARBITRAGE FOUND: {movie_title} box office ${gross/1e6:.1f}M > ${threshold/1e6:.0f}M")
             log.info(f"    Market: {ticker} YES at {price}c | conf={confidence*100:.0f}%")
-            result = trade_manager.place_order(ticker, "yes", price, count, reasoning)
+            result = trade_manager.place_order(ticker, "yes", price, count, reasoning,
+                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
             if result:
                 allocator.record_trade("source-monitor", ticker, risk)
 
@@ -398,14 +405,15 @@ def evaluate_boxoffice_trade(market, movie):
             budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence)
             if not budget.approved:
                 return
-            price = compute_limit_price(yes_bid, yes_ask, "no") or no_ask
+            price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
             count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
             if count <= 0:
                 return
             reasoning = f"Box office data shows {movie_title} at ${gross/1e6:.1f}M vs ${threshold/1e6:.0f}M threshold (conf {confidence*100:.0f}%)"
             log.info(f"\nARBITRAGE FOUND: {movie_title} box office ${gross/1e6:.1f}M < ${threshold/1e6:.0f}M")
             log.info(f"    Market: {ticker} NO at {price}c | conf={confidence*100:.0f}%")
-            result = trade_manager.place_order(ticker, "no", price, count, reasoning)
+            result = trade_manager.place_order(ticker, "no", price, count, reasoning,
+                                                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
             if result:
                 allocator.record_trade("source-monitor", ticker, risk)
 
@@ -593,7 +601,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                     budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=prob)
                     if not budget.approved:
                         continue
-                    price = compute_limit_price(yes_bid, yes_ask, "yes") or yes_ask
+                    price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
                     count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
                     if count <= 0:
                         continue
@@ -603,7 +611,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                         reasoning = f"NWS {city} running high {running_high:.1f}F in bracket [{threshold}, {threshold+1})F, prob {prob*100:.0f}%"
                     log.info(f"\nARBITRAGE FOUND: NWS {city} high {running_high:.1f}F -> YES on {ticker}")
                     log.info(f"    YES at {price}c | Edge: ~{edge*100:.0f}% | Prob: {prob*100:.0f}%")
-                    result = trade_manager.place_order(ticker, "yes", price, count, reasoning)
+                    result = trade_manager.place_order(ticker, "yes", price, count, reasoning,
+                                                        market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
                     if result:
                         allocator.record_trade("source-monitor", ticker, risk)
 
@@ -619,7 +628,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                     budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=no_prob)
                     if not budget.approved:
                         continue
-                    price = compute_limit_price(yes_bid, yes_ask, "no") or no_ask
+                    price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
                     count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
                     if count <= 0:
                         continue
@@ -629,7 +638,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                         reasoning = f"NWS {city} running high {running_high:.1f}F outside bracket [{threshold}, {threshold+1})F, prob NO {no_prob*100:.0f}%"
                     log.info(f"\nARBITRAGE FOUND: NWS {city} high {running_high:.1f}F -> NO on {ticker}")
                     log.info(f"    NO at {price}c | Edge: ~{edge*100:.0f}% | Prob NO: {no_prob*100:.0f}%")
-                    result = trade_manager.place_order(ticker, "no", price, count, reasoning)
+                    result = trade_manager.place_order(ticker, "no", price, count, reasoning,
+                                                        market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
                     if result:
                         allocator.record_trade("source-monitor", ticker, risk)
 

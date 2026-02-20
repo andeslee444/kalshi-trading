@@ -19,7 +19,7 @@ import json, time, datetime, os, sys, re, math, argparse, traceback
 from pathlib import Path
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
-    PROJECT_DIR, TradeManager, trim_trade_log,
+    PROJECT_DIR, TradeManager, trim_trade_log, build_market_snapshot,
 )
 from probability import weather_probability, is_market_liquid
 from capital_allocator import PortfolioAllocator
@@ -178,14 +178,16 @@ def cancel_existing_orders(ticker):
         log.error(f"  Failed to fetch orders for {ticker}: {e}")
 
 
-def place_quotes(ticker, bid_price, ask_price, size=1):
+def place_quotes(ticker, bid_price, ask_price, size=1, yes_bid=None, yes_ask=None):
     """Place bid and ask limit orders for market making."""
     results = []
+    snapshot = build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask)
 
     # Place bid (buy YES)
     if bid_price > 0 and bid_price < 99:
         reasoning = f"MM bid: {ticker} YES@{bid_price}c (size={size})"
-        result = trade_manager.place_order(ticker, "yes", bid_price, size, reasoning)
+        result = trade_manager.place_order(ticker, "yes", bid_price, size, reasoning,
+                                            market_snapshot=snapshot)
         if result:
             results.append(("bid", result))
 
@@ -194,7 +196,8 @@ def place_quotes(ticker, bid_price, ask_price, size=1):
         no_price = 100 - ask_price
         if no_price > 0:
             reasoning = f"MM ask: {ticker} NO@{no_price}c (equiv YES ask@{ask_price}c, size={size})"
-            result = trade_manager.place_order(ticker, "no", no_price, size, reasoning)
+            result = trade_manager.place_order(ticker, "no", no_price, size, reasoning,
+                                                market_snapshot=snapshot)
             if result:
                 results.append(("ask", result))
 
@@ -274,7 +277,7 @@ def scan_and_quote():
 
             # Cancel existing orders and place new quotes
             cancel_existing_orders(ticker)
-            results = place_quotes(ticker, bid_price, ask_price)
+            results = place_quotes(ticker, bid_price, ask_price, yes_bid=yes_bid, yes_ask=yes_ask)
             if results:
                 quoted += 1
                 for side, result in results:

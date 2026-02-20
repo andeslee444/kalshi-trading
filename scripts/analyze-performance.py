@@ -289,7 +289,15 @@ def _print_text_reconciliation(rec: dict):
         print(f"\n  --- {label} ---")
         print(f"    Settled: {bot['wins'] + bot['losses']}  (wins={bot['wins']}, losses={bot['losses']})")
         if bot["wins"] + bot["losses"] > 0:
-            print(f"    Win rate: {bot['win_rate'] * 100:.1f}%")
+            wr_str = f"{bot['win_rate'] * 100:.1f}%"
+            parts = []
+            if bot.get("yes_win_rate") is not None:
+                parts.append(f"YES: {bot['yes_win_rate'] * 100:.1f}%")
+            if bot.get("no_win_rate") is not None:
+                parts.append(f"NO: {bot['no_win_rate'] * 100:.1f}%")
+            if parts:
+                wr_str += f" ({', '.join(parts)})"
+            print(f"    Win rate: {wr_str}")
         print(f"    P&L: ${bot['pnl_cents'] / 100:.2f}")
         print(f"    Unmatched local trades: {bot['unmatched']}")
 
@@ -299,7 +307,15 @@ def _print_text_reconciliation(rec: dict):
     total_settled = agg["wins"] + agg["losses"]
     print(f"    Total settled: {total_settled}  (wins={agg['wins']}, losses={agg['losses']})")
     if total_settled > 0:
-        print(f"    Win rate: {agg['win_rate'] * 100:.1f}%")
+        wr_str = f"{agg['win_rate'] * 100:.1f}%"
+        parts = []
+        if agg.get("yes_win_rate") is not None:
+            parts.append(f"YES: {agg['yes_win_rate'] * 100:.1f}%")
+        if agg.get("no_win_rate") is not None:
+            parts.append(f"NO: {agg['no_win_rate'] * 100:.1f}%")
+        if parts:
+            wr_str += f" ({', '.join(parts)})"
+        print(f"    Win rate: {wr_str}")
     print(f"    Total P&L: ${agg['pnl_cents'] / 100:.2f}")
     if agg["sharpe"] is not None:
         print(f"    Sharpe ratio (annualised): {agg['sharpe']:.2f}")
@@ -427,10 +443,19 @@ def reconcile_trades(
             day = st[:10]
             daily_pnl[day] += revenue
 
-    # Per-bot reconciliation
+    # Per-bot reconciliation with dedup by order_id
+    # Track counted order_ids to prevent double-counting when the same ticker
+    # appears in multiple bots' trade logs
+    counted_order_ids: set[str] = set()
+    counted_tickers: set[str] = set()  # fallback dedup for old records without order_id
+
     per_bot: list[dict] = []
     agg_wins = 0
     agg_losses = 0
+    agg_yes_wins = 0
+    agg_yes_losses = 0
+    agg_no_wins = 0
+    agg_no_losses = 0
     agg_pnl = 0
 
     for bot_entry in local_trades_by_bot:
@@ -438,39 +463,87 @@ def reconcile_trades(
         trades = bot_entry.get("trades") or []
         wins = 0
         losses = 0
+        yes_wins = 0
+        yes_losses = 0
+        no_wins = 0
+        no_losses = 0
         pnl_cents = 0
         unmatched = 0
 
         for t in trades:
             ticker = t.get("ticker", "")
+            order_id = t.get("order_id", "")
+            side = t.get("side", "")
+
+            # Dedup: skip if this exact order_id was already counted,
+            # or if this ticker's revenue was already claimed by any trade
+            if order_id and order_id in counted_order_ids:
+                continue
+            if ticker in counted_tickers:
+                continue
+
             if ticker in ticker_revenue:
                 rev = ticker_revenue[ticker]
                 pnl_cents += rev
                 if rev > 0:
                     wins += 1
+                    if side == "yes":
+                        yes_wins += 1
+                    elif side == "no":
+                        no_wins += 1
                 else:
                     losses += 1
+                    if side == "yes":
+                        yes_losses += 1
+                    elif side == "no":
+                        no_losses += 1
+                # Mark both order_id and ticker as counted
+                if order_id:
+                    counted_order_ids.add(order_id)
+                counted_tickers.add(ticker)
             else:
                 unmatched += 1
 
         total_settled = wins + losses
         win_rate = (wins / total_settled) if total_settled > 0 else 0.0
 
+        # Per-side win rates
+        yes_total = yes_wins + yes_losses
+        no_total = no_wins + no_losses
+        yes_win_rate = (yes_wins / yes_total) if yes_total > 0 else None
+        no_win_rate = (no_wins / no_total) if no_total > 0 else None
+
         per_bot.append({
             "label": label,
             "wins": wins,
             "losses": losses,
             "win_rate": round(win_rate, 4),
+            "yes_wins": yes_wins,
+            "yes_losses": yes_losses,
+            "yes_win_rate": round(yes_win_rate, 4) if yes_win_rate is not None else None,
+            "no_wins": no_wins,
+            "no_losses": no_losses,
+            "no_win_rate": round(no_win_rate, 4) if no_win_rate is not None else None,
             "pnl_cents": pnl_cents,
             "unmatched": unmatched,
         })
 
         agg_wins += wins
         agg_losses += losses
+        agg_yes_wins += yes_wins
+        agg_yes_losses += yes_losses
+        agg_no_wins += no_wins
+        agg_no_losses += no_losses
         agg_pnl += pnl_cents
 
     agg_total_settled = agg_wins + agg_losses
     agg_win_rate = (agg_wins / agg_total_settled) if agg_total_settled > 0 else 0.0
+
+    # Per-side aggregate win rates
+    agg_yes_total = agg_yes_wins + agg_yes_losses
+    agg_no_total = agg_no_wins + agg_no_losses
+    agg_yes_win_rate = (agg_yes_wins / agg_yes_total) if agg_yes_total > 0 else None
+    agg_no_win_rate = (agg_no_wins / agg_no_total) if agg_no_total > 0 else None
 
     # Sharpe ratio: (mean daily P&L / std daily P&L) * sqrt(252)
     sharpe = None
@@ -488,6 +561,12 @@ def reconcile_trades(
             "wins": agg_wins,
             "losses": agg_losses,
             "win_rate": round(agg_win_rate, 4),
+            "yes_wins": agg_yes_wins,
+            "yes_losses": agg_yes_losses,
+            "yes_win_rate": round(agg_yes_win_rate, 4) if agg_yes_win_rate is not None else None,
+            "no_wins": agg_no_wins,
+            "no_losses": agg_no_losses,
+            "no_win_rate": round(agg_no_win_rate, 4) if agg_no_win_rate is not None else None,
             "pnl_cents": agg_pnl,
             "sharpe": sharpe,
         },

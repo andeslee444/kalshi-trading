@@ -14,7 +14,7 @@ import requests
 from pathlib import Path
 from bs4 import BeautifulSoup
 
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, notify_whatsapp
 
 # Unbuffered output
 setup_unbuffered()
@@ -413,29 +413,7 @@ def execute_exits(exit_trades):
 
 
 # === Notification ===
-def notify_whatsapp(message):
-    """Try to send WhatsApp notification via openclaw CLI."""
-    try:
-        import subprocess
-        # Write message to temp file to handle special chars
-        tmp = PROJECT_DIR / "data" / "beatrelease-msg.txt"
-        tmp.write_text(message)
-        phone = _bots_cfg.get("notificationPhone", "")
-        if not phone:
-            log.warning("  No notificationPhone configured — notification logged only")
-            return
-        result = subprocess.run(
-            ["openclaw", "message", "send", "--to", phone, "--message", message, "--channel", "whatsapp"],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0:
-            log.info("  WhatsApp notification sent")
-        else:
-            log.warning(f"  WhatsApp send failed: {result.stderr[:200]}")
-    except FileNotFoundError:
-        log.warning("  openclaw CLI not found — notification logged only")
-    except Exception as e:
-        log.warning(f"  WhatsApp error: {e}")
+# notify_whatsapp imported from kalshi_auth (shared implementation)
 
 
 # === Stale Order Cleanup ===
@@ -638,7 +616,7 @@ def scan_cycle():
     if all_new_trades or all_exit_trades:
         msg = "\n".join(notification_lines)
         log.info(f"\nNotification:\n{msg}")
-        notify_whatsapp(msg)
+        notify_whatsapp(msg, logger=log)
 
     log.info(f"\nScan complete — {len(posts_to_process)} posts processed, {len(all_new_trades)} entries + {len(all_exit_trades)} exits placed")
 

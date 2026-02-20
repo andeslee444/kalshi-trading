@@ -19,7 +19,7 @@ from pathlib import Path
 from difflib import SequenceMatcher
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
-    PROJECT_DIR, TradeManager, trim_trade_log,
+    PROJECT_DIR, TradeManager, trim_trade_log, build_market_snapshot,
 )
 from polymarket_client import PolymarketClient
 from capital_allocator import PortfolioAllocator
@@ -275,7 +275,7 @@ def scan_spreads():
 
                 yes_bid = spread["kalshi_yes_bid"]
                 yes_ask = spread["kalshi_yes_ask"]
-                price = compute_limit_price(yes_bid, yes_ask, "yes") or yes_ask
+                price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
                 count, risk = half_kelly(edge, price, budget.max_cost_cents,
                                           bankroll_cents=budget.bankroll_cents)
                 if count > 0:
@@ -284,7 +284,8 @@ def scan_spreads():
                         f"Polymarket YES@{spread['polymarket_yes']*100:.0f}c, "
                         f"net spread={spread['net_spread']*100:.1f}%"
                     )
-                    result = trade_manager.place_order(k_ticker, "yes", price, count, reasoning)
+                    result = trade_manager.place_order(k_ticker, "yes", price, count, reasoning,
+                                                        market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask))
                     if result:
                         allocator.record_trade("cross-platform-arb", k_ticker, risk)
         else:

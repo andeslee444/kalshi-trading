@@ -1,19 +1,23 @@
 """Tests for optimization changes: longshot_edge, compute_limit_price,
 continuous NWS sigma, risk-adjusted daily loss, PortfolioAllocator,
 ensemble weather, economics, crypto models, city exposure tracking,
-sell_position, and BeatRelease scanner (ticker map, content hashing, state migration).
+sell_position, BeatRelease scanner (ticker map, content hashing, state migration),
+and logging/audit infrastructure (auto file logging, source_bot, market snapshot,
+scan decision log).
 
 Covers:
   - probability.py: longshot_edge(), classify_ticker_category(), compute_limit_price()
   - probability.py: continuous NWS sigma model (no calibration overrides)
   - probability.py: ensemble_weather_probability(), econ_nowcast_probability(), crypto_price_probability()
   - kalshi_auth.py: TradeManager risk-adjusted daily loss tracking, sell_position()
+  - kalshi_auth.py: setup_logging() auto file logging, source_bot field, build_market_snapshot(), log_decision()
   - capital_allocator.py: PortfolioAllocator, city-level exposure tracking
   - beatrelease-scanner.py: build_ticker_map(), content_hash(), state migration
 """
 
 import math
 import json
+import os
 import types
 import sys
 import importlib.util
@@ -38,11 +42,21 @@ from probability import (
     _reset_calibration,
     LONGSHOT_BIAS_PARAMS,
 )
-from kalshi_auth import TradeManager, load_trades
+from kalshi_auth import TradeManager, load_trades, setup_logging, build_market_snapshot, save_decision
 from capital_allocator import (
     PortfolioAllocator, BudgetResponse, MAX_TICKER_FRACTION,
-    MAX_CITY_FRACTION, _extract_city_key,
+    MAX_CITY_FRACTION, _extract_city_key, DEFAULT_STATE_PATH,
 )
+
+# Counter for unique temp state paths in tests
+_state_counter = 0
+
+
+def _temp_state_path():
+    """Generate a unique temp state path so allocator tests don't share state."""
+    global _state_counter
+    _state_counter += 1
+    return f"/tmp/kalshi_test_alloc_{_state_counter}_{os.getpid()}.json"
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +80,7 @@ def _load_beatrelease_scanner():
         "place_order": lambda self, *a, **kw: None,
     })
     fake_auth.trim_trade_log = lambda *a, **kw: None
+    fake_auth.notify_whatsapp = lambda *a, **kw: False
     sys.modules["kalshi_auth"] = fake_auth
 
     # Create config/data dirs and a minimal bots-config.json
@@ -207,22 +222,22 @@ class TestComputeLimitPrice:
         price = compute_limit_price(40, 50, "yes")
         assert 40 < price <= 50
 
-    def test_yes_at_midpoint_plus_one(self):
-        """Midpoint of 40-50 is 45, plus 1 = 46."""
+    def test_yes_default_returns_full_ask(self):
+        """Without edge param, returns full ask (urgency default)."""
         price = compute_limit_price(40, 50, "yes")
-        assert price == 46
+        assert price == 50
 
     def test_yes_no_bid(self):
         """Without bid, falls back to ask."""
         price = compute_limit_price(0, 50, "yes")
         assert price == 50
 
-    def test_no_with_spread(self):
-        """For NO side, should compute from NO bid/ask derived from YES prices."""
+    def test_no_default_returns_full_ask(self):
+        """Without edge param, NO side returns full NO ask (urgency default)."""
         price = compute_limit_price(40, 50, "no")
         # NO bid = 100 - 50 = 50, NO ask = 100 - 40 = 60
-        # Midpoint = 55, + 1 = 56
-        assert price == 56
+        # Default (no edge) = full NO ask = 60
+        assert price == 60
 
     def test_no_no_bid(self):
         """Without YES bid, NO ask = 100 - 0 = 0, should return 0 or fallback."""
@@ -339,7 +354,7 @@ class TestPortfolioAllocator:
     def _make_allocator(self, balance=10000):
         client = MagicMock()
         client.get_balance.return_value = (balance, balance)
-        return PortfolioAllocator(client=client)
+        return PortfolioAllocator(client=client, state_path=_temp_state_path())
 
     def test_basic_approval(self):
         alloc = self._make_allocator()
@@ -397,8 +412,9 @@ class TestPortfolioAllocator:
         alloc = self._make_allocator()
         alloc.record_trade("weather", "T1", 100)
         assert alloc.is_ticker_traded("T1")
-        # Simulate day change
+        # Simulate day change — must save so _load_state sees old date
         alloc._daily_date = "1999-01-01"
+        alloc._save_state()
         assert not alloc.is_ticker_traded("T1")
 
     def test_no_balance_denied(self):
@@ -621,7 +637,7 @@ class TestConcentrationLimit:
         """Single ticker should get at most 5% of bankroll."""
         client = MagicMock()
         client.get_balance.return_value = (10000, 10000)
-        alloc = PortfolioAllocator(client=client)
+        alloc = PortfolioAllocator(client=client, state_path=_temp_state_path())
         budget = alloc.request_budget("weather", "TICK-1", edge=0.10)
         assert budget.approved
         # 5% of 10000 = 500c
@@ -631,7 +647,7 @@ class TestConcentrationLimit:
         """At $400 bankroll, single ticker should be capped at $20 (not $60+)."""
         client = MagicMock()
         client.get_balance.return_value = (40000, 40000)
-        alloc = PortfolioAllocator(client=client)
+        alloc = PortfolioAllocator(client=client, state_path=_temp_state_path())
         budget = alloc.request_budget("weather", "TICK-1", edge=0.10)
         assert budget.approved
         # 5% of 40000 = 2000c = $20
@@ -819,7 +835,7 @@ class TestCityExposureLimit:
         """Multiple brackets on same city should be capped at city limit."""
         client = MagicMock()
         client.get_balance.return_value = (10000, 10000)
-        alloc = PortfolioAllocator(client=client)
+        alloc = PortfolioAllocator(client=client, state_path=_temp_state_path())
 
         # City limit = 10% of 10000 = 1000c
         # Record trades on same city, different brackets
@@ -835,7 +851,7 @@ class TestCityExposureLimit:
         """Once city limit is reached, further same-city trades should be denied."""
         client = MagicMock()
         client.get_balance.return_value = (10000, 10000)
-        alloc = PortfolioAllocator(client=client)
+        alloc = PortfolioAllocator(client=client, state_path=_temp_state_path())
 
         # Exhaust city limit
         alloc.record_trade("weather", "KXHIGHHOU-26FEB16-B77", 1000)
@@ -848,7 +864,7 @@ class TestCityExposureLimit:
         """Different cities should have independent limits."""
         client = MagicMock()
         client.get_balance.return_value = (10000, 10000)
-        alloc = PortfolioAllocator(client=client)
+        alloc = PortfolioAllocator(client=client, state_path=_temp_state_path())
 
         # Exhaust Houston limit
         alloc.record_trade("weather", "KXHIGHHOU-26FEB16-B77", 1000)
@@ -861,7 +877,7 @@ class TestCityExposureLimit:
         """Non-weather tickers should not be affected by city limits."""
         client = MagicMock()
         client.get_balance.return_value = (10000, 10000)
-        alloc = PortfolioAllocator(client=client)
+        alloc = PortfolioAllocator(client=client, state_path=_temp_state_path())
 
         # City limits shouldn't affect album/crypto/econ tickers
         budget = alloc.request_budget("entertainment", "KXALBUMSALES-WUT-15000", edge=0.10)
@@ -871,11 +887,12 @@ class TestCityExposureLimit:
         """City risk tracking should reset on new day."""
         client = MagicMock()
         client.get_balance.return_value = (10000, 10000)
-        alloc = PortfolioAllocator(client=client)
+        alloc = PortfolioAllocator(client=client, state_path=_temp_state_path())
 
         alloc.record_trade("weather", "KXHIGHHOU-26FEB16-B77", 1000)
-        # Simulate day change
+        # Simulate day change — must save so _load_state sees old date
         alloc._daily_date = "1999-01-01"
+        alloc._save_state()
 
         budget = alloc.request_budget("weather", "KXHIGHHOU-26FEB16-B77", edge=0.10)
         # Should be approved after daily reset (dedup also resets)
@@ -1240,7 +1257,7 @@ class TestKellyBankrollUsesTotalBalance:
         client = MagicMock()
         # Total = 20000, Available = 8000 (positions lock 12000)
         client.get_balance.return_value = (20000, 8000)
-        alloc = PortfolioAllocator(client=client)
+        alloc = PortfolioAllocator(client=client, state_path=_temp_state_path())
         budget = alloc.request_budget("weather", "TICK-1", edge=0.10)
         assert budget.approved
         # Kelly bankroll should be total equity (20000), not available (8000)
@@ -1251,7 +1268,7 @@ class TestKellyBankrollUsesTotalBalance:
         client = MagicMock()
         # Total = 50000, Available = 5000
         client.get_balance.return_value = (50000, 5000)
-        alloc = PortfolioAllocator(client=client)
+        alloc = PortfolioAllocator(client=client, state_path=_temp_state_path())
         # Portfolio limit = 25% of available (5000) = 1250
         alloc.record_trade("source-monitor", "T1", 1250)
         budget = alloc.request_budget("source-monitor", "T2", edge=0.10)
@@ -1269,7 +1286,7 @@ class TestHighConfCityLimitFix:
         """High-confidence override should NOT bypass city exposure limit."""
         client = MagicMock()
         client.get_balance.return_value = (100000, 100000)
-        alloc = PortfolioAllocator(client=client)
+        alloc = PortfolioAllocator(client=client, state_path=_temp_state_path())
 
         # City limit = 10% of 100000 = 10000c
         alloc.record_trade("source-monitor", "KXHIGHHOU-26FEB16-B77", 10000)
@@ -1286,7 +1303,7 @@ class TestHighConfCityLimitFix:
         """High-confidence should work on a different city."""
         client = MagicMock()
         client.get_balance.return_value = (100000, 100000)
-        alloc = PortfolioAllocator(client=client)
+        alloc = PortfolioAllocator(client=client, state_path=_temp_state_path())
 
         alloc.record_trade("source-monitor", "KXHIGHHOU-26FEB16-B77", 10000)
 
@@ -1426,3 +1443,635 @@ class TestFeeAdjustedEdgeRollout:
         """Fee adjustment on already-negative edge makes it more negative."""
         net = edge_after_fees(-0.05, 50)
         assert net < -0.05
+
+
+# ===================================================================
+# Edge-adaptive limit pricing tests (Fund Optimization Change 2)
+# ===================================================================
+
+class TestEdgeAdaptivePricing:
+
+    def test_high_edge_returns_full_ask(self):
+        """edge >= 0.15 should return full ask for urgency."""
+        price = compute_limit_price(40, 50, "yes", edge=0.20)
+        assert price == 50
+
+    def test_medium_edge_returns_ask_minus_one(self):
+        """0.08 <= edge < 0.15 should return ask - 1c."""
+        price = compute_limit_price(40, 50, "yes", edge=0.10)
+        assert price == 49  # ask - 1
+
+    def test_low_edge_returns_midpoint_plus_one(self):
+        """edge < 0.08 should return midpoint + 1c (legacy behavior)."""
+        price = compute_limit_price(40, 50, "yes", edge=0.05)
+        assert price == 46  # (40+50)//2 + 1
+
+    def test_no_edge_returns_full_ask(self):
+        """edge=None should return full ask (backward compatibility)."""
+        price = compute_limit_price(40, 50, "yes", edge=None)
+        assert price == 50
+
+    def test_no_side_pricing(self):
+        """NO-side tiers should work correctly."""
+        # NO bid=50, NO ask=60 (from yes_bid=40, yes_ask=50)
+        # High edge: full NO ask = 60
+        price_high = compute_limit_price(40, 50, "no", edge=0.20)
+        assert price_high == 60
+        # Medium edge: NO ask - 1 = 59
+        price_med = compute_limit_price(40, 50, "no", edge=0.10)
+        assert price_med == 59
+        # Low edge: midpoint + 1 = (50+60)//2 + 1 = 56
+        price_low = compute_limit_price(40, 50, "no", edge=0.05)
+        assert price_low == 56
+
+    def test_no_spread_returns_ask(self):
+        """When bid == ask (no spread), should return ask regardless of edge."""
+        # No spread: bid=50, ask=50 → yes_ask > yes_bid is False → return yes_ask
+        price = compute_limit_price(50, 50, "yes", edge=0.05)
+        assert price == 50
+
+
+# ===================================================================
+# Allocator shared state tests (Fund Optimization Change 1)
+# ===================================================================
+
+class TestAllocatorSharedState:
+
+    def _make_allocator(self, tmp_path, balance=10000):
+        client = MagicMock()
+        client.get_balance.return_value = (balance, balance)
+        state_path = tmp_path / "allocator-state.json"
+        return PortfolioAllocator(client=client, state_path=str(state_path))
+
+    def test_save_and_load_roundtrip(self, tmp_path):
+        """Save state, create new allocator, load, verify."""
+        alloc1 = self._make_allocator(tmp_path)
+        alloc1.record_trade("weather", "TICK-1", 200)
+        alloc1.record_trade("entertainment", "TICK-2", 300)
+
+        # New allocator should see the state
+        alloc2 = self._make_allocator(tmp_path)
+        assert alloc2.is_ticker_traded("TICK-1")
+        assert alloc2.is_ticker_traded("TICK-2")
+
+    def test_daily_reset_clears_state_file(self, tmp_path):
+        """State file cleared on date change."""
+        alloc = self._make_allocator(tmp_path)
+        alloc.record_trade("weather", "TICK-1", 200)
+        assert alloc.is_ticker_traded("TICK-1")
+
+        # Simulate day change
+        alloc._daily_date = "1999-01-01"
+        alloc._save_state()
+
+        alloc2 = self._make_allocator(tmp_path)
+        # After daily reset, ticker should no longer be traded
+        assert not alloc2.is_ticker_traded("TICK-1")
+
+    def test_concurrent_access_with_locking(self, tmp_path):
+        """Two allocators recording trades — no data loss."""
+        alloc1 = self._make_allocator(tmp_path)
+        alloc2 = self._make_allocator(tmp_path)
+
+        alloc1.record_trade("weather", "TICK-1", 100)
+        alloc2.record_trade("entertainment", "TICK-2", 200)
+
+        # Both should be visible from a fresh allocator
+        alloc3 = self._make_allocator(tmp_path)
+        assert alloc3.is_ticker_traded("TICK-1")
+        assert alloc3.is_ticker_traded("TICK-2")
+
+    def test_missing_state_file_initializes_empty(self, tmp_path):
+        """Fresh start with no file should work."""
+        state_path = tmp_path / "nonexistent.json"
+        client = MagicMock()
+        client.get_balance.return_value = (10000, 10000)
+        alloc = PortfolioAllocator(client=client, state_path=str(state_path))
+        # Should not crash, and no tickers traded
+        assert not alloc.is_ticker_traded("TICK-1")
+
+    def test_corrupt_state_file_recovers(self, tmp_path):
+        """Invalid JSON should reset to empty state."""
+        state_path = tmp_path / "allocator-state.json"
+        state_path.write_text("not valid json {{{")
+        client = MagicMock()
+        client.get_balance.return_value = (10000, 10000)
+        alloc = PortfolioAllocator(client=client, state_path=str(state_path))
+        # Should recover gracefully
+        assert not alloc.is_ticker_traded("TICK-1")
+        budget = alloc.request_budget("weather", "TICK-1", edge=0.10)
+        assert budget.approved
+
+    def test_record_trade_persists(self, tmp_path):
+        """Record trade, verify in file."""
+        alloc = self._make_allocator(tmp_path)
+        alloc.record_trade("weather", "TICK-1", 500)
+
+        state_path = tmp_path / "allocator-state.json"
+        data = json.loads(state_path.read_text())
+        assert "TICK-1" in data["traded_tickers"]
+        assert data["bot_spend"]["weather"] == 500
+        assert data["total_risk_cents"] == 500
+
+    def test_is_ticker_traded_cross_process(self, tmp_path):
+        """Record in one allocator, check in another."""
+        alloc1 = self._make_allocator(tmp_path)
+        alloc1.record_trade("weather", "TICK-ABC", 100)
+
+        alloc2 = self._make_allocator(tmp_path)
+        assert alloc2.is_ticker_traded("TICK-ABC")
+
+    def test_default_state_path(self):
+        """Verify DEFAULT_STATE_PATH used when none provided."""
+        from capital_allocator import DEFAULT_STATE_PATH
+        alloc = PortfolioAllocator()
+        assert alloc.state_path == DEFAULT_STATE_PATH
+
+
+# ===================================================================
+# Reconciliation fix tests (Fund Optimization Change 4)
+# ===================================================================
+
+class TestReconciliationFix:
+
+    def _make_reconcile_inputs(self, trades_by_bot, settlements):
+        """Helper to build reconcile_trades inputs."""
+        local = [{"label": label, "trades": trades}
+                 for label, trades in trades_by_bot]
+        return local, settlements, []  # empty fills
+
+    def test_no_double_counting_same_ticker_two_bots(self):
+        """Same ticker in 2 bots — revenue counted only once."""
+        # Import here to avoid module-level issues
+        import importlib.util as ilu
+        spec = ilu.spec_from_file_location(
+            "analyze_performance",
+            str(Path(__file__).resolve().parent.parent / "scripts" / "analyze-performance.py"),
+        )
+        mod = ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        local = [
+            {"label": "bot-A", "trades": [
+                {"ticker": "TICK-1", "order_id": "ord-1", "side": "yes"}
+            ]},
+            {"label": "bot-B", "trades": [
+                {"ticker": "TICK-1", "order_id": "ord-2", "side": "yes"}
+            ]},
+        ]
+        settlements = [{"ticker": "TICK-1", "revenue": 100}]
+
+        result = mod.reconcile_trades(local, settlements, [])
+        # Only one bot should get credited
+        total_pnl = sum(b["pnl_cents"] for b in result["per_bot"])
+        assert total_pnl == 100  # NOT 200
+
+    def test_order_id_matching(self):
+        """Matches by order_id when available (dedup)."""
+        import importlib.util as ilu
+        spec = ilu.spec_from_file_location(
+            "analyze_performance",
+            str(Path(__file__).resolve().parent.parent / "scripts" / "analyze-performance.py"),
+        )
+        mod = ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        local = [
+            {"label": "bot-A", "trades": [
+                {"ticker": "TICK-1", "order_id": "ord-1", "side": "no"},
+                {"ticker": "TICK-1", "order_id": "ord-1", "side": "no"},  # dup
+            ]},
+        ]
+        settlements = [{"ticker": "TICK-1", "revenue": 50}]
+
+        result = mod.reconcile_trades(local, settlements, [])
+        assert result["per_bot"][0]["wins"] == 1  # not 2
+
+    def test_fallback_to_ticker_when_no_order_id(self):
+        """Old records without order_id still work via ticker dedup."""
+        import importlib.util as ilu
+        spec = ilu.spec_from_file_location(
+            "analyze_performance",
+            str(Path(__file__).resolve().parent.parent / "scripts" / "analyze-performance.py"),
+        )
+        mod = ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        local = [
+            {"label": "bot-A", "trades": [
+                {"ticker": "TICK-1", "side": "yes"},  # no order_id
+            ]},
+            {"label": "bot-B", "trades": [
+                {"ticker": "TICK-1", "side": "yes"},  # same ticker, no order_id
+            ]},
+        ]
+        settlements = [{"ticker": "TICK-1", "revenue": 75}]
+
+        result = mod.reconcile_trades(local, settlements, [])
+        total_pnl = sum(b["pnl_cents"] for b in result["per_bot"])
+        assert total_pnl == 75  # counted once
+
+    def test_per_side_win_rate(self):
+        """YES and NO win rates tracked separately."""
+        import importlib.util as ilu
+        spec = ilu.spec_from_file_location(
+            "analyze_performance",
+            str(Path(__file__).resolve().parent.parent / "scripts" / "analyze-performance.py"),
+        )
+        mod = ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        local = [
+            {"label": "bot-A", "trades": [
+                {"ticker": "T1", "order_id": "o1", "side": "yes"},
+                {"ticker": "T2", "order_id": "o2", "side": "yes"},
+                {"ticker": "T3", "order_id": "o3", "side": "no"},
+                {"ticker": "T4", "order_id": "o4", "side": "no"},
+                {"ticker": "T5", "order_id": "o5", "side": "no"},
+            ]},
+        ]
+        settlements = [
+            {"ticker": "T1", "revenue": 50},   # yes win
+            {"ticker": "T2", "revenue": -30},   # yes loss
+            {"ticker": "T3", "revenue": 40},    # no win
+            {"ticker": "T4", "revenue": 20},    # no win
+            {"ticker": "T5", "revenue": -10},   # no loss
+        ]
+
+        result = mod.reconcile_trades(local, settlements, [])
+        agg = result["aggregate"]
+        assert agg["yes_wins"] == 1
+        assert agg["yes_losses"] == 1
+        assert agg["no_wins"] == 2
+        assert agg["no_losses"] == 1
+        # YES win rate: 50%, NO win rate: 66.7%
+        assert abs(agg["yes_win_rate"] - 0.5) < 0.01
+        assert abs(agg["no_win_rate"] - 0.6667) < 0.01
+
+    def test_empty_settlements(self):
+        """No settlements → all unmatched."""
+        import importlib.util as ilu
+        spec = ilu.spec_from_file_location(
+            "analyze_performance",
+            str(Path(__file__).resolve().parent.parent / "scripts" / "analyze-performance.py"),
+        )
+        mod = ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        local = [
+            {"label": "bot-A", "trades": [
+                {"ticker": "T1", "order_id": "o1", "side": "yes"},
+            ]},
+        ]
+
+        result = mod.reconcile_trades(local, [], [])
+        assert result["per_bot"][0]["unmatched"] == 1
+        assert result["aggregate"]["pnl_cents"] == 0
+
+    def test_mixed_revenues(self):
+        """Positive and negative revenues counted correctly."""
+        import importlib.util as ilu
+        spec = ilu.spec_from_file_location(
+            "analyze_performance",
+            str(Path(__file__).resolve().parent.parent / "scripts" / "analyze-performance.py"),
+        )
+        mod = ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        local = [
+            {"label": "bot-A", "trades": [
+                {"ticker": "T1", "order_id": "o1", "side": "yes"},
+                {"ticker": "T2", "order_id": "o2", "side": "no"},
+            ]},
+        ]
+        settlements = [
+            {"ticker": "T1", "revenue": 100},
+            {"ticker": "T2", "revenue": -50},
+        ]
+
+        result = mod.reconcile_trades(local, settlements, [])
+        assert result["aggregate"]["pnl_cents"] == 50
+        assert result["aggregate"]["wins"] == 1
+        assert result["aggregate"]["losses"] == 1
+
+
+# ===================================================================
+# Settlement-aware stale order cleanup tests (Fund Optimization Change 3)
+# ===================================================================
+
+class TestSettlementAwareCleanup:
+    """Tests for the rewritten position-monitor cancel_stale_orders().
+
+    Since the function uses module-level `client` and `log`, we test the
+    logic by verifying the expected behavior via mock interactions.
+    """
+
+    def _load_position_monitor(self):
+        """Import position-monitor with stubbed side-effects."""
+        import types
+        orig_modules = {}
+        for mod_name in ("kalshi_auth", "probability", "capital_allocator"):
+            if mod_name in sys.modules:
+                orig_modules[mod_name] = sys.modules[mod_name]
+
+        fake_client = MagicMock()
+        fake_client.get_balance.return_value = (10000, 10000)
+
+        fake_auth = types.ModuleType("kalshi_auth")
+        fake_auth.KalshiClient = lambda *a, **kw: fake_client
+        fake_auth.setup_unbuffered = lambda: None
+        fake_auth.setup_signal_handlers = lambda: None
+        fake_auth.setup_logging = lambda *a, **kw: __import__("logging").getLogger("test")
+        fake_auth.PROJECT_DIR = Path("/tmp/fake_posmon")
+        fake_auth.TradeManager = type("TradeManager", (), {
+            "__init__": lambda self, *a, **kw: None,
+        })
+        fake_auth.trim_trade_log = lambda *a, **kw: None
+        fake_auth.load_trades = lambda *a, **kw: []
+        sys.modules["kalshi_auth"] = fake_auth
+
+        fake_prob = types.ModuleType("probability")
+        fake_prob.half_kelly = lambda *a, **kw: (0, 0)
+        fake_prob.half_kelly_sell = lambda *a, **kw: (0, 0)
+        fake_prob.compute_limit_price = lambda *a, **kw: 50
+        fake_prob.weather_probability = lambda *a, **kw: 0.5
+        fake_prob.nws_probability = lambda *a, **kw: 0.5
+        fake_prob.edge_after_fees = lambda *a, **kw: 0.0
+        sys.modules["probability"] = fake_prob
+
+        fake_alloc = types.ModuleType("capital_allocator")
+        fake_alloc.PortfolioAllocator = type("PortfolioAllocator", (), {
+            "__init__": lambda self, *a, **kw: None,
+        })
+        sys.modules["capital_allocator"] = fake_alloc
+
+        # Create dirs and config
+        data_dir = Path("/tmp/fake_posmon/data")
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "pids").mkdir(parents=True, exist_ok=True)
+        config_dir = Path("/tmp/fake_posmon/config")
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "bots-config.json").write_text(json.dumps({
+            "positionMonitor": {
+                "checkIntervalMinutes": 15,
+                "takeProfitPct": 0.20,
+                "stopLossPct": 0.50,
+                "maxDailyExits": 5,
+            }
+        }))
+
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "position_monitor",
+            str(Path(__file__).resolve().parent.parent / "src" / "kalshi" / "position-monitor.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        # Restore original modules
+        for mod_name in ("kalshi_auth", "probability", "capital_allocator"):
+            if mod_name in orig_modules:
+                sys.modules[mod_name] = orig_modules[mod_name]
+            elif mod_name in sys.modules:
+                del sys.modules[mod_name]
+
+        return mod, fake_client
+
+    def test_cancels_order_near_settlement(self):
+        """close_time < 2h from now should trigger cancel."""
+        import datetime as dt
+        mod, mock_client = self._load_position_monitor()
+
+        now = dt.datetime.now(dt.timezone.utc)
+        close_soon = (now + dt.timedelta(hours=1)).isoformat()
+
+        mock_client.get.return_value = {
+            "orders": [{
+                "order_id": "ORD-1",
+                "ticker": "TICK-1",
+                "expiration_time": close_soon,
+                "created_time": now.isoformat(),
+            }]
+        }
+        mock_client.delete = MagicMock()
+
+        mod.cancel_stale_orders()
+        mock_client.delete.assert_called_once_with("/portfolio/orders/ORD-1")
+
+    def test_keeps_order_far_from_settlement(self):
+        """close_time > 2h and age < 12h should keep order."""
+        import datetime as dt
+        mod, mock_client = self._load_position_monitor()
+
+        now = dt.datetime.now(dt.timezone.utc)
+        close_far = (now + dt.timedelta(hours=10)).isoformat()
+        recent = (now - dt.timedelta(hours=1)).isoformat()
+
+        mock_client.get.return_value = {
+            "orders": [{
+                "order_id": "ORD-2",
+                "ticker": "TICK-2",
+                "expiration_time": close_far,
+                "created_time": recent,
+            }]
+        }
+        mock_client.delete = MagicMock()
+
+        mod.cancel_stale_orders()
+        mock_client.delete.assert_not_called()
+
+    def test_cancels_old_order_without_close_time(self):
+        """age > 12h and no close_time → cancel."""
+        import datetime as dt
+        mod, mock_client = self._load_position_monitor()
+
+        now = dt.datetime.now(dt.timezone.utc)
+        old_time = (now - dt.timedelta(hours=15)).isoformat()
+
+        mock_client.get.return_value = {
+            "orders": [{
+                "order_id": "ORD-3",
+                "ticker": "TICK-3",
+                "created_time": old_time,
+            }]
+        }
+        mock_client.delete = MagicMock()
+
+        mod.cancel_stale_orders()
+        mock_client.delete.assert_called_once_with("/portfolio/orders/ORD-3")
+
+    def test_keeps_recent_order_without_close_time(self):
+        """age < 12h and no close_time → keep."""
+        import datetime as dt
+        mod, mock_client = self._load_position_monitor()
+
+        now = dt.datetime.now(dt.timezone.utc)
+        recent = (now - dt.timedelta(hours=5)).isoformat()
+
+        mock_client.get.return_value = {
+            "orders": [{
+                "order_id": "ORD-4",
+                "ticker": "TICK-4",
+                "created_time": recent,
+            }]
+        }
+        mock_client.delete = MagicMock()
+
+        mod.cancel_stale_orders()
+        mock_client.delete.assert_not_called()
+
+
+# ===================================================================
+# File logging tests (Logging Change 1)
+# ===================================================================
+
+class TestFileLogging:
+
+    def test_setup_logging_creates_log_file(self, tmp_path, monkeypatch):
+        """Auto-derived log file should be created."""
+        import logging
+        import kalshi_auth
+        monkeypatch.setattr(kalshi_auth, "PROJECT_DIR", tmp_path)
+        # Use a unique logger name to avoid handler caching
+        name = f"test-bot-{os.getpid()}-1"
+        logger = setup_logging(name)
+        log_file = tmp_path / "data" / "logs" / f"{name}.log"
+        assert log_file.exists()
+        # Cleanup handlers to avoid leaking
+        logger.handlers.clear()
+
+    def test_setup_logging_explicit_path(self, tmp_path):
+        """Explicit log_file should be used instead of auto-derived path."""
+        import logging
+        name = f"test-bot-{os.getpid()}-2"
+        explicit = str(tmp_path / "custom.log")
+        logger = setup_logging(name, log_file=explicit)
+        assert Path(explicit).exists()
+        logger.handlers.clear()
+
+    def test_setup_logging_mkdir_parents(self, tmp_path, monkeypatch):
+        """Nested dirs should be created automatically."""
+        import kalshi_auth
+        monkeypatch.setattr(kalshi_auth, "PROJECT_DIR", tmp_path)
+        name = f"test-bot-{os.getpid()}-3"
+        logger = setup_logging(name)
+        log_dir = tmp_path / "data" / "logs"
+        assert log_dir.is_dir()
+        logger.handlers.clear()
+
+    def test_log_writes_to_file(self, tmp_path, monkeypatch):
+        """Log message should appear in the file."""
+        import logging
+        import kalshi_auth
+        monkeypatch.setattr(kalshi_auth, "PROJECT_DIR", tmp_path)
+        name = f"test-bot-{os.getpid()}-4"
+        logger = setup_logging(name)
+        logger.info("Test message 12345")
+        # Flush all handlers
+        for h in logger.handlers:
+            h.flush()
+        log_file = tmp_path / "data" / "logs" / f"{name}.log"
+        content = log_file.read_text()
+        assert "Test message 12345" in content
+        logger.handlers.clear()
+
+
+# ===================================================================
+# Trade record fields tests (Logging Changes 2-4)
+# ===================================================================
+
+class TestTradeRecordFields:
+
+    def test_place_order_includes_source_bot(self, tmp_path):
+        """Trade record from place_order should include source_bot field."""
+        import logging
+        mgr, _ = _make_manager(tmp_path, logger=logging.getLogger("test-weather"))
+        mgr.place_order("T1", "yes", 50, 1, "test reason")
+        trades = load_trades(tmp_path / "trades.json")
+        assert len(trades) == 1
+        assert trades[0]["source_bot"] == "test-weather"
+
+    def test_sell_position_includes_source_bot(self, tmp_path):
+        """Trade record from sell_position should include source_bot field."""
+        import logging
+        mock_client = MagicMock()
+        mock_client.post.return_value = {
+            "order": {"order_id": "exit-1", "status": "resting"}
+        }
+        trades_path = tmp_path / "trades.json"
+        kill_path = tmp_path / "HALT"
+        mgr = TradeManager(
+            mock_client, trades_path,
+            {"maxTradeAmount": 50, "maxDailyTrades": 100, "maxDailyLoss": 100},
+            kill_switch_path=kill_path,
+            logger=logging.getLogger("test-posmon"),
+        )
+        mgr.sell_position("T1", "yes", 85, 5, "exit reason")
+        trades = load_trades(trades_path)
+        assert len(trades) == 1
+        assert trades[0]["source_bot"] == "test-posmon"
+
+    def test_place_order_includes_market_snapshot(self, tmp_path):
+        """market_snapshot passed via extra_fields should be in trade record."""
+        mgr, _ = _make_manager(tmp_path)
+        snap = build_market_snapshot(yes_bid=45, yes_ask=50)
+        mgr.place_order("T1", "yes", 50, 1, "test", market_snapshot=snap)
+        trades = load_trades(tmp_path / "trades.json")
+        assert trades[0]["market_snapshot"]["yes_bid"] == 45
+        assert trades[0]["market_snapshot"]["yes_ask"] == 50
+
+    def test_build_market_snapshot_full(self):
+        """All fields populated should all appear."""
+        snap = build_market_snapshot(yes_bid=40, yes_ask=50, volume=1000, open_interest=500)
+        assert snap == {"yes_bid": 40, "yes_ask": 50, "volume": 1000, "open_interest": 500}
+
+    def test_build_market_snapshot_partial(self):
+        """Only provided fields should appear (no None values)."""
+        snap = build_market_snapshot(yes_bid=40)
+        assert snap == {"yes_bid": 40}
+        assert "yes_ask" not in snap
+        assert "volume" not in snap
+
+    def test_log_decision_creates_file(self, tmp_path):
+        """log_decision should create a decisions file."""
+        mgr, _ = _make_manager(tmp_path)
+        mgr.log_decision("T1", "yes", "skipped", "edge below threshold", edge=0.05)
+        decisions_path = tmp_path / "trades-decisions.json"
+        assert decisions_path.exists()
+        decisions = json.loads(decisions_path.read_text())
+        assert len(decisions) == 1
+        assert decisions[0]["ticker"] == "T1"
+        assert decisions[0]["action"] == "skipped"
+
+    def test_log_decision_bounded(self, tmp_path):
+        """Decisions log should be bounded at ~500 entries."""
+        mgr, _ = _make_manager(tmp_path)
+        decisions_path = tmp_path / "trades-decisions.json"
+        # Pre-fill with 600 entries
+        prefill = [{"timestamp": "2025-01-01T00:00:00", "ticker": f"T{i}",
+                     "side": "yes", "action": "skipped", "reason": "test",
+                     "source_bot": "test"} for i in range(600)]
+        decisions_path.write_text(json.dumps(prefill))
+        # Add one more — should trigger truncation
+        mgr.log_decision("T999", "yes", "skipped", "test")
+        decisions = json.loads(decisions_path.read_text())
+        assert len(decisions) <= 501  # 400 kept + 1 new (after truncation from 600)
+
+    def test_log_decision_fields(self, tmp_path):
+        """All expected fields should be present in decision record."""
+        import logging
+        mgr, _ = _make_manager(tmp_path, logger=logging.getLogger("test-crypto"))
+        mgr.log_decision("T1", "no", "rejected", "daily limit reached",
+                          edge=0.12, price_cents=30, custom_field="extra")
+        decisions_path = tmp_path / "trades-decisions.json"
+        decisions = json.loads(decisions_path.read_text())
+        d = decisions[0]
+        assert d["ticker"] == "T1"
+        assert d["side"] == "no"
+        assert d["action"] == "rejected"
+        assert d["reason"] == "daily limit reached"
+        assert d["source_bot"] == "test-crypto"
+        assert d["edge"] == 0.12
+        assert d["price_cents"] == 30
+        assert d["custom_field"] == "extra"
+        assert "timestamp" in d

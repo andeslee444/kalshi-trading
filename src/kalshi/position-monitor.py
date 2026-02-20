@@ -202,30 +202,66 @@ def evaluate_model_shift(position, market):
 
 
 def cancel_stale_orders():
-    """Cancel resting orders on markets that are close to settlement."""
+    """Cancel resting orders that are near settlement or too old.
+
+    Settlement-aware logic (mirrors beatrelease-scanner approach):
+      1. If market close_time is within 2 hours → cancel (about to settle, won't fill)
+      2. If order age > 12 hours → cancel (stale capital)
+      3. Otherwise → keep the order
+    """
     try:
         data = client.get("/portfolio/orders?status=resting")
         orders = data.get("orders", [])
+        if not orders:
+            return
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        canceled = 0
 
         for order in orders:
             ticker = order.get("ticker", "")
             order_id = order.get("order_id", "")
-            created = order.get("created_time", "")
+            if not order_id:
+                continue
 
-            # Cancel orders older than 2 hours
-            if created:
+            should_cancel = False
+            reason = ""
+
+            # Check 1: Market close time — cancel if settling within 2 hours
+            close_time_str = order.get("expiration_time", "") or order.get("close_time", "")
+            if close_time_str:
                 try:
-                    created_dt = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
-                    age = datetime.datetime.now(datetime.timezone.utc) - created_dt
-                    if age.total_seconds() > 7200:  # 2 hours
-                        log.info(f"Cancelling stale order {order_id} on {ticker} (age: {age})")
-                        try:
-                            client.delete(f"/portfolio/orders/{order_id}")
-                            log.info(f"  Cancelled {order_id}")
-                        except Exception as e:
-                            log.error(f"  Failed to cancel {order_id}: {e}")
+                    close_dt = datetime.datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
+                    hours_to_close = (close_dt - now).total_seconds() / 3600
+                    if hours_to_close < 2:
+                        should_cancel = True
+                        reason = f"market closes in {hours_to_close:.1f}h"
                 except (ValueError, TypeError):
                     pass
+
+            # Check 2: Order age — cancel if older than 12 hours
+            if not should_cancel:
+                created = order.get("created_time", "")
+                if created:
+                    try:
+                        created_dt = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+                        age_hours = (now - created_dt).total_seconds() / 3600
+                        if age_hours > 12:
+                            should_cancel = True
+                            reason = f"age {age_hours:.0f}h > 12h"
+                    except (ValueError, TypeError):
+                        pass
+
+            if should_cancel:
+                try:
+                    client.delete(f"/portfolio/orders/{order_id}")
+                    log.info(f"  Canceled stale order {order_id} on {ticker} ({reason})")
+                    canceled += 1
+                except Exception as e:
+                    log.error(f"  Failed to cancel {order_id}: {e}")
+
+        if canceled:
+            log.info(f"  Canceled {canceled} stale resting orders")
 
     except Exception as e:
         log.error(f"Failed to fetch resting orders: {e}")

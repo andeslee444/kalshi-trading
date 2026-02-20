@@ -6,7 +6,7 @@ Scans KXHIGH temperature markets, compares to Open-Meteo forecasts, and places t
 import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log
+from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot
 from probability import weather_probability, ensemble_weather_probability, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, edge_after_fees
 from capital_allocator import PortfolioAllocator
 
@@ -235,6 +235,11 @@ def scan_and_trade():
             })
         else:
             skipped["low_edge"] += 1
+            trade_manager.log_decision(
+                ticker, "yes" if edge_yes > 0 else "no", "skipped",
+                "edge below threshold", edge=abs(edge_yes),
+                price_cents=yes_ask if edge_yes > 0 else no_ask,
+            )
 
     log.info(f"Skipped: {skipped}")
 
@@ -269,13 +274,13 @@ def scan_and_trade():
                 log.info(f"  Skipping YES on {ticker}: edge {actual_edge*100:.1f}% < 15% minimum for YES side")
                 continue
             side = "yes"
-            price = compute_limit_price(yes_bid, yes_ask, "yes")
+            price = compute_limit_price(yes_bid, yes_ask, "yes", edge=actual_edge)
             if not price or price <= 0:
                 price = yes_ask
             reasoning = f"{city_name} forecast: {forecast}F, {ticker} YES at {price}c -> our prob {opp['our_prob']*100:.0f}%, edge +{actual_edge*100:.1f}%, buying YES"
         elif edge < 0 and no_ask and no_ask < 99:
             side = "no"
-            price = compute_limit_price(yes_bid, yes_ask, "no")
+            price = compute_limit_price(yes_bid, yes_ask, "no", edge=actual_edge)
             if not price or price <= 0:
                 price = no_ask
             reasoning = f"{city_name} forecast: {forecast}F, {ticker} NO at {price}c -> our prob {(1-opp['our_prob'])*100:.0f}%, edge +{actual_edge*100:.1f}%, buying NO"
@@ -320,7 +325,8 @@ def scan_and_trade():
 
         result = trade_manager.place_order(
             ticker, side, price, count, reasoning,
-            forecast_temp=forecast, threshold=threshold, edge=round(actual_edge, 4)
+            forecast_temp=forecast, threshold=threshold, edge=round(actual_edge, 4),
+            market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
         )
         if result:
             allocator.record_trade("weather", ticker, risk)

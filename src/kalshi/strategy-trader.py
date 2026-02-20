@@ -6,7 +6,7 @@ Strategies: Longshot bias selling, maker-only limit orders, info arbitrage near 
 import json, time, datetime, os, sys, math
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log, _atomic_write_json
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log, _atomic_write_json, build_market_snapshot
 from probability import half_kelly_sell, longshot_edge, compute_limit_price, kalshi_fee_cents
 from capital_allocator import PortfolioAllocator
 
@@ -72,7 +72,7 @@ def find_longshot_sells(markets, bankroll):
             continue
 
         # Place limit within the spread instead of at full ask
-        sell_price = compute_limit_price(yes_bid, yes_ask, "yes") if yes_bid else yes_ask
+        sell_price = compute_limit_price(yes_bid, yes_ask, "yes", edge=est_edge) if yes_bid else yes_ask
         if sell_price <= 1:
             sell_price = max(yes_bid, yes_ask - 1) if yes_bid > 0 else yes_ask
         if sell_price <= 1:
@@ -113,6 +113,8 @@ def find_longshot_sells(markets, bankroll):
             "risk_cents": risk,
             "hours_to_close": hours,
             "volume": volume,
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
             "reasoning": f"Longshot bias: YES@{sell_price}c implies {implied_prob*100:.1f}% prob, Becker model est true prob ~{true_prob*100:.2f}%. Sell YES (buy NO@{100-sell_price}c) for ~{est_edge*100:.2f}% edge."
         })
 
@@ -261,6 +263,7 @@ def main():
             risk_cents=c["risk_cents"], title=c["title"],
             subtitle=c.get("subtitle", ""),
             yes_price_at_entry=c["yes_price"],
+            market_snapshot=build_market_snapshot(yes_bid=c.get("yes_bid", 0), yes_ask=c.get("yes_ask", 0)),
         )
         if result:
             allocator.record_trade("strategy", ticker, c["risk_cents"])
