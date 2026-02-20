@@ -15,6 +15,21 @@ cp .env.example .env  # Fill in KALSHI_API_KEY, KALSHI_KEY_FILE, KALSHI_MODE
 
 RSA private keys go in `config/keys/` (gitignored): `kalshi-demo.pem`, `kalshi-live.pem`. For beatrelease scanner, add DeepSeek API key to `config/keys/deepseek.txt` or set `DEEPSEEK_API_KEY` env var. Production mode requires `KALSHI_CONFIRM_PRODUCTION=yes` as a safety guard.
 
+## Data Sync
+
+Trade logs in `data/` are gitignored but essential for backtesting and auditing. S3 syncs them between machines (Mac Mini production ↔ MacBook development).
+
+```bash
+npm run sync:setup   # Create S3 bucket (one-time)
+npm run sync:up      # Push trade logs + calibration to S3
+npm run sync:down    # Pull trade logs + calibration from S3
+```
+
+Requires AWS CLI configured with credentials. Set `S3_BUCKET` in `.env` (defaults to `kalshi-trading-logs`).
+
+**Synced:** `data/kalshi-*-trades.json`, `data/beatrelease-trades.json`, `data/beatrelease-state.json`, `data/backtest-results.json`, `config/calibration.json`.
+**Excluded:** `data/logs/`, `data/pids/`, `data/HALT_TRADING`, market caches, demo trades, source snapshots.
+
 ## Running Bots
 
 All bots are run via npm scripts that call Python 3:

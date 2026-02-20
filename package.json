@@ -17,7 +17,12 @@
     "mm": "python3 src/kalshi/market-maker.py",
     "calibrate": "python3 scripts/calibrate-sigma.py",
     "backtest": "python3 scripts/backtest.py",
-    "report": "python3 scripts/daily-report.py"
+    "report": "python3 scripts/daily-report.py",
+    "audit": "python3 scripts/audit.py",
+    "reconcile": "python3 scripts/reconcile-trades.py",
+    "sync:up": "bash scripts/s3-sync.sh upload",
+    "sync:down": "bash scripts/s3-sync.sh download",
+    "sync:setup": "bash scripts/s3-sync.sh setup"
   },
   "dependencies": {},
   "devDependencies": {}
