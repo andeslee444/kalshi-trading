@@ -1,8 +1,8 @@
 {
   "mode": "demo",
-  "maxTradeAmount": 10,
+  "maxTradeAmount": 25,
   "maxDailyTrades": 20,
-  "maxDailyLoss": 50,
+  "maxDailyLoss": 75,
   "sources": {
     "hdd": {
       "enabled": true,
@@ -24,8 +24,11 @@
         "MIA": "KMIA",
         "LAX": "KLAX",
         "PHIL": "KPHL",
-        "NYC": "KJFK",
-        "CHI": "KORD"
+        "NY": "KJFK",
+        "CHI": "KORD",
+        "AUS": "KAUS",
+        "DEN": "KDEN",
+        "HOU": "KIAH"
       },
       "intervalMinutes": 10
     }

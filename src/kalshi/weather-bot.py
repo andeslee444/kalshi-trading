@@ -7,7 +7,8 @@ import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log
-from probability import weather_probability, half_kelly
+from probability import weather_probability, ensemble_weather_probability, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, edge_after_fees
+from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
 log = setup_logging("weather")
@@ -22,6 +23,7 @@ config = json.loads(CONFIG_PATH.read_text())
 CITIES = config["cities"]
 
 client = KalshiClient()
+allocator = PortfolioAllocator(client, logger=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": config["maxTradeAmount"],
     "maxDailyTrades": config.get("maxDailyTrades", 10),
@@ -30,11 +32,76 @@ trade_manager = TradeManager(client, TRADES_PATH, {
 trim_trade_log(TRADES_PATH)
 
 # === Weather Forecast ===
+
+# Ensemble model endpoints for Open-Meteo
+ENSEMBLE_MODELS = {
+    "gfs": "gfs_seamless",
+    "ecmwf": "ecmwf_ifs04",
+    "icon": "icon_seamless",
+}
+ENSEMBLE_ENABLED = config.get("ensemble", {}).get("enabled", False)
+
+
 def get_forecast(lat, lon):
+    """Single-model GFS forecast (fallback)."""
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max&temperature_unit=fahrenheit&timezone=America%2FNew_York&forecast_days=7"
     r = retry_request("GET", url, timeout=10)
     d = r.json()["daily"]
     return dict(zip(d["time"], d["temperature_2m_max"]))
+
+
+def get_ensemble_forecast(lat, lon):
+    """Fetch GFS, ECMWF, and ICON forecasts in parallel.
+
+    Returns dict: {date_str: {"gfs": temp, "ecmwf": temp, "icon": temp}}
+    Falls back to single-model GFS if any API fails.
+    """
+    from kalshi_auth import fetch_parallel
+
+    urls = {}
+    for model_key, model_name in ENSEMBLE_MODELS.items():
+        url = (
+            f"https://api.open-meteo.com/v1/forecast?"
+            f"latitude={lat}&longitude={lon}"
+            f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
+            f"&timezone=America%2FNew_York&forecast_days=7"
+            f"&models={model_name}"
+        )
+        urls[url] = model_key
+
+    responses = fetch_parallel(list(urls.keys()), timeout=15)
+
+    # Parse each model's response
+    model_forecasts = {}  # model_key -> {date: temp}
+    for url, response in responses.items():
+        model_key = urls[url]
+        if response is None or response.status_code != 200:
+            log.warning(f"Ensemble model {model_key} failed, will use single-model fallback")
+            continue
+        try:
+            d = response.json()["daily"]
+            model_forecasts[model_key] = dict(zip(d["time"], d["temperature_2m_max"]))
+        except (KeyError, ValueError) as e:
+            log.warning(f"Ensemble model {model_key} parse error: {e}")
+
+    if not model_forecasts:
+        log.warning("All ensemble models failed, falling back to single GFS")
+        single = get_forecast(lat, lon)
+        return {date: {"gfs": temp} for date, temp in single.items()}
+
+    # Combine into {date: {model: temp}} structure
+    all_dates = set()
+    for forecasts in model_forecasts.values():
+        all_dates.update(forecasts.keys())
+
+    combined = {}
+    for date in sorted(all_dates):
+        combined[date] = {}
+        for model_key, forecasts in model_forecasts.items():
+            if date in forecasts:
+                combined[date][model_key] = forecasts[date]
+
+    return combined
 
 # === Ticker Parsing ===
 MONTHS = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,"JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
@@ -94,11 +161,14 @@ def scan_and_trade():
         log.info("No weather markets found.")
         return
 
-    # Get forecasts
+    # Get forecasts (ensemble or single-model)
     forecasts = {}
     for code, info in CITIES.items():
         try:
-            forecasts[code] = get_forecast(info["lat"], info["lon"])
+            if ENSEMBLE_ENABLED:
+                forecasts[code] = get_ensemble_forecast(info["lat"], info["lon"])
+            else:
+                forecasts[code] = get_forecast(info["lat"], info["lon"])
         except Exception as e:
             log.error(f"Forecast error for {info['name']}: {e}")
 
@@ -122,38 +192,44 @@ def scan_and_trade():
             skipped["no_date"] += 1
             continue
 
-        forecast_temp = forecasts[city][date_str]
+        forecast_data = forecasts[city][date_str]
         try:
             market_date = datetime.date.fromisoformat(date_str)
             days_out = max(0, (market_date - datetime.date.today()).days)
         except (ValueError, TypeError):
             days_out = 0
-        our_prob = compute_probability(forecast_temp, parsed["threshold"], parsed["direction"], days_out, city=city)
+
+        # Compute probability — ensemble or single-model
+        if ENSEMBLE_ENABLED and isinstance(forecast_data, dict):
+            our_prob = ensemble_weather_probability(forecast_data, parsed["threshold"], parsed["direction"], days_out, city=city)
+            forecast_temp = sum(forecast_data.values()) / len(forecast_data)  # mean for logging
+        else:
+            forecast_temp = forecast_data if not isinstance(forecast_data, dict) else list(forecast_data.values())[0]
+            our_prob = compute_probability(forecast_temp, parsed["threshold"], parsed["direction"], days_out, city=city)
 
         yes_ask = m.get("yes_ask", 0)
         yes_bid = m.get("yes_bid", 0)
         no_ask = m.get("no_ask", 0)
         last = m.get("last_price", 0)
 
-        if yes_bid and yes_ask and yes_ask < 100:
-            market_price = (yes_bid + yes_ask) / 2 / 100
-        elif yes_ask and yes_ask < 100:
-            market_price = yes_ask / 100
-        elif last and last < 100:
-            market_price = last / 100
+        # Compute edge against the price we'd actually pay (ask for YES, 100-bid for NO)
+        # not the midpoint, to avoid false positives from wide spreads
+        city_name = CITIES[city]["name"]
+
+        if our_prob > 0.5 and yes_ask and yes_ask < 99:
+            edge_yes = edge_after_fees(our_prob - (yes_ask / 100.0), yes_ask)
+        elif our_prob <= 0.5 and no_ask and no_ask < 99:
+            edge_yes = -(edge_after_fees((1 - our_prob) - (no_ask / 100.0), no_ask))  # negative = NO signal
         else:
             skipped["no_price"] += 1
             continue
-
-        edge_yes = our_prob - market_price
-
-        city_name = CITIES[city]["name"]
 
         if abs(edge_yes) >= config["edgeThreshold"]:
             opportunities.append({
                 "ticker": ticker, "market": m, "parsed": parsed,
                 "forecast": forecast_temp, "our_prob": our_prob,
-                "market_price": market_price, "edge": edge_yes,
+                "market_price": (yes_ask / 100.0) if edge_yes > 0 else (no_ask / 100.0),
+                "edge": edge_yes,
                 "city_name": city_name,
                 "yes_ask": yes_ask, "no_ask": no_ask,
             })
@@ -171,31 +247,83 @@ def scan_and_trade():
         edge = opp["edge"]
         forecast = opp["forecast"]
         threshold = opp["parsed"]["threshold"]
+        direction = opp["parsed"]["direction"]  # T=threshold, B=bracket
         city_name = opp["city_name"]
+        yes_ask = opp["yes_ask"]
+        no_ask = opp["no_ask"]
+        yes_bid = opp["market"].get("yes_bid", 0)
+        is_bracket = (direction == "B")
 
-        if edge > 0 and opp["yes_ask"] and opp["yes_ask"] < 99:
+        # Rec 1: Brackets require 2x edge threshold (higher model uncertainty)
+        if is_bracket and abs(edge) < config["edgeThreshold"] * 2:
+            log.info(f"  Skipping bracket {ticker}: edge {abs(edge)*100:.1f}% < {config['edgeThreshold']*200:.0f}% (2x threshold)")
+            continue
+
+        # Edge already computed against actual ask price in the filter above
+        actual_edge = abs(edge)
+
+        if edge > 0 and yes_ask and yes_ask < 99:
+            # Rec 2: NO-only weather constraint — skip YES unless edge >= 15%
+            # YES side has 0% historical win rate; only trade with very high conviction
+            if actual_edge < 0.15:
+                log.info(f"  Skipping YES on {ticker}: edge {actual_edge*100:.1f}% < 15% minimum for YES side")
+                continue
             side = "yes"
-            price = opp["yes_ask"]
-            reasoning = f"{city_name} forecast: {forecast}F, {ticker} YES at {price}c -> our prob {opp['our_prob']*100:.0f}%, edge +{edge*100:.1f}%, buying YES"
-        elif edge < 0 and opp["no_ask"] and opp["no_ask"] < 99:
+            price = compute_limit_price(yes_bid, yes_ask, "yes")
+            if not price or price <= 0:
+                price = yes_ask
+            reasoning = f"{city_name} forecast: {forecast}F, {ticker} YES at {price}c -> our prob {opp['our_prob']*100:.0f}%, edge +{actual_edge*100:.1f}%, buying YES"
+        elif edge < 0 and no_ask and no_ask < 99:
             side = "no"
-            price = opp["no_ask"]
-            reasoning = f"{city_name} forecast: {forecast}F, {ticker} NO at {price}c -> our prob {(1-opp['our_prob'])*100:.0f}%, edge +{abs(edge)*100:.1f}%, buying NO"
+            price = compute_limit_price(yes_bid, yes_ask, "no")
+            if not price or price <= 0:
+                price = no_ask
+            reasoning = f"{city_name} forecast: {forecast}F, {ticker} NO at {price}c -> our prob {(1-opp['our_prob'])*100:.0f}%, edge +{actual_edge*100:.1f}%, buying NO"
         else:
             continue
 
-        max_cost = config["maxTradeAmount"] * 100
-        count, risk = half_kelly(abs(edge), price, max_cost)
-        if count < 1:
-            count = 1
+        # Request budget from portfolio allocator (includes Rec 6 dedup via global ticker check)
+        budget = allocator.request_budget("weather", ticker, edge=abs(actual_edge))
+        if not budget.approved:
+            log.info(f"  Allocator denied {ticker}: {budget.reason}")
+            continue
+
+        # Position sizing based on market type and conviction
+        if is_bracket:
+            # Rec 3+10: Quarter-Kelly for brackets (cap scales with bankroll)
+            count, risk = quarter_kelly(
+                abs(actual_edge), price, budget.max_cost_cents,
+                bankroll_cents=budget.bankroll_cents,
+            )
+            sizing_label = "quarter-Kelly"
+        elif side == "no" and (1 - opp["our_prob"]) > 0.80:
+            # Rec 4: High-conviction threshold-NO → 60% Kelly
+            count, risk = high_conviction_kelly(
+                abs(actual_edge), price, budget.max_cost_cents,
+                bankroll_cents=budget.bankroll_cents,
+            )
+            sizing_label = "60%-Kelly (high-conviction)"
+        else:
+            # Standard half-Kelly
+            count, risk = half_kelly(
+                abs(actual_edge), price, budget.max_cost_cents,
+                bankroll_cents=budget.bankroll_cents,
+            )
+            sizing_label = "half-Kelly"
+
+        if count <= 0:
+            log.info(f"  Kelly says 0 contracts for {ticker} (edge too small for price), skipping")
+            continue
 
         log.info(f"\n-> TRADE: {reasoning}")
-        log.info(f"  Placing: {count}x {side} @ {price}c")
+        log.info(f"  Placing: {count}x {side} @ {price}c ({sizing_label}, bankroll=${budget.bankroll_cents/100:.2f})")
 
-        trade_manager.place_order(
+        result = trade_manager.place_order(
             ticker, side, price, count, reasoning,
-            forecast_temp=forecast, threshold=threshold, edge=round(edge, 4)
+            forecast_temp=forecast, threshold=threshold, edge=round(actual_edge, 4)
         )
+        if result:
+            allocator.record_trade("weather", ticker, risk)
 
 def main():
     log.info("=" * 60)

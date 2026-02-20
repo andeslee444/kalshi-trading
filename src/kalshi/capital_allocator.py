@@ -1,0 +1,271 @@
+"""Cross-bot capital allocator for Kalshi trading system.
+
+Provides portfolio-level capital coordination across all bots:
+  - Global dedup: prevents multiple bots from doubling up on the same ticker
+  - Dynamic allocation: bots with higher-edge opportunities get more capital
+  - Portfolio risk limits: single daily loss cap across the entire system
+  - Concentration limits: prevents over-exposure to a single market type
+  - City-level exposure limits: caps total risk on correlated weather brackets
+
+Usage:
+    from capital_allocator import PortfolioAllocator
+
+    allocator = PortfolioAllocator(client)
+    budget = allocator.request_budget("weather-bot", ticker, edge, confidence)
+    if budget.approved:
+        count, risk = half_kelly(edge, price, budget.max_cost_cents, budget.bankroll_cents)
+"""
+
+import json
+import re
+import time
+import datetime
+import logging
+from pathlib import Path
+
+_log = logging.getLogger("capital_allocator")
+
+# ─── Budget priority tiers ───
+# Higher priority = larger share of available capital
+# Info-arb gets highest because edge is information-based (near-certain)
+BOT_PRIORITY = {
+    "source-monitor": 1.0,    # info-arb: highest edge quality
+    "position-monitor": 0.9,  # exits free capital, not consuming allocation
+    "economics": 0.9,         # nowcast-based: high edge quality (like info-arb)
+    "entertainment": 0.8,     # info-arb: high edge quality
+    "weather": 0.5,           # model-based: moderate edge quality
+    "crypto": 0.4,            # model-based: high vol, lower confidence
+    "strategy": 0.3,          # statistical: lower per-trade edge
+    "beatrelease": 0.3,       # copy-trading: variable quality
+    "trade-cycle": 0.2,       # one-shot: lowest priority
+}
+
+# Max fraction of bankroll any single bot can consume per day
+MAX_BOT_FRACTION = 0.40
+
+# Max fraction of bankroll in any single ticker
+# Reduced from 0.15 to 0.05 — prevents single-position blowups like
+# the Houston B77.5 position (66 contracts, $29 exposure on one bracket)
+MAX_TICKER_FRACTION = 0.05
+
+# Max fraction of bankroll in any single city (weather markets)
+# Multiple brackets on the same city (e.g., Houston B77, B78, B79) are
+# correlated — capping at 10% prevents over-concentration
+MAX_CITY_FRACTION = 0.10
+
+# Portfolio-wide daily loss cap as fraction of bankroll
+PORTFOLIO_DAILY_LOSS_FRACTION = 0.25
+
+
+# ─── City key extraction ───
+
+_CITY_KEY_RE = re.compile(r"KXHIGH([A-Z]+)-(\d{2}[A-Z]{3}\d{2})")
+
+
+def _extract_city_key(ticker):
+    """Extract a city+date key from a KXHIGH ticker for exposure grouping.
+
+    Returns "CITY:DATE" (e.g. "HOU:26FEB16") for weather tickers,
+    or None for non-weather tickers.
+    """
+    m = _CITY_KEY_RE.match(ticker)
+    if m:
+        return f"{m.group(1)}:{m.group(2)}"
+    return None
+
+
+class BudgetResponse:
+    """Response from the allocator for a trade request."""
+
+    __slots__ = ("approved", "max_cost_cents", "bankroll_cents", "reason")
+
+    def __init__(self, approved, max_cost_cents=0, bankroll_cents=0, reason=""):
+        self.approved = approved
+        self.max_cost_cents = max_cost_cents
+        self.bankroll_cents = bankroll_cents
+        self.reason = reason
+
+    def __repr__(self):
+        if self.approved:
+            return f"BudgetResponse(approved=True, max_cost=${self.max_cost_cents/100:.2f}, bankroll=${self.bankroll_cents/100:.2f})"
+        return f"BudgetResponse(approved=False, reason={self.reason!r})"
+
+
+class PortfolioAllocator:
+    """Portfolio-level capital allocator across all bots.
+
+    Tracks global state: which tickers have been traded today, how much
+    each bot has spent, and total portfolio risk. All bots should share
+    a single instance (or use the file-backed state for multi-process).
+
+    Args:
+        client: KalshiClient for balance queries.
+        state_path: Path to shared state file (for multi-process coordination).
+        logger: Optional logger instance.
+    """
+
+    def __init__(self, client=None, state_path=None, logger=None):
+        self.client = client
+        self.log = logger or _log
+        self.state_path = Path(state_path) if state_path else None
+
+        # In-memory state (single process)
+        self._traded_tickers = {}       # ticker -> (bot_name, timestamp)
+        self._bot_spend = {}            # bot_name -> cents risked today
+        self._city_risk = {}            # city_key -> cents risked today
+        self._total_risk_cents = 0      # portfolio-wide risk today
+        self._daily_date = None
+        self._cached_balance = None
+        self._cached_available = None
+        self._balance_fetched_at = 0
+
+    def _reset_daily_if_needed(self):
+        today = datetime.date.today().isoformat()
+        if self._daily_date != today:
+            self._traded_tickers = {}
+            self._bot_spend = {}
+            self._city_risk = {}
+            self._total_risk_cents = 0
+            self._daily_date = today
+
+    def _get_balance(self):
+        """Get total and available balance, cached for 60 seconds.
+
+        Returns (total_balance, available_balance) in cents.
+        Total balance is used for Kelly sizing (total equity = wealth).
+        Available balance is used for risk limit checks (can't spend locked funds).
+        """
+        now = time.time()
+        if self._cached_balance is not None and (now - self._balance_fetched_at) < 60:
+            return self._cached_balance, self._cached_available
+        if self.client:
+            try:
+                total, avail = self.client.get_balance()
+                self._cached_balance = total
+                self._cached_available = avail
+                self._balance_fetched_at = now
+                return total, avail
+            except Exception as e:
+                self.log.warning("Balance fetch failed: %s", e)
+        return self._cached_balance or 0, self._cached_available or 0
+
+    def is_ticker_traded(self, ticker):
+        """Check if any bot has already traded this ticker today."""
+        self._reset_daily_if_needed()
+        return ticker in self._traded_tickers
+
+    def record_trade(self, bot_name, ticker, risk_cents):
+        """Record that a trade was executed."""
+        self._reset_daily_if_needed()
+        self._traded_tickers[ticker] = (bot_name, datetime.datetime.now().isoformat())
+        self._bot_spend[bot_name] = self._bot_spend.get(bot_name, 0) + risk_cents
+        self._total_risk_cents += risk_cents
+        # Track city-level exposure for weather tickers
+        city_key = _extract_city_key(ticker)
+        if city_key:
+            self._city_risk[city_key] = self._city_risk.get(city_key, 0) + risk_cents
+
+    def request_budget(self, bot_name, ticker, edge=0.0, confidence=0.0,
+                       bot_max_cost_cents=500):
+        """Request a capital allocation for a trade.
+
+        Args:
+            bot_name: Identifier for the requesting bot.
+            ticker: Market ticker to trade.
+            edge: Estimated edge (probability difference).
+            confidence: Model confidence (0-1).
+            bot_max_cost_cents: Bot's own per-trade cost cap from config.
+
+        Returns:
+            BudgetResponse with approved flag, allocated max_cost, and bankroll.
+        """
+        self._reset_daily_if_needed()
+
+        # 1. Global dedup
+        if ticker in self._traded_tickers:
+            other_bot = self._traded_tickers[ticker][0]
+            return BudgetResponse(False, reason=f"already traded by {other_bot}")
+
+        # 2. Get balance — total for Kelly sizing, available for risk checks
+        total_balance, available_balance = self._get_balance()
+        if available_balance <= 0:
+            return BudgetResponse(False, reason="no balance available")
+
+        # Use total balance for Kelly bankroll (total equity = wealth)
+        # Use available balance for risk limit checks (can't spend locked funds)
+        bankroll = total_balance if total_balance > 0 else available_balance
+
+        # 3. Portfolio-level daily loss check (based on available)
+        max_portfolio_risk = int(available_balance * PORTFOLIO_DAILY_LOSS_FRACTION)
+        remaining_portfolio = max_portfolio_risk - self._total_risk_cents
+        if remaining_portfolio <= 0:
+            return BudgetResponse(False, reason="portfolio daily loss limit reached")
+
+        # 4. Per-bot daily spending check (based on available)
+        priority = BOT_PRIORITY.get(bot_name, 0.2)
+        max_bot_risk = int(available_balance * MAX_BOT_FRACTION * priority)
+        bot_spent = self._bot_spend.get(bot_name, 0)
+        remaining_bot = max_bot_risk - bot_spent
+        if remaining_bot <= 0:
+            return BudgetResponse(False, reason=f"{bot_name} daily allocation exhausted")
+
+        # 5. Per-ticker concentration limit (based on available)
+        max_ticker_risk = int(available_balance * MAX_TICKER_FRACTION)
+
+        # 5b. City-level concentration limit (weather markets)
+        city_key = _extract_city_key(ticker)
+        max_city_risk = int(available_balance * MAX_CITY_FRACTION)
+        remaining_city = max_city_risk
+        if city_key:
+            city_spent = self._city_risk.get(city_key, 0)
+            remaining_city = max_city_risk - city_spent
+            if remaining_city <= 0:
+                return BudgetResponse(False, reason=f"city exposure limit reached for {city_key}")
+
+        # 6. Compute allocated budget
+        # The allocation is the minimum of all constraints
+        allocated = min(
+            bot_max_cost_cents,       # bot's own config cap
+            remaining_portfolio,       # portfolio daily limit
+            remaining_bot,             # per-bot daily limit
+            max_ticker_risk,           # concentration limit
+            remaining_city,            # city-level concentration (weather)
+        )
+
+        # 7. Scale up for high-confidence info-arb trades
+        # When confidence > 90%, allow up to 25% of bankroll per trade
+        if confidence > 0.90 and edge > 0.15:
+            high_conf_max = int(available_balance * 0.25)
+            allocated = min(
+                high_conf_max,
+                remaining_portfolio,
+                remaining_bot * 2,  # relax bot cap for high-confidence
+                max_ticker_risk * 2,
+                remaining_city,     # NEVER bypass city limit
+            )
+            self.log.info(
+                "High-confidence trade: %s edge=%.1f%% conf=%.0f%% -> budget $%.2f",
+                ticker, edge * 100, confidence * 100, allocated / 100
+            )
+
+        if allocated <= 0:
+            return BudgetResponse(False, reason="computed allocation is zero")
+
+        return BudgetResponse(
+            approved=True,
+            max_cost_cents=allocated,
+            bankroll_cents=bankroll,  # total equity for Kelly sizing
+        )
+
+    def get_status(self):
+        """Return current allocation status for logging/monitoring."""
+        self._reset_daily_if_needed()
+        total, available = self._get_balance()
+        return {
+            "bankroll_cents": total,
+            "available_cents": available,
+            "total_risk_today_cents": self._total_risk_cents,
+            "portfolio_risk_limit_cents": int(available * PORTFOLIO_DAILY_LOSS_FRACTION) if available else 0,
+            "tickers_traded_today": len(self._traded_tickers),
+            "bot_spend": dict(self._bot_spend),
+        }

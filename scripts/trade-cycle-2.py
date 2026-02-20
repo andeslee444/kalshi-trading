@@ -10,6 +10,7 @@ from pathlib import Path
 # sys.path directly so that ``from kalshi_auth import ...`` works.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"))
 from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_logging, PROJECT_DIR
+from probability import half_kelly_sell, longshot_edge, kalshi_fee_cents
 
 setup_unbuffered()
 
@@ -198,20 +199,28 @@ for m in all_longshots:
     title = m.get("title", "")
     subtitle = m.get("subtitle", "")
 
-    if not no_ask or no_ask > 99 or no_ask < 90:
+    # Rec 5: Only sell longshots when NO ≤ 96c (profit/risk ratio floor)
+    if not no_ask or no_ask > 96:
         continue
 
-    # Buy NO at no_ask — risk = no_ask per contract, profit = 100 - no_ask if longshot loses
-    # Max $5 -> contracts = min(floor(500/no_ask), 5)
-    contracts = min(500 // no_ask, 5)
+    # Category-adjusted Becker model: returns additive edge (implied - true)
+    est_edge = longshot_edge(yes_ask, ticker=ticker)
+    fee_per_contract = kalshi_fee_cents(yes_ask)
+    fee_as_edge = fee_per_contract / 100
+    min_edge = fee_as_edge + 0.005
+    if est_edge < min_edge:
+        continue
+
+    # Half-Kelly sizing with actual bankroll
+    contracts, risk_c = half_kelly_sell(est_edge, yes_ask, 500, bankroll_cents=balance_cents)
+    if contracts < 1:
+        contracts = min(500 // no_ask, 5)
     if contracts < 1:
         continue
 
-    # Becker model edge estimate
     implied_prob = yes_ask / 100
-    # Longshots at <=5c historically win ~40-60% less than implied
-    est_true_prob = max(0.001, implied_prob * 0.43)  # Becker: 1c contracts win 0.43% vs 1% implied
-    edge = (1 - est_true_prob) - (no_ask / 100)
+    est_true_prob = max(0.001, implied_prob - est_edge)
+    edge = est_edge
 
     order = {
         "ticker": ticker,

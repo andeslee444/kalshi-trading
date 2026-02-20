@@ -592,14 +592,20 @@ class TradeManager:
             self.log.warning("Daily trade limit (%d) reached — skipping %s", max_daily, ticker)
             return None
 
-        # 4. Daily loss/spend limit
+        # 4. Daily loss/spend limit (risk-adjusted: YES risk = cost, NO risk = 100-price per contract)
         max_loss_cents = int(self.config["maxDailyLoss"] * 100)
-        cost_cents = price_cents * count
-        if self._daily_spend_cents + cost_cents > max_loss_cents:
+        if side == "no":
+            # Buying NO: max loss per contract is (100 - no_price) cents
+            risk_per_contract = 100 - price_cents
+        else:
+            # Buying YES: max loss per contract is price_cents
+            risk_per_contract = price_cents
+        risk_cents = risk_per_contract * count
+        if self._daily_spend_cents + risk_cents > max_loss_cents:
             self.log.warning(
-                "Daily loss limit ($%.2f) would be exceeded — spent $%.2f + $%.2f > $%.2f. Skipping %s",
+                "Daily loss limit ($%.2f) would be exceeded — risked $%.2f + $%.2f > $%.2f. Skipping %s",
                 self.config["maxDailyLoss"],
-                self._daily_spend_cents / 100, cost_cents / 100,
+                self._daily_spend_cents / 100, risk_cents / 100,
                 max_loss_cents / 100, ticker
             )
             return None
@@ -609,13 +615,14 @@ class TradeManager:
             self.log.info("Skipping %s — traded recently (dedup)", ticker)
             return None
 
-        # 6. Cost cap (adjust count down if needed)
+        # 6. Cost cap (adjust count down if needed, using risk-adjusted cost)
         max_cost_cents = int(self.config["maxTradeAmount"] * 100)
-        if price_cents * count > max_cost_cents:
-            count = max(1, max_cost_cents // price_cents)
+        cost_per_contract = price_cents
+        if cost_per_contract * count > max_cost_cents:
+            count = max(1, max_cost_cents // cost_per_contract)
 
         # 7. Balance check (optional)
-        cost_cents = price_cents * count
+        cost_cents = cost_per_contract * count
         if available_balance_cents is not None and cost_cents > available_balance_cents:
             self.log.warning(
                 "Insufficient balance: need %dc but only %dc available. Skipping %s",
@@ -658,9 +665,12 @@ class TradeManager:
             self.log.error("Order failed for %s: %s", ticker, e)
             return None
 
-        # 10. Update counters and save trade
+        # 10. Update counters and save trade (track risk, not raw cost)
         self._daily_trades += 1
-        self._daily_spend_cents += cost_cents
+        if side == "no":
+            self._daily_spend_cents += (100 - price_cents) * count
+        else:
+            self._daily_spend_cents += cost_cents
 
         trade_record = {
             "timestamp": datetime.datetime.now().isoformat(),
@@ -678,6 +688,85 @@ class TradeManager:
         self.tracker.record(ticker)
 
         self.log.info("Order placed: %dx %s @ %dc on %s (ID: %s, Status: %s)",
+                       count, side, price_cents, ticker,
+                       order_info.get("order_id"), order_info.get("status"))
+        return order_info
+
+    def sell_position(self, ticker, side, price_cents, count, reasoning,
+                      **extra_fields):
+        """Sell/exit an existing position with lighter safety checks.
+
+        Exits free capital rather than consuming it, so daily trade limits
+        and dedup are skipped. Only kill switch + circuit breaker enforced.
+
+        Args:
+            ticker: Market ticker string.
+            side: "yes" or "no" — the side we're selling.
+            price_cents: Limit price in cents (1-99).
+            count: Number of contracts to sell.
+            reasoning: Human-readable exit rationale.
+            **extra_fields: Additional fields for the trade record.
+
+        Returns:
+            Order info dict from API on success, or None if blocked/failed.
+        """
+        if side not in ("yes", "no"):
+            self.log.error("Invalid side '%s' — must be 'yes' or 'no'", side)
+            return None
+
+        # 1. Kill switch
+        if check_kill_switch(self.kill_switch_path):
+            self.log.warning("KILL SWITCH ACTIVE — refusing exit on %s", ticker)
+            return None
+
+        # 2. Circuit breaker
+        if self.breaker.is_open():
+            self.log.warning("Circuit breaker OPEN — skipping exit on %s", ticker)
+            return None
+
+        # Build sell order
+        order_body = {
+            "ticker": ticker,
+            "action": "sell",
+            "side": side,
+            "type": "limit",
+            "count": count,
+        }
+        if side == "yes":
+            order_body["yes_price"] = price_cents
+        else:
+            order_body["no_price"] = price_cents
+
+        try:
+            result = self.client.post("/portfolio/orders", body=order_body)
+            order_info = result.get("order", {})
+            self.breaker.record_success()
+        except requests.exceptions.HTTPError as e:
+            self.breaker.record_failure()
+            self.log.error("Sell order failed for %s: %s %s", ticker,
+                           e.response.status_code, e.response.text[:300])
+            return None
+        except Exception as e:
+            self.breaker.record_failure()
+            self.log.error("Sell order failed for %s: %s", ticker, e)
+            return None
+
+        # Save exit record
+        trade_record = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "ticker": ticker,
+            "action": "sell",
+            "side": side,
+            "price_cents": price_cents,
+            "count": count,
+            "reasoning": reasoning,
+            "order_id": order_info.get("order_id"),
+            "status": order_info.get("status"),
+        }
+        trade_record.update(extra_fields)
+        save_trade(self.trades_path, trade_record)
+
+        self.log.info("EXIT placed: sell %dx %s @ %dc on %s (ID: %s, Status: %s)",
                        count, side, price_cents, ticker,
                        order_info.get("order_id"), order_info.get("status"))
         return order_info

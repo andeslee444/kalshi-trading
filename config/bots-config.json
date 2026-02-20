@@ -8,7 +8,7 @@
     "tickers": ["ALBUM", "BOX", "MOVIE", "STREAM", "MUSIC", "BILLBOARD", "OSCAR", "GRAMMY", "SPOTIFY", "FILM", "ENTERTAIN"]
   },
   "beatrelease": {
-    "checkIntervalHours": 4,
+    "checkIntervalHours": 1,
     "maxTradeCents": 500,
     "maxDailyTrades": 10,
     "maxDailyLoss": 25,
@@ -22,5 +22,46 @@
     "maxBetCents": 500,
     "maxDailyTrades": 20,
     "maxDailyLoss": 50
+  },
+  "crypto": {
+    "maxTradeAmount": 10,
+    "maxDailyTrades": 30,
+    "maxDailyLoss": 25,
+    "scanIntervalMinutes": 5,
+    "edgeThreshold": 0.06,
+    "settlementBufferMinutes": 2
+  },
+  "economics": {
+    "maxTradeAmount": 15,
+    "maxDailyTrades": 5,
+    "maxDailyLoss": 30,
+    "scanIntervalMinutes": 360,
+    "edgeThreshold": 0.08
+  },
+  "cross_platform_arb": {
+    "scanIntervalMinutes": 30,
+    "minSpreadPct": 0.02,
+    "executionEnabled": false,
+    "maxTradeAmount": 10,
+    "maxDailyTrades": 10,
+    "maxDailyLoss": 25
+  },
+  "position_monitor": {
+    "scanIntervalMinutes": 15,
+    "takeProfitThreshold": 0.85,
+    "stopLossThreshold": 0.20,
+    "modelShiftThreshold": 0.25,
+    "maxDailyExits": 20
+  },
+  "market_maker": {
+    "enabled": false,
+    "scanIntervalMinutes": 5,
+    "maxInventoryPerMarket": 20,
+    "gamma": 0.3,
+    "kParam": 1.5,
+    "maxTradeAmount": 5,
+    "maxDailyTrades": 50,
+    "maxDailyLoss": 25,
+    "targetMarkets": ["KXHIGH"]
   }
 }

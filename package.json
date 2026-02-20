@@ -10,6 +10,11 @@
     "hdd": "python3 src/kalshi/hdd-scraper.py",
     "monitor": "python3 src/kalshi/source-monitor.py",
     "cycle": "python3 scripts/trade-cycle-2.py",
+    "positions": "python3 src/kalshi/position-monitor.py",
+    "economics": "python3 src/kalshi/economics-bot.py",
+    "crypto": "python3 src/kalshi/crypto-bot.py",
+    "arb": "python3 src/kalshi/cross-platform-arb.py",
+    "mm": "python3 src/kalshi/market-maker.py",
     "calibrate": "python3 scripts/calibrate-sigma.py",
     "backtest": "python3 scripts/backtest.py"
   },

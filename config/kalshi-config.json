@@ -1,8 +1,8 @@
 {
   "mode": "demo",
-  "maxTradeAmount": 5,
+  "maxTradeAmount": 15,
   "maxDailyTrades": 10,
-  "maxDailyLoss": 10,
+  "maxDailyLoss": 30,
   "scanIntervalMinutes": 30,
   "edgeThreshold": 0.08,
   "cities": {
@@ -14,5 +14,10 @@
     "AUS": { "lat": 30.27, "lon": -97.74, "name": "Austin" },
     "DEN": { "lat": 39.74, "lon": -104.99, "name": "Denver" },
     "HOU": { "lat": 29.76, "lon": -95.37, "name": "Houston" }
+  },
+  "ensemble": {
+    "enabled": false,
+    "models": ["gfs", "ecmwf", "icon"],
+    "weights": { "gfs": 0.40, "ecmwf": 0.40, "icon": 0.20 }
   }
 }

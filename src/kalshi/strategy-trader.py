@@ -7,7 +7,8 @@ import json, time, datetime, os, sys, math
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log, _atomic_write_json
-from probability import half_kelly_sell
+from probability import half_kelly_sell, longshot_edge, compute_limit_price, kalshi_fee_cents
+from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
 log = setup_logging("strategy")
@@ -21,6 +22,7 @@ _bots_cfg = json.loads(BOTS_CONFIG_PATH.read_text())["strategy"]
 MAX_BET = _bots_cfg["maxBetCents"]
 
 client = KalshiClient()
+allocator = PortfolioAllocator(client, logger=log)
 
 TRADES_JSON_PATH = DATA_DIR / "kalshi-strategy-trades.json"
 trade_manager = TradeManager(client, TRADES_JSON_PATH, {
@@ -31,7 +33,11 @@ trade_manager = TradeManager(client, TRADES_JSON_PATH, {
 trim_trade_log(TRADES_JSON_PATH)
 
 def find_longshot_sells(markets, bankroll):
-    """Find contracts priced <10c YES to SELL (exploit longshot bias)."""
+    """Find contracts priced <15c YES to SELL (exploit longshot bias).
+
+    Uses category-adjusted Becker model via longshot_edge() which returns
+    a proper additive probability edge (implied_prob - true_prob).
+    """
     now = datetime.datetime.now(datetime.timezone.utc)
     candidates = []
     for m in markets:
@@ -53,24 +59,45 @@ def find_longshot_sells(markets, bankroll):
         if hours < 0.5:
             continue
 
-        # Becker (2025) "Favourite-Longshot Bias in Prediction Markets":
-        #   1-cent contracts are overpriced by ~57% (win rate 0.43% vs 1% implied).
-        #   Mispricing decays exponentially with price: edge ≈ 0.57 * e^(-0.15 * price).
-        #   At 5c, edge ≈ 27%; at 10c, edge ≈ 13%; at 15c, edge ≈ 6%.
-        # Time-decay: full edge only if >24h to close, decay to 50% at 1h
-        time_factor = min(1.0, 0.5 + 0.5 * min(hours, 24) / 24)
-        est_edge = max(0, 0.57 * math.exp(-0.15 * yes_ask) * time_factor)
+        # Category-adjusted Becker model: returns additive edge
+        # (implied_prob - true_prob), correctly accounting for category-specific
+        # bias strength and time decay
+        est_edge = longshot_edge(yes_ask, ticker=ticker, hours_to_close=hours)
 
-        if est_edge < 0.03:
+        # Fee-aware minimum edge: need net edge after Kalshi fees
+        fee_per_contract = kalshi_fee_cents(yes_ask)
+        fee_as_edge = fee_per_contract / 100  # convert to probability edge
+        min_edge = fee_as_edge + 0.005  # need 0.5% net edge after fees
+        if est_edge < min_edge:
             continue
 
-        sell_price = max(yes_bid, yes_ask - 1) if yes_bid > 0 else yes_ask
+        # Place limit within the spread instead of at full ask
+        sell_price = compute_limit_price(yes_bid, yes_ask, "yes") if yes_bid else yes_ask
+        if sell_price <= 1:
+            sell_price = max(yes_bid, yes_ask - 1) if yes_bid > 0 else yes_ask
         if sell_price <= 1:
             continue
 
-        contracts, risk = half_kelly_sell(est_edge, sell_price, MAX_BET, bankroll_cents=bankroll)
+        # Rec 5: Only sell longshots when NO ≤ 96c (profit/risk ratio floor)
+        # At NO=99c, profit:risk = 1:99. At NO=96c, ratio = 4:96 ≈ 4.2%
+        no_price = 100 - sell_price
+        if no_price > 96:
+            continue
+
+        # Request budget from portfolio allocator
+        budget = allocator.request_budget("strategy", ticker, edge=est_edge)
+        if not budget.approved:
+            continue
+
+        contracts, risk = half_kelly_sell(
+            est_edge, sell_price, budget.max_cost_cents,
+            bankroll_cents=budget.bankroll_cents,
+        )
         if contracts <= 0:
             continue
+
+        implied_prob = yes_ask / 100.0
+        true_prob = implied_prob - est_edge
 
         candidates.append({
             "ticker": ticker,
@@ -86,7 +113,7 @@ def find_longshot_sells(markets, bankroll):
             "risk_cents": risk,
             "hours_to_close": hours,
             "volume": volume,
-            "reasoning": f"Longshot bias: YES@{sell_price}c implies {sell_price}% prob, Becker model est true prob ~{sell_price - est_edge*100:.1f}%. Sell YES (buy NO@{100-sell_price}c) for ~{est_edge*100:.1f}% edge."
+            "reasoning": f"Longshot bias: YES@{sell_price}c implies {implied_prob*100:.1f}% prob, Becker model est true prob ~{true_prob*100:.2f}%. Sell YES (buy NO@{100-sell_price}c) for ~{est_edge*100:.2f}% edge."
         })
 
     candidates.sort(key=lambda x: -x["est_edge"] * math.log1p(x["volume"]))
@@ -230,12 +257,13 @@ def main():
 
         result = trade_manager.place_order(
             ticker, "no", no_price, contracts, c["reasoning"],
-            strategy="longshot_sell", est_edge=f"{c['est_edge']*100:.1f}%",
+            strategy="longshot_sell", est_edge=f"{c['est_edge']*100:.2f}%",
             risk_cents=c["risk_cents"], title=c["title"],
             subtitle=c.get("subtitle", ""),
             yes_price_at_entry=c["yes_price"],
         )
         if result:
+            allocator.record_trade("strategy", ticker, c["risk_cents"])
             trades_executed.append({
                 "ticker": ticker,
                 "title": c["title"],

@@ -43,6 +43,30 @@ TRADE_FILES = [
         "label": "BeatRelease Scanner",
         "path": PROJECT_DIR / "data" / "beatrelease-trades.json",
     },
+    {
+        "label": "Source Monitor",
+        "path": PROJECT_DIR / "data" / "kalshi-monitor-trades.json",
+    },
+    {
+        "label": "Position Monitor",
+        "path": PROJECT_DIR / "data" / "kalshi-position-trades.json",
+    },
+    {
+        "label": "Economics Bot",
+        "path": PROJECT_DIR / "data" / "kalshi-economics-trades.json",
+    },
+    {
+        "label": "Crypto Bot",
+        "path": PROJECT_DIR / "data" / "kalshi-crypto-trades.json",
+    },
+    {
+        "label": "Cross-Platform Arb",
+        "path": PROJECT_DIR / "data" / "kalshi-arb-trades.json",
+    },
+    {
+        "label": "Market Maker",
+        "path": PROJECT_DIR / "data" / "kalshi-mm-trades.json",
+    },
 ]
 
 

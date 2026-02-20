@@ -13,7 +13,8 @@ import json, time, datetime, os, sys, re, hashlib, traceback
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log
-from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, half_kelly
+from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, half_kelly, compute_limit_price, edge_after_fees
+from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
 log = setup_logging("source-monitor")
@@ -32,6 +33,7 @@ SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 config = json.loads(CONFIG_PATH.read_text())
 
 client = KalshiClient()
+allocator = PortfolioAllocator(client, logger=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": config["maxTradeAmount"],
     "maxDailyTrades": config["maxDailyTrades"],
@@ -200,31 +202,48 @@ def evaluate_album_trade(market, sale):
 
     yes_ask = market.get("yes_ask", 0)
     no_ask = market.get("no_ask", 0)
-    max_cost = config["maxTradeAmount"] * 100
+    yes_bid = market.get("yes_bid", 0)
+
+    # Lower edge threshold for confirmed data (sigma <= 5%)
+    min_edge = 0.05 if sigma <= 0.05 else 0.10
 
     if outcome == "yes" and yes_ask and yes_ask < 99:
-        edge = confidence - yes_ask / 100
-        if edge > 0.10:
-            count, risk = half_kelly(edge, yes_ask, max_cost)
-            if count < 1:
-                count = 1
-            reasoning = f"HDD confirms {artist} sold {units/1000:.0f}K units vs {threshold/1000:.0f}K threshold. YES at {yes_ask}c, confidence {confidence*100:.0f}%"
+        edge = edge_after_fees(confidence - yes_ask / 100, yes_ask)
+        if edge > min_edge:
+            budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence)
+            if not budget.approved:
+                log.info(f"  Allocator denied {ticker}: {budget.reason}")
+                return
+            price = compute_limit_price(yes_bid, yes_ask, "yes") or yes_ask
+            count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+            if count <= 0:
+                return
+            reasoning = f"HDD confirms {artist} sold {units/1000:.0f}K units vs {threshold/1000:.0f}K threshold. YES at {price}c, confidence {confidence*100:.0f}%"
             log.info(f"\nARBITRAGE FOUND: HITS Daily Double confirms {artist} sold {units/1000:.0f}K units")
-            log.info(f"    Market: {ticker} YES at {yes_ask}c -> buying YES (confirmed outcome)")
-            log.info(f"    Edge: ~{edge*100:.0f}% | Trade: {count} contracts @ {yes_ask}c = ${count*yes_ask/100:.2f}")
-            trade_manager.place_order(ticker, "yes", yes_ask, count, reasoning)
+            log.info(f"    Market: {ticker} YES at {price}c -> buying YES (confirmed outcome)")
+            log.info(f"    Edge: ~{edge*100:.0f}% | Trade: {count} contracts @ {price}c = ${count*price/100:.2f}")
+            result = trade_manager.place_order(ticker, "yes", price, count, reasoning)
+            if result:
+                allocator.record_trade("source-monitor", ticker, risk)
 
     elif outcome == "no" and no_ask and no_ask < 99:
-        edge = confidence - no_ask / 100
-        if edge > 0.10:
-            count, risk = half_kelly(edge, no_ask, max_cost)
-            if count < 1:
-                count = 1
-            reasoning = f"HDD confirms {artist} sold {units/1000:.0f}K units vs {threshold/1000:.0f}K threshold. NO at {no_ask}c, confidence {confidence*100:.0f}%"
+        edge = edge_after_fees(confidence - no_ask / 100, no_ask)
+        if edge > min_edge:
+            budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence)
+            if not budget.approved:
+                log.info(f"  Allocator denied {ticker}: {budget.reason}")
+                return
+            price = compute_limit_price(yes_bid, yes_ask, "no") or no_ask
+            count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+            if count <= 0:
+                return
+            reasoning = f"HDD confirms {artist} sold {units/1000:.0f}K units vs {threshold/1000:.0f}K threshold. NO at {price}c, confidence {confidence*100:.0f}%"
             log.info(f"\nARBITRAGE FOUND: HITS Daily Double confirms {artist} sold {units/1000:.0f}K units")
-            log.info(f"    Market: {ticker} NO at {no_ask}c -> buying NO (confirmed under threshold)")
-            log.info(f"    Edge: ~{edge*100:.0f}% | Trade: {count} contracts @ {no_ask}c = ${count*no_ask/100:.2f}")
-            trade_manager.place_order(ticker, "no", no_ask, count, reasoning)
+            log.info(f"    Market: {ticker} NO at {price}c -> buying NO (confirmed under threshold)")
+            log.info(f"    Edge: ~{edge*100:.0f}% | Trade: {count} contracts @ {price}c = ${count*price/100:.2f}")
+            result = trade_manager.place_order(ticker, "no", price, count, reasoning)
+            if result:
+                allocator.record_trade("source-monitor", ticker, risk)
 
 
 # ============================================================
@@ -351,29 +370,44 @@ def evaluate_boxoffice_trade(market, movie):
 
     yes_ask = market.get("yes_ask", 0)
     no_ask = market.get("no_ask", 0)
-    max_cost = config["maxTradeAmount"] * 100
+    yes_bid = market.get("yes_bid", 0)
+
+    # Lower edge threshold for confirmed data (sigma <= 5%)
+    min_edge = 0.05 if sigma <= 0.05 else 0.10
 
     if outcome == "yes" and yes_ask and yes_ask < 99:
-        edge = confidence - yes_ask / 100
-        if edge > 0.10:
-            count, risk = half_kelly(edge, yes_ask, max_cost)
-            if count < 1:
-                count = 1
+        edge = edge_after_fees(confidence - yes_ask / 100, yes_ask)
+        if edge > min_edge:
+            budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence)
+            if not budget.approved:
+                return
+            price = compute_limit_price(yes_bid, yes_ask, "yes") or yes_ask
+            count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+            if count <= 0:
+                return
             reasoning = f"Box office data shows {movie_title} at ${gross/1e6:.1f}M vs ${threshold/1e6:.0f}M threshold (conf {confidence*100:.0f}%)"
             log.info(f"\nARBITRAGE FOUND: {movie_title} box office ${gross/1e6:.1f}M > ${threshold/1e6:.0f}M")
-            log.info(f"    Market: {ticker} YES at {yes_ask}c | conf={confidence*100:.0f}%")
-            trade_manager.place_order(ticker, "yes", yes_ask, count, reasoning)
+            log.info(f"    Market: {ticker} YES at {price}c | conf={confidence*100:.0f}%")
+            result = trade_manager.place_order(ticker, "yes", price, count, reasoning)
+            if result:
+                allocator.record_trade("source-monitor", ticker, risk)
 
     elif outcome == "no" and no_ask and no_ask < 99:
-        edge = confidence - no_ask / 100
-        if edge > 0.10:
-            count, risk = half_kelly(edge, no_ask, max_cost)
-            if count < 1:
-                count = 1
+        edge = edge_after_fees(confidence - no_ask / 100, no_ask)
+        if edge > min_edge:
+            budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence)
+            if not budget.approved:
+                return
+            price = compute_limit_price(yes_bid, yes_ask, "no") or no_ask
+            count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+            if count <= 0:
+                return
             reasoning = f"Box office data shows {movie_title} at ${gross/1e6:.1f}M vs ${threshold/1e6:.0f}M threshold (conf {confidence*100:.0f}%)"
             log.info(f"\nARBITRAGE FOUND: {movie_title} box office ${gross/1e6:.1f}M < ${threshold/1e6:.0f}M")
-            log.info(f"    Market: {ticker} NO at {no_ask}c | conf={confidence*100:.0f}%")
-            trade_manager.place_order(ticker, "no", no_ask, count, reasoning)
+            log.info(f"    Market: {ticker} NO at {price}c | conf={confidence*100:.0f}%")
+            result = trade_manager.place_order(ticker, "no", price, count, reasoning)
+            if result:
+                allocator.record_trade("source-monitor", ticker, risk)
 
 
 # ============================================================
@@ -521,16 +555,6 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
         log.info(f"  Found {len(today_markets)} temperature markets settling today")
 
         now = datetime.datetime.now()
-        if now.hour < 15:
-            log.info(f"  Before 3 PM -- waiting for more temperature data before trading")
-            for m, parsed in today_markets:
-                city = parsed["city"]
-                if city in temp_data and "running_high_f" in temp_data[city]:
-                    high = temp_data[city]["running_high_f"]
-                    thresh = parsed["threshold"]
-                    direction = "above" if parsed["direction"] == "T" else "bracket"
-                    log.info(f"    {m['ticker']}: running high {high:.1f}F vs threshold {thresh}F ({direction})")
-            return
 
         for m, parsed in today_markets:
             city = parsed["city"]
@@ -542,70 +566,72 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
             direction = parsed["direction"]
             ticker = m.get("ticker", "")
             max_cost = config["maxTradeAmount"] * 100
+            is_bracket = (direction == "B")
 
             prob = nws_probability(running_high, threshold, direction, now.hour)
 
+            yes_ask = m.get("yes_ask", 0)
+            no_ask = m.get("no_ask", 0)
+            yes_bid = m.get("yes_bid", 0)
+
+            # Determine trade side and edge
             if direction == "T":
                 margin = running_high - threshold
+            else:
+                margin = 0  # bracket
 
-                if prob > 0.5:
-                    # Likely YES
-                    yes_ask = m.get("yes_ask", 0)
-                    if yes_ask and yes_ask < 99:
-                        edge = prob - yes_ask / 100
-                        if edge > 0.10:
-                            count, risk = half_kelly(edge, yes_ask, max_cost)
-                            if count < 1:
-                                count = 1
-                            reasoning = f"NWS {city} running high {running_high:.1f}F > {threshold}F by {margin:.1f}F, prob {prob*100:.0f}% (hour {now.hour})"
-                            log.info(f"\nARBITRAGE FOUND: NWS actual temp confirms {city} high {running_high:.1f}F > {threshold}F")
-                            log.info(f"    Market: {ticker} YES at {yes_ask}c -> buying YES")
-                            log.info(f"    Edge: ~{edge*100:.0f}% | Prob: {prob*100:.0f}% | Margin: {margin:.1f}F")
-                            trade_manager.place_order(ticker, "yes", yes_ask, count, reasoning)
-                else:
-                    # Likely NO
-                    no_ask = m.get("no_ask", 0)
-                    if no_ask and no_ask < 99:
-                        edge = (1.0 - prob) - no_ask / 100
-                        if edge > 0.10:
-                            count, risk = half_kelly(edge, no_ask, max_cost)
-                            if count < 1:
-                                count = 1
-                            reasoning = f"NWS {city} running high {running_high:.1f}F < {threshold}F by {abs(margin):.1f}F, prob NO {(1-prob)*100:.0f}% (hour {now.hour})"
-                            log.info(f"\nARBITRAGE FOUND: NWS actual temp confirms {city} high {running_high:.1f}F < {threshold}F")
-                            log.info(f"    Market: {ticker} NO at {no_ask}c -> buying NO")
-                            log.info(f"    Edge: ~{edge*100:.0f}% | Prob NO: {(1-prob)*100:.0f}% | Margin: {abs(margin):.1f}F")
-                            trade_manager.place_order(ticker, "no", no_ask, count, reasoning)
+            if prob > 0.5 and yes_ask and yes_ask < 99:
+                # Buy YES
+                edge = edge_after_fees(prob - yes_ask / 100, yes_ask)
+                # Rec 1: Brackets need 2x edge threshold (20% for NWS)
+                base_min_edge = 0.20 if is_bracket else 0.10
+                # Lower threshold for high-confidence NWS (hour >= 17, non-bracket)
+                min_edge = base_min_edge * 0.5 if now.hour >= 17 and not is_bracket else base_min_edge
+                # Rec 2: YES side requires 15%+ edge (0% historical win rate)
+                min_edge = max(min_edge, 0.15)
+                if edge > min_edge:
+                    budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=prob)
+                    if not budget.approved:
+                        continue
+                    price = compute_limit_price(yes_bid, yes_ask, "yes") or yes_ask
+                    count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+                    if count <= 0:
+                        continue
+                    if direction == "T":
+                        reasoning = f"NWS {city} running high {running_high:.1f}F > {threshold}F by {margin:.1f}F, prob {prob*100:.0f}% (hour {now.hour})"
+                    else:
+                        reasoning = f"NWS {city} running high {running_high:.1f}F in bracket [{threshold}, {threshold+1})F, prob {prob*100:.0f}%"
+                    log.info(f"\nARBITRAGE FOUND: NWS {city} high {running_high:.1f}F -> YES on {ticker}")
+                    log.info(f"    YES at {price}c | Edge: ~{edge*100:.0f}% | Prob: {prob*100:.0f}%")
+                    result = trade_manager.place_order(ticker, "yes", price, count, reasoning)
+                    if result:
+                        allocator.record_trade("source-monitor", ticker, risk)
 
-            elif direction == "B":
-                # Bracket market: P(threshold <= actual < threshold+1)
-                if prob > 0.5:
-                    # Bracket likely to hit — buy YES
-                    yes_ask = m.get("yes_ask", 0)
-                    if yes_ask and yes_ask < 99:
-                        edge = prob - yes_ask / 100
-                        if edge > 0.10:
-                            count, risk = half_kelly(edge, yes_ask, max_cost)
-                            if count < 1:
-                                count = 1
-                            reasoning = f"NWS {city} running high {running_high:.1f}F in bracket [{threshold}, {threshold+1})F, prob {prob*100:.0f}%"
-                            log.info(f"\nARBITRAGE FOUND: NWS confirms {city} high {running_high:.1f}F in bracket {threshold}-{threshold+1}F")
-                            log.info(f"    Market: {ticker} YES at {yes_ask}c | Prob: {prob*100:.0f}%")
-                            trade_manager.place_order(ticker, "yes", yes_ask, count, reasoning)
-                else:
-                    # Bracket unlikely — buy NO
-                    no_prob = 1.0 - prob
-                    no_ask = m.get("no_ask", 0)
-                    if no_ask and no_ask < 99:
-                        edge = no_prob - no_ask / 100
-                        if edge > 0.10:
-                            count, risk = half_kelly(edge, no_ask, max_cost)
-                            if count < 1:
-                                count = 1
-                            reasoning = f"NWS {city} running high {running_high:.1f}F outside bracket [{threshold}, {threshold+1})F, prob NO {no_prob*100:.0f}%"
-                            log.info(f"\nARBITRAGE FOUND: NWS confirms {city} high {running_high:.1f}F outside bracket {threshold}-{threshold+1}F")
-                            log.info(f"    Market: {ticker} NO at {no_ask}c | Prob NO: {no_prob*100:.0f}%")
-                            trade_manager.place_order(ticker, "no", no_ask, count, reasoning)
+            elif prob <= 0.5 and no_ask and no_ask < 99:
+                # Buy NO
+                no_prob = 1.0 - prob
+                edge = edge_after_fees(no_prob - no_ask / 100, no_ask)
+                # Rec 1: Brackets need 2x edge threshold (20% for NWS)
+                base_min_edge = 0.20 if is_bracket else 0.10
+                # Lower threshold for high-confidence NWS (hour >= 17, non-bracket)
+                min_edge = base_min_edge * 0.5 if now.hour >= 17 and not is_bracket else base_min_edge
+                if edge > min_edge:
+                    budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=no_prob)
+                    if not budget.approved:
+                        continue
+                    price = compute_limit_price(yes_bid, yes_ask, "no") or no_ask
+                    count, risk = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents)
+                    if count <= 0:
+                        continue
+                    if direction == "T":
+                        reasoning = f"NWS {city} running high {running_high:.1f}F < {threshold}F by {abs(margin):.1f}F, prob NO {no_prob*100:.0f}% (hour {now.hour})"
+                    else:
+                        reasoning = f"NWS {city} running high {running_high:.1f}F outside bracket [{threshold}, {threshold+1})F, prob NO {no_prob*100:.0f}%"
+                    log.info(f"\nARBITRAGE FOUND: NWS {city} high {running_high:.1f}F -> NO on {ticker}")
+                    log.info(f"    NO at {price}c | Edge: ~{edge*100:.0f}% | Prob NO: {no_prob*100:.0f}%")
+                    result = trade_manager.place_order(ticker, "no", price, count, reasoning)
+                    if result:
+                        allocator.record_trade("source-monitor", ticker, risk)
 
     except Exception as e:
         log.error(f"  NWS market matching failed: {e}")
