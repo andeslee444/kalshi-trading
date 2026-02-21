@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -130,16 +131,42 @@ def format_report(data: dict) -> str:
     return "\n".join(lines)
 
 
+def append_backtest_info(lines: list) -> None:
+    """Append backtest Brier score summary if results file exists."""
+    backtest_path = Path(__file__).resolve().parent.parent / "data" / "backtest-results.json"
+    if not backtest_path.exists():
+        return
+    try:
+        bt = json.loads(backtest_path.read_text())
+        bs = bt.get("brier_score")
+        gen = bt.get("generated_at", "?")
+        if bs is not None:
+            lines.append(f"\nBacktest: Brier={bs:.4f} (as of {gen})")
+            per_bot = bt.get("per_bot", {})
+            for bot, stats in per_bot.items():
+                bot_bs = stats.get("brier_score")
+                if bot_bs is not None:
+                    lines.append(f"  {bot}: Brier={bot_bs:.4f} (n={stats.get('n_evaluated', 0)})")
+    except Exception:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(description="Daily P&L report")
     parser.add_argument("--notify", action="store_true",
                         help="Send report via WhatsApp")
+    parser.add_argument("--with-backtest", action="store_true",
+                        help="Include backtest Brier score summary")
     args = parser.parse_args()
 
     log.info("Building daily report...")
     data = build_report()
-    report = format_report(data)
+    report_lines = format_report(data).split("\n")
 
+    if args.with_backtest:
+        append_backtest_info(report_lines)
+
+    report = "\n".join(report_lines)
     print(report)
 
     if args.notify:

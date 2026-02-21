@@ -13,15 +13,16 @@ Usage:
 
 import json, time, datetime, os, sys, re, argparse, traceback
 import requests
+from bs4 import BeautifulSoup
 from pathlib import Path
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot,
-    HealthCheckMonitor,
+    HealthCheckMonitor, OrderMonitor,
 )
 from probability import (
     econ_nowcast_probability, cpi_nowcast_sigma, half_kelly, compute_limit_price,
-    kalshi_fee_cents,
+    kalshi_fee_cents, gas_price_probability,
 )
 from capital_allocator import PortfolioAllocator
 
@@ -47,24 +48,136 @@ EDGE_THRESHOLD = econ_config.get("edgeThreshold", 0.08)
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
 health = HealthCheckMonitor(logger=log)
+order_monitor = OrderMonitor(client, log=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": MAX_TRADE,
     "maxDailyTrades": MAX_DAILY_TRADES,
     "maxDailyLoss": MAX_DAILY_LOSS,
-}, logger=log)
+}, logger=log, order_monitor=order_monitor)
 trim_trade_log(TRADES_PATH)
 
 # === Market ticker prefixes ===
-ECON_PREFIXES = ["KXCPI", "KXGDP", "KXJOBS", "KXFED", "KXINFLATION", "KXECON"]
+ECON_PREFIXES = ["KXCPI", "KXGDP", "KXJOBS", "KXFED", "KXINFLATION", "KXECON", "KXGAS"]
+
+# === Nowcast cache ===
+NOWCAST_CACHE_PATH = PROJECT_DIR / "data" / "econ-nowcast-cache.json"
+NOWCAST_CACHE_TTL = 24 * 3600  # 24 hours
+
+
+def _load_nowcast_cache():
+    """Load cached nowcast values if fresh (within TTL)."""
+    if not NOWCAST_CACHE_PATH.exists():
+        return None
+    try:
+        cache = json.loads(NOWCAST_CACHE_PATH.read_text())
+        ts = cache.get("cached_at", 0)
+        if time.time() - ts < NOWCAST_CACHE_TTL:
+            return cache.get("data", {})
+    except Exception:
+        pass
+    return None
+
+
+def _save_nowcast_cache(data):
+    """Save nowcast values to cache with timestamp."""
+    from kalshi_auth import _atomic_write_json
+    _atomic_write_json(NOWCAST_CACHE_PATH, {"cached_at": time.time(), "data": data})
 
 
 # === Data Sources ===
 
+def _parse_nowcast_bs4(html):
+    """Parse Cleveland Fed nowcast page using BeautifulSoup.
+
+    Looks for percentage values in table cells and labeled spans/divs
+    near CPI/PCE context. Returns dict or empty dict.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    nowcast = {}
+
+    # Strategy 1: look for table cells with percentage values near CPI/PCE labels
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        for row in rows:
+            cells = row.find_all(["td", "th"])
+            row_text = row.get_text(" ", strip=True)
+            for cell in cells:
+                cell_text = cell.get_text(strip=True)
+                # Match standalone percentage like "2.8%" or "2.83%"
+                m = re.match(r'^(\d+\.?\d*)\s*%?$', cell_text)
+                if not m:
+                    continue
+                val = float(m.group(1))
+                if not (0.0 < val < 20.0):
+                    continue
+                row_lower = row_text.lower()
+                if "core cpi" in row_lower and "core_cpi_yoy" not in nowcast:
+                    nowcast["core_cpi_yoy"] = val
+                elif "cpi" in row_lower and "core" not in row_lower and "cpi_yoy" not in nowcast:
+                    nowcast["cpi_yoy"] = val
+                elif "pce" in row_lower and "pce_yoy" not in nowcast:
+                    nowcast["pce_yoy"] = val
+
+    # Strategy 2: look for labeled spans/divs with percentages
+    if not nowcast:
+        text_blocks = soup.find_all(["span", "div", "p", "strong"])
+        for el in text_blocks:
+            txt = el.get_text(" ", strip=True)
+            if len(txt) > 200:
+                continue
+            lower = txt.lower()
+            pct_match = re.search(r'(\d+\.?\d*)\s*%', txt)
+            if not pct_match:
+                continue
+            val = float(pct_match.group(1))
+            if not (0.0 < val < 20.0):
+                continue
+            if "core cpi" in lower and "core_cpi_yoy" not in nowcast:
+                nowcast["core_cpi_yoy"] = val
+            elif "cpi" in lower and "core" not in lower and "cpi_yoy" not in nowcast:
+                nowcast["cpi_yoy"] = val
+            elif "pce" in lower and "pce_yoy" not in nowcast:
+                nowcast["pce_yoy"] = val
+
+    return nowcast
+
+
+def _parse_nowcast_regex(html):
+    """Fallback regex parser for Cleveland Fed nowcast page."""
+    nowcast = {}
+
+    cpi_pattern = r'(?:CPI|Consumer Price Index)[^%]*?(\d+\.?\d*)\s*%'
+    cpi_matches = re.findall(cpi_pattern, html, re.IGNORECASE)
+    if cpi_matches:
+        try:
+            nowcast["cpi_yoy"] = float(cpi_matches[0])
+        except (ValueError, IndexError):
+            pass
+
+    core_pattern = r'(?:Core CPI|core.*?CPI)[^%]*?(\d+\.?\d*)\s*%'
+    core_matches = re.findall(core_pattern, html, re.IGNORECASE)
+    if core_matches:
+        try:
+            nowcast["core_cpi_yoy"] = float(core_matches[0])
+        except (ValueError, IndexError):
+            pass
+
+    pce_pattern = r'(?:PCE)[^%]*?(\d+\.?\d*)\s*%'
+    pce_matches = re.findall(pce_pattern, html, re.IGNORECASE)
+    if pce_matches:
+        try:
+            nowcast["pce_yoy"] = float(pce_matches[0])
+        except (ValueError, IndexError):
+            pass
+
+    return nowcast
+
+
 def fetch_cleveland_fed_nowcast():
     """Fetch Cleveland Fed inflation nowcast.
 
-    Returns dict with 'cpi_yoy' (year-over-year %), 'core_cpi_yoy', 'pce_yoy'
-    if available, or empty dict on failure.
+    Uses layered parsing: BS4 structured parsing -> regex fallback -> cache fallback.
+    Returns dict with 'cpi_yoy', 'core_cpi_yoy', 'pce_yoy' or empty dict.
     """
     try:
         url = "https://www.clevelandfed.org/indicators-and-data/inflation-nowcasting"
@@ -72,42 +185,38 @@ def fetch_cleveland_fed_nowcast():
         r = retry_request("GET", url, headers=headers, timeout=20)
         html = r.text
 
-        nowcast = {}
+        # Primary: BeautifulSoup structured parsing
+        nowcast = _parse_nowcast_bs4(html)
 
-        # Look for CPI nowcast values in the page
-        # Pattern: "CPI" followed by a percentage like "3.2%"
-        cpi_pattern = r'(?:CPI|Consumer Price Index)[^%]*?(\d+\.?\d*)\s*%'
-        cpi_matches = re.findall(cpi_pattern, html, re.IGNORECASE)
-        if cpi_matches:
-            try:
-                nowcast["cpi_yoy"] = float(cpi_matches[0])
-                log.info(f"  Cleveland Fed CPI nowcast: {nowcast['cpi_yoy']}%")
-            except (ValueError, IndexError):
-                pass
+        # Fallback: regex parsing
+        if not nowcast:
+            nowcast = _parse_nowcast_regex(html)
 
-        # Core CPI
-        core_pattern = r'(?:Core CPI|core.*?CPI)[^%]*?(\d+\.?\d*)\s*%'
-        core_matches = re.findall(core_pattern, html, re.IGNORECASE)
-        if core_matches:
-            try:
-                nowcast["core_cpi_yoy"] = float(core_matches[0])
-                log.info(f"  Cleveland Fed Core CPI nowcast: {nowcast['core_cpi_yoy']}%")
-            except (ValueError, IndexError):
-                pass
+        if nowcast:
+            for key, val in nowcast.items():
+                log.info(f"  Cleveland Fed {key}: {val}%")
+            _save_nowcast_cache(nowcast)
+            health.record_source_success("cleveland-fed")
+            return nowcast
 
-        # PCE
-        pce_pattern = r'(?:PCE)[^%]*?(\d+\.?\d*)\s*%'
-        pce_matches = re.findall(pce_pattern, html, re.IGNORECASE)
-        if pce_matches:
-            try:
-                nowcast["pce_yoy"] = float(pce_matches[0])
-            except (ValueError, IndexError):
-                pass
+        # No values found from live page — try cache
+        log.warning("  Cleveland Fed: no values parsed from live page, trying cache")
+        cached = _load_nowcast_cache()
+        if cached:
+            log.info(f"  Using cached nowcast: {cached}")
+            return cached
 
-        return nowcast
+        health.record_source_error("cleveland-fed", "no values parsed")
+        return {}
 
     except Exception as e:
         log.error(f"  Cleveland Fed fetch failed: {e}")
+        # Try cache on HTTP/network failure
+        cached = _load_nowcast_cache()
+        if cached:
+            log.info(f"  Using cached nowcast after error: {cached}")
+            return cached
+        health.record_source_error("cleveland-fed", str(e))
         return {}
 
 
@@ -201,6 +310,107 @@ def estimate_days_to_release(market):
     return 7
 
 
+def parse_gas_threshold(market):
+    """Extract price threshold from gas market ticker/title.
+
+    KXGAS-...-T3.50 -> (3.50, "T")
+    KXGAS-...-B3.50 -> (3.50, "B_below")
+    """
+    ticker = market.get("ticker", "")
+    m = re.search(r'-([TB])([\d.]+)$', ticker)
+    if m:
+        direction_type = m.group(1) if m.group(1) == "T" else "B_below"
+        return float(m.group(2)), direction_type
+
+    title = market.get("title", "")
+    above = re.search(r'(?:above|over)\s+\$?([\d.]+)', title, re.I)
+    if above:
+        return float(above.group(1)), "T"
+    below = re.search(r'(?:below|under)\s+\$?([\d.]+)', title, re.I)
+    if below:
+        return float(below.group(1)), "B_below"
+    return None, None
+
+
+# === FedWatch Data ===
+
+def fetch_fedwatch_probabilities():
+    """Fetch CME FedWatch implied probabilities for upcoming FOMC meetings.
+
+    Scrapes CME FedWatch page for rate decision probabilities.
+    Returns dict: {target_rate: probability} or empty dict on failure.
+
+    Example: {4.25: 0.05, 4.50: 0.85, 4.75: 0.10}
+    """
+    try:
+        url = "https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html"
+        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+        r = retry_request("GET", url, headers=headers, timeout=20)
+        html = r.text
+
+        probs = {}
+        # CME FedWatch shows rate ranges and probabilities
+        # Pattern: "4.25-4.50" ... "85.0%"
+        rate_pattern = r'(\d+\.?\d*)\s*[-–]\s*(\d+\.?\d*)\s*.*?(\d+\.?\d*)%'
+        matches = re.findall(rate_pattern, html)
+        for low, high, prob_str in matches:
+            low_f, high_f = float(low), float(high)
+            prob_f = float(prob_str) / 100
+            if 0 < low_f < 20 and 0 < prob_f <= 1.0:
+                rate = (low_f + high_f) / 2 / 100  # midpoint as decimal (e.g. 0.0438)
+                probs[rate] = prob_f
+
+        if probs:
+            log.info(f"  FedWatch probabilities: {len(probs)} rate buckets loaded")
+            health.record_source_success("cme-fedwatch")
+        return probs
+    except Exception as e:
+        log.error(f"  CME FedWatch fetch failed: {e}")
+        health.record_source_error("cme-fedwatch", str(e))
+        return {}
+
+
+def match_fed_market_to_fedwatch(market, fedwatch_probs):
+    """Match a KXFED market to its CME FedWatch probability.
+
+    Parses market title for rate action (cut/hold/hike) and maps to
+    the appropriate FedWatch probability sum.
+
+    Returns probability (0-1) or None if no match.
+    """
+    if not fedwatch_probs:
+        return None
+
+    title = market.get("title", "").lower()
+    ticker = market.get("ticker", "").upper()
+
+    # Estimate current target rate from FedWatch: rate with highest probability
+    current_rate = max(fedwatch_probs, key=fedwatch_probs.get)
+
+    if "cut" in title or "lower" in title or "decrease" in title:
+        # P(cut) = sum of probabilities for rates below current
+        prob = sum(p for r, p in fedwatch_probs.items() if r < current_rate)
+        return prob if prob > 0 else None
+    elif "hold" in title or "unchanged" in title or "maintain" in title or "no change" in title:
+        return fedwatch_probs.get(current_rate)
+    elif "raise" in title or "hike" in title or "increase" in title or "higher" in title:
+        # P(hike) = sum of probabilities for rates above current
+        prob = sum(p for r, p in fedwatch_probs.items() if r > current_rate)
+        return prob if prob > 0 else None
+
+    # Try to extract a specific rate from title/ticker
+    # e.g. "Fed funds rate above 4.5%" or "KXFED-...-T4.50"
+    rate_match = re.search(r'(\d+\.?\d*)\s*%', title)
+    if rate_match:
+        target = float(rate_match.group(1)) / 100
+        # Find closest FedWatch bucket
+        closest = min(fedwatch_probs.keys(), key=lambda r: abs(r - target))
+        if abs(closest - target) < 0.005:  # within 0.5%
+            return fedwatch_probs[closest]
+
+    return None
+
+
 # === Scanning ===
 
 def scan_and_trade():
@@ -217,19 +427,15 @@ def scan_and_trade():
         log.error(f"Balance error: {e}")
         return
 
-    # Fetch nowcast data
+    # Fetch nowcast data (health recording handled inside fetch_cleveland_fed_nowcast)
     log.info("\nFetching economic data sources...")
     nowcast = fetch_cleveland_fed_nowcast()
-    if nowcast:
-        health.record_source_success("cleveland-fed")
-    else:
-        health.record_source_error("cleveland-fed", "empty nowcast")
     gas_price = fetch_gas_prices()
     if gas_price:
         health.record_source_success("aaa-gas")
 
-    if not nowcast:
-        log.info("No nowcast data available, skipping scan.")
+    if not nowcast and not gas_price:
+        log.info("No data sources available (nowcast + gas), skipping scan.")
         return
 
     # Fetch economics markets
@@ -317,6 +523,85 @@ def scan_and_trade():
                     edge=edge, price_cents=no_ask,
                 )
 
+    # Gas price markets
+    if gas_price:
+        gas_markets = [m for m in all_markets if m.get("ticker", "").startswith("KXGAS")]
+        if gas_markets:
+            log.info(f"  Evaluating {len(gas_markets)} gas price markets (AAA avg: ${gas_price:.2f})")
+        for gm in gas_markets:
+            ticker = gm.get("ticker", "")
+            threshold, direction_type = parse_gas_threshold(gm)
+            if threshold is None:
+                continue
+            direction = "above" if direction_type == "T" else "below"
+            prob = gas_price_probability(gas_price, threshold, direction)
+
+            yes_ask = gm.get("yes_ask", 0)
+            no_ask = gm.get("no_ask", 0)
+            yes_bid = gm.get("yes_bid", 0)
+            if not yes_ask or yes_ask >= 99:
+                continue
+
+            if prob > 0.5:
+                edge = prob - yes_ask / 100
+                if edge > EDGE_THRESHOLD:
+                    opportunities.append({
+                        "ticker": ticker, "market": gm, "side": "yes",
+                        "prob": prob, "edge": edge, "threshold": threshold,
+                        "nowcast_value": gas_price, "sigma": gas_price * 0.02,
+                        "days_to_release": 0,
+                    })
+            else:
+                no_prob = 1.0 - prob
+                edge = no_prob - (no_ask / 100 if no_ask else 1.0)
+                if edge > EDGE_THRESHOLD:
+                    opportunities.append({
+                        "ticker": ticker, "market": gm, "side": "no",
+                        "prob": no_prob, "edge": edge, "threshold": threshold,
+                        "nowcast_value": gas_price, "sigma": gas_price * 0.02,
+                        "days_to_release": 0,
+                    })
+
+    # Fed rate decision markets
+    fed_markets = [m for m in all_markets if m.get("ticker", "").startswith("KXFED")]
+    if fed_markets:
+        fedwatch = fetch_fedwatch_probabilities()
+        if fedwatch:
+            log.info(f"  Evaluating {len(fed_markets)} Fed rate markets")
+            for fm in fed_markets:
+                ticker = fm.get("ticker", "")
+                cme_prob = match_fed_market_to_fedwatch(fm, fedwatch)
+                if cme_prob is None:
+                    continue
+
+                yes_ask = fm.get("yes_ask", 0)
+                no_ask = fm.get("no_ask", 0)
+                yes_bid = fm.get("yes_bid", 0)
+                if not yes_ask or yes_ask >= 99:
+                    continue
+
+                kalshi_price = yes_ask / 100.0
+                edge = cme_prob - kalshi_price
+
+                if edge > EDGE_THRESHOLD:
+                    opportunities.append({
+                        "ticker": ticker, "market": fm, "side": "yes",
+                        "prob": cme_prob, "edge": edge, "threshold": 0,
+                        "nowcast_value": cme_prob, "sigma": 0,
+                        "days_to_release": 0,
+                    })
+                elif (-edge) > EDGE_THRESHOLD:
+                    # Kalshi overpriced YES -> buy NO
+                    no_prob = 1.0 - cme_prob
+                    no_edge = no_prob - (no_ask / 100 if no_ask else 1.0)
+                    if no_edge > EDGE_THRESHOLD:
+                        opportunities.append({
+                            "ticker": ticker, "market": fm, "side": "no",
+                            "prob": no_prob, "edge": no_edge, "threshold": 0,
+                            "nowcast_value": cme_prob, "sigma": 0,
+                            "days_to_release": 0,
+                        })
+
     # Sort by edge
     opportunities.sort(key=lambda x: x["edge"], reverse=True)
     log.info(f"Found {len(opportunities)} opportunities with edge >= {EDGE_THRESHOLD*100:.0f}%")
@@ -394,6 +679,7 @@ def main():
     while True:
         try:
             health.record_bot_heartbeat("economics")
+            order_monitor.check_orders()
             scan_and_trade()
         except Exception as e:
             log.error(f"Scan error: {e}")
