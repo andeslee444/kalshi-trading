@@ -12,7 +12,7 @@
     "maxTradeCents": 500,
     "maxDailyTrades": 10,
     "maxDailyLoss": 25,
-    "notificationPhone": "+14255336828",
+    "notificationPhone": "",
     "blogUrls": [
       "https://www.beatrelease.com/blog/categories/kalshi-predictions",
       "https://www.beatrelease.com/blog"
@@ -28,8 +28,9 @@
     "maxTradeAmount": 10,
     "maxDailyTrades": 30,
     "maxDailyLoss": 25,
-    "scanIntervalMinutes": 1,
-    "edgeThreshold": 0.06,
+    "scanIntervalMinutes": 5,
+    "edgeThreshold": 0.08,
+    "driftPct": 0.0,
     "settlementBufferMinutes": 5,
     "useOrnsteinUhlenbeck": true,
     "ouHalfLifeMinutes": 120

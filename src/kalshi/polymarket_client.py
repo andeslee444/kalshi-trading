@@ -105,6 +105,19 @@ class PolymarketClient:
             _log.error("Polymarket midpoint fetch failed for %s: %s", token_id, e)
             return None
 
+    def get_best_bid(self, token_id):
+        """Get best bid price for a token (what you could sell at).
+
+        Returns best bid as decimal (0-1), or None if no bids.
+        """
+        book = self.get_orderbook(token_id)
+        if book and book.get("bids"):
+            try:
+                return max(float(b["price"]) for b in book["bids"])
+            except (ValueError, KeyError):
+                pass
+        return None
+
     def get_price(self, token_id):
         """Get last traded price for a token.
 

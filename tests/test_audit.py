@@ -243,8 +243,8 @@ class TestSigmaSchedules:
 
 class TestCPINowcastSigma:
     def test_at_release(self):
-        """At release day (0), sigma should be 0.01."""
-        assert cpi_nowcast_sigma(0) == 0.01
+        """At release day (0), sigma should be 0.03 (floor prevents overconfidence)."""
+        assert cpi_nowcast_sigma(0) == 0.03
 
     def test_monotonic_increase_with_days(self):
         """Sigma should monotonically increase as days_to_release increases (more uncertainty)."""

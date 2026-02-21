@@ -26,7 +26,8 @@
     "supervisor:status": "python3 scripts/supervisor.py status",
     "sync:up": "bash scripts/s3-sync.sh upload",
     "sync:down": "bash scripts/s3-sync.sh download",
-    "sync:setup": "bash scripts/s3-sync.sh setup"
+    "sync:setup": "bash scripts/s3-sync.sh setup",
+    "test": "pytest tests/ -v"
   },
   "dependencies": {},
   "devDependencies": {}

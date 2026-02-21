@@ -105,9 +105,9 @@ client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
 health = HealthCheckMonitor(logger=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
-    "maxTradeAmount": 50,  # exits can be larger
+    "maxTradeAmount": pm_config.get("maxTradeAmount", 50),  # exits can be larger
     "maxDailyTrades": MAX_DAILY_EXITS,
-    "maxDailyLoss": 100,
+    "maxDailyLoss": pm_config.get("maxDailyLoss", 100),
 }, logger=log)
 trim_trade_log(TRADES_PATH)
 
@@ -468,6 +468,13 @@ def cancel_stale_orders():
         log.error(f"Failed to fetch resting orders: {e}")
 
 
+def _count_exits_today():
+    """Count exit trades placed today from the trade log."""
+    trades = load_trades(TRADES_PATH)
+    today = datetime.date.today().isoformat()
+    return sum(1 for t in trades if t.get("action") == "sell" and t.get("timestamp", "").startswith(today))
+
+
 # === Main Scan ===
 
 def scan_positions():
@@ -493,7 +500,7 @@ def scan_positions():
         return
 
     log.info(f"Found {len(positions)} positions to evaluate")
-    exits_today = 0
+    exits_today = _count_exits_today()
 
     # Load entry records for entry-price stop and info-arb gate
     entry_records = _load_entry_records()

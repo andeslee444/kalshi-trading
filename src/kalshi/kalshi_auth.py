@@ -11,7 +11,7 @@ Usage:
     client.post("/portfolio/orders", body={...})
 """
 
-import json, time, base64, os, sys, signal, logging, datetime, tempfile
+import json, time, base64, os, sys, signal, logging, datetime, tempfile, fcntl
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 from logging.handlers import RotatingFileHandler
@@ -360,10 +360,17 @@ def _atomic_write_json(path: Path, data):
 
 
 def save_trade(trades_path: Path, trade: dict):
-    """Append a trade to a JSON trades file (atomic write)."""
-    trades = load_trades(trades_path)
-    trades.append(trade)
-    _atomic_write_json(trades_path, trades)
+    """Append a trade to a JSON trades file (atomic write with file lock)."""
+    trades_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = trades_path.with_suffix(".lock")
+    with open(lock_path, "w") as lock_fd:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            trades = load_trades(trades_path)
+            trades.append(trade)
+            _atomic_write_json(trades_path, trades)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 
 # === Shared market data cache ===
@@ -543,6 +550,19 @@ class CircuitBreaker:
         self._opened_at = None
         self.state_path = Path(state_path) if state_path else None
 
+    def _with_shared_lock(self, fn):
+        """Execute fn under file lock on shared state."""
+        if not self.state_path:
+            return fn()
+        lock_path = self.state_path.with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "w") as lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                return fn()
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
     def _load_shared(self):
         """Load shared breaker state from disk."""
         if not self.state_path or not self.state_path.exists():
@@ -577,37 +597,43 @@ class CircuitBreaker:
 
     def record_success(self):
         """Record a successful operation — resets the failure counter."""
-        if self.state_path:
-            self._load_shared()
-        self._failures = 0
-        self._opened_at = None
-        if self.state_path:
-            self._save_shared()
-
-    def record_failure(self):
-        """Record a failed operation — may open the breaker."""
-        if self.state_path:
-            self._load_shared()
-        self._failures += 1
-        if self._failures >= self.max_failures and self._opened_at is None:
-            self._opened_at = time.time()
-        if self.state_path:
-            self._save_shared()
-
-    def is_open(self):
-        """Return True if the breaker is open (callers should back off)."""
-        if self.state_path:
-            self._load_shared()
-        if self._failures < self.max_failures:
-            return False
-        if self._opened_at and isinstance(self._opened_at, (int, float)) and (time.time() - self._opened_at) >= self.reset_seconds:
-            # Auto-reset after timeout
+        def _do():
+            if self.state_path:
+                self._load_shared()
             self._failures = 0
             self._opened_at = None
             if self.state_path:
                 self._save_shared()
-            return False
-        return True
+        self._with_shared_lock(_do)
+
+    def record_failure(self):
+        """Record a failed operation — may open the breaker."""
+        def _do():
+            if self.state_path:
+                self._load_shared()
+            self._failures += 1
+            if self._failures >= self.max_failures and self._opened_at is None:
+                self._opened_at = time.time()
+            if self.state_path:
+                self._save_shared()
+        self._with_shared_lock(_do)
+
+    def is_open(self):
+        """Return True if the breaker is open (callers should back off)."""
+        def _do():
+            if self.state_path:
+                self._load_shared()
+            if self._failures < self.max_failures:
+                return False
+            if self._opened_at and isinstance(self._opened_at, (int, float)) and (time.time() - self._opened_at) >= self.reset_seconds:
+                # Auto-reset after timeout
+                self._failures = 0
+                self._opened_at = None
+                if self.state_path:
+                    self._save_shared()
+                return False
+            return True
+        return self._with_shared_lock(_do)
 
 
 # === Config validation ===
@@ -641,31 +667,40 @@ def trim_trade_log(trades_path, max_age_days=90, max_entries=5000):
     """Remove old entries from a trade log file.
 
     Keeps only entries newer than max_age_days and limits total to max_entries.
+    Uses file locking to prevent races with save_trade().
     """
-    trades = load_trades(trades_path)
-    if not trades:
-        return
+    trades_path = Path(trades_path)
+    lock_path = trades_path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_fd:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            trades = load_trades(trades_path)
+            if not trades:
+                return
 
-    cutoff = datetime.datetime.now() - datetime.timedelta(days=max_age_days)
-    filtered = []
-    for t in trades:
-        ts_str = t.get("timestamp", "")
-        if ts_str:
-            try:
-                ts = datetime.datetime.fromisoformat(ts_str).replace(tzinfo=None)
-                if ts < cutoff:
-                    continue
-            except (ValueError, TypeError):
-                pass
-        filtered.append(t)
+            cutoff = datetime.datetime.now() - datetime.timedelta(days=max_age_days)
+            filtered = []
+            for t in trades:
+                ts_str = t.get("timestamp", "")
+                if ts_str:
+                    try:
+                        ts = datetime.datetime.fromisoformat(ts_str).replace(tzinfo=None)
+                        if ts < cutoff:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                filtered.append(t)
 
-    # Also limit by count (keep most recent)
-    if len(filtered) > max_entries:
-        filtered = filtered[-max_entries:]
+            # Also limit by count (keep most recent)
+            if len(filtered) > max_entries:
+                filtered = filtered[-max_entries:]
 
-    if len(filtered) != len(trades):
-        _log.info("Trimmed trade log %s: %d -> %d entries", trades_path.name, len(trades), len(filtered))
-        _atomic_write_json(trades_path, filtered)
+            if len(filtered) != len(trades):
+                _log.info("Trimmed trade log %s: %d -> %d entries", trades_path.name, len(trades), len(filtered))
+                _atomic_write_json(trades_path, filtered)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 
 # === Order Monitor ===
@@ -814,6 +849,16 @@ class TradeManager:
             self._daily_trades = 0
             self._daily_spend_cents = 0
             self._daily_date = today
+            self._rebuild_daily_counters_from_log(today)
+
+    def _rebuild_daily_counters_from_log(self, today_str):
+        """Reconstruct daily counters from trade log after restart."""
+        trades = load_trades(self.trades_path)
+        for t in trades:
+            ts = t.get("timestamp", "")
+            if ts.startswith(today_str) and t.get("action", "buy") != "sell":
+                self._daily_trades += 1
+                self._daily_spend_cents += t.get("cost_cents", 0)
 
     @staticmethod
     def _classify_limit_tier(edge):
@@ -908,6 +953,14 @@ class TradeManager:
 
         if side not in ("yes", "no"):
             self.log.error("Invalid side '%s' — must be 'yes' or 'no'", side)
+            return None
+
+        # Validate price range
+        if price_cents < 1 or price_cents > 99:
+            self.log.error("Invalid price_cents=%d — must be 1-99. Skipping %s", price_cents, ticker)
+            return None
+        if count < 1:
+            self.log.error("Invalid count=%d — must be >= 1. Skipping %s", count, ticker)
             return None
 
         # 1. Kill switch
@@ -1275,6 +1328,8 @@ def notify_whatsapp(message, phone=None, logger=None):
     """
     import subprocess
     _log = logger or logging.getLogger("notify")
+    if not phone:
+        phone = os.environ.get("NOTIFICATION_PHONE", "")
     if not phone:
         try:
             cfg_path = PROJECT_DIR / "config" / "bots-config.json"

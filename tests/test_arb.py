@@ -32,6 +32,11 @@ def _load_arb_module():
     })
     fake_auth.trim_trade_log = lambda *a, **kw: None
     fake_auth.build_market_snapshot = lambda **kw: kw
+    fake_auth._atomic_write_json = lambda *a, **kw: None
+    fake_auth.HealthCheckMonitor = type("HealthCheckMonitor", (), {
+        "__init__": lambda self, *a, **kw: None,
+        "record_bot_heartbeat": lambda self, *a, **kw: None,
+    })
     sys.modules["kalshi_auth"] = fake_auth
 
     fake_prob = types.ModuleType("probability")

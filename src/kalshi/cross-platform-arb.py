@@ -20,6 +20,7 @@ from difflib import SequenceMatcher
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, TradeManager, trim_trade_log, build_market_snapshot,
+    _atomic_write_json, HealthCheckMonitor,
 )
 from polymarket_client import PolymarketClient
 from capital_allocator import PortfolioAllocator
@@ -46,12 +47,13 @@ MAX_TRADE = arb_config.get("maxTradeAmount", 10)
 MAX_DAILY_TRADES = arb_config.get("maxDailyTrades", 10)
 MAX_DAILY_LOSS = arb_config.get("maxDailyLoss", 25)
 
-# Polymarket fee ~0.01%; Kalshi fee is price-dependent via kalshi_fee_cents()
-POLYMARKET_FEE = 0.0001
+# Polymarket fee ~2% (taker fee on CLOB); Kalshi fee is price-dependent via kalshi_fee_cents()
+POLYMARKET_FEE = 0.02
 
 client = KalshiClient()
 pm_client = PolymarketClient()
 allocator = PortfolioAllocator(client, logger=log)
+health = HealthCheckMonitor(logger=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": MAX_TRADE,
     "maxDailyTrades": MAX_DAILY_TRADES,
@@ -150,41 +152,41 @@ def compute_spread(kalshi_market, pm_market):
     if not k_yes_ask or k_yes_ask >= 99:
         return None
 
-    # Get Polymarket price
+    # Get Polymarket best bid (executable sell price, not midpoint)
     tokens = pm_market.get("tokens", [])
-    pm_yes_price = None
+    pm_yes_bid = None
     for token in tokens:
         outcome = token.get("outcome", "").lower()
         if outcome == "yes":
             token_id = token.get("token_id")
             if token_id:
-                pm_yes_price = pm_client.get_midpoint(token_id)
+                pm_yes_bid = pm_client.get_best_bid(token_id)
             break
 
-    # Fallback to market-level price
-    if pm_yes_price is None:
-        pm_yes_price = pm_market.get("outcomePrices")
-        if isinstance(pm_yes_price, list) and len(pm_yes_price) > 0:
+    # Fallback to market-level price (less accurate but better than nothing)
+    if pm_yes_bid is None:
+        pm_yes_bid = pm_market.get("outcomePrices")
+        if isinstance(pm_yes_bid, list) and len(pm_yes_bid) > 0:
             try:
-                pm_yes_price = float(pm_yes_price[0])
+                pm_yes_bid = float(pm_yes_bid[0])
             except (ValueError, TypeError):
-                pm_yes_price = None
+                pm_yes_bid = None
 
-    if pm_yes_price is None:
+    if pm_yes_bid is None:
         return None
 
     k_yes_price = k_yes_ask / 100  # convert cents to decimal
 
-    # Spread = Polymarket YES - Kalshi YES (positive = Kalshi is cheap)
-    spread = pm_yes_price - k_yes_price
-    kalshi_fee = kalshi_fee_cents(k_yes_ask) / k_yes_ask if k_yes_ask > 0 else 0.007
+    # Spread = Polymarket YES bid - Kalshi YES ask (positive = Kalshi is cheap)
+    spread = pm_yes_bid - k_yes_price
+    kalshi_fee = kalshi_fee_cents(k_yes_ask) / 100 if k_yes_ask > 0 else 0.007
     net_spread = spread - (kalshi_fee + POLYMARKET_FEE)
 
     return {
         "kalshi_yes_ask": k_yes_ask,
         "kalshi_yes_bid": k_yes_bid,
         "kalshi_no_ask": k_no_ask,
-        "polymarket_yes": round(pm_yes_price, 4),
+        "polymarket_yes_bid": round(pm_yes_bid, 4),
         "raw_spread": round(spread, 4),
         "net_spread": round(net_spread, 4),
         "is_tradeable": net_spread > MIN_SPREAD_PCT,
@@ -208,7 +210,7 @@ def log_spread(kalshi_ticker, pm_question, spread_info):
         # Keep last 1000 entries
         if len(existing) > 1000:
             existing = existing[-1000:]
-        SPREADS_LOG.write_text(json.dumps(existing, indent=2))
+        _atomic_write_json(SPREADS_LOG, existing)
     except Exception as e:
         log.error(f"Failed to log spread: {e}")
 
@@ -279,7 +281,7 @@ def scan_spreads():
             tradeable += 1
             log.info(f"\n  SPREAD OPPORTUNITY:")
             log.info(f"    Kalshi: {k_ticker} YES@{spread['kalshi_yes_ask']}c")
-            log.info(f"    Polymarket: {p_question[:60]}... YES@{spread['polymarket_yes']*100:.0f}c")
+            log.info(f"    Polymarket: {p_question[:60]}... YES bid@{spread['polymarket_yes_bid']*100:.0f}c")
             log.info(f"    Raw spread: {spread['raw_spread']*100:.1f}% | Net: {spread['net_spread']*100:.1f}%")
             log.info(f"    Match score: {score:.2f}")
 
@@ -353,6 +355,7 @@ def main():
     # Daemon loop
     while True:
         try:
+            health.record_bot_heartbeat("cross-platform-arb")
             scan_spreads()
         except Exception as e:
             log.error(f"Scan error: {e}")

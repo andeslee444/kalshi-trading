@@ -629,11 +629,19 @@ def scan_and_trade():
         if count <= 0:
             continue
 
-        reasoning = (
-            f"Econ nowcast: {opp['nowcast_value']:.2f}% vs threshold {opp['threshold']:.1f}%, "
-            f"sigma={opp['sigma']:.3f}, days_to_release={opp['days_to_release']}, "
-            f"prob={opp['prob']*100:.0f}%, edge={edge*100:.1f}%"
-        )
+        # Format gas price markets differently (dollars, not percentages)
+        is_gas = ticker.startswith("KXGAS")
+        if is_gas:
+            reasoning = (
+                f"Gas price: ${opp['nowcast_value']:.2f} vs threshold ${opp['threshold']:.2f}, "
+                f"prob={opp['prob']*100:.0f}%, edge={edge*100:.1f}%"
+            )
+        else:
+            reasoning = (
+                f"Econ nowcast: {opp['nowcast_value']:.2f}% vs threshold {opp['threshold']:.1f}%, "
+                f"sigma={opp['sigma']:.3f}, days_to_release={opp['days_to_release']}, "
+                f"prob={opp['prob']*100:.0f}%, edge={edge*100:.1f}%"
+            )
 
         log.info(f"\n-> TRADE: {reasoning}")
         log.info(f"  Placing: {count}x {side} @ {price}c on {ticker}")

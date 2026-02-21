@@ -49,6 +49,7 @@ EDGE_THRESHOLD = crypto_config.get("edgeThreshold", 0.06)
 SETTLEMENT_BUFFER_MINUTES = crypto_config.get("settlementBufferMinutes", 2)
 USE_OU = crypto_config.get("useOrnsteinUhlenbeck", False)
 OU_HALF_LIFE = crypto_config.get("ouHalfLifeMinutes", 120)
+DRIFT_PCT = crypto_config.get("driftPct", 0.0)
 
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
@@ -195,6 +196,24 @@ def estimate_time_to_settlement(market):
     return 1440
 
 
+def _parse_bracket_range(ticker, asset, markets):
+    """Parse bracket range from market data. Falls back to defaults."""
+    for m in markets:
+        if m.get("ticker") == ticker:
+            title = m.get("title", "") + " " + m.get("subtitle", "")
+            nums = re.findall(r'\$([\d,]+)', title)
+            if len(nums) >= 2:
+                try:
+                    low = int(nums[0].replace(',', ''))
+                    high = int(nums[1].replace(',', ''))
+                    if high > low > 0:
+                        return high - low
+                except ValueError:
+                    pass
+            break
+    return 1000 if asset == "BTC" else 100  # fallback defaults
+
+
 # === Scanning ===
 
 def scan_and_trade():
@@ -298,22 +317,24 @@ def scan_and_trade():
                 time_horizon_minutes=minutes_to_settle,
                 realized_vol_pct=vol_to_use, iv_pct=None,
                 use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
+                drift_pct=DRIFT_PCT,
             )
         else:
             # Bracket: probability price lands in [threshold, threshold+range)
-            # For crypto, brackets are typically $1000 wide for BTC
-            range_size = 1000 if asset == "BTC" else 100
+            range_size = _parse_bracket_range(ticker, asset, all_markets)
             prob_above_low = crypto_price_probability(
                 current_price, threshold, "above",
                 time_horizon_minutes=minutes_to_settle,
                 realized_vol_pct=vol_to_use, iv_pct=None,
                 use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
+                drift_pct=DRIFT_PCT,
             )
             prob_above_high = crypto_price_probability(
                 current_price, threshold + range_size, "above",
                 time_horizon_minutes=minutes_to_settle,
                 realized_vol_pct=vol_to_use, iv_pct=None,
                 use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
+                drift_pct=DRIFT_PCT,
             )
             prob = prob_above_low - prob_above_high
 

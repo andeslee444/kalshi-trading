@@ -7,7 +7,7 @@ import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor
-from probability import weather_probability, ensemble_weather_probability, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents
+from probability import weather_probability, ensemble_weather_probability, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid
 from ticker_utils import parse_weather_ticker as parse_ticker
 from capital_allocator import PortfolioAllocator
 
@@ -111,8 +111,7 @@ def get_ensemble_forecast(lat, lon):
 def compute_probability(forecast_temp, threshold, direction, days_out=0, city=None):
     """Estimate probability that YES resolves true.
 
-    CDF-based model using weather_probability() from shared probability module.
-    sigma scales with forecast horizon: sigma = 2.5 + 0.5 * days_out.
+    Delegates to weather_probability() with calibrated sigma from probability module.
     If city is provided and calibration data exists, uses calibrated sigma.
     """
     return weather_probability(forecast_temp, threshold, direction, days_out, city=city)
@@ -194,6 +193,9 @@ def scan_and_trade():
         yes_bid = m.get("yes_bid", 0)
         no_ask = m.get("no_ask", 0)
         last = m.get("last_price", 0)
+
+        if not is_market_liquid(m):
+            continue
 
         # Compute edge against the price we'd actually pay (ask for YES, 100-bid for NO)
         # not the midpoint, to avoid false positives from wide spreads

@@ -53,7 +53,7 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": MAX_TRADE,
     "maxDailyTrades": MAX_DAILY_TRADES,
     "maxDailyLoss": MAX_DAILY_LOSS,
-}, logger=log, cooldown_hours=0.25)
+}, logger=log, cooldown_hours=0)  # MM must re-quote every cycle
 trim_trade_log(TRADES_PATH)
 
 # === Inventory Tracking ===
@@ -89,7 +89,7 @@ def compute_reservation_price(mid_price, inventory, sigma, time_to_settlement_ho
     Args:
         mid_price: current midpoint price (0-100 cents).
         inventory: net position (positive = long).
-        sigma: price volatility (in cents).
+        sigma: price volatility (in cents, converted to 0-1 fraction internally).
         time_to_settlement_hours: hours until settlement.
         gamma: risk aversion parameter (higher = more conservative).
 
@@ -100,10 +100,11 @@ def compute_reservation_price(mid_price, inventory, sigma, time_to_settlement_ho
         gamma = GAMMA
 
     T = max(0.01, time_to_settlement_hours / 24)  # in days
-    r = mid_price - inventory * gamma * (sigma ** 2) * T
-
-    # Clamp to valid price range
-    return max(1, min(99, round(r)))
+    sigma_frac = sigma / 100.0  # convert cents to 0-1 fraction for A-S formula
+    # A-S reservation price: mid - inventory * gamma * sigma^2 * T (all in fraction space)
+    r = mid_price / 100.0 - inventory * gamma * (sigma_frac ** 2) * T
+    # Convert back to cents
+    return max(1, min(99, round(r * 100)))
 
 
 def compute_optimal_spread(sigma, time_to_settlement_hours, gamma=None, k=None):
@@ -111,7 +112,7 @@ def compute_optimal_spread(sigma, time_to_settlement_hours, gamma=None, k=None):
 
     delta = gamma * sigma^2 * T + (2/gamma) * ln(1 + gamma/k)
 
-    Returns half-spread (distance from reservation price to bid/ask).
+    Returns half-spread in cents (distance from reservation price to bid/ask).
     """
     if gamma is None:
         gamma = GAMMA
@@ -119,10 +120,12 @@ def compute_optimal_spread(sigma, time_to_settlement_hours, gamma=None, k=None):
         k = K_PARAM
 
     T = max(0.01, time_to_settlement_hours / 24)
-    delta = gamma * (sigma ** 2) * T + (2 / gamma) * math.log(1 + gamma / k)
+    sigma_frac = sigma / 100.0  # convert cents to 0-1 fraction for A-S formula
+    delta = gamma * (sigma_frac ** 2) * T + (2 / gamma) * math.log(1 + gamma / k)
 
+    # delta is in fraction space; convert back to cents
     # Minimum spread of 2c (1c each side) to cover exchange fees
-    return max(1, round(delta / 2))
+    return max(1, round(delta * 100 / 2))
 
 
 def estimate_market_sigma(market):
@@ -149,8 +152,8 @@ def estimate_market_sigma(market):
                 try:
                     market_date = datetime.date(2000 + yr, month, day)
                     days_out = max(0, (market_date - datetime.date.today()).days)
-                    # Weather sigma: intercept + slope * days_out (in degrees F)
-                    weather_sigma_f = 2.0 + 0.5 * days_out
+                    # Weather sigma: intercept + slope * sqrt(days_out) (matching probability.py)
+                    weather_sigma_f = 2.0 + 0.5 * math.sqrt(max(1, days_out))
                     # Convert F uncertainty to price-cents uncertainty (~4 cents per degree F)
                     return max(2, round(weather_sigma_f * 4))
                 except (ValueError, TypeError):

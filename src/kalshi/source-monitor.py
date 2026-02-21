@@ -14,7 +14,7 @@ import requests
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor
-from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, half_kelly, compute_limit_price, kalshi_fee_cents
+from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, half_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
 from hdd_parser import get_album_sales
 from capital_allocator import PortfolioAllocator
@@ -50,6 +50,14 @@ def save_snapshot(source_name, content, ext="html"):
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     fname = f"{source_name}_{ts}.{ext}"
     (SNAPSHOTS_DIR / fname).write_text(content[:500000] if isinstance(content, str) else json.dumps(content, indent=2)[:500000])
+    # Cleanup: delete snapshots older than 7 days
+    try:
+        cutoff = time.time() - 7 * 86400
+        for old_file in SNAPSHOTS_DIR.iterdir():
+            if old_file.is_file() and old_file.stat().st_mtime < cutoff:
+                old_file.unlink()
+    except Exception:
+        pass
     return fname
 
 # === Kalshi Market Helpers ===
@@ -537,6 +545,9 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
             yes_ask = m.get("yes_ask", 0)
             no_ask = m.get("no_ask", 0)
             yes_bid = m.get("yes_bid", 0)
+
+            if not is_market_liquid(m):
+                continue
 
             # Determine trade side and edge
             if direction == "T":

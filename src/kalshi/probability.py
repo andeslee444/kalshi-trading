@@ -169,7 +169,7 @@ def weather_probability(forecast_temp, threshold, direction, days_out=0, city=No
         intercept = weather_cal["global_sigma_intercept"]
         slope = weather_cal.get("global_sigma_slope", slope)
 
-    sigma = intercept + slope * math.sqrt(max(0, days_out))
+    sigma = max(0.5, intercept + slope * math.sqrt(max(0, days_out)))
 
     # Degrees of freedom for Student's t (fat tails for forecast errors)
     df = weather_cal.get("df", 6)
@@ -186,7 +186,7 @@ def weather_probability(forecast_temp, threshold, direction, days_out=0, city=No
 
 
 def ensemble_weather_probability(forecasts, threshold, direction, days_out=0, city=None):
-    """Bayesian Model Averaging probability for KXHIGH weather markets.
+    """Weighted ensemble averaging (linear opinion pool) for KXHIGH weather markets.
 
     Combines GFS, ECMWF, and ICON forecasts with calibrated weights.
     Each model produces an independent probability via weather_probability(),
@@ -239,14 +239,14 @@ def nws_probability(running_high, threshold, direction, hour_of_day):
     """Probability for NWS actual-temp arbitrage (source-monitor).
 
     Uses a continuous exponential decay model for residual uncertainty:
-      sigma = max(0.3, 4.0 * exp(-0.18 * (hour - 6)))
+      sigma = max(0.5, 4.0 * exp(-0.18 * (hour - 6)))
 
     This gives smooth transitions instead of discontinuous steps:
       hour  6: sigma ~4.0F (morning, full uncertainty)
       hour 12: sigma ~1.4F (midday)
       hour 15: sigma ~0.7F (afternoon, mostly locked)
       hour 17: sigma ~0.4F (evening, essentially final)
-      hour 20: sigma ~0.3F (floor)
+      hour 20: sigma ~0.5F (floor)
 
     If config/calibration.json has nws sigma_by_hour overrides, falls back
     to the legacy 3-step model for backwards compatibility.
@@ -262,11 +262,11 @@ def nws_probability(running_high, threshold, direction, hour_of_day):
     if nws_cal:
         # Legacy step-function: use calibrated values
         if hour_of_day >= 17:
-            sigma = nws_cal.get("17+", 0.5)
+            sigma = max(0.5, nws_cal.get("17+", 0.5))
         elif hour_of_day >= 15:
-            sigma = nws_cal.get("15-16", 1.5)
+            sigma = max(0.5, nws_cal.get("15-16", 1.5))
         else:
-            sigma = nws_cal.get("before_15", 3.0)
+            sigma = max(0.5, nws_cal.get("before_15", 3.0))
     else:
         # Continuous model: exponential decay from morning uncertainty
         if hour_of_day < 6:
@@ -356,7 +356,7 @@ def cpi_nowcast_sigma(days_to_release):
 
     If config/calibration.json has cpi.sigma_by_days (from calibrate-cpi-sigma.py),
     uses empirically calibrated values. Otherwise falls back to heuristic:
-    ~0.10 at 14d, ~0.06 at 7d, ~0.03 at 1d, 0.01 at release day.
+    ~0.10 at 14d, ~0.04 at 7d, ~0.03 at 1d, 0.03 at release day.
     """
     cal = _load_calibration()
     cpi_cal = cal.get("cpi", {}).get("sigma_by_days", {})
@@ -367,8 +367,8 @@ def cpi_nowcast_sigma(days_to_release):
 
     # Fallback heuristic
     if days_to_release <= 0:
-        return 0.01
-    return max(0.01, 0.10 * math.exp(-0.12 * (14 - min(14, days_to_release))))
+        return 0.03
+    return max(0.03, 0.10 * math.exp(-0.12 * (14 - min(14, days_to_release))))
 
 
 def boxoffice_data_sigma(day_of_week):
@@ -446,13 +446,14 @@ def edge_after_fees(raw_edge, price_cents):
 
 def crypto_price_probability(current_price, threshold, direction="above",
                               time_horizon_minutes=1440, realized_vol_pct=None,
-                              iv_pct=None, use_ou=False, ou_half_life_minutes=None):
+                              iv_pct=None, use_ou=False, ou_half_life_minutes=None,
+                              drift_pct=0.0):
     """Log-normal probability for crypto price markets (BTC/ETH).
 
-    Uses geometric Brownian motion: ln(S_T/S_0) ~ N(-0.5*sigma^2*T, sigma^2*T)
-    where sigma is annualized volatility.
+    Uses geometric Brownian motion: ln(S_T/S_0) ~ N((drift-0.5*sigma^2)*T, sigma^2*T)
+    where sigma is annualized volatility and drift is annualized return rate.
 
-    P(S_T > K) = Phi(d2) where d2 = (ln(S/K) - 0.5*sigma^2*T) / (sigma*sqrt(T))
+    P(S_T > K) = Phi(d2) where d2 = (ln(S/K) + (drift-0.5*sigma^2)*T) / (sigma*sqrt(T))
 
     Args:
         current_price: current spot price (e.g. 67500 for BTC).
@@ -462,6 +463,8 @@ def crypto_price_probability(current_price, threshold, direction="above",
         time_horizon_minutes: time to settlement in minutes (default 1440 = 1 day).
         realized_vol_pct: realized annualized volatility as decimal (e.g. 0.60 = 60%).
         iv_pct: implied volatility as decimal. Takes precedence over realized.
+        drift_pct: annualized drift rate as decimal (default 0.0 = risk-neutral).
+                   Pass positive value for physical measure (e.g. 0.30 = 30% annual).
 
     Returns:
         Probability (0-1).
@@ -482,13 +485,17 @@ def crypto_price_probability(current_price, threshold, direction="above",
     if T <= 0:
         return 1.0 if current_price > threshold else 0.0
 
-    # Ornstein-Uhlenbeck mean-reversion adjustment for short horizons
-    if use_ou and time_horizon_minutes < 240:
+    # Ornstein-Uhlenbeck mean-reversion adjustment with smooth blend
+    if use_ou:
         half_life = ou_half_life_minutes or 120  # default 2-hour half-life
         theta_per_min = math.log(2) / max(1, half_life)
         two_theta_T = 2 * theta_per_min * time_horizon_minutes
         if two_theta_T > 1e-10:
             ou_factor = math.sqrt((1 - math.exp(-two_theta_T)) / two_theta_T)
+            # Smooth blend: full OU below 180 min, linear taper to 1.0 at 300 min
+            if time_horizon_minutes > 180:
+                blend = max(0.0, (300 - time_horizon_minutes) / 120)
+                ou_factor = blend * ou_factor + (1 - blend) * 1.0
             sigma = sigma * ou_factor
 
     sqrt_T = math.sqrt(T)
@@ -497,8 +504,8 @@ def crypto_price_probability(current_price, threshold, direction="above",
     if sigma_sqrt_T <= 0:
         return 1.0 if current_price > threshold else 0.0
 
-    # d2 from Black-Scholes (no drift assumption for risk-neutral pricing)
-    d2 = (math.log(current_price / threshold) - 0.5 * sigma**2 * T) / sigma_sqrt_T
+    # d2 with configurable drift (default 0.0 = risk-neutral)
+    d2 = (math.log(current_price / threshold) + (drift_pct - 0.5 * sigma**2) * T) / sigma_sqrt_T
     prob_above = _norm_cdf(d2)
 
     if direction == "below":
@@ -629,7 +636,7 @@ def half_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None, fee_cents
         return _zero
 
     # Max contracts from Kelly fraction (if bankroll provided)
-    if bankroll_cents and bankroll_cents > 0:
+    if bankroll_cents is not None and bankroll_cents > 0:
         max_kelly = int((half_f * bankroll_cents) / price_cents)
     else:
         max_kelly = 999999
@@ -694,7 +701,7 @@ def half_kelly_sell(edge, sell_price_cents, max_cost_cents, bankroll_cents=None,
     risk_per = 100 - sell_price_cents
 
     # Max contracts from Kelly fraction (if bankroll provided)
-    if bankroll_cents and bankroll_cents > 0:
+    if bankroll_cents is not None and bankroll_cents > 0:
         max_kelly = int((half_f * bankroll_cents) / risk_per)
     else:
         max_kelly = 999999
@@ -777,7 +784,7 @@ def high_conviction_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None
     if scaled_f <= 0:
         return _zero
 
-    if bankroll_cents and bankroll_cents > 0:
+    if bankroll_cents is not None and bankroll_cents > 0:
         max_kelly = int((scaled_f * bankroll_cents) / price_cents)
     else:
         max_kelly = 999999

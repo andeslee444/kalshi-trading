@@ -14,7 +14,7 @@ import requests
 from pathlib import Path
 from bs4 import BeautifulSoup
 
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, notify_whatsapp
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, notify_whatsapp, _atomic_write_json, HealthCheckMonitor
 from capital_allocator import PortfolioAllocator
 
 # Unbuffered output
@@ -46,6 +46,7 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxDailyLoss": _bots_cfg.get("maxDailyLoss", 25),
 }, logger=log)
 allocator = PortfolioAllocator(client, logger=log)
+health = HealthCheckMonitor(logger=log)
 trim_trade_log(TRADES_PATH)
 
 
@@ -96,7 +97,7 @@ def load_state():
 
 def save_state(state):
     state["last_check"] = datetime.datetime.now().isoformat()
-    STATE_PATH.write_text(json.dumps(state, indent=2))
+    _atomic_write_json(STATE_PATH, state)
 
 
 def content_hash(text):
@@ -383,23 +384,11 @@ def execute_exits(exit_trades):
         sell_qty = min(t["quantity"], held)
         sell_price = t["price_cents"]
 
-        # Place sell order
-        order_body = {
-            "ticker": ticker,
-            "action": "sell",
-            "side": side,
-            "type": "limit",
-            "count": sell_qty,
-        }
-        if side == "yes":
-            order_body["yes_price"] = sell_price
-        else:
-            order_body["no_price"] = sell_price
-
-        try:
-            result = client.post("/portfolio/orders", body=order_body)
-            order_info = result.get("order", {})
-            log.info(f"  EXIT: Sell {sell_qty}x {side.upper()} {ticker} @ {sell_price}c (ID: {order_info.get('order_id')})")
+        # Place sell order via TradeManager (enforces kill switch, circuit breaker, logging)
+        reasoning = f"BeatRelease exit: {t.get('reasoning', 'signal reversed')}"
+        result = trade_manager.sell_position(ticker, side, sell_price, sell_qty, reasoning)
+        if result:
+            log.info(f"  EXIT: Sell {sell_qty}x {side.upper()} {ticker} @ {sell_price}c (ID: {result.get('order_id')})")
             placed.append({
                 "ticker": ticker,
                 "side": side,
@@ -408,8 +397,6 @@ def execute_exits(exit_trades):
                 "action": "exit",
             })
             time.sleep(0.5)
-        except Exception as e:
-            log.error(f"  Exit order failed for {ticker}: {e}")
 
     return placed
 
@@ -646,6 +633,7 @@ def run_daemon():
 
     while True:
         try:
+            health.record_bot_heartbeat("beatrelease")
             scan_cycle()
         except Exception as e:
             log.error(f"Scan cycle error: {e}")

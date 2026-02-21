@@ -36,6 +36,8 @@ CONFIDENCE_THRESHOLD = _bots_cfg["confidenceThreshold"]
 SCAN_INTERVAL_MINUTES = _bots_cfg["scanIntervalMinutes"]
 ENTERTAINMENT_TICKERS = _bots_cfg["tickers"]
 
+MIN_EDGE = 0.03  # 3% minimum edge to cover fees + noise
+
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 client = KalshiClient()
@@ -275,7 +277,7 @@ def evaluate_album_opportunity(market, album, market_price):
 
     if side == "yes" and yes_ask and yes_ask < 99:
         edge = confidence - yes_ask / 100
-        if edge > 0:
+        if edge >= MIN_EDGE:
             # Request budget — info-arb with high confidence gets larger allocation
             budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence)
             if not budget.approved:
@@ -301,7 +303,7 @@ def evaluate_album_opportunity(market, album, market_price):
 
     elif side == "no" and no_ask and no_ask < 99:
         edge = confidence - no_ask / 100
-        if edge > 0:
+        if edge >= MIN_EDGE:
             budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence)
             if not budget.approved:
                 log.info(f"     Allocator denied {ticker}: {budget.reason}")
@@ -363,7 +365,7 @@ def evaluate_boxoffice_opportunity(market, movie, market_price):
 
     if side == "yes" and yes_ask and yes_ask < 99:
         edge = confidence - yes_ask / 100
-        if edge > 0:
+        if edge >= MIN_EDGE:
             budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence)
             if not budget.approved:
                 return
@@ -386,7 +388,7 @@ def evaluate_boxoffice_opportunity(market, movie, market_price):
 
     elif side == "no" and no_ask and no_ask < 99:
         edge = confidence - no_ask / 100
-        if edge > 0:
+        if edge >= MIN_EDGE:
             budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence)
             if not budget.approved:
                 return

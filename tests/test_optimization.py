@@ -82,6 +82,13 @@ def _load_beatrelease_scanner():
     })
     fake_auth.trim_trade_log = lambda *a, **kw: None
     fake_auth.notify_whatsapp = lambda *a, **kw: False
+    fake_auth._atomic_write_json = lambda *a, **kw: None
+    fake_auth.HealthCheckMonitor = type("HealthCheckMonitor", (), {
+        "__init__": lambda self, *a, **kw: None,
+        "record_bot_heartbeat": lambda self, *a, **kw: None,
+        "record_source_success": lambda self, *a, **kw: None,
+        "record_source_error": lambda self, *a, **kw: None,
+    })
     sys.modules["kalshi_auth"] = fake_auth
 
     fake_alloc = types.ModuleType("capital_allocator")
@@ -1108,7 +1115,7 @@ class TestEconNowcastProbability:
 class TestCpiNowcastSigma:
 
     def test_release_day(self):
-        assert cpi_nowcast_sigma(0) == 0.01
+        assert cpi_nowcast_sigma(0) == 0.03
 
     def test_one_day_out(self):
         """Smooth exponential: day 1 should be around 0.03."""
@@ -1126,8 +1133,8 @@ class TestCpiNowcastSigma:
         assert 0.08 < sigma < 0.12
 
     def test_sigma_decreases_toward_release(self):
-        """Sigma should decrease monotonically as release approaches."""
-        assert cpi_nowcast_sigma(14) > cpi_nowcast_sigma(7) > cpi_nowcast_sigma(1) > cpi_nowcast_sigma(0)
+        """Sigma should decrease monotonically as release approaches (floored at 0.03)."""
+        assert cpi_nowcast_sigma(14) > cpi_nowcast_sigma(7) > cpi_nowcast_sigma(1) >= cpi_nowcast_sigma(0)
 
     def test_no_discontinuous_cliff(self):
         """Adjacent days should not have massive sigma jumps."""

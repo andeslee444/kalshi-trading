@@ -291,7 +291,7 @@ def run_scan():
             bankroll_used=c.get("bankroll_used"),
         )
         if result:
-            allocator.record_trade("strategy", ticker, c["risk_cents"], edge=c.get("edge", 0))
+            allocator.record_trade("strategy", ticker, c["risk_cents"], edge=c.get("est_edge", 0))
             trades_executed.append({
                 "ticker": ticker,
                 "title": c["title"],
@@ -348,7 +348,11 @@ def run_scan():
     if not existing:
         existing = "# Kalshi Trade Performance Log\n\nAutomated trading performance tracking.\n"
 
-    log_path.write_text(existing + new_section)
+    full_text = existing + new_section
+    # Keep last 50KB to prevent unbounded growth
+    if len(full_text) > 50000:
+        full_text = full_text[-50000:]
+    log_path.write_text(full_text)
     log.info(f"  Logged to {log_path}")
 
     # Trade data already saved by TradeManager; save performance summary
@@ -360,6 +364,9 @@ def run_scan():
         except (json.JSONDecodeError, ValueError):
             pass
     perf_data.extend(trades_executed)
+    # Keep last 500 entries to prevent unbounded growth
+    if len(perf_data) > 500:
+        perf_data = perf_data[-500:]
     _atomic_write_json(perf_json_path, perf_data)
 
     log.info(f"\n{'='*70}")

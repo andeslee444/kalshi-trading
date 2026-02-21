@@ -326,7 +326,8 @@ class TestTradeManager:
     def test_daily_counters_reset_on_new_day(self, tmp_path):
         mgr, _, _ = _make_manager(tmp_path, {"maxTradeAmount": 5, "maxDailyTrades": 1, "maxDailyLoss": 100})
         mgr.place_order("T1", "yes", 10, 1, "r1")
-        # Simulate next day
+        # Simulate next day — clear the trade log so reconstruction doesn't count T1
+        _atomic_write_json(mgr.trades_path, [])
         mgr._daily_date = "1999-01-01"
         result = mgr.place_order("T2", "yes", 10, 1, "r2")
         assert result is not None
