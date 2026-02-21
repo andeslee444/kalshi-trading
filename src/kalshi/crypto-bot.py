@@ -19,12 +19,13 @@ from pathlib import Path
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot,
-    HealthCheckMonitor,
+    HealthCheckMonitor, OrderMonitor,
 )
 from probability import (
     crypto_price_probability, quarter_kelly, half_kelly, compute_limit_price,
     kalshi_fee_cents,
 )
+from ticker_utils import parse_crypto_ticker
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -46,15 +47,18 @@ MAX_DAILY_LOSS = crypto_config.get("maxDailyLoss", 25)
 SCAN_INTERVAL = crypto_config.get("scanIntervalMinutes", 5)
 EDGE_THRESHOLD = crypto_config.get("edgeThreshold", 0.06)
 SETTLEMENT_BUFFER_MINUTES = crypto_config.get("settlementBufferMinutes", 2)
+USE_OU = crypto_config.get("useOrnsteinUhlenbeck", False)
+OU_HALF_LIFE = crypto_config.get("ouHalfLifeMinutes", 120)
 
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
 health = HealthCheckMonitor(logger=log)
+order_monitor = OrderMonitor(client, log=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": MAX_TRADE,
     "maxDailyTrades": MAX_DAILY_TRADES,
     "maxDailyLoss": MAX_DAILY_LOSS,
-}, logger=log, cooldown_hours=0.5)  # short cooldown for fast markets
+}, logger=log, cooldown_hours=0.5, order_monitor=order_monitor)  # short cooldown for fast markets
 trim_trade_log(TRADES_PATH)
 
 # === Market ticker prefixes ===
@@ -172,45 +176,6 @@ def compute_realized_vol(asset, current_price):
     vol = math.sqrt(variance * intervals_per_year)
 
     return max(0.10, min(3.0, vol))  # clamp to reasonable range
-
-
-# === Ticker Parsing ===
-
-def parse_crypto_ticker(ticker):
-    """Parse crypto market tickers.
-
-    Examples:
-      KXBTC-26FEB16-T70000 -> {"asset": "BTC", "threshold": 70000, "direction": "T", ...}
-      KXETH-26FEB16-B3500  -> {"asset": "ETH", "threshold": 3500, "direction": "B", ...}
-    """
-    m = re.match(r"KX(BTC|ETH|SOL|CRYPTO)(\w*)-(\d{2})([A-Z]{3})(\d{2})-([TB])([\d.]+)", ticker)
-    if not m:
-        # Try simpler format
-        m2 = re.match(r"KX(BTC|ETH|SOL).*-([TB])([\d.]+)$", ticker)
-        if m2:
-            return {
-                "asset": m2.group(1),
-                "direction": m2.group(2),
-                "threshold": float(m2.group(3)),
-            }
-        return None
-
-    MONTHS = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
-              "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
-    asset = m.group(1)
-    day, mon, yr = int(m.group(3)), m.group(4), int(m.group(5))
-    direction = m.group(6)
-    threshold = float(m.group(7))
-    month = MONTHS.get(mon)
-    if not month:
-        return None
-
-    return {
-        "asset": asset,
-        "date": f"{2000+yr}-{month:02d}-{day:02d}",
-        "direction": direction,
-        "threshold": threshold,
-    }
 
 
 def estimate_time_to_settlement(market):
@@ -332,6 +297,7 @@ def scan_and_trade():
                 current_price, threshold, "above",
                 time_horizon_minutes=minutes_to_settle,
                 realized_vol_pct=vol_to_use, iv_pct=None,
+                use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
             )
         else:
             # Bracket: probability price lands in [threshold, threshold+range)
@@ -341,11 +307,13 @@ def scan_and_trade():
                 current_price, threshold, "above",
                 time_horizon_minutes=minutes_to_settle,
                 realized_vol_pct=vol_to_use, iv_pct=None,
+                use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
             )
             prob_above_high = crypto_price_probability(
                 current_price, threshold + range_size, "above",
                 time_horizon_minutes=minutes_to_settle,
                 realized_vol_pct=vol_to_use, iv_pct=None,
+                use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
             )
             prob = prob_above_low - prob_above_high
 
@@ -467,6 +435,7 @@ def main():
     while True:
         try:
             health.record_bot_heartbeat("crypto")
+            order_monitor.check_orders()
             scan_and_trade()
         except Exception as e:
             log.error(f"Scan error: {e}")

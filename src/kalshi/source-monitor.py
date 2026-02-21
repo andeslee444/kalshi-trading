@@ -13,8 +13,10 @@ import json, time, datetime, os, sys, re, hashlib, traceback
 import requests
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor
+from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, half_kelly, compute_limit_price, kalshi_fee_cents
+from ticker_utils import parse_weather_ticker as parse_temp_ticker
+from hdd_parser import get_album_sales
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -36,11 +38,12 @@ config = json.loads(CONFIG_PATH.read_text())
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
 health = HealthCheckMonitor(logger=log)
+order_monitor = OrderMonitor(client, log=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": config["maxTradeAmount"],
     "maxDailyTrades": config["maxDailyTrades"],
     "maxDailyLoss": config["maxDailyLoss"],
-}, logger=log)
+}, logger=log, order_monitor=order_monitor)
 trim_trade_log(TRADES_PATH)
 
 def save_snapshot(source_name, content, ext="html"):
@@ -59,85 +62,18 @@ def get_markets_by_prefix(prefix, status="open"):
 # ============================================================
 
 def check_hdd(prefetched_markets=None):
-    """Scrape HITS Daily Double for album sales data."""
-    log.info(f"\n[HDD] Checking HITS Daily Double...")
+    """Fetch album sales data from HDD via Sanity CMS API."""
+    log.info(f"\n[HDD] Checking HITS Daily Double (Sanity CMS)...")
 
-    user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-    for url in config["sources"]["hdd"]["urls"]:
-        try:
-            headers = {"User-Agent": user_agent}
-            r = retry_request("GET", url, headers=headers, timeout=20)
-            html = r.text
-            save_snapshot("hdd", html)
-
-            keywords = config["sources"]["hdd"]["keywords"]
-            html_lower = html.lower()
-
-            found_keywords = [kw for kw in keywords if kw.lower() in html_lower]
-            if not found_keywords:
-                log.info(f"  No relevant keywords found on {url}")
-                continue
-
-            log.info(f"  Found keywords: {found_keywords}")
-
-            sales_patterns = [
-                r'(?i)(\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+.*?(\d{2,3}[,.]?\d{0,3})\s*[Kk]\s*(?:units|copies|sales|albums)',
-                r'(?i)(\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+.*?(\d{1,3}(?:,\d{3})+)\s*(?:units|copies|sales|albums)',
-                r'(?i)(\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+.*?projected\s+.*?(\d{2,3}[,.]?\d{0,3})\s*[Kk]',
-                r'(?i)(\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+.*?building\s+.*?(\d{2,3}[,.]?\d{0,3})\s*[Kk]',
-            ]
-
-            found_data = []
-            for pattern in sales_patterns:
-                matches = re.findall(pattern, html)
-                for match in matches:
-                    artist = match[0].strip()
-                    units_str = match[1].replace(",", "")
-                    try:
-                        units = int(float(units_str))
-                        if units < 1000:
-                            units = units * 1000
-                        found_data.append({"artist": artist, "units": units, "source_url": url})
-                    except (ValueError, TypeError):
-                        pass
-
-            if found_data:
-                log.info(f"  Found album sales data: {found_data}")
-                match_hdd_to_markets(found_data, prefetched_markets=prefetched_markets)
-            else:
-                log.info(f"  Keywords found but no structured sales data parsed")
-
-        except Exception as e:
-            log.error(f"  HDD check failed for {url}: {e}")
-
-    # Also try the building chart
     try:
-        building_url = "https://hitsdd.section101.com/building_album_chart"
-        r = retry_request("GET", building_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-        if r.status_code == 200:
-            save_snapshot("hdd_building", r.text)
-            log.info(f"  Building chart fetched ({len(r.text)} bytes)")
-            parse_building_chart(r.text)
+        found_data = get_album_sales(logger=log)
+        if found_data:
+            log.info(f"  Found {len(found_data)} album sales entries")
+            match_hdd_to_markets(found_data, prefetched_markets=prefetched_markets)
+        else:
+            log.info(f"  No album sales data found")
     except Exception as e:
-        log.error(f"  Building chart fetch failed: {e}")
-
-def parse_building_chart(html):
-    """Parse the HDD building album chart for mid-week estimates."""
-    rows = re.findall(r'(?i)<tr[^>]*>.*?</tr>', html, re.DOTALL)
-    found = []
-    for row in rows[:50]:
-        cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
-        if len(cells) >= 2:
-            text = " ".join(re.sub(r'<[^>]+>', '', c).strip() for c in cells)
-            nums = re.findall(r'(\d{2,3}(?:,\d{3})*)', text)
-            if nums:
-                found.append(text[:200])
-
-    if found:
-        log.info(f"  Building chart entries: {len(found)}")
-        for f in found[:5]:
-            log.info(f"    -> {f}")
+        log.error(f"  HDD check failed: {e}")
 
 def match_hdd_to_markets(sales_data, prefetched_markets=None):
     """Match parsed album sales data to open Kalshi markets."""
@@ -313,15 +249,18 @@ def check_boxoffice(prefetched_markets=None):
         r = retry_request("GET", url, headers={"User-Agent": user_agent}, timeout=20)
         save_snapshot("boxoffice_mojo", r.text)
 
-        movies = re.findall(r'(?:>)([^<]{3,50})</a>.*?\$([\d,.]+)\s*[MmBb]?', r.text, re.DOTALL)
+        movies = re.findall(r'(?:>)([^<]{3,50})</a>.*?\$([\d,.]+)\s*([MmBb])?', r.text, re.DOTALL)
 
         mojo_data = []
-        for title, gross in movies[:10]:
-            title = title.strip()
-            gross_clean = gross.replace(",", "")
+        for match in movies[:10]:
+            title = match[0].strip()
+            gross_clean = match[1].replace(",", "")
+            suffix = match[2].upper() if match[2] else ""
             try:
                 gross_val = float(gross_clean)
-                if gross_val < 1000:
+                if suffix == "B":
+                    gross_val *= 1_000_000_000
+                elif suffix == "M":
                     gross_val *= 1_000_000
                 mojo_data.append({"title": title, "gross": int(gross_val), "source": "boxofficemojo.com"})
             except (ValueError, TypeError):
@@ -447,27 +386,6 @@ def evaluate_boxoffice_trade(market, movie):
 # ============================================================
 # SOURCE 3: NWS Actual Temperature
 # ============================================================
-
-MONTHS = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,"JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
-
-def parse_temp_ticker(ticker):
-    """Parse KXHIGHMIA-26FEB16-T86 or KXHIGHMIA-26FEB16-B85.5"""
-    m = re.match(r"KXHIGH([A-Z]+)-(\d{2})([A-Z]{3})(\d{2})-([TB])([\d.]+)", ticker)
-    if not m:
-        return None
-    city = m.group(1)
-    day, mon, yr = int(m.group(2)), m.group(3), int(m.group(4))
-    direction = m.group(5)
-    threshold = float(m.group(6))
-    month = MONTHS.get(mon)
-    if not month:
-        return None
-    return {
-        "city": city,
-        "date": f"{2000+yr}-{month:02d}-{day:02d}",
-        "direction": direction,
-        "threshold": threshold,
-    }
 
 def check_nws(prefetched_markets=None):
     """Check NWS actual temperature observations for all stations (parallel fetch)."""
@@ -595,7 +513,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                 today_markets.append((m, parsed))
 
         if not today_markets:
-            log.info(f"  No KXHIGH markets settling today ({today})")
+            log.info(f"  No KXHIGH markets settling today ({datetime.date.today().isoformat()})")
             return
 
         log.info(f"  Found {len(today_markets)} temperature markets settling today")
@@ -733,6 +651,7 @@ def main():
     while True:
         now = time.time()
         health.record_bot_heartbeat("source-monitor")
+        order_monitor.check_orders()
 
         try:
             # Determine which sources need checking this cycle

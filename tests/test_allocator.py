@@ -6,6 +6,7 @@ Fix 3: Validates the "best signal wins" mechanism and backward compatibility.
 
 import datetime
 import json
+import time
 import tempfile
 import pytest
 from pathlib import Path
@@ -13,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 from capital_allocator import (
     PortfolioAllocator, compute_signal_quality, MODEL_QUALITY_FACTOR, BudgetResponse,
+    CITY_REGIONS, _CITY_TO_REGION, MAX_REGION_FRACTION,
 )
 
 
@@ -211,3 +213,116 @@ class TestBackwardCompat:
         assert isinstance(entry, dict)
         assert entry["bot"] == "weather"
         assert entry["signal_quality"] == 0.0  # old format has no quality
+
+
+class TestBalanceCacheTTL:
+    """Test that balance cache expires after 5 seconds (Fix 5)."""
+
+    def _make_allocator(self):
+        mock_client = MagicMock()
+        mock_client.get_balance.return_value = (50000, 50000)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            json.dump({}, f)
+            state_path = f.name
+        alloc = PortfolioAllocator(client=mock_client, state_path=state_path)
+        alloc._daily_date = datetime.date.today().isoformat()
+        return alloc, mock_client
+
+    def test_cache_expires_after_5_seconds(self):
+        """Balance should be re-fetched after 5 seconds."""
+        alloc, mock_client = self._make_allocator()
+        # First call fetches from API
+        alloc._get_balance()
+        assert mock_client.get_balance.call_count == 1
+        # Simulate cache expiry by backdating the fetch time
+        alloc._balance_fetched_at = time.time() - 6
+        alloc._get_balance()
+        assert mock_client.get_balance.call_count == 2
+
+    def test_cache_hit_within_window(self):
+        """Balance should be cached within 5 seconds."""
+        alloc, mock_client = self._make_allocator()
+        alloc._get_balance()
+        alloc._get_balance()
+        alloc._get_balance()
+        # Only one actual API call
+        assert mock_client.get_balance.call_count == 1
+
+
+# ===================================================================
+# Region Exposure tests (Phase 4.5)
+# ===================================================================
+
+class TestRegionExposure:
+    """Test correlated city/region exposure limits."""
+
+    def _make_allocator(self, balance=50000):
+        mock_client = MagicMock()
+        mock_client.get_balance.return_value = (balance, balance)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            json.dump({}, f)
+            state_path = f.name
+        alloc = PortfolioAllocator(client=mock_client, state_path=state_path)
+        alloc._daily_date = datetime.date.today().isoformat()
+        return alloc
+
+    def test_region_constants_defined(self):
+        """Region groupings should include known correlated cities."""
+        assert "HOU" in _CITY_TO_REGION
+        assert "AUS" in _CITY_TO_REGION
+        assert _CITY_TO_REGION["HOU"] == _CITY_TO_REGION["AUS"]
+
+    def test_region_limit_blocks_combined(self):
+        """Combined HOU + AUS spending should trigger region limit."""
+        alloc = self._make_allocator(balance=50000)
+        # Max region risk = 50000 * 0.15 = 7500 cents
+        # Fill up HOU to near the limit
+        alloc.record_trade("weather", "KXHIGHHOU-26FEB16-B77", 4000, edge=0.10)
+        alloc.record_trade("weather", "KXHIGHHOU-26FEB16-B78", 3500, edge=0.10)
+        # Now AUS should be blocked — region already at 7500 >= 7500
+        result = alloc.request_budget("weather", "KXHIGHAUS-26FEB16-B90", edge=0.12)
+        assert not result.approved
+        assert "region" in result.reason
+
+    def test_different_region_not_blocked(self):
+        """NY trades should NOT block CHI trades (different region or no region)."""
+        alloc = self._make_allocator(balance=50000)
+        alloc.record_trade("weather", "KXHIGHNY-26FEB16-T40", 4000, edge=0.10)
+        # CHI has no region grouping, should not be blocked by NY
+        result = alloc.request_budget("weather", "KXHIGHCHI-26FEB16-T50", edge=0.12)
+        assert result.approved
+
+
+# ===================================================================
+# Max Concurrent Positions tests (Phase 4.6)
+# ===================================================================
+
+class TestMaxConcurrentPositions:
+    """Test max concurrent positions limit."""
+
+    def _make_allocator(self, balance=50000, max_positions=5, position_count=0):
+        mock_client = MagicMock()
+        mock_client.get_balance.return_value = (balance, balance)
+        positions = [{"total_traded": 1}] * position_count
+        mock_client.get.return_value = {"market_positions": positions}
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            json.dump({}, f)
+            state_path = f.name
+        alloc = PortfolioAllocator(
+            client=mock_client, state_path=state_path, max_positions=max_positions
+        )
+        alloc._daily_date = datetime.date.today().isoformat()
+        return alloc
+
+    def test_blocks_when_at_limit(self):
+        """Should reject when position count >= max_positions."""
+        alloc = self._make_allocator(max_positions=5, position_count=5)
+        result = alloc.request_budget("weather", "KXHIGHCHI-26FEB16-T50", edge=0.12)
+        assert not result.approved
+        assert "max concurrent positions" in result.reason
+
+    def test_allows_under_limit(self):
+        """Should allow when position count < max_positions."""
+        alloc = self._make_allocator(max_positions=20, position_count=5)
+        result = alloc.request_budget("weather", "KXHIGHCHI-26FEB16-T50", edge=0.12)
+        assert result.approved

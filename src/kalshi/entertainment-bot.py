@@ -7,8 +7,9 @@ DEMO API ONLY — $5 max per trade.
 import json, time, datetime, os, sys, re, traceback
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor
+from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, half_kelly, compute_limit_price, is_market_liquid, kalshi_fee_cents
+from hdd_parser import get_album_sales
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -40,11 +41,12 @@ USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
 health = HealthCheckMonitor(logger=log)
+order_monitor = OrderMonitor(client, log=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": MAX_TRADE_AMOUNT,
     "maxDailyTrades": MAX_DAILY_TRADES,
     "maxDailyLoss": _bots_cfg.get("maxDailyLoss", 25),
-}, logger=log)
+}, logger=log, order_monitor=order_monitor)
 trim_trade_log(TRADES_PATH)
 
 # === Market Discovery ===
@@ -84,82 +86,11 @@ def find_entertainment_markets():
 
 # === Source: HITS Daily Double ===
 def scrape_hdd():
-    """Scrape HITS Daily Double for album sales data (parallel fetch)."""
-    log.info("Checking HITS Daily Double...")
-
-    album_data = []
-    urls = [
-        "https://hitsdailydouble.com/charts/hits-top-50",
-        "https://hitsdailydouble.com/news?id=1",
-        "https://hitsdailydouble.com/news/charts",
-        "https://hitsdailydouble.com/",
-    ]
-    building_urls = [
-        "https://hitsdailydouble.com/building_album_chart",
-        "https://hitsdd.section101.com/building_album_chart",
-    ]
-
-    headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
-
-    # Fetch all HDD URLs concurrently
-    all_urls = urls + building_urls
-    responses = fetch_parallel(all_urls, headers=headers, timeout=20)
-
-    for url in all_urls:
-        r = responses.get(url)
-        if r is None:
-            log.warning(f"  HDD fetch failed: {url}")
-            continue
-        if r.status_code != 200:
-            log.warning(f"  HDD {url}: HTTP {r.status_code}")
-            continue
-
-        html = r.text
-        log.info(f"  HDD {url}: {len(html)} bytes fetched")
-
-        parsed = parse_album_sales(html)
-        if parsed:
-            album_data.extend(parsed)
-            log.info(f"  Found {len(parsed)} album entries from {url}")
-
+    """Fetch album sales data from HDD via Sanity CMS API."""
+    log.info("Checking HITS Daily Double (Sanity CMS)...")
+    album_data = get_album_sales(logger=log)
+    log.info(f"  Found {len(album_data)} album entries from HDD")
     return album_data
-
-def parse_album_sales(html):
-    """Extract album sales data from HTML."""
-    results = []
-
-    patterns = [
-        r'(?i)([A-Z][a-zA-Z\s\'.]+?)\s+[-\u2013\u2014]\s+.*?(\d{2,3}(?:,\d{3})*)\s*[Kk]\s*(?:units|copies|sales|albums|total)?',
-        r'(?i)([A-Z][a-zA-Z\s\'.]+?)\s+.*?(\d{1,3}(?:,\d{3})+)\s*(?:units|copies|sales|albums)',
-        r'(?i)([A-Z][a-zA-Z\s\'.]+?)\s+.*?(?:projected|expected|tracking|building)\s+.*?(\d{2,3}(?:,\d{3})*)\s*[Kk]',
-        r'(?i)(?:^|\n)\s*\d+\.\s+([A-Z][a-zA-Z\s\'.]+?)\s+.*?(\d{2,3}(?:,\d{3})*)',
-        r'"artist"\s*:\s*"([^"]+)".*?"(?:sales|units|total)"\s*:\s*(\d+)',
-    ]
-
-    for pattern in patterns:
-        matches = re.findall(pattern, html)
-        for match in matches:
-            artist = match[0].strip()
-            units_str = match[1].replace(",", "")
-            try:
-                units = int(float(units_str))
-                if units < 1000:
-                    units *= 1000
-                if 5000 < units < 5_000_000:
-                    results.append({"artist": artist, "units": units})
-            except (ValueError, TypeError):
-                pass
-
-    # Deduplicate by artist
-    seen = set()
-    deduped = []
-    for r in results:
-        key = r["artist"].lower().strip()
-        if key not in seen:
-            seen.add(key)
-            deduped.append(r)
-
-    return deduped
 
 # === Source: Box Office Mojo ===
 def scrape_box_office():
@@ -180,13 +111,16 @@ def scrape_box_office():
     if r and r.status_code == 200:
         html = r.text
         log.info(f"  Box Office Mojo: {len(html)} bytes")
-        movies = re.findall(r'>([^<]{3,60})</a>.*?\$([\d,.]+)', html, re.DOTALL)
-        for title, gross in movies[:15]:
-            title = title.strip()
-            gross_clean = gross.replace(",", "")
+        movies = re.findall(r'>([^<]{3,60})</a>.*?\$([\d,.]+)\s*([MmBb])?', html, re.DOTALL)
+        for match in movies[:15]:
+            title = match[0].strip()
+            gross_clean = match[1].replace(",", "")
+            suffix = match[2].upper() if match[2] else ""
             try:
                 val = float(gross_clean)
-                if val < 1000:
+                if suffix == "B":
+                    val *= 1_000_000_000
+                elif suffix == "M":
                     val *= 1_000_000
                 if val > 50_000:
                     box_data.append({"title": title, "gross": int(val), "source": "boxofficemojo"})
@@ -212,13 +146,16 @@ def scrape_box_office():
     r = responses.get("https://www.boxofficemojo.com/weekend/")
     if r and r.status_code == 200:
         html = r.text
-        movies = re.findall(r'>([^<]{3,60})</a>.*?\$([\d,.]+)', html, re.DOTALL)
-        for title, gross in movies[:15]:
-            title = title.strip()
-            gross_clean = gross.replace(",", "")
+        movies = re.findall(r'>([^<]{3,60})</a>.*?\$([\d,.]+)\s*([MmBb])?', html, re.DOTALL)
+        for match in movies[:15]:
+            title = match[0].strip()
+            gross_clean = match[1].replace(",", "")
+            suffix = match[2].upper() if match[2] else ""
             try:
                 val = float(gross_clean)
-                if val < 1000:
+                if suffix == "B":
+                    val *= 1_000_000_000
+                elif suffix == "M":
                     val *= 1_000_000
                 if val > 50_000 and not any(d["title"] == title for d in box_data):
                     box_data.append({"title": title, "gross": int(val), "source": "boxofficemojo-weekend"})
@@ -535,6 +472,7 @@ def main():
     while True:
         try:
             health.record_bot_heartbeat("entertainment")
+            order_monitor.check_orders()
             scan()
         except Exception as e:
             log.error(f"Scan error: {e}")

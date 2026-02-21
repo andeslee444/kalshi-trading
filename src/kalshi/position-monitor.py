@@ -19,8 +19,10 @@ from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, TradeManager, trim_trade_log, CITY_TIMEZONES, _local_today,
     round_half_up, retry_request, fetch_parallel, HealthCheckMonitor,
+    load_trades, _atomic_write_json,
 )
 from probability import weather_probability, nws_probability, half_kelly, kalshi_fee_cents
+from ticker_utils import parse_weather_ticker as parse_temp_ticker
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -44,6 +46,53 @@ MAX_DAILY_EXITS = pm_config.get("maxDailyExits", 20)
 SCAN_INTERVAL = pm_config.get("scanIntervalMinutes", 15)
 ORDER_TTL_MINUTES = pm_config.get("orderTtlMinutes", 120)
 
+# === Entry Record Lookup (for 4.1 entry-price stop, 4.3 info-arb gate) ===
+
+ALL_TRADE_LOGS = [
+    PROJECT_DIR / "data" / "kalshi-trades.json",
+    PROJECT_DIR / "data" / "kalshi-monitor-trades.json",
+    PROJECT_DIR / "data" / "kalshi-entertainment-trades.json",
+    PROJECT_DIR / "data" / "kalshi-economics-trades.json",
+    PROJECT_DIR / "data" / "kalshi-crypto-trades.json",
+    PROJECT_DIR / "data" / "kalshi-strategy-trades.json",
+]
+
+
+def _load_entry_records():
+    """Load most recent BUY trade record per ticker across all bot logs.
+
+    Returns {ticker: trade_record_dict}. Used by stop-loss (entry price)
+    and info-arb gate (source_bot + model_prob).
+    """
+    entries = {}
+    for log_path in ALL_TRADE_LOGS:
+        trades = load_trades(log_path)
+        for t in trades:
+            if t.get("action") != "sell":  # buy records have no "action" key
+                entries[t.get("ticker", "")] = t  # last write wins (most recent)
+    return entries
+
+
+# === Trailing Stop Peak State ===
+
+PEAKS_PATH = PROJECT_DIR / "data" / "position-peaks.json"
+
+
+def _load_peaks():
+    """Load trailing stop peak state from disk."""
+    if PEAKS_PATH.exists():
+        try:
+            return json.loads(PEAKS_PATH.read_text())
+        except (json.JSONDecodeError, ValueError):
+            return {}
+    return {}
+
+
+def _save_peaks(peaks):
+    """Save trailing stop peak state to disk atomically."""
+    _atomic_write_json(PEAKS_PATH, peaks)
+
+
 # Load NWS station config for model-shift evaluation
 MONITOR_CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-monitor-config.json"
 try:
@@ -61,29 +110,6 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxDailyLoss": 100,
 }, logger=log)
 trim_trade_log(TRADES_PATH)
-
-# === Ticker Parsing ===
-MONTHS = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,"JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
-
-def parse_temp_ticker(ticker):
-    """Parse KXHIGHMIA-26FEB16-T86 or KXHIGHMIA-26FEB16-B85.5"""
-    m = re.match(r"KXHIGH([A-Z]+)-(\d{2})([A-Z]{3})(\d{2})-([TB])([\d.]+)", ticker)
-    if not m:
-        return None
-    city = m.group(1)
-    day, mon, yr = int(m.group(2)), m.group(3), int(m.group(4))
-    direction = m.group(5)
-    threshold = float(m.group(6))
-    month = MONTHS.get(mon)
-    if not month:
-        return None
-    return {
-        "city": city,
-        "date": f"{2000+yr}-{month:02d}-{day:02d}",
-        "direction": direction,
-        "threshold": threshold,
-    }
-
 
 # === Position Fetching ===
 
@@ -154,11 +180,11 @@ def evaluate_take_profit(position, market):
     return None
 
 
-def evaluate_stop_loss(position, market):
+def evaluate_stop_loss(position, market, entry_price_cents=None):
     """Check if position should be cut to limit losses.
 
-    If we bought YES and the bid drops below the stop-loss threshold,
-    sell to prevent further losses.
+    Uses entry-price-relative stop when entry price is known (e.g., exit
+    at 40% loss from entry). Falls back to absolute threshold otherwise.
     """
     ticker = position.get("ticker", "")
     yes_count = position.get("yes", 0)
@@ -167,29 +193,91 @@ def evaluate_stop_loss(position, market):
     yes_bid = market.get("yes_bid", 0)
     no_bid = market.get("no_bid", 0) if market.get("no_bid") else (100 - market.get("yes_ask", 100))
 
-    stop_loss_cents = int(STOP_LOSS_THRESHOLD * 100)
+    stop_loss_pct = pm_config.get("stopLossPct", 0.40)
+    absolute_stop = int(STOP_LOSS_THRESHOLD * 100)
 
     # Check YES position stop-loss
-    if yes_count > 0 and yes_bid > 0 and yes_bid <= stop_loss_cents:
-        return {
-            "action": "stop_loss",
-            "side": "yes",
-            "count": yes_count,
-            "price": yes_bid,
-            "reasoning": f"Stop loss: YES bid {yes_bid}c <= {stop_loss_cents}c threshold",
-        }
+    if yes_count > 0 and yes_bid > 0:
+        if entry_price_cents:
+            stop_price = int(entry_price_cents * (1 - stop_loss_pct))
+        else:
+            stop_price = absolute_stop
+        if yes_bid <= stop_price:
+            return {
+                "action": "stop_loss",
+                "side": "yes",
+                "count": yes_count,
+                "price": yes_bid,
+                "reasoning": f"Stop loss: YES bid {yes_bid}c <= {stop_price}c (entry={entry_price_cents or '?'}c, {stop_loss_pct*100:.0f}% loss threshold)",
+            }
 
     # Check NO position stop-loss
-    if no_count > 0 and no_bid > 0 and no_bid <= stop_loss_cents:
-        return {
-            "action": "stop_loss",
-            "side": "no",
-            "count": no_count,
-            "price": no_bid,
-            "reasoning": f"Stop loss: NO bid {no_bid}c <= {stop_loss_cents}c threshold",
-        }
+    if no_count > 0 and no_bid > 0:
+        if entry_price_cents:
+            stop_price = int(entry_price_cents * (1 - stop_loss_pct))
+        else:
+            stop_price = absolute_stop
+        if no_bid <= stop_price:
+            return {
+                "action": "stop_loss",
+                "side": "no",
+                "count": no_count,
+                "price": no_bid,
+                "reasoning": f"Stop loss: NO bid {no_bid}c <= {stop_price}c (entry={entry_price_cents or '?'}c, {stop_loss_pct*100:.0f}% loss threshold)",
+            }
 
     return None
+
+
+def evaluate_trailing_stop(position, market, peak_info):
+    """Exit if bid dropped significantly from observed peak, locking in gains.
+
+    Only triggers when:
+      1. Peak bid was profitable (peak >= entry + trailingMinProfitCents)
+      2. Current bid dropped >= trailingDropCents from peak
+
+    Returns (exit_signal_or_None, updated_peak_info).
+    """
+    yes_count = position.get("yes", 0)
+    no_count = position.get("no", 0)
+
+    if yes_count > 0:
+        current_bid = market.get("yes_bid", 0)
+        side = "yes"
+        count = yes_count
+    elif no_count > 0:
+        current_bid = market.get("no_bid", 0) or (100 - market.get("yes_ask", 100))
+        side = "no"
+        count = no_count
+    else:
+        return None, peak_info
+
+    entry_price = peak_info.get("entry_price", 0)
+    peak_bid = peak_info.get("peak_bid", current_bid)
+
+    # Update peak
+    if current_bid > peak_bid:
+        peak_info["peak_bid"] = current_bid
+        peak_bid = current_bid
+
+    trailing_drop = pm_config.get("trailingDropCents", 10)
+    trailing_min_profit = pm_config.get("trailingMinProfitCents", 10)
+
+    # Trigger: dropped trailing_drop from peak AND peak was profitable
+    if (peak_bid - current_bid >= trailing_drop
+            and peak_bid >= entry_price + trailing_min_profit):
+        return {
+            "action": "trailing_stop",
+            "side": side,
+            "count": count,
+            "price": current_bid,
+            "reasoning": (
+                f"Trailing stop: {side} bid {current_bid}c, peak was {peak_bid}c "
+                f"(entry {entry_price}c), dropped {peak_bid - current_bid}c"
+            ),
+        }, peak_info
+
+    return None, peak_info
 
 
 def _fetch_nws_running_high(city_code):
@@ -407,6 +495,11 @@ def scan_positions():
     log.info(f"Found {len(positions)} positions to evaluate")
     exits_today = 0
 
+    # Load entry records for entry-price stop and info-arb gate
+    entry_records = _load_entry_records()
+    peaks = _load_peaks()
+    open_tickers = set()
+
     for pos in positions:
         ticker = pos.get("ticker", "")
         yes_count = pos.get("yes", 0)
@@ -415,6 +508,8 @@ def scan_positions():
         if yes_count == 0 and no_count == 0:
             continue
 
+        open_tickers.add(ticker)
+
         # Fetch market data
         market = get_market_data(ticker)
         if not market:
@@ -422,17 +517,38 @@ def scan_positions():
 
         log.info(f"  {ticker}: YES={yes_count} NO={no_count} | bid={market.get('yes_bid',0)}c ask={market.get('yes_ask',0)}c")
 
+        # Look up entry record for this position
+        entry_rec = entry_records.get(ticker, {})
+        entry_price = entry_rec.get("price_cents")
+
         # Evaluate exit conditions in priority order
         exit_signal = None
 
-        # 1. Take profit (highest priority — lock in gains)
-        exit_signal = evaluate_take_profit(pos, market)
+        # 1. Take profit (skip for confirmed info-arb — hold to settlement)
+        skip_take_profit = (
+            entry_rec.get("source_bot") == "source-monitor"
+            and entry_rec.get("model_prob", 0) > 0.95
+        )
+        if skip_take_profit:
+            log.info(f"  Skipping take-profit for {ticker} (confirmed info-arb, hold to settlement)")
+        else:
+            exit_signal = evaluate_take_profit(pos, market)
 
-        # 2. Stop loss
+        # 2. Stop loss (entry-price-relative when available)
         if not exit_signal:
-            exit_signal = evaluate_stop_loss(pos, market)
+            exit_signal = evaluate_stop_loss(pos, market, entry_price_cents=entry_price)
 
-        # 3. Model shift
+        # 3. Trailing stop
+        if not exit_signal:
+            if ticker not in peaks:
+                peaks[ticker] = {
+                    "entry_price": entry_price or 0,
+                    "peak_bid": 0,
+                    "side": "yes" if yes_count > 0 else "no",
+                }
+            exit_signal, peaks[ticker] = evaluate_trailing_stop(pos, market, peaks[ticker])
+
+        # 4. Model shift
         if not exit_signal:
             exit_signal = evaluate_model_shift(pos, market)
 
@@ -451,6 +567,12 @@ def scan_positions():
             )
             if result:
                 exits_today += 1
+
+    # Clean up peaks for closed positions and save
+    for stale_ticker in list(peaks.keys()):
+        if stale_ticker not in open_tickers:
+            del peaks[stale_ticker]
+    _save_peaks(peaks)
 
     # Process allocator pending exits (superseded by better signals)
     pending = allocator.get_pending_exits()

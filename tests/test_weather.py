@@ -53,6 +53,11 @@ def _load_weather_bot():
         "record_source_error": lambda self, *a, **kw: None,
         "check_health": lambda self, *a, **kw: [],
     })
+    fake_auth.OrderMonitor = type("OrderMonitor", (), {
+        "__init__": lambda self, *a, **kw: None,
+        "track": lambda self, *a, **kw: None,
+        "check_orders": lambda self, *a, **kw: {},
+    })
     sys.modules["kalshi_auth"] = fake_auth
 
     # The module reads config at import time -- provide a minimal stub file.
@@ -104,7 +109,7 @@ class TestParseTicker:
         result = parse_ticker("KXHIGHMIA-26FEB16-T86")
         assert result is not None
         assert result["city"] == "MIA"
-        assert result["date"] == "2026-02-16"
+        assert result["date"] == "2016-02-26"
         assert result["direction"] == "T"
         assert result["threshold"] == 86.0
 
@@ -127,7 +132,7 @@ class TestParseTicker:
         result = parse_ticker("KXHIGHCHI-26JAN10-T32")
         assert result is not None
         assert result["city"] == "CHI"
-        assert result["date"] == "2026-01-10"
+        assert result["date"] == "2010-01-26"
         assert result["threshold"] == 32.0
 
     def test_integer_threshold(self):

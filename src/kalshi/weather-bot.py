@@ -6,8 +6,9 @@ Scans KXHIGH temperature markets, compares to Open-Meteo forecasts, and places t
 import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor
+from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor
 from probability import weather_probability, ensemble_weather_probability, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents
+from ticker_utils import parse_weather_ticker as parse_ticker
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -25,11 +26,12 @@ CITIES = config["cities"]
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
 health = HealthCheckMonitor(logger=log)
+order_monitor = OrderMonitor(client, log=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": config["maxTradeAmount"],
     "maxDailyTrades": config.get("maxDailyTrades", 10),
     "maxDailyLoss": config.get("maxDailyLoss", 10),
-}, logger=log)
+}, logger=log, order_monitor=order_monitor)
 trim_trade_log(TRADES_PATH)
 
 # === Weather Forecast ===
@@ -103,28 +105,6 @@ def get_ensemble_forecast(lat, lon):
                 combined[date][model_key] = forecasts[date]
 
     return combined
-
-# === Ticker Parsing ===
-MONTHS = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,"JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
-
-def parse_ticker(ticker):
-    """Parse KXHIGHMIA-26FEB16-T86 or KXHIGHMIA-26FEB16-B85.5"""
-    m = re.match(r"KXHIGH([A-Z]+)-(\d{2})([A-Z]{3})(\d{2})-([TB])([\d.]+)", ticker)
-    if not m:
-        return None
-    city = m.group(1)
-    yr, mon, day = int(m.group(2)), m.group(3), int(m.group(4))
-    direction = m.group(5)
-    threshold = float(m.group(6))
-    month = MONTHS.get(mon)
-    if not month:
-        return None
-    return {
-        "city": city,
-        "date": f"{2000+yr}-{month:02d}-{day:02d}",
-        "direction": direction,  # T=above, B=bracket
-        "threshold": threshold,
-    }
 
 # === Trading ===
 
@@ -332,6 +312,12 @@ def scan_and_trade():
         log.info(f"\n-> TRADE: {reasoning}")
         log.info(f"  Placing: {count}x {side} @ {price}c ({sizing_label}, bankroll=${budget.bankroll_cents/100:.2f})")
 
+        # Include per-model forecasts for ensemble weight calibration
+        city_code = opp["parsed"]["city"]
+        date_str = opp["parsed"]["date"]
+        raw_forecast = forecasts.get(city_code, {}).get(date_str) if ENSEMBLE_ENABLED else None
+        ensemble_data = raw_forecast if isinstance(raw_forecast, dict) else None
+
         result = trade_manager.place_order(
             ticker, side, price, count, reasoning,
             forecast_temp=forecast, threshold=threshold, edge=round(actual_edge, 4),
@@ -343,6 +329,7 @@ def scan_and_trade():
             market_close_time=opp["market"].get("close_time"),
             kelly_fraction=kelly_details.get("kelly_fraction"),
             bankroll_used=kelly_details.get("bankroll_used"),
+            ensemble_forecasts=ensemble_data,
         )
         if result:
             allocator.record_trade("weather", ticker, risk, edge=actual_edge)
@@ -366,6 +353,7 @@ def main():
     while True:
         try:
             health.record_bot_heartbeat("weather")
+            order_monitor.check_orders()
             scan_and_trade()
         except Exception as e:
             log.error(f"Scan error: {e}")

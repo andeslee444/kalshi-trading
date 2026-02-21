@@ -15,6 +15,108 @@ def _norm_cdf(x):
     return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
 
+def _ln_gamma(x):
+    """Log-gamma via Lanczos approximation (g=7, n=9). No scipy needed."""
+    if x <= 0:
+        return float('inf')
+    coefs = [
+        0.99999999999980993,
+        676.5203681218851,
+        -1259.1392167224028,
+        771.32342877765313,
+        -176.61502916214059,
+        12.507343278686905,
+        -0.13857109526572012,
+        9.9843695780195716e-6,
+        1.5056327351493116e-7,
+    ]
+    if x < 0.5:
+        # Reflection formula
+        return math.log(math.pi / math.sin(math.pi * x)) - _ln_gamma(1 - x)
+    x -= 1
+    a = coefs[0]
+    t = x + 7.5
+    for i in range(1, 9):
+        a += coefs[i] / (x + i)
+    return 0.5 * math.log(2 * math.pi) + (x + 0.5) * math.log(t) - t + math.log(a)
+
+
+def _regularized_beta_cf(x, a, b, max_iter=200, tol=1e-12):
+    """Regularized incomplete beta I_x(a, b) via continued fraction (Numerical Recipes)."""
+    if x < 0 or x > 1:
+        return 0.0
+    if x == 0 or x == 1:
+        return x
+
+    # Use symmetry relation for better convergence
+    if x > (a + 1) / (a + b + 2):
+        return 1.0 - _regularized_beta_cf(1 - x, b, a, max_iter, tol)
+
+    # Prefactor: x^a * (1-x)^b / (a * B(a,b))
+    ln_prefactor = a * math.log(x) + b * math.log(1 - x) - math.log(a) \
+                   + _ln_gamma(a + b) - _ln_gamma(a) - _ln_gamma(b)
+    prefactor = math.exp(ln_prefactor)
+
+    # Modified Lentz continued fraction (Numerical Recipes style)
+    tiny = 1e-30
+    qab = a + b
+    qap = a + 1.0
+    qam = a - 1.0
+
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < tiny:
+        d = tiny
+    d = 1.0 / d
+    h = d
+
+    for m in range(1, max_iter + 1):
+        m2 = 2 * m
+        # Even step
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        h *= d * c
+
+        # Odd step
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+
+        if abs(delta - 1.0) < tol:
+            break
+
+    return prefactor * h
+
+
+def _student_t_cdf(x, df=6):
+    """Student's t CDF using regularized incomplete beta.
+
+    At df=6, tails are ~3x heavier than Gaussian at 3-sigma.
+    Converges to _norm_cdf as df -> infinity.
+    """
+    if df <= 0:
+        return _norm_cdf(x)
+    t2 = x * x
+    ix = _regularized_beta_cf(df / (df + t2), df / 2.0, 0.5)
+    cdf = 0.5 * ix
+    if x >= 0:
+        return 1.0 - cdf
+    return cdf
+
+
 # ─── Calibration loading ───
 
 _CALIBRATION_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "calibration.json"
@@ -44,9 +146,9 @@ def _reset_calibration():
 def weather_probability(forecast_temp, threshold, direction, days_out=0, city=None):
     """CDF-based probability for KXHIGH weather markets.
 
-    sigma scales with forecast horizon: sigma = intercept + slope * days_out
-    Default: sigma = 2.5 + 0.5 * days_out
-    (day-0 sigma ~2.5F, day-3 sigma ~4.0F, day-7 sigma ~6.0F per NWS verification).
+    sigma scales with forecast horizon: sigma = intercept + slope * sqrt(days_out)
+    Default: sigma = 2.0 + 0.5 * sqrt(days_out)
+    Sublinear (sqrt) scaling matches random-walk forecast error growth.
 
     If config/calibration.json exists with per-city or global sigma parameters,
     those override the defaults.
@@ -67,17 +169,20 @@ def weather_probability(forecast_temp, threshold, direction, days_out=0, city=No
         intercept = weather_cal["global_sigma_intercept"]
         slope = weather_cal.get("global_sigma_slope", slope)
 
-    sigma = intercept + slope * max(0, days_out)
+    sigma = intercept + slope * math.sqrt(max(0, days_out))
+
+    # Degrees of freedom for Student's t (fat tails for forecast errors)
+    df = weather_cal.get("df", 6)
 
     if direction == "T":
         # P(actual > threshold)
         z = (threshold - forecast_temp) / sigma
-        return 1.0 - _norm_cdf(z)
+        return 1.0 - _student_t_cdf(z, df)
     else:
         # B = bracket: P(threshold <= actual < threshold + 1)
         z_low = (threshold - forecast_temp) / sigma
         z_high = (threshold + 1 - forecast_temp) / sigma
-        return _norm_cdf(z_high) - _norm_cdf(z_low)
+        return _student_t_cdf(z_high, df) - _student_t_cdf(z_low, df)
 
 
 def ensemble_weather_probability(forecasts, threshold, direction, days_out=0, city=None):
@@ -150,7 +255,9 @@ def nws_probability(running_high, threshold, direction, hour_of_day):
     direction="B": P(threshold <= final_high < threshold+1)
     """
     cal = _load_calibration()
-    nws_cal = cal.get("nws", {}).get("sigma_by_hour", {})
+    nws_section = cal.get("nws", {})
+    nws_cal = nws_section.get("sigma_by_hour", {})
+    nws_df = nws_section.get("df", 6)
 
     if nws_cal:
         # Legacy step-function: use calibrated values
@@ -169,12 +276,12 @@ def nws_probability(running_high, threshold, direction, hour_of_day):
 
     if direction == "T":
         z = (threshold - running_high) / sigma
-        return 1.0 - _norm_cdf(z)
+        return 1.0 - _student_t_cdf(z, nws_df)
     else:
         # Bracket
         z_low = (threshold - running_high) / sigma
         z_high = (threshold + 1 - running_high) / sigma
-        return _norm_cdf(z_high) - _norm_cdf(z_low)
+        return _student_t_cdf(z_high, nws_df) - _student_t_cdf(z_low, nws_df)
 
 
 def info_arb_probability(observed, threshold, data_sigma_pct=0.05):
@@ -247,9 +354,18 @@ def cpi_nowcast_sigma(days_to_release):
 
     Returns sigma in percentage points (e.g. 0.10 = 0.10%).
 
-    Smooth transitions: ~0.10 at 14d, ~0.06 at 7d, ~0.03 at 1d, 0.01 at release day.
-    Replaces the old step function to avoid discontinuous cliff effects at day boundaries.
+    If config/calibration.json has cpi.sigma_by_days (from calibrate-cpi-sigma.py),
+    uses empirically calibrated values. Otherwise falls back to heuristic:
+    ~0.10 at 14d, ~0.06 at 7d, ~0.03 at 1d, 0.01 at release day.
     """
+    cal = _load_calibration()
+    cpi_cal = cal.get("cpi", {}).get("sigma_by_days", {})
+    if cpi_cal:
+        key = str(min(14, max(0, days_to_release)))
+        if key in cpi_cal:
+            return cpi_cal[key]
+
+    # Fallback heuristic
     if days_to_release <= 0:
         return 0.01
     return max(0.01, 0.10 * math.exp(-0.12 * (14 - min(14, days_to_release))))
@@ -275,6 +391,30 @@ def boxoffice_data_sigma(day_of_week):
         return box_cal.get("sun", 0.05)
     else:  # Mon-Thu
         return box_cal.get("mon_thu", 0.02)
+
+
+# ─── Gas price probability model ───
+
+def gas_price_probability(current_price, threshold, direction="above", weekly_sigma_pct=0.02):
+    """CDF probability for gas price markets.
+
+    Uses current national avg price and historical weekly volatility (~2%).
+
+    Args:
+        current_price: current AAA national average (dollars).
+        threshold: market threshold (dollars).
+        direction: "above" or "below".
+        weekly_sigma_pct: weekly price std dev as fraction (default 2%).
+
+    Returns:
+        Probability (0-1).
+    """
+    sigma = current_price * weekly_sigma_pct
+    if sigma <= 0:
+        return 1.0 if current_price > threshold else 0.0
+    z = (threshold - current_price) / sigma
+    prob_above = 1.0 - _norm_cdf(z)
+    return prob_above if direction == "above" else 1.0 - prob_above
 
 
 # ─── Kalshi fee helpers ───
@@ -306,7 +446,7 @@ def edge_after_fees(raw_edge, price_cents):
 
 def crypto_price_probability(current_price, threshold, direction="above",
                               time_horizon_minutes=1440, realized_vol_pct=None,
-                              iv_pct=None):
+                              iv_pct=None, use_ou=False, ou_half_life_minutes=None):
     """Log-normal probability for crypto price markets (BTC/ETH).
 
     Uses geometric Brownian motion: ln(S_T/S_0) ~ N(-0.5*sigma^2*T, sigma^2*T)
@@ -341,6 +481,15 @@ def crypto_price_probability(current_price, threshold, direction="above",
     T = time_horizon_minutes / (365.25 * 24 * 60)
     if T <= 0:
         return 1.0 if current_price > threshold else 0.0
+
+    # Ornstein-Uhlenbeck mean-reversion adjustment for short horizons
+    if use_ou and time_horizon_minutes < 240:
+        half_life = ou_half_life_minutes or 120  # default 2-hour half-life
+        theta_per_min = math.log(2) / max(1, half_life)
+        two_theta_T = 2 * theta_per_min * time_horizon_minutes
+        if two_theta_T > 1e-10:
+            ou_factor = math.sqrt((1 - math.exp(-two_theta_T)) / two_theta_T)
+            sigma = sigma * ou_factor
 
     sqrt_T = math.sqrt(T)
     sigma_sqrt_T = sigma * sqrt_T

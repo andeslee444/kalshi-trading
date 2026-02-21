@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"))
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
-from probability import _norm_cdf
+from probability import _norm_cdf, _student_t_cdf
 
 
 # ─── Trade file definitions (mirrors analyze-performance.py) ───
@@ -92,15 +92,15 @@ def parse_weather_ticker(ticker):
     }
 
 
-def weather_prob_with_sigma(forecast_temp, threshold, direction, sigma):
-    """Compute weather probability with a specific sigma (for grid search)."""
+def weather_prob_with_sigma(forecast_temp, threshold, direction, sigma, df=6):
+    """Compute weather probability with a specific sigma and df (for grid search)."""
     if direction == "T":
         z = (threshold - forecast_temp) / sigma
-        return 1.0 - _norm_cdf(z)
+        return 1.0 - _student_t_cdf(z, df)
     else:
         z_low = (threshold - forecast_temp) / sigma
         z_high = (threshold + 1 - forecast_temp) / sigma
-        return _norm_cdf(z_high) - _norm_cdf(z_low)
+        return _student_t_cdf(z_high, df) - _student_t_cdf(z_low, df)
 
 
 def brier_score(predictions):
@@ -177,25 +177,29 @@ def calibrate_weather(trades, settlement_map):
     if not matched:
         return {"n": 0}
 
-    # Global grid search: find (intercept, slope) minimizing Brier score
+    # Global grid search: find (intercept, slope, df) minimizing Brier score
     best_brier = float("inf")
     best_intercept = 2.5
     best_slope = 0.5
+    best_df = 6
+    df_candidates = [4, 5, 6, 7, 8, 10, 15, 30]
 
     for intercept_x10 in range(5, 60):  # 0.5 to 5.9
         intercept = intercept_x10 / 10.0
-        for slope_x10 in range(1, 20):  # 0.1 to 1.9
+        for slope_x10 in range(2, 40):  # 0.2 to 3.9 (wider range for sqrt scaling)
             slope = slope_x10 / 10.0
-            preds = []
-            for m in matched:
-                sigma = intercept + slope * m["days_out"]
-                prob = weather_prob_with_sigma(m["forecast_temp"], m["threshold"], m["direction"], sigma)
-                preds.append((prob, m["actual"]))
-            bs = brier_score(preds)
-            if bs is not None and bs < best_brier:
-                best_brier = bs
-                best_intercept = intercept
-                best_slope = slope
+            for df in df_candidates:
+                preds = []
+                for m in matched:
+                    sigma = intercept + slope * math.sqrt(m["days_out"])
+                    prob = weather_prob_with_sigma(m["forecast_temp"], m["threshold"], m["direction"], sigma, df=df)
+                    preds.append((prob, m["actual"]))
+                bs = brier_score(preds)
+                if bs is not None and bs < best_brier:
+                    best_brier = bs
+                    best_intercept = intercept
+                    best_slope = slope
+                    best_df = df
 
     # Per-city calibration
     by_city = defaultdict(list)
@@ -209,29 +213,34 @@ def calibrate_weather(trades, settlement_map):
         city_best_brier = float("inf")
         city_intercept = best_intercept
         city_slope = best_slope
+        city_df = best_df
         for intercept_x10 in range(5, 60):
             intercept = intercept_x10 / 10.0
-            for slope_x10 in range(1, 20):
+            for slope_x10 in range(2, 40):  # wider range for sqrt scaling
                 slope = slope_x10 / 10.0
-                preds = []
-                for m in city_trades:
-                    sigma = intercept + slope * m["days_out"]
-                    prob = weather_prob_with_sigma(m["forecast_temp"], m["threshold"], m["direction"], sigma)
-                    preds.append((prob, m["actual"]))
-                bs = brier_score(preds)
-                if bs is not None and bs < city_best_brier:
-                    city_best_brier = bs
-                    city_intercept = intercept
-                    city_slope = slope
+                for df in df_candidates:
+                    preds = []
+                    for m in city_trades:
+                        sigma = intercept + slope * math.sqrt(m["days_out"])
+                        prob = weather_prob_with_sigma(m["forecast_temp"], m["threshold"], m["direction"], sigma, df=df)
+                        preds.append((prob, m["actual"]))
+                    bs = brier_score(preds)
+                    if bs is not None and bs < city_best_brier:
+                        city_best_brier = bs
+                        city_intercept = intercept
+                        city_slope = slope
+                        city_df = df
         per_city[city] = {
             "sigma_intercept": city_intercept,
             "sigma_slope": city_slope,
+            "df": city_df,
             "n": len(city_trades),
         }
 
     return {
         "global_sigma_intercept": best_intercept,
         "global_sigma_slope": best_slope,
+        "df": best_df,
         "global_brier": round(best_brier, 6) if best_brier < float("inf") else None,
         "per_city": per_city,
         "n": len(matched),
@@ -306,11 +315,11 @@ def calibrate_nws(trades, settlement_map):
             for m in items:
                 if m["direction"] == "T":
                     z = (m["threshold"] - m["running_high"]) / sigma
-                    prob = 1.0 - _norm_cdf(z)
+                    prob = 1.0 - _student_t_cdf(z, 6)
                 else:
                     z_lo = (m["threshold"] - m["running_high"]) / sigma
                     z_hi = (m["threshold"] + 1 - m["running_high"]) / sigma
-                    prob = _norm_cdf(z_hi) - _norm_cdf(z_lo)
+                    prob = _student_t_cdf(z_hi, 6) - _student_t_cdf(z_lo, 6)
                 preds.append((prob, m["actual"]))
             bs = brier_score(preds)
             if bs is not None and bs < best_bs:
@@ -380,6 +389,106 @@ def calibrate_info_arb(trades, settlement_map, label):
     return {"sigma_by_day": sigma_by_day, "n": len(matched)}
 
 
+def calibrate_ensemble_weights(trades, settlement_map):
+    """Calibrate ensemble model weights from weather trades with per-model forecasts.
+
+    Scans trades for ensemble_forecasts field, matches against settlements,
+    computes per-model MAE, and updates weights via inverse-MAE weighting.
+
+    Returns dict with weights and model_maes, or {"n": 0} if no data.
+    """
+    matched = []
+    for t in trades:
+        ticker = t.get("ticker", "")
+        ensemble = t.get("ensemble_forecasts")
+        if not ensemble or not isinstance(ensemble, dict):
+            continue
+
+        parsed = parse_weather_ticker(ticker)
+        if not parsed:
+            continue
+
+        revenue = settlement_map.get(ticker)
+        if revenue is None:
+            continue
+
+        side = t.get("side", "").lower()
+        if side == "yes":
+            actual = 1 if revenue > 0 else 0
+        elif side == "no":
+            actual = 0 if revenue > 0 else 1
+        else:
+            continue
+
+        # Compute days_out for sigma
+        ts = t.get("timestamp", "")
+        try:
+            trade_date = datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
+            market_date = datetime.strptime(parsed["date"], "%Y-%m-%d").date()
+            days = max(0, (market_date - trade_date).days)
+        except (ValueError, TypeError):
+            days = 0
+
+        matched.append({
+            "ensemble": ensemble,
+            "threshold": parsed["threshold"],
+            "direction": parsed["direction"],
+            "days_out": days,
+            "actual": actual,
+        })
+
+    if not matched:
+        return {"n": 0}
+
+    # Compute per-model absolute error of probability prediction
+    model_errors = defaultdict(list)  # model_name -> [abs_error, ...]
+    for m in matched:
+        for model_name, temp in m["ensemble"].items():
+            prob = weather_prob_with_sigma(temp, m["threshold"], m["direction"],
+                                           sigma=2.0 + 0.5 * math.sqrt(m["days_out"]))
+            error = abs(prob - m["actual"])
+            model_errors[model_name].append(error)
+
+    if not model_errors:
+        return {"n": len(matched)}
+
+    # Compute MAE per model
+    model_maes = {}
+    for model_name, errors in model_errors.items():
+        model_maes[model_name] = round(sum(errors) / len(errors), 6)
+
+    # Weights = inverse MAE, normalized (EMA with existing weights)
+    existing_weights = {"gfs": 0.40, "ecmwf": 0.40, "icon": 0.20}
+    inv_maes = {}
+    for model_name, mae in model_maes.items():
+        inv_maes[model_name] = 1.0 / max(0.001, mae)
+
+    total_inv = sum(inv_maes.values())
+    if total_inv <= 0:
+        return {"n": len(matched), "model_maes": model_maes}
+
+    new_weights = {m: inv / total_inv for m, inv in inv_maes.items()}
+
+    # EMA blend: 90% old + 10% new (smooth update)
+    ema_alpha = 0.1
+    blended = {}
+    for model_name in set(list(existing_weights.keys()) + list(new_weights.keys())):
+        old_w = existing_weights.get(model_name, 0.0)
+        new_w = new_weights.get(model_name, 0.0)
+        blended[model_name] = (1 - ema_alpha) * old_w + ema_alpha * new_w
+
+    # Normalize
+    total_w = sum(blended.values())
+    if total_w > 0:
+        blended = {m: round(w / total_w, 4) for m, w in blended.items()}
+
+    return {
+        "weights": blended,
+        "model_maes": model_maes,
+        "n": len(matched),
+    }
+
+
 # ─── Main ───
 
 def main():
@@ -437,6 +546,9 @@ def main():
     beat_trades = all_trades.get("BeatRelease Scanner", [])
     box_cal = calibrate_info_arb(beat_trades, settlement_map, "box_office")
 
+    # Ensemble weight calibration
+    ensemble_cal = calibrate_ensemble_weights(all_bot_trades, settlement_map)
+
     # Build calibration result
     calibration = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
@@ -446,6 +558,7 @@ def main():
         "nws": nws_cal,
         "album_sales": album_cal,
         "box_office": box_cal,
+        "ensemble": ensemble_cal,
     }
 
     if args.save:
@@ -471,11 +584,11 @@ def _print_report(cal, saved):
     w = cal["weather"]
     print(f"\n--- Weather (n={w.get('n', 0)}) ---")
     if w.get("n", 0) > 0:
-        print(f"  Global: sigma = {w['global_sigma_intercept']:.1f} + {w['global_sigma_slope']:.1f} * days_out")
+        print(f"  Global: sigma = {w['global_sigma_intercept']:.1f} + {w['global_sigma_slope']:.1f} * sqrt(days_out)")
         if w.get("global_brier") is not None:
             print(f"  Brier score: {w['global_brier']:.4f}")
         for city, cc in w.get("per_city", {}).items():
-            print(f"  {city}: sigma = {cc['sigma_intercept']:.1f} + {cc['sigma_slope']:.1f} * days_out (n={cc['n']})")
+            print(f"  {city}: sigma = {cc['sigma_intercept']:.1f} + {cc['sigma_slope']:.1f} * sqrt(days_out) (n={cc['n']})")
     else:
         print("  No matched weather trades.")
 
@@ -505,6 +618,16 @@ def _print_report(cal, saved):
             print(f"  {bucket}: sigma = {sigma}")
     else:
         print("  No matched box office trades.")
+
+    # Ensemble weights
+    e = cal.get("ensemble", {})
+    print(f"\n--- Ensemble Weights (n={e.get('n', 0)}) ---")
+    if e.get("n", 0) > 0:
+        for model, w in e.get("weights", {}).items():
+            mae = e.get("model_maes", {}).get(model, "?")
+            print(f"  {model}: weight={w:.3f}  MAE={mae}")
+    else:
+        print("  No trades with ensemble_forecasts data.")
 
     if saved:
         print(f"\nCalibration saved to {CALIBRATION_PATH}")

@@ -36,6 +36,10 @@ RETRY_BACKOFF_BASE = 1.0  # seconds
 
 KILL_SWITCH_PATH = PROJECT_DIR / "data" / "HALT_TRADING"
 
+# Shared market cache — cross-process file cache for market data
+MARKET_CACHE_PATH = PROJECT_DIR / "data" / "market-cache.json"
+MARKET_CACHE_TTL = 60  # seconds
+
 # City timezone mapping — shared by source-monitor, position-monitor, etc.
 CITY_TIMEZONES = {
     "MIA": "America/New_York",
@@ -242,7 +246,7 @@ class KalshiClient:
         """Make an authenticated DELETE request."""
         return self._request("DELETE", path, **kwargs)
 
-    def get_all_markets(self, prefix=None, status="open", max_pages=50, cache_ttl=0):
+    def get_all_markets(self, prefix=None, status="open", max_pages=50, cache_ttl=0, use_shared_cache=True):
         """Paginate through all open markets, optionally filtering by ticker prefix.
 
         Args:
@@ -252,14 +256,29 @@ class KalshiClient:
             cache_ttl: When >0, return cached results if they are younger than
                        this many seconds. Daemon bots can pass e.g. 300 (5 min)
                        to avoid refetching identical market data every scan.
+            use_shared_cache: When True, check/update the cross-process file cache
+                       at data/market-cache.json. This avoids redundant API calls
+                       when multiple bots fetch the same prefix within 60s.
         """
         cache_key = f"{prefix or ''}:{status}"
+
+        # 1. Check in-memory cache (existing behavior)
         if cache_ttl > 0 and cache_key in self._market_cache:
             cached_time, cached_data = self._market_cache[cache_key]
             if time.time() - cached_time < cache_ttl:
                 _log.debug("Market cache hit for %s (%d markets)", cache_key, len(cached_data))
                 return cached_data
 
+        # 2. Check shared file cache (cross-process)
+        if use_shared_cache and prefix and status == "open":
+            shared = read_market_cache(prefix=prefix)
+            if shared is not None:
+                _log.debug("Shared market cache hit for %s (%d markets)", prefix, len(shared))
+                if cache_ttl > 0:
+                    self._market_cache[cache_key] = (time.time(), shared)
+                return shared
+
+        # 3. Fetch from API
         all_markets = []
         cursor = None
         for _ in range(max_pages):
@@ -288,8 +307,20 @@ class KalshiClient:
                 "Increase max_pages if needed.", max_pages, len(all_markets)
             )
 
+        # 4. Update caches
         if cache_ttl > 0:
             self._market_cache[cache_key] = (time.time(), all_markets)
+
+        if use_shared_cache and prefix and status == "open":
+            try:
+                # Read existing cache, merge in new prefix data, write back
+                existing = read_market_cache(max_age=MARKET_CACHE_TTL * 10) or {}
+                if not isinstance(existing, dict):
+                    existing = {}
+                existing[prefix] = all_markets
+                write_market_cache(existing)
+            except Exception as e:
+                _log.debug("Failed to write shared market cache: %s", e)
 
         return all_markets
 
@@ -333,6 +364,45 @@ def save_trade(trades_path: Path, trade: dict):
     trades = load_trades(trades_path)
     trades.append(trade)
     _atomic_write_json(trades_path, trades)
+
+
+# === Shared market data cache ===
+
+def write_market_cache(markets_by_prefix):
+    """Write market data to shared cache file (atomic write).
+
+    Args:
+        markets_by_prefix: Dict mapping prefix strings to market lists.
+    """
+    _atomic_write_json(MARKET_CACHE_PATH, {
+        "updated_at": time.time(),
+        "markets": markets_by_prefix,
+    })
+
+
+def read_market_cache(prefix=None, max_age=MARKET_CACHE_TTL):
+    """Read markets from shared cache if fresh enough.
+
+    Args:
+        prefix: Ticker prefix to look up. If None, returns all cached data.
+        max_age: Maximum age in seconds before cache is considered stale.
+
+    Returns:
+        List of market dicts if cache is fresh, or None if missing/stale.
+    """
+    try:
+        if not MARKET_CACHE_PATH.exists():
+            return None
+        data = json.loads(MARKET_CACHE_PATH.read_text())
+        age = time.time() - data.get("updated_at", 0)
+        if age > max_age:
+            return None
+        markets = data.get("markets", {})
+        if prefix is not None:
+            return markets.get(prefix)
+        return markets
+    except (json.JSONDecodeError, OSError, KeyError):
+        return None
 
 
 # === Concurrent fetch utility ===
@@ -419,7 +489,7 @@ class RecentTradeTracker:
             if not ts_str or not ticker:
                 continue
             try:
-                ts = datetime.datetime.fromisoformat(ts_str)
+                ts = datetime.datetime.fromisoformat(ts_str).replace(tzinfo=None)
                 if ts > cutoff:
                     existing = self._recent.get(ticker)
                     if not existing or ts > existing:
@@ -450,41 +520,92 @@ def check_kill_switch(path=None):
 
 # === Circuit breaker ===
 
+SHARED_BREAKER_PATH = PROJECT_DIR / "data" / "allocator-state.json"
+
+
 class CircuitBreaker:
     """Tracks consecutive API failures and opens after a threshold.
 
     When open, callers should skip trading until the breaker auto-resets.
+    Optionally persists state to a shared file so all bots see the same
+    breaker status.
 
     Args:
         max_failures: Consecutive failures before opening (default 5).
         reset_seconds: Seconds to wait before auto-resetting (default 300).
+        state_path: Path to shared state file. If None, breaker is in-memory only.
     """
 
-    def __init__(self, max_failures=5, reset_seconds=300):
+    def __init__(self, max_failures=5, reset_seconds=300, state_path=None):
         self.max_failures = max_failures
         self.reset_seconds = reset_seconds
         self._failures = 0
         self._opened_at = None
+        self.state_path = Path(state_path) if state_path else None
+
+    def _load_shared(self):
+        """Load shared breaker state from disk."""
+        if not self.state_path or not self.state_path.exists():
+            return
+        try:
+            data = json.loads(self.state_path.read_text())
+            cb = data.get("circuit_breaker", {})
+            self._failures = cb.get("failures", 0)
+            self._opened_at = cb.get("opened_at")
+        except (json.JSONDecodeError, KeyError, OSError):
+            pass
+
+    def _save_shared(self):
+        """Save breaker state to shared file (merge into existing data)."""
+        if not self.state_path:
+            return
+        try:
+            existing = {}
+            if self.state_path.exists():
+                try:
+                    existing = json.loads(self.state_path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    pass
+            existing["circuit_breaker"] = {
+                "failures": self._failures,
+                "opened_at": self._opened_at,
+                "max_failures": self.max_failures,
+            }
+            _atomic_write_json(self.state_path, existing)
+        except Exception:
+            pass  # Don't crash on breaker persistence failure
 
     def record_success(self):
         """Record a successful operation — resets the failure counter."""
+        if self.state_path:
+            self._load_shared()
         self._failures = 0
         self._opened_at = None
+        if self.state_path:
+            self._save_shared()
 
     def record_failure(self):
         """Record a failed operation — may open the breaker."""
+        if self.state_path:
+            self._load_shared()
         self._failures += 1
         if self._failures >= self.max_failures and self._opened_at is None:
             self._opened_at = time.time()
+        if self.state_path:
+            self._save_shared()
 
     def is_open(self):
         """Return True if the breaker is open (callers should back off)."""
+        if self.state_path:
+            self._load_shared()
         if self._failures < self.max_failures:
             return False
-        if self._opened_at and (time.time() - self._opened_at) >= self.reset_seconds:
+        if self._opened_at and isinstance(self._opened_at, (int, float)) and (time.time() - self._opened_at) >= self.reset_seconds:
             # Auto-reset after timeout
             self._failures = 0
             self._opened_at = None
+            if self.state_path:
+                self._save_shared()
             return False
         return True
 
@@ -531,7 +652,7 @@ def trim_trade_log(trades_path, max_age_days=90, max_entries=5000):
         ts_str = t.get("timestamp", "")
         if ts_str:
             try:
-                ts = datetime.datetime.fromisoformat(ts_str)
+                ts = datetime.datetime.fromisoformat(ts_str).replace(tzinfo=None)
                 if ts < cutoff:
                     continue
             except (ValueError, TypeError):
@@ -545,6 +666,109 @@ def trim_trade_log(trades_path, max_age_days=90, max_entries=5000):
     if len(filtered) != len(trades):
         _log.info("Trimmed trade log %s: %d -> %d entries", trades_path.name, len(trades), len(filtered))
         _atomic_write_json(trades_path, filtered)
+
+
+# === Order Monitor ===
+
+class OrderMonitor:
+    """Tracks pending orders and manages their lifecycle.
+
+    Detects unfilled limit orders, cancels stale ones, and reclaims
+    capital from resting orders that have exceeded their max age.
+
+    Args:
+        client: KalshiClient instance.
+        log: Logger instance.
+        max_age_seconds: Cancel resting orders after this many seconds (default 300 = 5 min).
+        check_interval: Minimum seconds between check_orders() API calls (default 30).
+    """
+
+    def __init__(self, client, log=None, max_age_seconds=300, check_interval=30):
+        self.client = client
+        self.log = log or _log
+        self.max_age_seconds = max_age_seconds
+        self.check_interval = check_interval
+        self._pending = {}  # {order_id: {"placed_at": float, "ticker": str, "side": str, "price": int, "count": int}}
+        self._last_check = 0
+
+    def track(self, order_id, ticker, side, price_cents, count):
+        """Register a newly placed order for monitoring."""
+        self._pending[order_id] = {
+            "placed_at": time.time(),
+            "ticker": ticker,
+            "side": side,
+            "price": price_cents,
+            "count": count,
+        }
+
+    def check_orders(self):
+        """Poll order statuses and handle stale orders.
+
+        Called from daemon bot main loops (not a background thread).
+        Returns dict of {order_id: {"status": str, "action": str}} for any state changes.
+
+        Respects check_interval to avoid excessive API calls.
+        """
+        now = time.time()
+        if now - self._last_check < self.check_interval:
+            return {}
+        self._last_check = now
+
+        if not self._pending:
+            return {}
+
+        changes = {}
+
+        try:
+            data = self.client.get("/portfolio/orders?status=resting")
+            resting_ids = {o.get("order_id") for o in data.get("orders", [])}
+        except Exception as e:
+            self.log.warning("OrderMonitor: failed to fetch resting orders: %s", e)
+            return {}
+
+        stale_ids = []
+        for order_id, info in list(self._pending.items()):
+            age = now - info["placed_at"]
+
+            if order_id not in resting_ids:
+                # Order is no longer resting — filled, canceled, or expired
+                self.log.info("OrderMonitor: %s on %s no longer resting (filled/canceled after %.0fs)",
+                              order_id[:12], info["ticker"], age)
+                changes[order_id] = {"status": "filled_or_canceled", "action": "removed"}
+                del self._pending[order_id]
+            elif age > self.max_age_seconds:
+                # Still resting but too old — cancel it
+                stale_ids.append(order_id)
+
+        # Cancel stale orders
+        for order_id in stale_ids:
+            info = self._pending[order_id]
+            success = self.cancel_order(order_id)
+            if success:
+                self.log.info("OrderMonitor: canceled stale order %s on %s (age %.0fs > %ds)",
+                              order_id[:12], info["ticker"],
+                              now - info["placed_at"], self.max_age_seconds)
+                changes[order_id] = {"status": "canceled_stale", "action": "canceled"}
+                del self._pending[order_id]
+
+        return changes
+
+    def cancel_order(self, order_id):
+        """Cancel a specific order. Returns True on success."""
+        try:
+            self.client.delete(f"/portfolio/orders/{order_id}")
+            return True
+        except Exception as e:
+            self.log.warning("OrderMonitor: failed to cancel %s: %s", order_id[:12], e)
+            return False
+
+    def get_pending_count(self):
+        """Return number of orders still being tracked."""
+        return len(self._pending)
+
+    def get_pending_capital(self):
+        """Return total cents locked in pending orders."""
+        return sum(info["price"] * info["count"] for info in self._pending.values())
 
 
 # === TradeManager ===
@@ -567,7 +791,8 @@ class TradeManager:
     """
 
     def __init__(self, client, trades_path, config, logger=None,
-                 kill_switch_path=None, cooldown_hours=6):
+                 kill_switch_path=None, cooldown_hours=6, order_monitor=None,
+                 breaker_state_path=SHARED_BREAKER_PATH):
         validate_trade_config(config)
         self.client = client
         self.trades_path = Path(trades_path)
@@ -575,7 +800,8 @@ class TradeManager:
         self.log = logger or _log
         self.kill_switch_path = kill_switch_path or KILL_SWITCH_PATH
         self.tracker = RecentTradeTracker(self.trades_path, cooldown_hours=cooldown_hours)
-        self.breaker = CircuitBreaker()
+        self.breaker = CircuitBreaker(state_path=breaker_state_path)
+        self.order_monitor = order_monitor
 
         # Daily counters
         self._daily_trades = 0
@@ -780,6 +1006,10 @@ class TradeManager:
             self._daily_spend_cents += (100 - price_cents) * count
         else:
             self._daily_spend_cents += cost_cents
+
+        # 11. Register with order monitor for fill tracking
+        if self.order_monitor and order_info.get("order_id"):
+            self.order_monitor.track(order_info["order_id"], ticker, side, price_cents, count)
 
         extra_fields["caps_applied"] = caps_applied
         trade_record = self._build_golden_record(

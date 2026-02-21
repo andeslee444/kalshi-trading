@@ -94,6 +94,20 @@ def compute_signal_quality(bot_name, edge):
     return abs(edge) * factor
 
 
+# ─── Region-level correlation grouping ───
+# Cities in the same climate region are correlated — a heat wave hits both.
+CITY_REGIONS = {
+    "SOUTH_TX": ["HOU", "AUS"],
+    "NORTHEAST": ["NY", "PHIL"],
+}
+# Reverse lookup: city -> region
+_CITY_TO_REGION = {}
+for _region, _cities in CITY_REGIONS.items():
+    for _city in _cities:
+        _CITY_TO_REGION[_city] = _region
+
+MAX_REGION_FRACTION = 0.15  # 15% of bankroll per region
+
 _CITY_KEY_RE = re.compile(r"KXHIGH([A-Z]+)-(\d{2}[A-Z]{3}\d{2})")
 
 
@@ -140,7 +154,7 @@ class PortfolioAllocator:
         logger: Optional logger instance.
     """
 
-    def __init__(self, client=None, state_path=None, logger=None):
+    def __init__(self, client=None, state_path=None, logger=None, max_positions=None):
         self.client = client
         self.log = logger or _log
         if state_path is not None:
@@ -154,12 +168,16 @@ class PortfolioAllocator:
         self._traded_tickers = {}
         self._bot_spend = {}            # bot_name -> cents risked today
         self._city_risk = {}            # city_key -> cents risked today
+        self._region_risk = {}          # region -> cents risked today
         self._total_risk_cents = 0      # portfolio-wide risk today
         self._daily_date = None
         self._cached_balance = None
         self._cached_available = None
         self._balance_fetched_at = 0
         self._pending_exits = []        # tickers that should be exited (superseded)
+        self._max_positions = max_positions
+        self._position_count = None
+        self._position_count_fetched_at = 0
 
     def _load_state(self):
         """Load shared state from disk with advisory file locking."""
@@ -189,6 +207,7 @@ class PortfolioAllocator:
                     }
             self._bot_spend = data.get("bot_spend", {})
             self._city_risk = data.get("city_risk", {})
+            self._region_risk = data.get("region_risk", {})
             self._total_risk_cents = data.get("total_risk_cents", 0)
             self._daily_date = data.get("daily_date")
         except (json.JSONDecodeError, KeyError, TypeError) as e:
@@ -196,6 +215,7 @@ class PortfolioAllocator:
             self._traded_tickers = {}
             self._bot_spend = {}
             self._city_risk = {}
+            self._region_risk = {}
             self._total_risk_cents = 0
             self._daily_date = None
 
@@ -207,6 +227,7 @@ class PortfolioAllocator:
             "traded_tickers": self._traded_tickers,
             "bot_spend": self._bot_spend,
             "city_risk": self._city_risk,
+            "region_risk": self._region_risk,
             "total_risk_cents": self._total_risk_cents,
             "daily_date": self._daily_date,
         }
@@ -239,19 +260,20 @@ class PortfolioAllocator:
             self._traded_tickers = {}
             self._bot_spend = {}
             self._city_risk = {}
+            self._region_risk = {}
             self._total_risk_cents = 0
             self._daily_date = today
             self._pending_exits = []
             self._save_state()
 
     def _get_balance(self):
-        """Get total and available balance, cached for 60 seconds.
+        """Get total and available balance, cached for 5 seconds.
 
         Returns (total_balance, available_balance) in cents.
         Available balance is used for both Kelly sizing and risk limit checks.
         """
         now = time.time()
-        if self._cached_balance is not None and (now - self._balance_fetched_at) < 60:
+        if self._cached_balance is not None and (now - self._balance_fetched_at) < 5:
             return self._cached_balance, self._cached_available
         if self.client:
             try:
@@ -263,6 +285,23 @@ class PortfolioAllocator:
             except Exception as e:
                 self.log.warning("Balance fetch failed: %s", e)
         return self._cached_balance or 0, self._cached_available or 0
+
+    def _get_position_count(self):
+        """Get open position count, cached for 30 seconds."""
+        now = time.time()
+        if self._position_count is not None and (now - self._position_count_fetched_at) < 30:
+            return self._position_count
+        if self.client:
+            try:
+                data = self.client.get("/portfolio/positions")
+                positions = data.get("market_positions", [])
+                count = sum(1 for p in positions if p.get("total_traded", 0) > 0)
+                self._position_count = count
+                self._position_count_fetched_at = now
+                return count
+            except Exception as e:
+                self.log.warning("Position count fetch failed: %s", e)
+        return self._position_count or 0
 
     def is_ticker_traded(self, ticker):
         """Check if any bot has already traded this ticker today."""
@@ -289,10 +328,14 @@ class PortfolioAllocator:
         }
         self._bot_spend[bot_name] = self._bot_spend.get(bot_name, 0) + risk_cents
         self._total_risk_cents += risk_cents
-        # Track city-level exposure for weather tickers
+        # Track city-level and region-level exposure for weather tickers
         city_key = _extract_city_key(ticker)
         if city_key:
             self._city_risk[city_key] = self._city_risk.get(city_key, 0) + risk_cents
+            city_code = city_key.split(":")[0]
+            region = _CITY_TO_REGION.get(city_code)
+            if region:
+                self._region_risk[region] = self._region_risk.get(region, 0) + risk_cents
         self._save_state()
 
     def _risk_today_cents(self):
@@ -345,6 +388,12 @@ class PortfolioAllocator:
                 other_bot = existing.get("bot", "unknown")
                 return BudgetResponse(False, reason=f"already traded by {other_bot}")
 
+        # 1b. Max concurrent positions check
+        if self._max_positions and self._max_positions > 0:
+            count = self._get_position_count()
+            if count >= self._max_positions:
+                return BudgetResponse(False, reason=f"max concurrent positions ({self._max_positions}) reached")
+
         # 2. Get balance — available for both Kelly sizing and risk checks
         total_balance, available_balance = self._get_balance()
         if available_balance <= 0:
@@ -383,6 +432,17 @@ class PortfolioAllocator:
             remaining_city = max_city_risk - city_spent
             if remaining_city <= 0:
                 return BudgetResponse(False, reason=f"city exposure limit reached for {city_key}")
+
+        # 5c. Region-level exposure check (correlated cities)
+        if city_key:
+            city_code = city_key.split(":")[0]
+            region = _CITY_TO_REGION.get(city_code)
+            if region:
+                max_region_risk = int(available_balance * MAX_REGION_FRACTION)
+                region_spent = self._region_risk.get(region, 0)
+                if region_spent >= max_region_risk:
+                    return BudgetResponse(False, reason=f"region exposure limit reached for {region}")
+                remaining_city = min(remaining_city, max_region_risk - region_spent)
 
         # 6. Compute allocated budget
         # The allocation is the minimum of all constraints

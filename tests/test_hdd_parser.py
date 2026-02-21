@@ -1,72 +1,7 @@
-"""Tests for chart parsing and sales extraction in hdd-scraper.py."""
+"""Tests for HDD chart parsing and sales extraction."""
 
-import importlib
-import types
-import sys
 import pytest
-from pathlib import Path
-
-
-# ---------------------------------------------------------------------------
-# Import helper
-# ---------------------------------------------------------------------------
-
-def _load_hdd_scraper():
-    # Save the real kalshi_auth entry (if any) so we can restore it after
-    # loading hdd-scraper.py and avoid polluting other test modules.
-    orig_auth = sys.modules.get("kalshi_auth")
-
-    fake_auth = types.ModuleType("kalshi_auth")
-    fake_auth.KalshiClient = lambda *a, **kw: None
-    fake_auth.setup_unbuffered = lambda: None
-    fake_auth.setup_signal_handlers = lambda: None
-    fake_auth.setup_logging = lambda *a, **kw: __import__("logging").getLogger("test")
-    fake_auth.PROJECT_DIR = Path("/tmp/fake_project")
-    fake_auth.load_trades = lambda *a, **kw: []
-    fake_auth.save_trade = lambda *a, **kw: None
-    fake_auth.fetch_parallel = lambda *a, **kw: {}
-    fake_auth.retry_request = lambda *a, **kw: None
-    fake_auth.RecentTradeTracker = type("RecentTradeTracker", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "is_recent": lambda self, t: False,
-        "record": lambda self, t: None,
-    })
-    fake_auth.TradeManager = type("TradeManager", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "place_order": lambda self, *a, **kw: None,
-    })
-    fake_auth.CircuitBreaker = type("CircuitBreaker", (), {
-        "__init__": lambda self, *a, **kw: None,
-    })
-    fake_auth.check_kill_switch = lambda *a, **kw: False
-    fake_auth.validate_trade_config = lambda *a, **kw: None
-    fake_auth.trim_trade_log = lambda *a, **kw: None
-    fake_auth._atomic_write_json = lambda *a, **kw: None
-    sys.modules["kalshi_auth"] = fake_auth
-
-    # Create directories the module expects at import time
-    Path("/tmp/fake_project/data/kalshi-source-snapshots/hdd").mkdir(parents=True, exist_ok=True)
-
-    spec = importlib.util.spec_from_file_location(
-        "hdd_scraper",
-        str(Path(__file__).resolve().parent.parent / "src" / "kalshi" / "hdd-scraper.py"),
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    # Restore so later test modules get the real kalshi_auth.
-    if orig_auth is not None:
-        sys.modules["kalshi_auth"] = orig_auth
-    else:
-        del sys.modules["kalshi_auth"]
-
-    return mod
-
-
-_mod = _load_hdd_scraper()
-parse_chart_data = _mod.parse_chart_data
-clean_number = _mod.clean_number
-extract_sales_from_text = _mod.extract_sales_from_text
+from hdd_parser import parse_chart_data, clean_number, extract_sales_from_text
 
 
 # ===================================================================

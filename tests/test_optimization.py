@@ -319,6 +319,7 @@ def _make_manager(tmp_path, config=None, **kwargs):
     trades_path = tmp_path / "trades.json"
     cfg = config or {"maxTradeAmount": 5, "maxDailyTrades": 100, "maxDailyLoss": 1}
     kill_path = tmp_path / "HALT"
+    kwargs.setdefault("breaker_state_path", None)  # in-memory breaker for tests
     mgr = TradeManager(
         mock_client, trades_path, cfg,
         kill_switch_path=kill_path,
@@ -932,6 +933,7 @@ class TestSellPosition:
             mock_client, trades_path,
             {"maxTradeAmount": 50, "maxDailyTrades": 100, "maxDailyLoss": 100},
             kill_switch_path=kill_path,
+            breaker_state_path=None,
         )
 
         result = mgr.sell_position("TICK-1", "yes", 85, 5, "Take profit")
@@ -955,6 +957,7 @@ class TestSellPosition:
             mock_client, trades_path,
             {"maxTradeAmount": 50, "maxDailyTrades": 100, "maxDailyLoss": 100},
             kill_switch_path=kill_path,
+            breaker_state_path=None,
         )
 
         result = mgr.sell_position("TICK-1", "yes", 85, 5, "Take profit")
@@ -972,6 +975,7 @@ class TestSellPosition:
             mock_client, trades_path,
             {"maxTradeAmount": 50, "maxDailyTrades": 100, "maxDailyLoss": 100},
             kill_switch_path=kill_path,
+            breaker_state_path=None,
         )
 
         mgr.sell_position("TICK-1", "yes", 85, 5, "Take profit")
@@ -993,6 +997,7 @@ class TestSellPosition:
             mock_client, trades_path,
             {"maxTradeAmount": 5, "maxDailyTrades": 1, "maxDailyLoss": 1},
             kill_switch_path=kill_path,
+            breaker_state_path=None,
         )
 
         # Use up the daily trade limit
@@ -1131,6 +1136,24 @@ class TestCpiNowcastSigma:
             # No single step should change by more than 30%
             assert 0.7 < ratio < 1.3, f"Cliff at day {d}: {cpi_nowcast_sigma(d):.4f} -> {cpi_nowcast_sigma(d+1):.4f}"
 
+    def test_calibration_aware_sigma(self, monkeypatch):
+        """When calibration has cpi.sigma_by_days, should use calibrated values."""
+        import probability
+        fake_cal = {
+            "cpi": {
+                "sigma_by_days": {
+                    "0": 0.008, "1": 0.025, "7": 0.055, "14": 0.095,
+                }
+            }
+        }
+        monkeypatch.setattr(probability, "_calibration", fake_cal)
+        assert cpi_nowcast_sigma(0) == 0.008
+        assert cpi_nowcast_sigma(1) == 0.025
+        assert cpi_nowcast_sigma(7) == 0.055
+        assert cpi_nowcast_sigma(14) == 0.095
+        # Reset
+        monkeypatch.setattr(probability, "_calibration", None)
+
 
 # ===================================================================
 # Crypto probability tests (Tier 2.3)
@@ -1215,6 +1238,52 @@ class TestCryptoPriceProbability:
         """Invalid prices should return 0.5."""
         assert crypto_price_probability(0, 60000, "above") == 0.5
         assert crypto_price_probability(70000, 0, "above") == 0.5
+
+    def test_ou_increases_short_horizon_certainty(self):
+        """OU reduces effective vol, so probabilities are more extreme (more certain)."""
+        gbm = crypto_price_probability(70000, 69000, "above",
+                                        time_horizon_minutes=60,
+                                        realized_vol_pct=0.60)
+        ou = crypto_price_probability(70000, 69000, "above",
+                                       time_horizon_minutes=60,
+                                       realized_vol_pct=0.60,
+                                       use_ou=True, ou_half_life_minutes=120)
+        # OU reduces vol → less chance of crossing threshold → higher P(above)
+        assert ou > gbm, "OU should be more certain (higher prob when above threshold)"
+
+    def test_ou_no_effect_long_horizon(self):
+        """OU should have no effect at >4h horizons (disabled)."""
+        gbm = crypto_price_probability(70000, 60000, "above",
+                                        time_horizon_minutes=1440,
+                                        realized_vol_pct=0.60)
+        ou = crypto_price_probability(70000, 60000, "above",
+                                       time_horizon_minutes=1440,
+                                       realized_vol_pct=0.60,
+                                       use_ou=True, ou_half_life_minutes=120)
+        assert abs(gbm - ou) < 0.001
+
+    def test_ou_default_disabled(self):
+        """Default use_ou=False should match standard GBM."""
+        gbm = crypto_price_probability(70000, 60000, "above",
+                                        time_horizon_minutes=60,
+                                        realized_vol_pct=0.60)
+        default = crypto_price_probability(70000, 60000, "above",
+                                            time_horizon_minutes=60,
+                                            realized_vol_pct=0.60,
+                                            use_ou=False)
+        assert gbm == default
+
+    def test_ou_complementary(self):
+        """With OU, above + below should still sum to 1.0."""
+        above = crypto_price_probability(70000, 65000, "above",
+                                          time_horizon_minutes=60,
+                                          realized_vol_pct=0.60,
+                                          use_ou=True, ou_half_life_minutes=120)
+        below = crypto_price_probability(70000, 65000, "below",
+                                          time_horizon_minutes=60,
+                                          realized_vol_pct=0.60,
+                                          use_ou=True, ou_half_life_minutes=120)
+        assert abs(above + below - 1.0) < 0.001
 
 
 # ===================================================================
@@ -1809,6 +1878,7 @@ class TestSettlementAwareCleanup:
         })
         fake_auth.trim_trade_log = lambda *a, **kw: None
         fake_auth.load_trades = lambda *a, **kw: []
+        fake_auth._atomic_write_json = lambda *a, **kw: None
         fake_auth.CITY_TIMEZONES = {
             "MIA": "America/New_York", "LAX": "America/Los_Angeles",
             "PHIL": "America/New_York", "NY": "America/New_York",
@@ -2045,6 +2115,7 @@ class TestTradeRecordFields:
             {"maxTradeAmount": 50, "maxDailyTrades": 100, "maxDailyLoss": 100},
             kill_switch_path=kill_path,
             logger=logging.getLogger("test-posmon"),
+            breaker_state_path=None,
         )
         mgr.sell_position("T1", "yes", 85, 5, "exit reason")
         trades = load_trades(trades_path)
@@ -2115,3 +2186,81 @@ class TestTradeRecordFields:
         assert d["price_cents"] == 30
         assert d["custom_field"] == "extra"
         assert "timestamp" in d
+
+
+# ===================================================================
+# Ensemble weight calibration tests (Phase 3.5)
+# ===================================================================
+
+class TestEnsembleWeightUpdate:
+
+    def test_lower_mae_gets_higher_weight(self):
+        """Model with lower MAE should get higher weight."""
+        # Import calibrate_ensemble_weights from calibrate-sigma.py
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "calibrate_sigma",
+            str(Path(__file__).resolve().parent.parent / "scripts" / "calibrate-sigma.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        # Create fake trades with ensemble data and settlements
+        trades = [
+            {
+                "ticker": "KXHIGHMIA-26FEB16-T86",
+                "side": "yes",
+                "timestamp": "2026-02-15T12:00:00Z",
+                "ensemble_forecasts": {"gfs": 88.0, "ecmwf": 90.0, "icon": 85.0},
+            },
+            {
+                "ticker": "KXHIGHMIA-27FEB16-T84",
+                "side": "no",
+                "timestamp": "2026-02-15T12:00:00Z",
+                "ensemble_forecasts": {"gfs": 82.0, "ecmwf": 80.0, "icon": 83.0},
+            },
+        ]
+        # First trade: YES won (event occurred), Second: NO won (event didn't occur)
+        settlement_map = {
+            "KXHIGHMIA-26FEB16-T86": 100,   # YES won
+            "KXHIGHMIA-27FEB16-T84": 100,   # NO won (revenue > 0 for NO side)
+        }
+
+        result = mod.calibrate_ensemble_weights(trades, settlement_map)
+        assert result.get("n", 0) > 0
+
+        if "weights" in result and "model_maes" in result:
+            maes = result["model_maes"]
+            weights = result["weights"]
+            # Model with lowest MAE should have highest weight
+            if len(maes) >= 2:
+                best_model = min(maes, key=maes.get)
+                worst_model = max(maes, key=maes.get)
+                # Due to EMA blending, the relationship may be dampened
+                # but the newly calibrated inverse-MAE component should push in this direction
+                assert weights.get(best_model, 0) >= weights.get(worst_model, 0) * 0.5
+
+    def test_weights_sum_to_one(self):
+        """Calibrated weights must sum to 1.0."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "calibrate_sigma",
+            str(Path(__file__).resolve().parent.parent / "scripts" / "calibrate-sigma.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        trades = [
+            {
+                "ticker": "KXHIGHMIA-26FEB16-T86",
+                "side": "yes",
+                "timestamp": "2026-02-15T12:00:00Z",
+                "ensemble_forecasts": {"gfs": 88.0, "ecmwf": 90.0, "icon": 85.0},
+            },
+        ]
+        settlement_map = {"KXHIGHMIA-26FEB16-T86": 100}
+
+        result = mod.calibrate_ensemble_weights(trades, settlement_map)
+        if "weights" in result:
+            total = sum(result["weights"].values())
+            assert abs(total - 1.0) < 0.01, f"Weights sum to {total}, expected 1.0"

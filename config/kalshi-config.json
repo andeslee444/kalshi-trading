@@ -17,7 +17,7 @@
   },
   "disableWeatherYes": true,
   "ensemble": {
-    "enabled": false,
+    "enabled": true,
     "models": ["gfs", "ecmwf", "icon"],
     "weights": { "gfs": 0.40, "ecmwf": 0.40, "icon": 0.20 }
   }

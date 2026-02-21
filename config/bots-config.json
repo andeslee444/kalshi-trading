@@ -21,15 +21,18 @@
   "strategy": {
     "maxBetCents": 500,
     "maxDailyTrades": 20,
-    "maxDailyLoss": 50
+    "maxDailyLoss": 50,
+    "scanIntervalMinutes": 15
   },
   "crypto": {
     "maxTradeAmount": 10,
     "maxDailyTrades": 30,
     "maxDailyLoss": 25,
-    "scanIntervalMinutes": 5,
+    "scanIntervalMinutes": 1,
     "edgeThreshold": 0.06,
-    "settlementBufferMinutes": 5
+    "settlementBufferMinutes": 5,
+    "useOrnsteinUhlenbeck": true,
+    "ouHalfLifeMinutes": 120
   },
   "economics": {
     "maxTradeAmount": 15,
@@ -39,7 +42,7 @@
     "edgeThreshold": 0.08
   },
   "cross_platform_arb": {
-    "scanIntervalMinutes": 30,
+    "scanIntervalMinutes": 10,
     "minSpreadPct": 0.02,
     "executionEnabled": false,
     "maxTradeAmount": 10,
@@ -50,9 +53,15 @@
     "scanIntervalMinutes": 15,
     "takeProfitThreshold": 0.85,
     "stopLossThreshold": 0.20,
+    "stopLossPct": 0.40,
     "modelShiftThreshold": 0.25,
     "maxDailyExits": 20,
-    "orderTtlMinutes": 120
+    "orderTtlMinutes": 120,
+    "trailingDropCents": 10,
+    "trailingMinProfitCents": 10
+  },
+  "allocator": {
+    "maxConcurrentPositions": 20
   },
   "market_maker": {
     "enabled": false,

@@ -24,11 +24,11 @@
         "MIA": "KMIA",
         "LAX": "KLAX",
         "PHIL": "KPHL",
-        "NY": "KJFK",
-        "CHI": "KORD",
+        "NY": "KNYC",
+        "CHI": "KMDW",
         "AUS": "KAUS",
         "DEN": "KDEN",
-        "HOU": "KIAH"
+        "HOU": "KHOU"
       },
       "intervalMinutes": 10
     }

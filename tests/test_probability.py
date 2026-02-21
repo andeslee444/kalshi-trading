@@ -6,6 +6,7 @@ import pytest
 # conftest.py adds src/kalshi/ to sys.path, so direct import works
 from probability import (
     _norm_cdf,
+    _student_t_cdf,
     weather_probability,
     nws_probability,
     info_arb_probability,
@@ -14,6 +15,7 @@ from probability import (
     half_kelly,
     half_kelly_sell,
     _reset_calibration,
+    gas_price_probability,
 )
 
 
@@ -40,6 +42,60 @@ class TestNormCdf:
     def test_one_sigma(self):
         """CDF(1) ≈ 0.8413."""
         assert abs(_norm_cdf(1.0) - 0.8413) < 0.001
+
+
+# ===================================================================
+# _student_t_cdf tests
+# ===================================================================
+
+class TestStudentTCdf:
+
+    def test_zero_gives_half(self):
+        assert abs(_student_t_cdf(0, 6) - 0.5) < 1e-10
+
+    def test_symmetry(self):
+        """CDF(x) + CDF(-x) = 1."""
+        for x in [0.5, 1.0, 2.0, 3.0]:
+            assert abs(_student_t_cdf(x, 6) + _student_t_cdf(-x, 6) - 1.0) < 1e-8
+
+    def test_monotonically_increasing(self):
+        vals = [_student_t_cdf(x, 6) for x in [-3, -2, -1, 0, 1, 2, 3]]
+        for i in range(len(vals) - 1):
+            assert vals[i] < vals[i + 1]
+
+    def test_fatter_tails_than_normal(self):
+        """1 - t_cdf(3, 6) > 1 - norm_cdf(3): more mass in tails."""
+        t_tail = 1 - _student_t_cdf(3.0, 6)
+        n_tail = 1 - _norm_cdf(3.0)
+        assert t_tail > n_tail
+
+    def test_converges_to_normal_at_high_df(self):
+        """t_cdf(x, 1000) should be very close to norm_cdf(x)."""
+        for x in [0.5, 1.0, 2.0]:
+            assert abs(_student_t_cdf(x, 1000) - _norm_cdf(x)) < 0.001
+
+    def test_known_values_df6(self):
+        """Verify against known t-distribution table values for df=6."""
+        # t(1.0, 6) ≈ 0.8220
+        assert abs(_student_t_cdf(1.0, 6) - 0.8220) < 0.002
+        # t(2.0, 6) ≈ 0.9536
+        assert abs(_student_t_cdf(2.0, 6) - 0.9536) < 0.002
+
+    def test_large_positive(self):
+        assert _student_t_cdf(10.0, 6) > 0.9999
+
+    def test_large_negative(self):
+        assert _student_t_cdf(-10.0, 6) < 0.0001
+
+    def test_df_4_fatter_than_df_6(self):
+        """Lower df should have fatter tails."""
+        tail_4 = 1 - _student_t_cdf(3.0, 4)
+        tail_6 = 1 - _student_t_cdf(3.0, 6)
+        assert tail_4 > tail_6
+
+    def test_fallback_to_normal_on_invalid_df(self):
+        """df <= 0 should fall back to normal CDF."""
+        assert abs(_student_t_cdf(1.0, 0) - _norm_cdf(1.0)) < 1e-10
 
 
 # ===================================================================
@@ -101,6 +157,13 @@ class TestWeatherProbability:
         """Default days_out=0 should work."""
         prob = weather_probability(90, 86, "T")
         assert 0.5 < prob < 1.0
+
+    def test_sqrt_sigma_scaling(self):
+        """Sigma grows sublinearly: day-1→day-4 gap < day-4→day-9 (sqrt)."""
+        prob_1 = weather_probability(90, 86, "T", 1)
+        prob_4 = weather_probability(90, 86, "T", 4)
+        prob_9 = weather_probability(90, 86, "T", 9)
+        assert prob_1 > prob_4 > prob_9
 
 
 # ===================================================================
@@ -323,8 +386,8 @@ class TestCalibration:
         _reset_calibration()
 
     def test_default_sigma_without_calibration_file(self):
-        """Without calibration.json, weather uses default sigma = 2.5 + 0.5 * days_out."""
-        # At day 0 with forecast = threshold, prob should be ~0.50 (sigma=2.5)
+        """Without calibration.json, weather uses default sigma = 2.0 + 0.5 * sqrt(days_out)."""
+        # At day 0 with forecast = threshold, prob should be ~0.50 (sigma=2.0)
         prob = weather_probability(86, 86, "T", 0)
         assert 0.45 <= prob <= 0.55
 
@@ -345,3 +408,36 @@ class TestCalibration:
         """Without calibration, box office sigma returns hardcoded defaults."""
         assert boxoffice_data_sigma(4) == 0.12
         assert boxoffice_data_sigma(0) == 0.02
+
+
+# ===================================================================
+# gas_price_probability tests
+# ===================================================================
+
+class TestGasPriceProbability:
+
+    def test_well_above_threshold(self):
+        """Gas at $3.45, threshold $3.00 above -> very high."""
+        prob = gas_price_probability(3.45, 3.00, "above")
+        assert prob > 0.99
+
+    def test_well_below_threshold(self):
+        """Gas at $3.45, threshold $4.00 above -> very low."""
+        prob = gas_price_probability(3.45, 4.00, "above")
+        assert prob < 0.01
+
+    def test_at_threshold(self):
+        """Gas at threshold -> ~0.50."""
+        prob = gas_price_probability(3.50, 3.50, "above")
+        assert 0.45 <= prob <= 0.55
+
+    def test_below_direction(self):
+        """P(below X) = 1 - P(above X)."""
+        prob_above = gas_price_probability(3.45, 3.50, "above")
+        prob_below = gas_price_probability(3.45, 3.50, "below")
+        assert abs(prob_above + prob_below - 1.0) < 1e-10
+
+    def test_near_threshold(self):
+        """Gas at $3.45, threshold $3.50 above -> below 50% but not extreme."""
+        prob = gas_price_probability(3.45, 3.50, "above")
+        assert 0.15 < prob < 0.50

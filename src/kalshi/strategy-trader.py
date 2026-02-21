@@ -3,10 +3,10 @@
 Strategies: Longshot bias selling, maker-only limit orders, info arbitrage near settlement.
 """
 
-import json, time, datetime, os, sys, math
+import json, time, datetime, os, sys, math, argparse, traceback
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log, _atomic_write_json, build_market_snapshot
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log, _atomic_write_json, build_market_snapshot, HealthCheckMonitor, OrderMonitor
 from probability import half_kelly_sell, longshot_edge, compute_limit_price, kalshi_fee_cents
 from capital_allocator import PortfolioAllocator
 
@@ -23,13 +23,19 @@ MAX_BET = _bots_cfg["maxBetCents"]
 
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
+health = HealthCheckMonitor(logger=log)
+order_monitor = OrderMonitor(client, log=log)
+
+SCAN_INTERVAL = _bots_cfg.get("scanIntervalMinutes", 15)
+
+SPORTS_PREFIXES = ["KXNBA", "KXNFL", "KXNHL", "KXMLB", "KXUFC", "KXNCAA", "KXSPORT", "KXSOCCER", "KXMARMAD"]
 
 TRADES_JSON_PATH = DATA_DIR / "kalshi-strategy-trades.json"
 trade_manager = TradeManager(client, TRADES_JSON_PATH, {
     "maxTradeAmount": MAX_BET / 100,
     "maxDailyTrades": _bots_cfg.get("maxDailyTrades", 20),
     "maxDailyLoss": _bots_cfg.get("maxDailyLoss", 50),
-}, logger=log)
+}, logger=log, order_monitor=order_monitor)
 trim_trade_log(TRADES_JSON_PATH)
 
 def find_longshot_sells(markets, bankroll):
@@ -181,7 +187,8 @@ def check_settled_trades():
         log.error(f"  Error checking settlements: {e}")
     return settled
 
-def main():
+def run_scan():
+    """Run a single strategy scan cycle."""
     log.info("=" * 70)
     log.info("KALSHI STRATEGY TRADER")
     log.info(f"   {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -230,6 +237,13 @@ def main():
     log.info("=" * 70)
     longshots = find_longshot_sells(markets, avail)
     log.info(f"  Found {len(longshots)} longshot sell candidates")
+    sports_candidates = [c for c in longshots if any(
+        c["ticker"].upper().startswith(p) for p in SPORTS_PREFIXES
+    )]
+    if sports_candidates:
+        log.info(f"  Sports candidates: {len(sports_candidates)}")
+        for sc in sports_candidates[:5]:
+            log.info(f"    {sc['ticker']} | Edge: {sc['est_edge']*100:.1f}% | YES@{sc['yes_price']}c")
     for i, c in enumerate(longshots[:10]):
         log.info(f"\n  {i+1}. {c['ticker']}")
         log.info(f"     {c['title']}")
@@ -351,6 +365,43 @@ def main():
     log.info(f"\n{'='*70}")
     log.info(f"STRATEGY TRADER COMPLETE -- {len(trades_executed)} trades placed")
     log.info(f"{'='*70}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Kalshi Strategy Trader")
+    parser.add_argument("--once", action="store_true", help="Run single scan and exit")
+    args = parser.parse_args()
+
+    log.info("=" * 60)
+    log.info("Kalshi Strategy Trader (Longshot Bias + Near-Settlement)")
+    log.info(f"  Max bet: ${MAX_BET/100:.0f} | Scan interval: {SCAN_INTERVAL} min")
+    log.info("=" * 60)
+
+    # Verify auth
+    log.info("\nVerifying authentication...")
+    try:
+        balance, _ = client.get_balance()
+        log.info(f"Auth OK! Balance: ${balance/100:.2f}")
+    except Exception as e:
+        log.error(f"Auth failed: {e}")
+        sys.exit(1)
+
+    if args.once:
+        run_scan()
+        return
+
+    # Daemon loop
+    while True:
+        try:
+            health.record_bot_heartbeat("strategy")
+            order_monitor.check_orders()
+            run_scan()
+        except Exception as e:
+            log.error(f"Scan error: {e}")
+            traceback.print_exc()
+
+        log.info(f"\nNext scan in {SCAN_INTERVAL} minutes...")
+        time.sleep(SCAN_INTERVAL * 60)
+
 
 if __name__ == "__main__":
     main()

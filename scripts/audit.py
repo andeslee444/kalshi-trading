@@ -415,11 +415,11 @@ class AuditEngine:
                 "MIA": ("KMIA", "Miami"),
                 "LAX": ("KLAX", "Los Angeles"),
                 "PHIL": ("KPHL", "Philadelphia"),
-                "NY": ("KJFK", "John F. Kennedy"),
-                "CHI": ("KORD", "Chicago"),
+                "NY": ("KNYC", "Central Park"),
+                "CHI": ("KMDW", "Chicago Midway"),
                 "AUS": ("KAUS", "Austin"),
                 "DEN": ("KDEN", "Denver"),
-                "HOU": ("KIAH", "Houston"),
+                "HOU": ("KHOU", "Houston Hobby"),
             }
 
             mismatches = []
