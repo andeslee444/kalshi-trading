@@ -6,7 +6,7 @@ Strategies: Longshot bias selling, maker-only limit orders, info arbitrage near 
 import json, time, datetime, os, sys, math, argparse, traceback
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log, _atomic_write_json, build_market_snapshot, HealthCheckMonitor, OrderMonitor
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log, _atomic_write_json, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary
 from probability import half_kelly_sell, longshot_edge, compute_limit_price, kalshi_fee_cents
 from capital_allocator import PortfolioAllocator
 
@@ -93,6 +93,7 @@ def find_longshot_sells(markets, bankroll):
         # Request budget from portfolio allocator
         budget = allocator.request_budget("strategy", ticker, edge=est_edge)
         if not budget.approved:
+            log.info(f"  Allocator denied {ticker}: {budget.reason}")
             continue
 
         contracts, risk, kelly_details = half_kelly_sell(
@@ -189,6 +190,7 @@ def check_settled_trades():
 
 def run_scan():
     """Run a single strategy scan cycle."""
+    ss = ScanSummary("strategy", log)
     log.info("=" * 70)
     log.info("KALSHI STRATEGY TRADER")
     log.info(f"   {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -229,6 +231,7 @@ def run_scan():
     # Fetch markets
     log.info("\nScanning all open markets...")
     markets = client.get_all_markets()
+    ss.markets_fetched = len(markets)
     log.info(f"  Found {len(markets)} open markets")
 
     # Strategy 1: Longshot bias selling
@@ -369,6 +372,9 @@ def run_scan():
         perf_data = perf_data[-500:]
     _atomic_write_json(perf_json_path, perf_data)
 
+    ss.trades_placed = len([t for t in trades_executed if t.get("status") not in ("BLOCKED/FAILED",)])
+    ss.finalize()
+
     log.info(f"\n{'='*70}")
     log.info(f"STRATEGY TRADER COMPLETE -- {len(trades_executed)} trades placed")
     log.info(f"{'='*70}")
@@ -400,6 +406,9 @@ def main():
     while True:
         try:
             health.record_bot_heartbeat("strategy")
+            issues = health.check_health()
+            if issues:
+                log.warning("Health issues: %s", "; ".join(issues))
             order_monitor.check_orders()
             run_scan()
         except Exception as e:

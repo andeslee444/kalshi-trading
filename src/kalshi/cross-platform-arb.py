@@ -302,7 +302,7 @@ def scan_spreads():
                 if count > 0:
                     reasoning = (
                         f"Cross-platform arb: Kalshi {k_ticker} YES@{price}c vs "
-                        f"Polymarket YES@{spread['polymarket_yes']*100:.0f}c, "
+                        f"Polymarket YES@{spread['polymarket_yes_bid']*100:.0f}c, "
                         f"net spread={spread['net_spread']*100:.1f}%"
                     )
                     result = trade_manager.place_order(k_ticker, "yes", price, count, reasoning,
@@ -356,6 +356,9 @@ def main():
     while True:
         try:
             health.record_bot_heartbeat("cross-platform-arb")
+            issues = health.check_health()
+            if issues:
+                log.warning("Health issues: %s", "; ".join(issues))
             scan_spreads()
         except Exception as e:
             log.error(f"Scan error: {e}")

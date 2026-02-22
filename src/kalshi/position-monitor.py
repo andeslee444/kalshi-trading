@@ -504,6 +504,7 @@ def scan_positions():
 
     # Load entry records for entry-price stop and info-arb gate
     entry_records = _load_entry_records()
+    log.info(f"Loaded {len(entry_records)} entry records from {len(ALL_TRADE_LOGS)} trade logs")
     peaks = _load_peaks()
     open_tickers = set()
 
@@ -649,6 +650,9 @@ def main():
     while True:
         try:
             health.record_bot_heartbeat("position-monitor")
+            issues = health.check_health()
+            if issues:
+                log.warning("Health issues: %s", "; ".join(issues))
             scan_positions()
         except Exception as e:
             log.error(f"Scan error: {e}")

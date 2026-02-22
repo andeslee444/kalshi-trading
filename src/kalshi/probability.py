@@ -6,8 +6,11 @@ to avoid a scipy dependency.
 """
 
 import json
+import logging
 import math
 from pathlib import Path
+
+_log = logging.getLogger("probability")
 
 
 def _norm_cdf(x):
@@ -132,6 +135,12 @@ def _load_calibration():
         _calibration = json.loads(_CALIBRATION_PATH.read_text()) if _CALIBRATION_PATH.exists() else {}
     except (json.JSONDecodeError, OSError):
         _calibration = {}
+    if _calibration:
+        _log.info("Calibration loaded: %d cities, %d market types",
+                  len(_calibration.get("weather", {}).get("per_city", {})),
+                  len([k for k in _calibration if k not in ("weather",)]))
+    else:
+        _log.info("Calibration: using hardcoded defaults (no calibration.json)")
     return _calibration
 
 
@@ -619,7 +628,10 @@ def half_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None, fee_cents
     our_prob = implied_prob + edge
 
     # Clamp to valid probability range
+    original_prob = our_prob
     our_prob = max(0.001, min(0.999, our_prob))
+    if original_prob <= 0.001 or original_prob >= 0.999:
+        _log.warning("Probability clamped: %.6f → [0.001, 0.999]", original_prob)
 
     # Kelly fraction: f = (b*p - q) / b
     # where b = win/loss ratio, p = win prob, q = 1 - p
@@ -680,7 +692,10 @@ def half_kelly_sell(edge, sell_price_cents, max_cost_cents, bankroll_cents=None,
     # Market implied prob of event
     implied_prob = sell_price_cents / 100.0
     # Our estimated true probability (lower than market thinks)
-    p_true = max(0.001, min(0.999, implied_prob - edge))
+    raw_p_true = implied_prob - edge
+    p_true = max(0.001, min(0.999, raw_p_true))
+    if raw_p_true <= 0.001 or raw_p_true >= 0.999:
+        _log.warning("Probability clamped (sell): %.6f → [0.001, 0.999]", raw_p_true)
 
     # Selling YES: win (sell_price - fee) cents with prob (1-p_true),
     #              lose (100-sell_price) cents with prob p_true

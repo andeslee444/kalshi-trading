@@ -58,6 +58,16 @@ def _load_weather_bot():
         "track": lambda self, *a, **kw: None,
         "check_orders": lambda self, *a, **kw: {},
     })
+    fake_auth.ScanSummary = type("ScanSummary", (), {
+        "__init__": lambda self, *a, **kw: None,
+        "skip": lambda self, *a, **kw: None,
+        "source_ok": lambda self, *a, **kw: None,
+        "source_fail": lambda self, *a, **kw: None,
+        "finalize": lambda self, *a, **kw: {},
+        "markets_fetched": 0,
+        "markets_evaluated": 0,
+        "trades_placed": 0,
+    })
     sys.modules["kalshi_auth"] = fake_auth
 
     # The module reads config at import time -- provide a minimal stub file.

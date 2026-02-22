@@ -37,6 +37,16 @@ def _load_economics_bot():
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_text(json.dumps(data, indent=2))
     fake_auth._atomic_write_json = _fake_atomic_write
+    fake_auth.ScanSummary = type("ScanSummary", (), {
+        "__init__": lambda self, *a, **kw: None,
+        "skip": lambda self, *a, **kw: None,
+        "source_ok": lambda self, *a, **kw: None,
+        "source_fail": lambda self, *a, **kw: None,
+        "finalize": lambda self, *a, **kw: {},
+        "markets_fetched": 0,
+        "markets_evaluated": 0,
+        "trades_placed": 0,
+    })
     sys.modules["kalshi_auth"] = fake_auth
 
     # Lightweight probability stub
@@ -251,30 +261,34 @@ class TestNowcastParsing:
 
     def test_bs4_parses_table(self):
         """BS4 parser extracts values from table rows."""
-        result = _econ._parse_nowcast_bs4(self.SAMPLE_TABLE_HTML)
+        result, strategy = _econ._parse_nowcast_bs4(self.SAMPLE_TABLE_HTML)
         assert result["cpi_yoy"] == 2.83
         assert result["core_cpi_yoy"] == 3.14
         assert result["pce_yoy"] == 2.51
+        assert strategy is not None
 
     def test_bs4_parses_spans(self):
         """BS4 parser extracts values from span elements."""
-        result = _econ._parse_nowcast_bs4(self.SAMPLE_SPAN_HTML)
+        result, strategy = _econ._parse_nowcast_bs4(self.SAMPLE_SPAN_HTML)
         assert result.get("cpi_yoy") == 2.9
         assert result.get("core_cpi_yoy") == 3.2
+        assert strategy == "span_text"
 
     def test_regex_parses_cpi(self):
         """Regex fallback extracts CPI percentage."""
         html = "The CPI nowcast is 2.8% for this month."
-        result = _econ._parse_nowcast_regex(html)
+        result, strategy = _econ._parse_nowcast_regex(html)
         assert result["cpi_yoy"] == 2.8
+        assert strategy is not None
 
     def test_regex_parses_core_cpi(self):
         """Regex fallback extracts Core CPI percentage."""
         html = "Core CPI is expected at 3.1% year-over-year."
-        result = _econ._parse_nowcast_regex(html)
+        result, strategy = _econ._parse_nowcast_regex(html)
         assert result["core_cpi_yoy"] == 3.1
 
     def test_bs4_empty_html(self):
-        """BS4 parser returns empty dict for empty HTML."""
-        result = _econ._parse_nowcast_bs4("<html><body></body></html>")
+        """BS4 parser returns empty dict/None for empty HTML."""
+        result, strategy = _econ._parse_nowcast_bs4("<html><body></body></html>")
         assert result == {}
+        assert strategy is None

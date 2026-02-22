@@ -35,6 +35,7 @@ MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 1.0  # seconds
 
 KILL_SWITCH_PATH = PROJECT_DIR / "data" / "HALT_TRADING"
+SCAN_SUMMARIES_PATH = PROJECT_DIR / "data" / "scan-summaries.json"
 
 # Shared market cache — cross-process file cache for market data
 MARKET_CACHE_PATH = PROJECT_DIR / "data" / "market-cache.json"
@@ -703,6 +704,69 @@ def trim_trade_log(trades_path, max_age_days=90, max_entries=5000):
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 
+# === Scan Summary ===
+
+class ScanSummary:
+    """Tracks scan-level metrics for observability."""
+
+    def __init__(self, bot_name, logger=None):
+        self.bot = bot_name
+        self.log = logger
+        self._start = time.time()
+        self.markets_fetched = 0
+        self.markets_evaluated = 0
+        self.trades_placed = 0
+        self.skips = {}           # reason -> count
+        self.data_sources = {}    # source -> "ok" | error msg
+
+    def skip(self, reason):
+        self.skips[reason] = self.skips.get(reason, 0) + 1
+
+    def source_ok(self, name):
+        self.data_sources[name] = "ok"
+
+    def source_fail(self, name, msg="error"):
+        self.data_sources[name] = msg
+
+    def finalize(self):
+        duration = round(time.time() - self._start, 1)
+        total_skipped = sum(self.skips.values())
+        summary = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "bot": self.bot,
+            "duration_seconds": duration,
+            "markets_fetched": self.markets_fetched,
+            "markets_evaluated": self.markets_evaluated,
+            "trades_placed": self.trades_placed,
+            "total_skipped": total_skipped,
+            "skips": dict(self.skips),
+            "data_sources": dict(self.data_sources),
+        }
+        if self.log:
+            skip_str = ", ".join(f"{k}={v}" for k, v in sorted(self.skips.items())) or "none"
+            self.log.info(
+                f"SCAN SUMMARY: {duration}s | fetched={self.markets_fetched} "
+                f"evaluated={self.markets_evaluated} placed={self.trades_placed} "
+                f"skipped={total_skipped} ({skip_str})"
+            )
+        _append_scan_summary(summary)
+        return summary
+
+
+def _append_scan_summary(summary):
+    """Append scan summary to rotating JSON log (max 2000 entries)."""
+    try:
+        existing = []
+        if SCAN_SUMMARIES_PATH.exists():
+            existing = json.loads(SCAN_SUMMARIES_PATH.read_text())
+        existing.append(summary)
+        if len(existing) > 2000:
+            existing = existing[-1500:]
+        _atomic_write_json(SCAN_SUMMARIES_PATH, existing)
+    except Exception:
+        pass
+
+
 # === Order Monitor ===
 
 class OrderMonitor:
@@ -859,6 +923,9 @@ class TradeManager:
             if ts.startswith(today_str) and t.get("action", "buy") != "sell":
                 self._daily_trades += 1
                 self._daily_spend_cents += t.get("cost_cents", 0)
+        if self._daily_trades > 0:
+            self.log.info("Daily counters rebuilt from log: %d trades, $%.2f risk",
+                          self._daily_trades, self._daily_spend_cents / 100)
 
     @staticmethod
     def _classify_limit_tier(edge):
@@ -1006,8 +1073,11 @@ class TradeManager:
         max_cost_cents = int(self.config["maxTradeAmount"] * 100)
         cost_per_contract = price_cents
         if cost_per_contract * count > max_cost_cents:
+            original_count = count
             count = max(1, max_cost_cents // cost_per_contract)
             caps_applied.append("cost_cap")
+            self.log.info("Cost cap: %dx → %dx on %s (max $%.2f)",
+                          original_count, count, ticker, max_cost_cents / 100)
 
         # 7. Balance check (optional)
         cost_cents = cost_per_contract * count
@@ -1202,9 +1272,9 @@ def build_market_snapshot(yes_bid=None, yes_ask=None, volume=None, open_interest
 def save_decision(decisions_path: Path, decision: dict):
     """Append a scan decision to the decisions log (atomic write)."""
     decisions = load_trades(decisions_path)  # reuse same JSON array format
-    # Keep log bounded — retain last 500 decisions
-    if len(decisions) >= 500:
-        decisions = decisions[-400:]
+    # Keep log bounded — retain last 5000 decisions
+    if len(decisions) >= 5000:
+        decisions = decisions[-4000:]
     decisions.append(decision)
     _atomic_write_json(decisions_path, decisions)
 

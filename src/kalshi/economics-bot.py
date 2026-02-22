@@ -18,7 +18,7 @@ from pathlib import Path
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot,
-    HealthCheckMonitor, OrderMonitor,
+    HealthCheckMonitor, OrderMonitor, ScanSummary,
 )
 from probability import (
     econ_nowcast_probability, cpi_nowcast_sigma, half_kelly, compute_limit_price,
@@ -84,18 +84,77 @@ def _save_nowcast_cache(data):
     _atomic_write_json(NOWCAST_CACHE_PATH, {"cached_at": time.time(), "data": data})
 
 
+def _nowcast_cache_age_hours():
+    """Return age of nowcast cache in hours, or float('inf') if missing."""
+    try:
+        if NOWCAST_CACHE_PATH.exists():
+            cache = json.loads(NOWCAST_CACHE_PATH.read_text())
+            return (time.time() - cache.get("cached_at", 0)) / 3600
+    except Exception:
+        pass
+    return float("inf")
+
+
 # === Data Sources ===
 
 def _parse_nowcast_bs4(html):
     """Parse Cleveland Fed nowcast page using BeautifulSoup.
 
-    Looks for percentage values in table cells and labeled spans/divs
-    near CPI/PCE context. Returns dict or empty dict.
+    The page has tables identified by <caption> text. Column headers (CPI,
+    Core CPI, PCE, Core PCE) are in <th> elements; values are bare decimals
+    in <td> cells (no % sign). We target the "year-over-year" table.
     """
     soup = BeautifulSoup(html, "html.parser")
     nowcast = {}
 
-    # Strategy 1: look for table cells with percentage values near CPI/PCE labels
+    # Strategy 1: find the year-over-year table by caption text
+    for table in soup.find_all("table"):
+        caption = table.find("caption")
+        if not caption:
+            continue
+        caption_text = caption.get_text(" ", strip=True).lower()
+        if "year" not in caption_text:
+            continue
+
+        # Map column headers to indices
+        header_row = table.find("thead")
+        if not header_row:
+            continue
+        headers = [th.get_text(strip=True).lower() for th in header_row.find_all("th")]
+        col_map = {}
+        for i, h in enumerate(headers):
+            if h == "core cpi":
+                col_map["core_cpi_yoy"] = i
+            elif h == "cpi":
+                col_map["cpi_yoy"] = i
+            elif h == "core pce":
+                col_map["core_pce_yoy"] = i
+            elif h == "pce":
+                col_map["pce_yoy"] = i
+
+        if not col_map:
+            continue
+
+        # Read the first data row (most recent nowcast)
+        tbody = table.find("tbody")
+        rows = tbody.find_all("tr") if tbody else table.find_all("tr")[1:]
+        for row in rows:
+            cells = row.find_all("td")
+            for key, idx in col_map.items():
+                if idx < len(cells):
+                    cell_text = cells[idx].get_text(strip=True)
+                    m = re.match(r'^(\d+\.?\d*)$', cell_text)
+                    if m:
+                        val = float(m.group(1))
+                        if 0.0 < val < 20.0 and key not in nowcast:
+                            nowcast[key] = val
+            if nowcast:
+                break  # first row with data is enough
+
+    if nowcast:
+        return nowcast, "yoy_table"
+
+    # Strategy 2: broader table search — look for rows with CPI/PCE labels and values
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
         for row in rows:
@@ -103,7 +162,6 @@ def _parse_nowcast_bs4(html):
             row_text = row.get_text(" ", strip=True)
             for cell in cells:
                 cell_text = cell.get_text(strip=True)
-                # Match standalone percentage like "2.8%" or "2.83%"
                 m = re.match(r'^(\d+\.?\d*)\s*%?$', cell_text)
                 if not m:
                     continue
@@ -118,35 +176,69 @@ def _parse_nowcast_bs4(html):
                 elif "pce" in row_lower and "pce_yoy" not in nowcast:
                     nowcast["pce_yoy"] = val
 
-    # Strategy 2: look for labeled spans/divs with percentages
-    if not nowcast:
-        text_blocks = soup.find_all(["span", "div", "p", "strong"])
-        for el in text_blocks:
-            txt = el.get_text(" ", strip=True)
-            if len(txt) > 200:
-                continue
-            lower = txt.lower()
-            pct_match = re.search(r'(\d+\.?\d*)\s*%', txt)
-            if not pct_match:
-                continue
-            val = float(pct_match.group(1))
-            if not (0.0 < val < 20.0):
-                continue
-            if "core cpi" in lower and "core_cpi_yoy" not in nowcast:
-                nowcast["core_cpi_yoy"] = val
-            elif "cpi" in lower and "core" not in lower and "cpi_yoy" not in nowcast:
-                nowcast["cpi_yoy"] = val
-            elif "pce" in lower and "pce_yoy" not in nowcast:
-                nowcast["pce_yoy"] = val
+    if nowcast:
+        return nowcast, "table_row_labels"
 
-    return nowcast
+    # Strategy 3: look for labeled spans/divs with percentages
+    text_blocks = soup.find_all(["span", "div", "p", "strong"])
+    for el in text_blocks:
+        txt = el.get_text(" ", strip=True)
+        if len(txt) > 200:
+            continue
+        lower = txt.lower()
+        pct_match = re.search(r'(\d+\.?\d*)\s*%', txt)
+        if not pct_match:
+            continue
+        val = float(pct_match.group(1))
+        if not (0.0 < val < 20.0):
+            continue
+        if "core cpi" in lower and "core_cpi_yoy" not in nowcast:
+            nowcast["core_cpi_yoy"] = val
+        elif "cpi" in lower and "core" not in lower and "cpi_yoy" not in nowcast:
+            nowcast["cpi_yoy"] = val
+        elif "pce" in lower and "pce_yoy" not in nowcast:
+            nowcast["pce_yoy"] = val
+
+    if nowcast:
+        return nowcast, "span_text"
+
+    return nowcast, None
 
 
 def _parse_nowcast_regex(html):
-    """Fallback regex parser for Cleveland Fed nowcast page."""
+    """Fallback regex parser for Cleveland Fed nowcast page.
+
+    The table structure has headers (CPI, Core CPI, PCE, Core PCE) in <th>
+    and values as bare decimals in <td> cells. Match the year-over-year
+    table by its caption and extract values from the first data row.
+    """
     nowcast = {}
 
-    cpi_pattern = r'(?:CPI|Consumer Price Index)[^%]*?(\d+\.?\d*)\s*%'
+    # Strategy 1: match the year-over-year table structure
+    # Caption identifies the table, then first <tr> in <tbody> has the data
+    yoy_match = re.search(
+        r'year-over-year.*?<tbody>(.*?)</tbody>',
+        html, re.IGNORECASE | re.DOTALL
+    )
+    if yoy_match:
+        first_row = re.search(r'<tr>(.*?)</tr>', yoy_match.group(1), re.DOTALL)
+        if first_row:
+            cells = re.findall(r'<td[^>]*>(.*?)</td>', first_row.group(1), re.DOTALL)
+            # Expected columns: Month, CPI, Core CPI, PCE, Core PCE, Updated
+            keys = [None, "cpi_yoy", "core_cpi_yoy", "pce_yoy", "core_pce_yoy"]
+            for i, key in enumerate(keys):
+                if key and i < len(cells):
+                    val_match = re.match(r'^\s*(\d+\.?\d*)\s*$', cells[i].strip())
+                    if val_match:
+                        val = float(val_match.group(1))
+                        if 0.0 < val < 20.0:
+                            nowcast[key] = val
+
+    if nowcast:
+        return nowcast, "regex_yoy_tbody"
+
+    # Strategy 2: broader patterns (CPI label near percentage value)
+    cpi_pattern = r'(?:CPI|Consumer Price Index)[^<]{0,200}?(\d+\.?\d*)\s*%'
     cpi_matches = re.findall(cpi_pattern, html, re.IGNORECASE)
     if cpi_matches:
         try:
@@ -154,7 +246,7 @@ def _parse_nowcast_regex(html):
         except (ValueError, IndexError):
             pass
 
-    core_pattern = r'(?:Core CPI|core.*?CPI)[^%]*?(\d+\.?\d*)\s*%'
+    core_pattern = r'(?:Core CPI|core.*?CPI)[^<]{0,200}?(\d+\.?\d*)\s*%'
     core_matches = re.findall(core_pattern, html, re.IGNORECASE)
     if core_matches:
         try:
@@ -162,7 +254,7 @@ def _parse_nowcast_regex(html):
         except (ValueError, IndexError):
             pass
 
-    pce_pattern = r'(?:PCE)[^%]*?(\d+\.?\d*)\s*%'
+    pce_pattern = r'(?:PCE)[^<]{0,200}?(\d+\.?\d*)\s*%'
     pce_matches = re.findall(pce_pattern, html, re.IGNORECASE)
     if pce_matches:
         try:
@@ -170,7 +262,7 @@ def _parse_nowcast_regex(html):
         except (ValueError, IndexError):
             pass
 
-    return nowcast
+    return nowcast, "regex_patterns" if nowcast else None
 
 
 def fetch_cleveland_fed_nowcast():
@@ -186,11 +278,14 @@ def fetch_cleveland_fed_nowcast():
         html = r.text
 
         # Primary: BeautifulSoup structured parsing
-        nowcast = _parse_nowcast_bs4(html)
+        nowcast, strategy = _parse_nowcast_bs4(html)
 
         # Fallback: regex parsing
         if not nowcast:
-            nowcast = _parse_nowcast_regex(html)
+            nowcast, strategy = _parse_nowcast_regex(html)
+
+        if nowcast and strategy:
+            log.info(f"  Cleveland Fed parsed via: {strategy}")
 
         if nowcast:
             for key, val in nowcast.items():
@@ -203,7 +298,11 @@ def fetch_cleveland_fed_nowcast():
         log.warning("  Cleveland Fed: no values parsed from live page, trying cache")
         cached = _load_nowcast_cache()
         if cached:
-            log.info(f"  Using cached nowcast: {cached}")
+            cache_age = _nowcast_cache_age_hours()
+            log.info(f"  Using cached nowcast (age: {cache_age:.1f}h): {cached}")
+            if cache_age > 24:
+                log.error(f"  Nowcast cache is {cache_age:.0f}h stale — will skip trading on stale data")
+                cached["_stale"] = True
             return cached
 
         health.record_source_error("cleveland-fed", "no values parsed")
@@ -214,7 +313,11 @@ def fetch_cleveland_fed_nowcast():
         # Try cache on HTTP/network failure
         cached = _load_nowcast_cache()
         if cached:
-            log.info(f"  Using cached nowcast after error: {cached}")
+            cache_age = _nowcast_cache_age_hours()
+            log.info(f"  Using cached nowcast after error (age: {cache_age:.1f}h): {cached}")
+            if cache_age > 24:
+                log.error(f"  Nowcast cache is {cache_age:.0f}h stale — will skip trading on stale data")
+                cached["_stale"] = True
             return cached
         health.record_source_error("cleveland-fed", str(e))
         return {}
@@ -416,6 +519,7 @@ def match_fed_market_to_fedwatch(market, fedwatch_probs):
 def scan_and_trade():
     """Scan economics markets and trade on nowcast edge."""
     now = datetime.datetime.now()
+    ss = ScanSummary("economics", log)
     log.info(f"\n{'='*60}")
     log.info(f"[{now.isoformat()}] Economics scan starting...")
 
@@ -425,6 +529,7 @@ def scan_and_trade():
         log.info(f"Balance: ${balance/100:.2f}")
     except Exception as e:
         log.error(f"Balance error: {e}")
+        ss.finalize()
         return
 
     # Fetch nowcast data (health recording handled inside fetch_cleveland_fed_nowcast)
@@ -434,8 +539,20 @@ def scan_and_trade():
     if gas_price:
         health.record_source_success("aaa-gas")
 
+    nowcast_stale = nowcast.pop("_stale", False) if nowcast else False
+    if nowcast_stale:
+        log.warning("Nowcast data is stale (>24h) — skipping CPI/GDP/Jobs trading this cycle")
+
+    if nowcast:
+        ss.source_ok("cleveland-fed")
+    else:
+        ss.source_fail("cleveland-fed", "no data")
+    if gas_price:
+        ss.source_ok("aaa-gas")
+
     if not nowcast and not gas_price:
         log.info("No data sources available (nowcast + gas), skipping scan.")
+        ss.finalize()
         return
 
     # Fetch economics markets
@@ -449,8 +566,10 @@ def scan_and_trade():
 
     if not all_markets:
         log.info("No open economics markets found.")
+        ss.finalize()
         return
 
+    ss.markets_fetched = len(all_markets)
     log.info(f"Found {len(all_markets)} economics markets")
 
     # Evaluate each market
@@ -461,6 +580,7 @@ def scan_and_trade():
 
         threshold, direction_type = parse_econ_threshold(m)
         if threshold is None:
+            ss.skip("no_threshold")
             continue
 
         # Determine which nowcast value to use
@@ -473,7 +593,15 @@ def scan_and_trade():
             nowcast_value = nowcast.get("nonfarm_payrolls")
 
         if nowcast_value is None:
+            ss.skip("no_nowcast")
             continue
+
+        # Skip nowcast-based trades when data is stale
+        if nowcast_stale:
+            ss.skip("stale_nowcast")
+            continue
+
+        ss.markets_evaluated += 1
 
         # Estimate uncertainty
         days_to_release = estimate_days_to_release(m)
@@ -618,6 +746,7 @@ def scan_and_trade():
         budget = allocator.request_budget("economics", ticker, edge=edge, confidence=opp["prob"])
         if not budget.approved:
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
+            ss.skip("allocator_denied")
             continue
 
         price = compute_limit_price(yes_bid, yes_ask, side, edge=edge) or (yes_ask if side == "yes" else no_ask)
@@ -627,6 +756,7 @@ def scan_and_trade():
         fee = kalshi_fee_cents(price)
         count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
+            ss.skip("kelly_zero")
             continue
 
         # Format gas price markets differently (dollars, not percentages)
@@ -654,7 +784,10 @@ def scan_and_trade():
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"))
         if result:
+            ss.trades_placed += 1
             allocator.record_trade("economics", ticker, risk, edge=edge)
+
+    ss.finalize()
 
 
 # === Entry Point ===
@@ -687,6 +820,9 @@ def main():
     while True:
         try:
             health.record_bot_heartbeat("economics")
+            issues = health.check_health()
+            if issues:
+                log.warning("Health issues: %s", "; ".join(issues))
             order_monitor.check_orders()
             scan_and_trade()
         except Exception as e:

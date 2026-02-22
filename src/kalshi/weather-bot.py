@@ -6,7 +6,7 @@ Scans KXHIGH temperature markets, compares to Open-Meteo forecasts, and places t
 import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor
+from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary
 from probability import weather_probability, ensemble_weather_probability, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid
 from ticker_utils import parse_weather_ticker as parse_ticker
 from capital_allocator import PortfolioAllocator
@@ -118,6 +118,7 @@ def compute_probability(forecast_temp, threshold, direction, days_out=0, city=No
 
 def scan_and_trade():
     now = datetime.datetime.now()
+    ss = ScanSummary("weather", log)
     log.info(f"\n{'='*60}")
     log.info(f"[{now.isoformat()}] Market scan starting...")
 
@@ -127,18 +128,22 @@ def scan_and_trade():
         log.info(f"Balance: ${balance/100:.2f}")
     except Exception as e:
         log.error(f"Balance error: {e}")
+        ss.finalize()
         return
 
     # Get weather markets (5-min cache — markets don't change that fast)
     try:
         markets = client.get_all_markets(prefix="KXHIGH", cache_ttl=300)
+        ss.markets_fetched = len(markets)
         log.info(f"Found {len(markets)} KXHIGH markets")
     except Exception as e:
         log.error(f"Market fetch error: {e}")
+        ss.finalize()
         return
 
     if not markets:
         log.info("No weather markets found.")
+        ss.finalize()
         return
 
     # Get forecasts (ensemble or single-model)
@@ -156,22 +161,21 @@ def scan_and_trade():
 
     # Analyze markets
     opportunities = []
-    skipped = {"no_parse": 0, "no_city": 0, "no_date": 0, "no_price": 0, "low_edge": 0}
     for m in markets:
         ticker = m.get("ticker", "")
         parsed = parse_ticker(ticker)
         if not parsed:
-            skipped["no_parse"] += 1
+            ss.skip("no_parse")
             continue
 
         city = parsed["city"]
         if city not in CITIES or city not in forecasts:
-            skipped["no_city"] += 1
+            ss.skip("no_city")
             continue
 
         date_str = parsed["date"]
         if date_str not in forecasts[city]:
-            skipped["no_date"] += 1
+            ss.skip("no_date")
             continue
 
         forecast_data = forecasts[city][date_str]
@@ -195,7 +199,10 @@ def scan_and_trade():
         last = m.get("last_price", 0)
 
         if not is_market_liquid(m):
+            ss.skip("illiquid")
             continue
+
+        ss.markets_evaluated += 1
 
         # Compute edge against the price we'd actually pay (ask for YES, 100-bid for NO)
         # not the midpoint, to avoid false positives from wide spreads
@@ -206,7 +213,7 @@ def scan_and_trade():
         elif our_prob <= 0.5 and no_ask and no_ask < 99:
             edge_yes = -((1 - our_prob) - (no_ask / 100.0))  # negative = NO signal
         else:
-            skipped["no_price"] += 1
+            ss.skip("no_price")
             continue
 
         if abs(edge_yes) >= config["edgeThreshold"]:
@@ -219,14 +226,12 @@ def scan_and_trade():
                 "yes_ask": yes_ask, "no_ask": no_ask,
             })
         else:
-            skipped["low_edge"] += 1
+            ss.skip("low_edge")
             trade_manager.log_decision(
                 ticker, "yes" if edge_yes > 0 else "no", "skipped",
                 "edge below threshold", edge=abs(edge_yes),
                 price_cents=yes_ask if edge_yes > 0 else no_ask,
             )
-
-    log.info(f"Skipped: {skipped}")
 
     # Sort by edge magnitude
     opportunities.sort(key=lambda x: abs(x["edge"]), reverse=True)
@@ -281,6 +286,7 @@ def scan_and_trade():
         budget = allocator.request_budget("weather", ticker, edge=abs(actual_edge))
         if not budget.approved:
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
+            ss.skip("allocator_denied")
             continue
 
         # Position sizing based on market type and conviction
@@ -309,6 +315,7 @@ def scan_and_trade():
 
         if count <= 0:
             log.info(f"  Kelly says 0 contracts for {ticker} (edge too small for price), skipping")
+            ss.skip("kelly_zero")
             continue
 
         log.info(f"\n-> TRADE: {reasoning}")
@@ -332,9 +339,13 @@ def scan_and_trade():
             kelly_fraction=kelly_details.get("kelly_fraction"),
             bankroll_used=kelly_details.get("bankroll_used"),
             ensemble_forecasts=ensemble_data,
+            ensemble_models=list(ensemble_data.keys()) if ensemble_data else None,
         )
         if result:
+            ss.trades_placed += 1
             allocator.record_trade("weather", ticker, risk, edge=actual_edge)
+
+    ss.finalize()
 
 def main():
     log.info("=" * 60)
@@ -355,6 +366,9 @@ def main():
     while True:
         try:
             health.record_bot_heartbeat("weather")
+            issues = health.check_health()
+            if issues:
+                log.warning("Health issues: %s", "; ".join(issues))
             order_monitor.check_orders()
             scan_and_trade()
         except Exception as e:

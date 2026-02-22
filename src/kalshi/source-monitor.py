@@ -13,7 +13,7 @@ import json, time, datetime, os, sys, re, hashlib, traceback
 import requests
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor
+from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, half_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
 from hdd_parser import get_album_sales
@@ -109,6 +109,8 @@ def match_hdd_to_markets(sales_data, prefetched_markets=None):
 
                 # Use word boundary matching to avoid false positives
                 if re.search(r'\b' + re.escape(artist) + r'\b', title) or re.search(r'\b' + re.escape(artist) + r'\b', subtitle):
+                    if not is_market_liquid(m):
+                        continue
                     evaluate_album_trade(m, sale)
 
     except Exception as e:
@@ -305,6 +307,8 @@ def match_boxoffice_to_markets(box_data, prefetched_markets=None):
                 market_title = m.get("title", "").lower()
                 title_words = [w for w in title_lower.split() if len(w) > 3]
                 if title_words and all(re.search(r'\b' + re.escape(w) + r'\b', market_title) for w in title_words):
+                    if not is_market_liquid(m):
+                        continue
                     evaluate_boxoffice_trade(m, movie)
 
     except Exception as e:
@@ -431,13 +435,23 @@ def check_nws(prefetched_markets=None):
 
             if temp_c is not None:
                 temp_f = temp_c * 9/5 + 32
+                obs_ts = props.get("timestamp", "")
                 actual_temps[city_code] = {
                     "temp_f": round_half_up(temp_f),
                     "temp_c": round(temp_c, 1),
                     "station": station_id,
-                    "timestamp": props.get("timestamp", ""),
+                    "timestamp": obs_ts,
                 }
-                log.info(f"  {city_code} ({station_id}): {temp_f:.1f}F ({temp_c:.1f}C) @ {props.get('timestamp', '?')}")
+                log.info(f"  {city_code} ({station_id}): {temp_f:.1f}F ({temp_c:.1f}C) @ {obs_ts or '?'}")
+                # Check observation staleness
+                if obs_ts:
+                    try:
+                        obs_dt = datetime.datetime.fromisoformat(obs_ts.replace("Z", "+00:00"))
+                        obs_age_hours = (datetime.datetime.now(datetime.timezone.utc) - obs_dt).total_seconds() / 3600
+                        if obs_age_hours > 2:
+                            log.warning(f"  {city_code}: NWS observation is {obs_age_hours:.1f}h stale")
+                    except (ValueError, TypeError):
+                        pass
             else:
                 log.info(f"  {city_code} ({station_id}): No temperature data available")
         except Exception as e:
@@ -487,14 +501,14 @@ def check_nws_daily_highs(current_temps):
                 t = f.get("properties", {}).get("temperature", {}).get("value")
                 if t is not None:
                     temp_f = t * 9/5 + 32
-                    temps.append(round_half_up(temp_f))
+                    temps.append(round(temp_f, 1))
 
             if temps:
                 running_high = max(temps)
                 if city_code in current_temps:
                     current_temps[city_code]["running_high_f"] = running_high
                     current_temps[city_code]["obs_count"] = len(temps)
-                log.info(f"  {city_code} running high today: {running_high}F ({len(temps)} observations)")
+                log.info(f"  {city_code} running high today: {running_high:.1f}F ({len(temps)} observations)")
         except Exception as e:
             log.error(f"  Daily high check failed for {city_code}: {e}")
 
@@ -662,6 +676,9 @@ def main():
     while True:
         now = time.time()
         health.record_bot_heartbeat("source-monitor")
+        issues = health.check_health()
+        if issues:
+            log.warning("Health issues: %s", "; ".join(issues))
         order_monitor.check_orders()
 
         try:
@@ -669,6 +686,9 @@ def main():
             need_hdd = config["sources"]["hdd"]["enabled"] and (now - last_hdd) >= hdd_interval
             need_box = config["sources"]["boxoffice"]["enabled"] and (now - last_boxoffice) >= box_interval
             need_nws = config["sources"]["nws"]["enabled"] and (now - last_nws) >= nws_interval
+
+            # Create scan summary for this iteration
+            ss = ScanSummary("source-monitor", log) if (need_hdd or need_box or need_nws) else None
 
             # Prefetch all needed markets once (with 5-min cache) instead of
             # fetching per-source which made 3 separate paginated API calls
@@ -692,9 +712,13 @@ def main():
                 try:
                     check_hdd(prefetched_markets=prefetched)
                     health.record_source_success("hdd")
+                    if ss:
+                        ss.source_ok("hdd")
                 except Exception as e:
                     log.error(f"HDD source error: {e}")
                     health.record_source_error("hdd", str(e))
+                    if ss:
+                        ss.source_fail("hdd", str(e))
                     traceback.print_exc()
                 last_hdd = now
 
@@ -702,9 +726,13 @@ def main():
                 try:
                     check_boxoffice(prefetched_markets=prefetched)
                     health.record_source_success("boxoffice")
+                    if ss:
+                        ss.source_ok("boxoffice")
                 except Exception as e:
                     log.error(f"Box office source error: {e}")
                     health.record_source_error("boxoffice", str(e))
+                    if ss:
+                        ss.source_fail("boxoffice", str(e))
                     traceback.print_exc()
                 last_boxoffice = now
 
@@ -712,11 +740,18 @@ def main():
                 try:
                     check_nws(prefetched_markets=prefetched)
                     health.record_source_success("nws")
+                    if ss:
+                        ss.source_ok("nws")
                 except Exception as e:
                     log.error(f"NWS source error: {e}")
                     health.record_source_error("nws", str(e))
+                    if ss:
+                        ss.source_fail("nws", str(e))
                     traceback.print_exc()
                 last_nws = now
+
+            if ss:
+                ss.finalize()
 
         except Exception as e:
             log.error(f"Main loop error: {e}")

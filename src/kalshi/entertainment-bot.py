@@ -7,7 +7,7 @@ DEMO API ONLY — $5 max per trade.
 import json, time, datetime, os, sys, re, traceback
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor
+from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, half_kelly, compute_limit_price, is_market_liquid, kalshi_fee_cents
 from hdd_parser import get_album_sales
 from capital_allocator import PortfolioAllocator
@@ -412,6 +412,7 @@ def evaluate_boxoffice_opportunity(market, movie, market_price):
 # === Main Loop ===
 def scan():
     """Single scan cycle."""
+    ss = ScanSummary("entertainment", log)
     log.info(f"\n{'='*60}")
     log.info(f"Entertainment market scan starting...")
 
@@ -420,9 +421,11 @@ def scan():
         log.info(f"Balance: ${balance/100:.2f}")
     except Exception as e:
         log.error(f"Balance check failed: {e}")
+        ss.finalize()
         return
 
     markets = find_entertainment_markets()
+    ss.markets_fetched = len(markets)
     log.info(f"Found {len(markets)} entertainment markets")
 
     for m in markets[:20]:
@@ -455,6 +458,7 @@ def scan():
         log.info("Markets found but no source data to compare -- will retry next cycle")
 
     log.info(f"Scan complete.")
+    ss.finalize()
 
 def main():
     log.info("=" * 60)
@@ -474,6 +478,9 @@ def main():
     while True:
         try:
             health.record_bot_heartbeat("entertainment")
+            issues = health.check_health()
+            if issues:
+                log.warning("Health issues: %s", "; ".join(issues))
             order_monitor.check_orders()
             scan()
         except Exception as e:

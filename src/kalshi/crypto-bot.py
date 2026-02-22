@@ -19,11 +19,11 @@ from pathlib import Path
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot,
-    HealthCheckMonitor, OrderMonitor,
+    HealthCheckMonitor, OrderMonitor, _atomic_write_json, ScanSummary,
 )
 from probability import (
     crypto_price_probability, quarter_kelly, half_kelly, compute_limit_price,
-    kalshi_fee_cents,
+    kalshi_fee_cents, is_market_liquid,
 )
 from ticker_utils import parse_crypto_ticker
 from capital_allocator import PortfolioAllocator
@@ -74,6 +74,31 @@ DEFAULT_VOLS = {
 
 # Recent price cache for realized vol computation
 _price_history = {}  # asset -> [(timestamp, price), ...]
+_PRICE_HISTORY_PATH = PROJECT_DIR / "data" / "crypto-price-history.json"
+
+
+def _load_price_history():
+    """Load price history from disk, keeping only last 24h."""
+    global _price_history
+    try:
+        if _PRICE_HISTORY_PATH.exists():
+            data = json.loads(_PRICE_HISTORY_PATH.read_text())
+            cutoff = time.time() - 86400
+            for asset, entries in data.items():
+                _price_history[asset] = [(t, p) for t, p in entries if t > cutoff]
+    except (json.JSONDecodeError, OSError, KeyError):
+        pass
+
+
+def _save_price_history():
+    """Persist price history to disk."""
+    try:
+        _atomic_write_json(_PRICE_HISTORY_PATH, _price_history)
+    except Exception:
+        pass  # best-effort
+
+
+_load_price_history()
 
 
 # === Data Sources ===
@@ -151,6 +176,7 @@ def compute_realized_vol(asset, current_price):
     # Keep only last 24h of observations
     cutoff = now - 86400
     _price_history[asset] = [(t, p) for t, p in _price_history[asset] if t > cutoff]
+    _save_price_history()
 
     history = _price_history[asset]
     if len(history) < 5:
@@ -219,6 +245,7 @@ def _parse_bracket_range(ticker, asset, markets):
 def scan_and_trade():
     """Scan crypto markets and trade on model edge."""
     now = datetime.datetime.now()
+    ss = ScanSummary("crypto", log)
     log.info(f"\n{'='*60}")
     log.info(f"[{now.isoformat()}] Crypto scan starting...")
 
@@ -228,6 +255,7 @@ def scan_and_trade():
         log.info(f"Balance: ${balance/100:.2f}")
     except Exception as e:
         log.error(f"Balance error: {e}")
+        ss.finalize()
         return
 
     # Fetch spot prices
@@ -243,6 +271,8 @@ def scan_and_trade():
 
     if not spot_prices:
         log.info("No spot prices available, skipping scan.")
+        ss.source_fail("coinbase", "no spot prices")
+        ss.finalize()
         return
 
     # Fetch IV (optional, fall back to realized vol)
@@ -272,8 +302,10 @@ def scan_and_trade():
 
     if not all_markets:
         log.info("No open crypto markets found.")
+        ss.finalize()
         return
 
+    ss.markets_fetched = len(all_markets)
     log.info(f"Found {len(all_markets)} crypto markets")
 
     # Evaluate each market
@@ -282,10 +314,12 @@ def scan_and_trade():
         ticker = m.get("ticker", "")
         parsed = parse_crypto_ticker(ticker)
         if not parsed:
+            ss.skip("unparseable")
             continue
 
         asset = parsed["asset"]
         if asset not in spot_prices:
+            ss.skip("no_spot")
             continue
 
         current_price = spot_prices[asset]
@@ -297,6 +331,7 @@ def scan_and_trade():
 
         # Skip markets about to settle (avoid last-minute noise)
         if minutes_to_settle < SETTLEMENT_BUFFER_MINUTES:
+            ss.skip("settlement_buffer")
             continue
 
         # Get volatility — IV is forward-looking so gets more weight
@@ -343,7 +378,14 @@ def scan_and_trade():
         yes_bid = m.get("yes_bid", 0)
 
         if not yes_ask or yes_ask >= 99:
+            ss.skip("no_price")
             continue
+
+        if not is_market_liquid(m):
+            ss.skip("illiquid")
+            continue
+
+        ss.markets_evaluated += 1
 
         # Determine trade direction and edge (raw edge, fees handled in Kelly)
         if prob > 0.5 and yes_ask:
@@ -394,6 +436,7 @@ def scan_and_trade():
         budget = allocator.request_budget("crypto", ticker, edge=edge, confidence=opp["prob"])
         if not budget.approved:
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
+            ss.skip("allocator_denied")
             continue
 
         price = compute_limit_price(yes_bid, yes_ask, side, edge=edge) or (yes_ask if side == "yes" else no_ask)
@@ -404,7 +447,20 @@ def scan_and_trade():
         fee = kalshi_fee_cents(price)
         count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
+            ss.skip("kelly_zero")
             continue
+
+        # Determine vol_source for trade record
+        iv = iv_data.get(opp["asset"])
+        rv = realized_vols.get(opp["asset"])
+        if iv is not None and rv is not None:
+            vol_source = "iv+rv"
+        elif iv is not None:
+            vol_source = "iv_only"
+        elif rv is not None:
+            vol_source = "rv_only"
+        else:
+            vol_source = "default"
 
         reasoning = (
             f"Crypto {opp['asset']}: spot ${opp['current_price']:,.0f} vs threshold ${opp['threshold']:,.0f}, "
@@ -421,9 +477,13 @@ def scan_and_trade():
                                             fee_cents=round(kalshi_fee_cents(price), 2), sizing_method="quarter_kelly",
                                             market_close_time=m.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
-                                            bankroll_used=kelly_details.get("bankroll_used"))
+                                            bankroll_used=kelly_details.get("bankroll_used"),
+                                            vol_source=vol_source)
         if result:
+            ss.trades_placed += 1
             allocator.record_trade("crypto", ticker, risk, edge=edge)
+
+    ss.finalize()
 
 
 # === Entry Point ===
@@ -456,6 +516,9 @@ def main():
     while True:
         try:
             health.record_bot_heartbeat("crypto")
+            issues = health.check_health()
+            if issues:
+                log.warning("Health issues: %s", "; ".join(issues))
             order_monitor.check_orders()
             scan_and_trade()
         except Exception as e:

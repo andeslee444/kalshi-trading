@@ -2162,18 +2162,18 @@ class TestTradeRecordFields:
         assert decisions[0]["action"] == "skipped"
 
     def test_log_decision_bounded(self, tmp_path):
-        """Decisions log should be bounded at ~500 entries."""
+        """Decisions log should be bounded at ~5000 entries."""
         mgr, _ = _make_manager(tmp_path)
         decisions_path = tmp_path / "trades-decisions.json"
-        # Pre-fill with 600 entries
+        # Pre-fill with 6000 entries
         prefill = [{"timestamp": "2025-01-01T00:00:00", "ticker": f"T{i}",
                      "side": "yes", "action": "skipped", "reason": "test",
-                     "source_bot": "test"} for i in range(600)]
+                     "source_bot": "test"} for i in range(6000)]
         decisions_path.write_text(json.dumps(prefill))
         # Add one more — should trigger truncation
         mgr.log_decision("T999", "yes", "skipped", "test")
         decisions = json.loads(decisions_path.read_text())
-        assert len(decisions) <= 501  # 400 kept + 1 new (after truncation from 600)
+        assert len(decisions) <= 5001  # 4000 kept + 1 new (after truncation from 6000)
 
     def test_log_decision_fields(self, tmp_path):
         """All expected fields should be present in decision record."""

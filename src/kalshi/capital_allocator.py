@@ -126,13 +126,14 @@ def _extract_city_key(ticker):
 class BudgetResponse:
     """Response from the allocator for a trade request."""
 
-    __slots__ = ("approved", "max_cost_cents", "bankroll_cents", "reason")
+    __slots__ = ("approved", "max_cost_cents", "bankroll_cents", "reason", "binding_constraint")
 
-    def __init__(self, approved, max_cost_cents=0, bankroll_cents=0, reason=""):
+    def __init__(self, approved, max_cost_cents=0, bankroll_cents=0, reason="", binding_constraint=""):
         self.approved = approved
         self.max_cost_cents = max_cost_cents
         self.bankroll_cents = bankroll_cents
         self.reason = reason
+        self.binding_constraint = binding_constraint
 
     def __repr__(self):
         if self.approved:
@@ -257,6 +258,9 @@ class PortfolioAllocator:
         self._load_state()
         today = datetime.date.today().isoformat()
         if self._daily_date != today:
+            if self._daily_date is not None:
+                self.log.info("Allocator daily reset: %d tickers, $%.2f risk cleared",
+                              len(self._traded_tickers), self._total_risk_cents / 100)
             self._traded_tickers = {}
             self._bot_spend = {}
             self._city_risk = {}
@@ -446,13 +450,15 @@ class PortfolioAllocator:
 
         # 6. Compute allocated budget
         # The allocation is the minimum of all constraints
-        allocated = min(
-            bot_max_cost_cents,       # bot's own config cap
-            remaining_portfolio,       # portfolio daily limit
-            remaining_bot,             # per-bot daily limit
-            max_ticker_risk,           # concentration limit
-            remaining_city,            # city-level concentration (weather)
-        )
+        constraints = {
+            "bot_config_cap": bot_max_cost_cents,
+            "portfolio_daily_limit": remaining_portfolio,
+            "bot_daily_limit": remaining_bot,
+            "ticker_concentration": max_ticker_risk,
+            "city_concentration": remaining_city,
+        }
+        allocated = min(constraints.values())
+        binding = min(constraints, key=constraints.get)
 
         # 7. Scale up for high-confidence info-arb trades
         # When confidence > 90%, allow up to 25% of bankroll per trade
@@ -477,6 +483,7 @@ class PortfolioAllocator:
             approved=True,
             max_cost_cents=allocated,
             bankroll_cents=bankroll,  # total equity for Kelly sizing
+            binding_constraint=binding,
         )
 
     def get_status(self):
