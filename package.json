@@ -27,6 +27,7 @@
     "sync:up": "bash scripts/s3-sync.sh upload",
     "sync:down": "bash scripts/s3-sync.sh download",
     "sync:setup": "bash scripts/s3-sync.sh setup",
+    "dashboard": "python3 scripts/dashboard.py",
     "test": "pytest tests/ -v"
   },
   "dependencies": {},

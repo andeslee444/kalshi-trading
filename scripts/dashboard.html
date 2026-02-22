@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kalshi Trading Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    .dot-green { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+    .dot-red { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
+    .dot-yellow { background: #eab308; box-shadow: 0 0 6px #eab308; }
+    .dot-gray { background: #6b7280; }
+    .log-viewer { max-height: 320px; overflow-y: auto; }
+    .log-viewer::-webkit-scrollbar { width: 6px; }
+    .log-viewer::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+    .progress-bar { height: 8px; border-radius: 4px; background: #374151; overflow: hidden; }
+    .progress-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
+    .card { background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 16px; }
+    .pulse { animation: pulse 2s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+
+  <!-- Header -->
+  <header class="border-b border-gray-800 px-6 py-3 flex items-center justify-between">
+    <h1 class="text-lg font-bold text-gray-100">Kalshi Trading Dashboard</h1>
+    <div class="flex items-center gap-4 text-sm text-gray-400">
+      <span id="last-update"></span>
+      <label class="flex items-center gap-2 cursor-pointer">
+        <input type="checkbox" id="auto-refresh" checked class="accent-green-500">
+        Auto-refresh
+      </label>
+    </div>
+  </header>
+
+  <main class="p-4 grid gap-4 max-w-[1400px] mx-auto">
+
+    <!-- Row 1: Bot Status + Account + Risk -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+
+      <!-- Bot Status -->
+      <div class="card">
+        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Bot Status</h2>
+        <div id="bot-status" class="space-y-2 text-sm">
+          <div class="text-gray-500">Loading...</div>
+        </div>
+      </div>
+
+      <!-- Account Overview -->
+      <div class="card">
+        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Account</h2>
+        <div id="account-info">
+          <div class="text-gray-500 text-sm">Loading...</div>
+        </div>
+      </div>
+
+      <!-- Risk & Safety -->
+      <div class="card">
+        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Risk & Safety</h2>
+        <div id="risk-info">
+          <div class="text-gray-500 text-sm">Loading...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Row 2: Risk Bars -->
+    <div class="card">
+      <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Daily Spend by Bot</h2>
+      <div id="risk-bars" class="space-y-2">
+        <div class="text-gray-500 text-sm">Loading...</div>
+      </div>
+    </div>
+
+    <!-- Row 2.5: Settlements & P&L -->
+    <div class="card">
+      <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Settlements & P&L</h2>
+      <div id="settlements-summary" class="mb-3"></div>
+      <div id="settlements-list" class="text-sm space-y-1 max-h-64 overflow-y-auto">
+        <div class="text-gray-500">Loading...</div>
+      </div>
+    </div>
+
+    <!-- Row 3: Open Orders + Positions -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+      <!-- Open Orders -->
+      <div class="card">
+        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Open Orders (Resting)</h2>
+        <div id="open-orders" class="text-sm">
+          <div class="text-gray-500">Loading...</div>
+        </div>
+      </div>
+
+      <!-- Positions -->
+      <div class="card">
+        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Open Positions</h2>
+        <div id="positions" class="text-sm">
+          <div class="text-gray-500">Loading...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Row 4: Trades + Decisions -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+      <!-- Recent Trades -->
+      <div class="card">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-wide">Recent Trades</h2>
+          <span id="trades-source" class="text-xs text-gray-600"></span>
+        </div>
+        <div id="recent-trades" class="text-sm space-y-1 max-h-80 overflow-y-auto">
+          <div class="text-gray-500">Loading...</div>
+        </div>
+      </div>
+
+      <!-- Decision Feed -->
+      <div class="card">
+        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Decision Feed</h2>
+        <div id="decision-feed" class="text-sm space-y-1 max-h-80 overflow-y-auto">
+          <div class="text-gray-500">Loading...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Row 5: Data Source Health + Log Viewer -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+      <!-- Data Source Health -->
+      <div class="card">
+        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Data Source Health</h2>
+        <div id="source-health" class="text-sm">
+          <div class="text-gray-500">Loading...</div>
+        </div>
+      </div>
+
+      <!-- Log Viewer -->
+      <div class="card">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-wide">Log Viewer</h2>
+          <select id="log-bot-select" class="bg-gray-800 text-gray-200 text-sm border border-gray-700 rounded px-2 py-1">
+            <option value="weather">weather</option>
+            <option value="entertainment">entertainment</option>
+            <option value="crypto">crypto</option>
+            <option value="economics">economics</option>
+            <option value="positions">positions</option>
+            <option value="monitor">monitor</option>
+            <option value="strategy">strategy</option>
+            <option value="hdd">hdd</option>
+            <option value="arb">arb</option>
+            <option value="mm">mm</option>
+            <option value="supervisor">supervisor</option>
+          </select>
+        </div>
+        <div id="log-viewer" class="log-viewer bg-gray-900 rounded p-3 text-xs text-gray-300 whitespace-pre-wrap font-mono">
+          Loading...
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+<script>
+const POLL_INTERVAL = 15000;
+let refreshTimer = null;
+
+// ─── Utilities ───
+
+function timeAgo(isoStr) {
+  if (!isoStr) return '-';
+  try {
+    const d = new Date(isoStr);
+    if (isNaN(d.getTime())) return isoStr;
+    const s = Math.floor((Date.now() - d.getTime()) / 1000);
+    if (s < 0) return 'just now';
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+    return Math.floor(s / 86400) + 'd ago';
+  } catch { return isoStr; }
+}
+
+function centsToUsd(cents) {
+  if (cents == null) return '-';
+  return '$' + (cents / 100).toFixed(2);
+}
+
+function shortTime(isoStr) {
+  if (!isoStr) return '';
+  try {
+    const d = new Date(isoStr);
+    if (isNaN(d.getTime())) return isoStr.substring(11, 16);
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  } catch { return ''; }
+}
+
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+function countdownStr(isoStr) {
+  if (!isoStr) return '';
+  try {
+    const d = new Date(isoStr);
+    if (isNaN(d.getTime())) return '';
+    const diff = d.getTime() - Date.now();
+    if (diff <= 0) return 'settled';
+    const mins = Math.floor(diff / 60000);
+    if (mins < 60) return mins + 'm';
+    const hrs = Math.floor(mins / 60);
+    const remMins = mins % 60;
+    if (hrs < 24) return hrs + 'h ' + remMins + 'm';
+    const days = Math.floor(hrs / 24);
+    const remHrs = hrs % 24;
+    return days + 'd ' + remHrs + 'h';
+  } catch { return ''; }
+}
+
+async function fetchJson(url) {
+  try {
+    const res = await fetch(url);
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+// ─── Bot Status ───
+
+async function loadBots() {
+  const data = await fetchJson('/api/bots');
+  const el = document.getElementById('bot-status');
+  if (!data || data.error) {
+    el.innerHTML = '<div class="text-gray-500">Unable to load</div>';
+    return;
+  }
+  el.innerHTML = data.map(b => {
+    let dotClass = 'dot-gray';
+    if (b.status === 'running') dotClass = 'dot-green';
+    else if (b.status === 'stale') dotClass = 'dot-yellow';
+    else if (b.status === 'stopped' && b.pid) dotClass = 'dot-red';
+
+    const hb = b.last_heartbeat ? timeAgo(b.last_heartbeat) : '-';
+    const interval = b.scan_interval_min ? `${b.scan_interval_min}m` : '';
+
+    return `<div class="flex items-center justify-between py-1">
+      <div class="flex items-center gap-2">
+        <span class="dot ${dotClass}"></span>
+        <span class="text-gray-200">${b.name}</span>
+      </div>
+      <div class="flex items-center gap-3 text-gray-500 text-xs">
+        ${interval ? `<span>${interval}</span>` : ''}
+        <span>${hb}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ─── Account ───
+
+async function loadAccount() {
+  const [account, risk] = await Promise.all([
+    fetchJson('/api/account'),
+    fetchJson('/api/risk'),
+  ]);
+
+  const el = document.getElementById('account-info');
+  if (!account || account.error) {
+    el.innerHTML = `<div class="text-gray-500 text-sm">API unavailable</div>`;
+  } else {
+    const pnl = account.pnl;
+    const pnlColor = v => v > 0 ? 'text-green-400' : v < 0 ? 'text-red-400' : 'text-gray-400';
+
+    el.innerHTML = `
+      <div class="mb-3">
+        <div class="text-xs text-gray-500">Total Value</div>
+        <div class="text-2xl font-bold text-green-400">${centsToUsd(account.total_value)}</div>
+      </div>
+      <div class="grid grid-cols-2 gap-4 mb-4">
+        <div>
+          <div class="text-xs text-gray-500">Cash Balance</div>
+          <div class="text-lg font-semibold text-gray-200">${centsToUsd(account.balance)}</div>
+        </div>
+        <div>
+          <div class="text-xs text-gray-500">Portfolio Value</div>
+          <div class="text-lg font-semibold text-gray-200">${centsToUsd(account.portfolio_value)}</div>
+        </div>
+      </div>
+      ${pnl ? `<div class="grid grid-cols-2 gap-x-4 gap-y-2 border-t border-gray-800 pt-3 mb-3">
+        <div>
+          <div class="text-xs text-gray-500">Total P&L</div>
+          <div class="text-lg font-bold ${pnlColor(pnl.total_pnl_cents)}">${centsToUsd(pnl.total_pnl_cents)}</div>
+        </div>
+        <div>
+          <div class="text-xs text-gray-500">Today's P&L</div>
+          <div class="text-lg font-bold ${pnlColor(pnl.today_pnl_cents)}">${centsToUsd(pnl.today_pnl_cents)}</div>
+        </div>
+        <div>
+          <div class="text-xs text-gray-500">Realized</div>
+          <div class="text-sm font-semibold ${pnlColor(pnl.realized_cents)}">${centsToUsd(pnl.realized_cents)}</div>
+        </div>
+        <div>
+          <div class="text-xs text-gray-500">Unrealized</div>
+          <div class="text-sm font-semibold ${pnlColor(pnl.unrealized_cents)}">${centsToUsd(pnl.unrealized_cents)}</div>
+        </div>
+        <div>
+          <div class="text-xs text-gray-500">Win Rate</div>
+          <div class="text-sm font-semibold text-gray-200">${pnl.win_rate}% <span class="text-xs text-gray-500">(${pnl.wins}W/${pnl.losses}L)</span></div>
+        </div>
+        <div>
+          <div class="text-xs text-gray-500">Fees Paid</div>
+          <div class="text-sm font-semibold text-gray-400">${centsToUsd(pnl.total_fees_cents)}</div>
+        </div>
+      </div>` : ''}`;
+  }
+
+  // Summary: today's trades across all bots
+  if (risk && risk.per_bot) {
+    const todayTrades = risk.per_bot.reduce((s, b) => s + b.today_trades, 0);
+    const todayRisk = risk.per_bot.reduce((s, b) => s + b.today_risk_cents, 0);
+    el.innerHTML += `
+      <div class="text-sm text-gray-400 border-t border-gray-800 pt-3">
+        Today: <span class="text-gray-200">${todayTrades} trades</span>,
+        <span class="text-gray-200">${centsToUsd(todayRisk)}</span> risked
+      </div>`;
+  }
+}
+
+// ─── Risk ───
+
+async function loadRisk() {
+  const data = await fetchJson('/api/risk');
+  const el = document.getElementById('risk-info');
+  const barsEl = document.getElementById('risk-bars');
+
+  if (!data) {
+    el.innerHTML = '<div class="text-gray-500 text-sm">Unable to load</div>';
+    barsEl.innerHTML = '';
+    return;
+  }
+
+  // Kill switch & circuit breaker
+  const ksColor = data.kill_switch ? 'text-red-400' : 'text-green-400';
+  const ksText = data.kill_switch ? 'ACTIVE' : 'OFF';
+  const cbColor = data.circuit_breaker_open ? 'text-red-400' : 'text-green-400';
+  const cbText = data.circuit_breaker_open ? 'OPEN' : 'CLOSED';
+
+  el.innerHTML = `
+    <div class="space-y-2">
+      <div class="flex justify-between">
+        <span class="text-gray-400">Kill Switch</span>
+        <span class="${ksColor} font-bold">${ksText}</span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-gray-400">Circuit Breaker</span>
+        <span class="${cbColor} font-bold">${cbText}</span>
+      </div>
+      ${data.circuit_breaker && data.circuit_breaker.failures ? `
+        <div class="flex justify-between text-xs">
+          <span class="text-gray-500">Failures</span>
+          <span class="text-gray-400">${data.circuit_breaker.failures} / ${data.circuit_breaker.max_failures}</span>
+        </div>` : ''}
+    </div>`;
+
+  // Risk bars
+  const bots = (data.per_bot || []).filter(b => b.today_trades > 0 || b.max_daily_loss);
+  if (bots.length === 0) {
+    barsEl.innerHTML = '<div class="text-gray-500 text-sm">No activity today</div>';
+    return;
+  }
+
+  barsEl.innerHTML = bots.map(b => {
+    const limitCents = (b.max_daily_loss || 50) * 100;
+    const pct = Math.min(100, Math.round((b.today_risk_cents / limitCents) * 100));
+    let barColor = 'bg-green-500';
+    if (pct > 80) barColor = 'bg-red-500';
+    else if (pct > 50) barColor = 'bg-yellow-500';
+
+    return `<div class="flex items-center gap-3 text-sm">
+      <span class="w-28 text-gray-300 truncate">${b.bot}</span>
+      <div class="progress-bar flex-1">
+        <div class="progress-fill ${barColor}" style="width:${pct}%"></div>
+      </div>
+      <span class="text-xs text-gray-400 w-24 text-right">${centsToUsd(b.today_risk_cents)} / ${centsToUsd(limitCents)}</span>
+      <span class="text-xs text-gray-500 w-8 text-right">${pct}%</span>
+    </div>`;
+  }).join('');
+}
+
+// ─── Open Orders ───
+
+async function loadOrders() {
+  const data = await fetchJson('/api/orders');
+  const el = document.getElementById('open-orders');
+
+  if (!data || data.error) {
+    el.innerHTML = '<div class="text-gray-500">API unavailable</div>';
+    return;
+  }
+  if (!Array.isArray(data) || data.length === 0) {
+    el.innerHTML = '<div class="text-gray-500">No resting orders</div>';
+    return;
+  }
+
+  el.innerHTML = `<div class="space-y-1">${data.map(o => {
+    const age = timeAgo(o.created_time);
+    return `<div class="flex justify-between py-1 border-b border-gray-800">
+      <div>
+        <span class="text-gray-200">${escapeHtml(o.ticker)}</span>
+        <span class="ml-2 ${o.side === 'yes' ? 'text-green-400' : 'text-red-400'}">${o.side?.toUpperCase()}</span>
+        <span class="text-gray-400 ml-1">@${o.price}c x${o.remaining_count}</span>
+      </div>
+      <span class="text-gray-500 text-xs">${age}</span>
+    </div>`;
+  }).join('')}</div>`;
+}
+
+// ─── Positions ───
+
+async function loadPositions() {
+  const data = await fetchJson('/api/positions');
+  const el = document.getElementById('positions');
+
+  if (!data || data.error) {
+    el.innerHTML = '<div class="text-gray-500">API unavailable</div>';
+    return;
+  }
+  if (!Array.isArray(data) || data.length === 0) {
+    el.innerHTML = '<div class="text-gray-500">No open positions</div>';
+    return;
+  }
+
+  el.innerHTML = `<div class="space-y-1">${data.map(p => {
+    const pnlColor = p.realized_pnl > 0 ? 'text-green-400' : p.realized_pnl < 0 ? 'text-red-400' : 'text-gray-400';
+    const countdown = p.close_time ? countdownStr(p.close_time) : '';
+    const spread = (p.yes_bid != null && p.yes_ask != null) ? `${p.yes_bid}-${p.yes_ask}c` : '';
+    return `<div class="flex justify-between py-1 border-b border-gray-800">
+      <div>
+        <span class="text-gray-200">${escapeHtml(p.ticker)}</span>
+        <span class="text-gray-400 ml-2">qty: ${p.position}</span>
+        ${countdown ? `<span class="text-yellow-400 text-xs ml-2">${countdown}</span>` : ''}
+      </div>
+      <div class="text-right">
+        ${spread ? `<span class="text-gray-500 text-xs">${spread}</span>` : ''}
+        <span class="text-gray-400 text-xs ml-2">exp: ${centsToUsd(p.market_exposure)}</span>
+        <span class="${pnlColor} text-xs ml-2">P&L: ${centsToUsd(p.realized_pnl)}</span>
+      </div>
+    </div>`;
+  }).join('')}</div>`;
+}
+
+// ─── Recent Trades ───
+
+async function loadTrades() {
+  const data = await fetchJson('/api/trades?limit=40');
+  const el = document.getElementById('recent-trades');
+  const srcEl = document.getElementById('trades-source');
+
+  if (!data || !Array.isArray(data) || data.length === 0) {
+    el.innerHTML = '<div class="text-gray-500">No trades</div>';
+    srcEl.textContent = '';
+    return;
+  }
+
+  const source = data[0]?.source || 'local';
+  srcEl.textContent = source === 'api' ? 'via Kalshi API' : 'local logs';
+
+  el.innerHTML = data.map(t => {
+    const time = shortTime(t.timestamp);
+    const dateStr = (t.timestamp || '').substring(0, 10);
+    const sideColor = t.side === 'YES' ? 'text-green-400' : t.side === 'NO' ? 'text-red-400' : 'text-gray-400';
+    const botLabel = t.bot || '?';
+    return `<div class="flex items-center gap-2 py-1 border-b border-gray-800/50">
+      <span class="text-gray-600 text-xs w-16 shrink-0">${dateStr.substring(5)} ${time}</span>
+      <span class="text-blue-400 text-xs w-20 truncate shrink-0">${botLabel}</span>
+      <span class="text-gray-200 flex-1 truncate">${escapeHtml(t.ticker)}</span>
+      <span class="${sideColor} w-8 shrink-0">${t.side}</span>
+      <span class="text-gray-400 text-xs shrink-0">x${t.count || '?'}</span>
+      <span class="text-gray-400 text-xs w-16 text-right shrink-0">${centsToUsd(t.risk_cents)}</span>
+    </div>`;
+  }).join('');
+}
+
+// ─── Decision Feed ───
+
+async function loadDecisions() {
+  const data = await fetchJson('/api/decisions?limit=30');
+  const el = document.getElementById('decision-feed');
+
+  if (!data || !Array.isArray(data) || data.length === 0) {
+    el.innerHTML = '<div class="text-gray-500">No decision logs available</div>';
+    return;
+  }
+
+  el.innerHTML = data.map(d => {
+    const time = shortTime(d.timestamp);
+    const reason = d.reason || d.skip_reason || '';
+    return `<div class="py-1 border-b border-gray-800/50">
+      <div class="flex items-center gap-2">
+        <span class="text-gray-500 text-xs w-12">${time}</span>
+        <span class="text-blue-400 text-xs">${d.bot || ''}</span>
+        <span class="text-gray-200 truncate">${escapeHtml(d.ticker || '')}</span>
+        <span class="text-yellow-400 text-xs">${d.action || 'skip'}</span>
+      </div>
+      ${reason ? `<div class="text-gray-500 text-xs ml-14 truncate">${escapeHtml(reason)}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+// ─── Settlements & P&L ───
+
+async function loadSettlements() {
+  const data = await fetchJson('/api/settlements?limit=50');
+  const summaryEl = document.getElementById('settlements-summary');
+  const listEl = document.getElementById('settlements-list');
+
+  if (!data || data.error) {
+    summaryEl.innerHTML = '';
+    listEl.innerHTML = '<div class="text-gray-500">API unavailable</div>';
+    return;
+  }
+
+  const s = data.summary || {};
+  const pnlColor = s.total_pnl_cents > 0 ? 'text-green-400' : s.total_pnl_cents < 0 ? 'text-red-400' : 'text-gray-400';
+
+  summaryEl.innerHTML = `
+    <div class="flex items-center gap-6 text-sm">
+      <div>
+        <span class="text-gray-500">Total P&L:</span>
+        <span class="font-bold ${pnlColor} ml-1">${centsToUsd(s.total_pnl_cents)}</span>
+      </div>
+      <div>
+        <span class="text-gray-500">Win Rate:</span>
+        <span class="text-gray-200 ml-1">${s.win_rate || 0}%</span>
+      </div>
+      <div>
+        <span class="text-gray-500">Record:</span>
+        <span class="text-green-400 ml-1">${s.wins || 0}W</span>
+        <span class="text-gray-500">/</span>
+        <span class="text-red-400">${s.losses || 0}L</span>
+      </div>
+      <div>
+        <span class="text-gray-500">Settled:</span>
+        <span class="text-gray-200 ml-1">${s.count || 0}</span>
+      </div>
+    </div>`;
+
+  const settlements = data.settlements || [];
+  if (settlements.length === 0) {
+    listEl.innerHTML = '<div class="text-gray-500">No settlements</div>';
+    return;
+  }
+
+  listEl.innerHTML = settlements.map(st => {
+    const profit = st.profit ?? (st.revenue || 0);
+    const isWin = profit > 0;
+    const isLoss = profit < 0;
+    const icon = isWin ? '<span class="text-green-400">W</span>' : isLoss ? '<span class="text-red-400">L</span>' : '<span class="text-gray-500">-</span>';
+    const profitColor = isWin ? 'text-green-400' : isLoss ? 'text-red-400' : 'text-gray-500';
+    const dateStr = (st.settled_time || '').substring(0, 10);
+    const timeStr = shortTime(st.settled_time);
+    return `<div class="flex items-center gap-2 py-1 border-b border-gray-800/50">
+      <span class="w-5 text-center font-bold">${icon}</span>
+      <span class="text-gray-600 text-xs w-20 shrink-0">${dateStr.substring(5)} ${timeStr}</span>
+      <span class="text-blue-400 text-xs w-20 truncate shrink-0">${st.bot || '?'}</span>
+      <span class="text-gray-200 flex-1 truncate">${escapeHtml(st.ticker)}</span>
+      <span class="${profitColor} text-xs w-16 text-right shrink-0">${profit >= 0 ? '+' : ''}${centsToUsd(profit)}</span>
+    </div>`;
+  }).join('');
+}
+
+// ─── Data Source Health ───
+
+async function loadHealth() {
+  const data = await fetchJson('/api/health');
+  const el = document.getElementById('source-health');
+
+  if (!data || (!data.sources && !data.bots)) {
+    el.innerHTML = '<div class="text-gray-500">No health data</div>';
+    return;
+  }
+
+  const sources = data.sources || {};
+  const keys = Object.keys(sources);
+  if (keys.length === 0) {
+    el.innerHTML = '<div class="text-gray-500">No data sources tracked</div>';
+    return;
+  }
+
+  el.innerHTML = keys.map(name => {
+    const s = sources[name];
+    const ok = s.status === 'ok' || !s.error_count;
+    const dotClass = ok ? 'dot-green' : (s.error_count > 3 ? 'dot-red' : 'dot-yellow');
+    const label = ok ? 'OK' : `${s.error_count} errors`;
+    const lastOk = s.last_success ? timeAgo(s.last_success) : '-';
+
+    return `<div class="flex items-center justify-between py-1">
+      <div class="flex items-center gap-2">
+        <span class="dot ${dotClass}"></span>
+        <span class="text-gray-200">${escapeHtml(name)}</span>
+      </div>
+      <div class="text-xs text-gray-500">
+        ${label} &middot; ${lastOk}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ─── Log Viewer ───
+
+async function loadLogs() {
+  const bot = document.getElementById('log-bot-select').value;
+  const data = await fetchJson(`/api/logs?bot=${bot}&lines=100`);
+  const el = document.getElementById('log-viewer');
+
+  if (!data || data.error) {
+    el.textContent = data?.error || 'Unable to load logs';
+    return;
+  }
+  if (!data.lines || data.lines.length === 0) {
+    el.textContent = 'No log output';
+    return;
+  }
+
+  el.textContent = data.lines.join('\n');
+  // Auto-scroll to bottom
+  el.scrollTop = el.scrollHeight;
+}
+
+// ─── Polling ───
+
+async function refreshAll() {
+  await Promise.all([
+    loadBots(),
+    loadSettlements(),
+    loadAccount(),
+    loadRisk(),
+    loadOrders(),
+    loadPositions(),
+    loadTrades(),
+    loadDecisions(),
+    loadHealth(),
+    loadLogs(),
+  ]);
+  document.getElementById('last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
+}
+
+function startPolling() {
+  refreshAll();
+  refreshTimer = setInterval(() => {
+    if (document.getElementById('auto-refresh').checked) {
+      refreshAll();
+    }
+  }, POLL_INTERVAL);
+}
+
+document.getElementById('log-bot-select').addEventListener('change', loadLogs);
+startPolling();
+</script>
+</body>
+</html>

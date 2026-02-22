@@ -44,6 +44,10 @@ cmd_upload() {
   aws s3 sync "$PROJECT_DIR/data/" "s3://${BUCKET}/data/" \
     $(sync_filters)
 
+  # Sync bot log files
+  aws s3 sync "$PROJECT_DIR/data/logs/" "s3://${BUCKET}/data/logs/" \
+    --exclude "*" --include "*.log"
+
   # Sync config/calibration.json
   if [ -f "$PROJECT_DIR/config/calibration.json" ]; then
     aws s3 cp "$PROJECT_DIR/config/calibration.json" "s3://${BUCKET}/config/calibration.json"
@@ -58,6 +62,10 @@ cmd_download() {
   # Sync data/ trade logs
   aws s3 sync "s3://${BUCKET}/data/" "$PROJECT_DIR/data/" \
     $(sync_filters)
+
+  # Sync bot log files
+  aws s3 sync "s3://${BUCKET}/data/logs/" "$PROJECT_DIR/data/logs/" \
+    --exclude "*" --include "*.log"
 
   # Sync config/calibration.json
   aws s3 cp "s3://${BUCKET}/config/calibration.json" "$PROJECT_DIR/config/calibration.json" 2>/dev/null || true
