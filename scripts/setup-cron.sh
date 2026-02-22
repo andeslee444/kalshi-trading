@@ -26,7 +26,7 @@ NPM_DIR="$(dirname "$NPM_PATH")"
 AWS_DIR="$(dirname "$AWS_PATH")"
 CRON_PATH="$NPM_DIR:$AWS_DIR:/usr/local/bin:/usr/bin:/bin"
 
-CRON_LINE="0 * * * * cd $PROJECT_DIR && npm run sync:up >> data/logs/sync.log 2>&1 $CRON_TAG"
+CRON_LINE="0 * * * * /bin/bash -c \"cd $PROJECT_DIR && $NPM_PATH run sync:up\" >> $PROJECT_DIR/data/logs/sync.log 2>&1 $CRON_TAG"
 
 # Get existing crontab (empty string if none)
 EXISTING="$(crontab -l 2>/dev/null || true)"
