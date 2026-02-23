@@ -46,7 +46,8 @@ MAX_DAILY_TRADES = crypto_config.get("maxDailyTrades", 30)
 MAX_DAILY_LOSS = crypto_config.get("maxDailyLoss", 25)
 SCAN_INTERVAL = crypto_config.get("scanIntervalMinutes", 5)
 EDGE_THRESHOLD = crypto_config.get("edgeThreshold", 0.06)
-SETTLEMENT_BUFFER_MINUTES = crypto_config.get("settlementBufferMinutes", 2)
+# 1 min buffer: Kalshi closes 15s before settlement + ~30s clock/network margin
+SETTLEMENT_BUFFER_MINUTES = crypto_config.get("settlementBufferMinutes", 1)
 USE_OU = crypto_config.get("useOrnsteinUhlenbeck", False)
 OU_HALF_LIFE = crypto_config.get("ouHalfLifeMinutes", 120)
 DRIFT_PCT = crypto_config.get("driftPct", 0.0)
@@ -339,7 +340,7 @@ def scan_and_trade():
         rv = realized_vols.get(asset)
         default_vol = DEFAULT_VOLS.get(asset, 0.50)
         if iv is not None and rv is not None:
-            vol_to_use = 0.6 * iv + 0.4 * rv
+            vol_to_use = 0.4 * iv + 0.6 * rv  # RV more predictive for short-term scans
         elif iv is not None:
             vol_to_use = iv
         elif rv is not None:

@@ -41,13 +41,21 @@ TRADE_FILES = [
 
 
 def _fetch_all_settlements(client):
-    """Fetch all settled positions from the API.
+    """Fetch all settled positions from the API (paginated).
 
     Returns dict: {ticker: {"revenue_cents": int, "yes_won": bool, "settled_time": str}}
     """
     settlements = {}
-    try:
-        data = client.get("/portfolio/settlements?limit=1000")
+    cursor = None
+    for _ in range(50):
+        path = "/portfolio/settlements?limit=1000"
+        if cursor:
+            path += f"&cursor={cursor}"
+        try:
+            data = client.get(path)
+        except Exception as e:
+            log.warning("Failed to fetch settlements: %s", e)
+            break
         for s in data.get("settlements", []):
             ticker = s.get("market_ticker", "")
             if ticker:
@@ -56,23 +64,31 @@ def _fetch_all_settlements(client):
                     "yes_won": s.get("yes_price", 0) == 100,
                     "settled_time": s.get("settled_time", ""),
                 }
-    except Exception as e:
-        log.warning("Failed to fetch settlements: %s", e)
+        cursor = data.get("cursor")
+        if not cursor or not data.get("settlements"):
+            break
     return settlements
 
 
 def _fetch_all_fills(client):
-    """Fetch recent order fills from the API.
+    """Fetch all order fills from the API (paginated).
 
     Returns dict: {order_id: {"fill_price_cents": int, "fill_count": int}}
     """
     fills = {}
-    try:
-        data = client.get("/portfolio/fills?limit=1000")
+    cursor = None
+    for _ in range(50):
+        path = "/portfolio/fills?limit=1000"
+        if cursor:
+            path += f"&cursor={cursor}"
+        try:
+            data = client.get(path)
+        except Exception as e:
+            log.warning("Failed to fetch fills: %s", e)
+            break
         for f in data.get("fills", []):
             order_id = f.get("order_id", "")
             if order_id:
-                # Average fill price if multiple fills for same order
                 if order_id in fills:
                     existing = fills[order_id]
                     total_count = existing["fill_count"] + (f.get("count", 0) or 0)
@@ -88,8 +104,9 @@ def _fetch_all_fills(client):
                         "fill_price_cents": f.get("yes_price", 0) or f.get("no_price", 0),
                         "fill_count": f.get("count", 0) or 0,
                     }
-    except Exception as e:
-        log.warning("Failed to fetch fills: %s", e)
+        cursor = data.get("cursor")
+        if not cursor or not data.get("fills"):
+            break
     return fills
 
 
@@ -129,7 +146,8 @@ def _annotate_trade(trade, settlements, fills):
     # Compute realized edge if we have enough data
     if trade.get("settlement_result") and trade.get("model_prob") is not None:
         actual = 1.0 if trade["settlement_result"] == "won" else 0.0
-        implied = (trade.get("price_cents", 50) or 50) / 100.0
+        fill_price = trade.get("fill_price_cents") or trade.get("price_cents", 50) or 50
+        implied = fill_price / 100.0
         trade["realized_edge"] = round(actual - implied, 4)
         modified = True
 

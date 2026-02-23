@@ -337,14 +337,13 @@ def _make_manager(tmp_path, config=None, **kwargs):
 
 class TestRiskAdjustedDailyLoss:
 
-    def test_no_side_tracks_risk_not_cost(self, tmp_path):
-        """Buying NO at 95c should track 5c risk, not 95c cost."""
+    def test_no_side_tracks_purchase_price(self, tmp_path):
+        """Buying NO at 95c should track 95c risk (purchase price)."""
         # maxDailyLoss=$1 = 100c
         mgr, _ = _make_manager(tmp_path)
-        # Buy NO at 95c: risk = 100-95 = 5c per contract
+        # Buy NO at 95c: risk = 95c (purchase price)
         mgr.place_order("T1", "no", 95, 1, "r1")
-        # Daily spend should be 5c (risk), not 95c (cost)
-        assert mgr._daily_spend_cents == 5
+        assert mgr._daily_spend_cents == 95
 
     def test_yes_side_tracks_cost_as_risk(self, tmp_path):
         """Buying YES at 30c should track 30c risk (same as cost)."""
@@ -352,19 +351,15 @@ class TestRiskAdjustedDailyLoss:
         mgr.place_order("T1", "yes", 30, 1, "r1")
         assert mgr._daily_spend_cents == 30
 
-    def test_no_side_allows_more_trades(self, tmp_path):
-        """With risk-adjusted tracking, high-priced NO trades use less budget."""
+    def test_no_side_purchase_price_limits(self, tmp_path):
+        """NO risk = purchase price, so 95c NO trades hit $1 limit after 1 trade."""
         # $1 daily loss limit = 100c
         mgr, _ = _make_manager(tmp_path)
-        # Each NO at 95c has only 5c risk, so we can do 20 trades before hitting 100c
-        for i in range(19):
-            result = mgr.place_order(f"T{i}", "no", 95, 1, f"r{i}")
-            assert result is not None
-        # 19 * 5c = 95c < 100c limit. 20th would be 100c = limit, should still work
-        result = mgr.place_order("T19", "no", 95, 1, "r19")
+        # Buy NO at 95c: risk = 95c. Only 5c remaining.
+        result = mgr.place_order("T1", "no", 95, 1, "r1")
         assert result is not None
-        # 21st should be blocked: 105c > 100c
-        result = mgr.place_order("T20", "no", 95, 1, "r20")
+        # 2nd at 95c should be blocked: 95+95=190 > 100c limit
+        result = mgr.place_order("T2", "no", 95, 1, "r2")
         assert result is None
 
 
@@ -1115,12 +1110,12 @@ class TestEconNowcastProbability:
 class TestCpiNowcastSigma:
 
     def test_release_day(self):
-        assert cpi_nowcast_sigma(0) == 0.03
+        assert cpi_nowcast_sigma(0) == 0.10
 
     def test_one_day_out(self):
-        """Smooth exponential: day 1 should be around 0.03."""
+        """Smooth exponential: day 1 should be around 0.06 (new floor)."""
         sigma = cpi_nowcast_sigma(1)
-        assert 0.015 < sigma < 0.05
+        assert 0.06 <= sigma < 0.08
 
     def test_one_week_out(self):
         """Smooth exponential: day 7 should be around 0.06."""
@@ -1133,8 +1128,8 @@ class TestCpiNowcastSigma:
         assert 0.08 < sigma < 0.12
 
     def test_sigma_decreases_toward_release(self):
-        """Sigma should decrease monotonically as release approaches (floored at 0.03)."""
-        assert cpi_nowcast_sigma(14) > cpi_nowcast_sigma(7) > cpi_nowcast_sigma(1) >= cpi_nowcast_sigma(0)
+        """Sigma should decrease monotonically from 14d down to 1d before release."""
+        assert cpi_nowcast_sigma(14) > cpi_nowcast_sigma(7) >= cpi_nowcast_sigma(1)
 
     def test_no_discontinuous_cliff(self):
         """Adjacent days should not have massive sigma jumps."""

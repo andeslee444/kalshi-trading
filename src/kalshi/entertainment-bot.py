@@ -37,6 +37,7 @@ SCAN_INTERVAL_MINUTES = _bots_cfg["scanIntervalMinutes"]
 ENTERTAINMENT_TICKERS = _bots_cfg["tickers"]
 
 MIN_EDGE = 0.03  # 3% minimum edge to cover fees + noise
+MAX_DATA_AGE_HOURS = 48  # HDD data older than 48h is considered stale
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -50,6 +51,37 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxDailyLoss": _bots_cfg.get("maxDailyLoss", 25),
 }, logger=log, order_monitor=order_monitor)
 trim_trade_log(TRADES_PATH)
+
+# === Data Freshness ===
+def _check_hdd_staleness(album_data):
+    """Remove stale HDD entries (older than MAX_DATA_AGE_HOURS).
+
+    Fail-open: entries with missing or unparseable chart_date pass through.
+    Returns filtered list.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    fresh = []
+    stale_count = 0
+    for entry in album_data:
+        chart_date = entry.get("chart_date", "")
+        if not chart_date:
+            fresh.append(entry)
+            continue
+        try:
+            dt = datetime.datetime.fromisoformat(chart_date.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            age_hours = (now - dt).total_seconds() / 3600
+            if age_hours <= MAX_DATA_AGE_HOURS:
+                fresh.append(entry)
+            else:
+                stale_count += 1
+        except (ValueError, TypeError):
+            fresh.append(entry)  # fail-open on unparseable dates
+    if stale_count:
+        log.warning("Removed %d stale HDD entries (older than %dh)", stale_count, MAX_DATA_AGE_HOURS)
+    return fresh
+
 
 # === Market Discovery ===
 def find_entertainment_markets():
@@ -436,6 +468,7 @@ def scan():
 
     try:
         album_data = scrape_hdd()
+        album_data = _check_hdd_staleness(album_data)
         health.record_source_success("hdd")
     except Exception as e:
         log.error(f"HDD scrape error: {e}")

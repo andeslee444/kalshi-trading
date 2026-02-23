@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 from capital_allocator import (
     PortfolioAllocator, compute_signal_quality, MODEL_QUALITY_FACTOR, BudgetResponse,
-    CITY_REGIONS, _CITY_TO_REGION, MAX_REGION_FRACTION,
+    CITY_REGIONS, _CITY_TO_REGION, MAX_REGION_FRACTION, _load_absolute_cap,
 )
 
 
@@ -168,21 +168,21 @@ class TestAbsoluteDailyLossCap:
         alloc._daily_date = datetime.date.today().isoformat()
         return alloc
 
-    def test_cap_blocks_after_100_dollars(self):
-        """After $100 in risk today, next request should be rejected."""
+    def test_cap_blocks_after_limit(self):
+        """After exceeding configured cap in risk today, next request should be rejected."""
         alloc = self._make_allocator(balance=200000)
-        # Record trades summing to $100 (10000 cents) of risk
-        for i in range(10):
+        # Record trades summing to the configured cap (15000 cents = $150)
+        for i in range(15):
             alloc.record_trade("weather", f"TICK-{i}", 1000, edge=0.10)
         budget = alloc.request_budget("weather", "TICK-NEW", edge=0.15)
         assert not budget.approved
         assert "absolute daily risk cap" in budget.reason
 
     def test_under_cap_allowed(self):
-        """Under $100 risk should still allow trading."""
+        """Under configured cap should still allow trading."""
         alloc = self._make_allocator(balance=200000)
-        # Record $90 of risk (9000 cents)
-        for i in range(9):
+        # Record $140 of risk (14000 cents, under $150 cap)
+        for i in range(14):
             alloc.record_trade("weather", f"TICK-{i}", 1000, edge=0.10)
         budget = alloc.request_budget("weather", "TICK-NEW", edge=0.15)
         assert budget.approved
@@ -272,6 +272,11 @@ class TestRegionExposure:
         assert "AUS" in _CITY_TO_REGION
         assert _CITY_TO_REGION["HOU"] == _CITY_TO_REGION["AUS"]
 
+    def test_all_traded_cities_have_regions(self):
+        """Every city in kalshi-config.json should have a region."""
+        for city in ["MIA", "LAX", "CHI", "DEN", "NY", "PHIL", "HOU", "AUS"]:
+            assert city in _CITY_TO_REGION, f"{city} missing from _CITY_TO_REGION"
+
     def test_region_limit_blocks_combined(self):
         """Combined HOU + AUS spending should trigger region limit."""
         alloc = self._make_allocator(balance=50000)
@@ -326,3 +331,48 @@ class TestMaxConcurrentPositions:
         alloc = self._make_allocator(max_positions=20, position_count=5)
         result = alloc.request_budget("weather", "KXHIGHCHI-26FEB16-T50", edge=0.12)
         assert result.approved
+
+
+# ===================================================================
+# Configurable Daily Loss Cap tests
+# ===================================================================
+
+class TestConfigurableDailyLossCap:
+    """Test that absoluteDailyLossCap is configurable from bots-config.json."""
+
+    def test_load_absolute_cap_from_config(self):
+        """_load_absolute_cap should read from bots-config.json."""
+        cap = _load_absolute_cap()
+        # Our config has absoluteDailyLossCap: 150, so cap should be 15000 cents
+        assert cap == 15000
+
+    def test_safety_ceiling(self):
+        """Cap should be clamped at $500 max."""
+        with patch("capital_allocator.Path.exists", return_value=True):
+            with patch("capital_allocator.Path.read_text",
+                       return_value=json.dumps({"allocator": {"absoluteDailyLossCap": 9999}})):
+                cap = _load_absolute_cap()
+        assert cap == 50000  # $500 max
+
+    def test_safety_floor(self):
+        """Cap should be clamped at $10 min."""
+        with patch("capital_allocator.Path.exists", return_value=True):
+            with patch("capital_allocator.Path.read_text",
+                       return_value=json.dumps({"allocator": {"absoluteDailyLossCap": 1}})):
+                cap = _load_absolute_cap()
+        assert cap == 1000  # $10 min
+
+    def test_default_when_key_missing(self):
+        """Missing absoluteDailyLossCap key should default to $100."""
+        with patch("capital_allocator.Path.exists", return_value=True):
+            with patch("capital_allocator.Path.read_text",
+                       return_value=json.dumps({"allocator": {}})):
+                cap = _load_absolute_cap()
+        assert cap == 10000  # $100 default
+
+    def test_default_on_corrupt_config(self):
+        """Corrupt config file should fall back to $100."""
+        with patch("capital_allocator.Path.exists", return_value=True):
+            with patch("capital_allocator.Path.read_text", return_value="not json"):
+                cap = _load_absolute_cap()
+        assert cap == 10000  # $100 default

@@ -227,7 +227,7 @@ class TestSigmaSchedules:
         assert album_data_sigma(2) == 0.10
 
     def test_album_sigma_friday(self):
-        assert album_data_sigma(4) == 0.03
+        assert album_data_sigma(4) == 0.05
 
     def test_boxoffice_sigma_friday(self):
         assert boxoffice_data_sigma(4) == 0.12
@@ -236,21 +236,21 @@ class TestSigmaSchedules:
         assert boxoffice_data_sigma(6) == 0.05
 
     def test_boxoffice_sigma_monday(self):
-        assert boxoffice_data_sigma(0) == 0.02
+        assert boxoffice_data_sigma(0) == 0.04
 
 
 # ─── CPI nowcast sigma ───
 
 class TestCPINowcastSigma:
     def test_at_release(self):
-        """At release day (0), sigma should be 0.03 (floor prevents overconfidence)."""
-        assert cpi_nowcast_sigma(0) == 0.03
+        """At release day (0), sigma should be 0.10 (wider floor prevents overconfidence)."""
+        assert cpi_nowcast_sigma(0) == 0.10
 
-    def test_monotonic_increase_with_days(self):
-        """Sigma should monotonically increase as days_to_release increases (more uncertainty)."""
-        sigmas = [cpi_nowcast_sigma(d) for d in range(15)]
+    def test_monotonic_increase_pre_release(self):
+        """Sigma should monotonically increase from day 1 to 14 (more uncertainty further out)."""
+        sigmas = [cpi_nowcast_sigma(d) for d in range(1, 15)]
         for i in range(len(sigmas) - 1):
-            assert sigmas[i] <= sigmas[i + 1], f"Non-monotonic at day {i}: {sigmas[i]} > {sigmas[i+1]}"
+            assert sigmas[i] <= sigmas[i + 1], f"Non-monotonic at day {i+1}: {sigmas[i]} > {sigmas[i+1]}"
 
 
 # ─── Crypto GBM model ───

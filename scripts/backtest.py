@@ -36,7 +36,7 @@ TRADE_FILES = [
     {"label": "weather", "path": PROJECT_DIR / "data" / "kalshi-trades.json"},
     {"label": "strategy", "path": PROJECT_DIR / "data" / "kalshi-strategy-trades.json"},
     {"label": "entertainment", "path": PROJECT_DIR / "data" / "kalshi-entertainment-trades.json"},
-    {"label": "beatrelease", "path": PROJECT_DIR / "data" / "kalshi-beatrelease-trades.json"},
+    {"label": "beatrelease", "path": PROJECT_DIR / "data" / "beatrelease-trades.json"},
 ]
 
 MONTHS = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
@@ -378,7 +378,7 @@ def main():
             settlements = fetch_settlements(client)
             n_settlements = len(settlements)
             for s in settlements:
-                ticker = s.get("ticker", "")
+                ticker = s.get("market_ticker", s.get("ticker", ""))
                 revenue = s.get("revenue", 0)
                 try:
                     revenue = int(revenue)
@@ -507,6 +507,8 @@ def _print_report(r):
     if r["n_evaluated"] == 0:
         print("\nNo trades could be matched to settlements.")
         print("Run with Kalshi API access or ensure trade logs exist in data/.")
+    elif r["n_evaluated"] < 30:
+        print(f"\nWARNING: Only {r['n_evaluated']} evaluated trades — metrics may be unreliable (need >= 30)")
 
 
 if __name__ == "__main__":

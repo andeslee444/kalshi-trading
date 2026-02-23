@@ -216,6 +216,7 @@ def get_album_sales(logger=None):
             if not chart:
                 continue
 
+            chart_date = chart.get("date", "")
             entries = parse_chart_data(chart.get("chart_data", ""))
             for entry in entries:
                 artist = entry.get("artist", "")
@@ -229,6 +230,7 @@ def get_album_sales(logger=None):
                             "artist": artist,
                             "units": units,
                             "source": f"hdd-{chart_slug}",
+                            "chart_date": chart_date,
                         })
         except Exception as e:
             log.warning(f"HDD chart {chart_slug} fetch failed: {e}")
@@ -254,6 +256,7 @@ def get_album_sales(logger=None):
                             "artist": artist,
                             "units": max(sales),
                             "source": "hdd-article",
+                            "chart_date": article.get("publishedAt", ""),
                         })
     except Exception as e:
         log.warning(f"HDD article fetch failed: {e}")

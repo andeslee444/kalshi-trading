@@ -63,8 +63,24 @@ MAX_CITY_FRACTION = 0.10
 # Portfolio-wide daily loss cap as fraction of bankroll
 PORTFOLIO_DAILY_LOSS_FRACTION = 0.25
 
-# Absolute daily risk cap regardless of balance ($100 hard cap)
-ABSOLUTE_DAILY_LOSS_CAP_CENTS = 10000
+# Absolute daily risk cap — loaded from config or defaults to $100
+def _load_absolute_cap():
+    """Load absoluteDailyLossCap from bots-config.json allocator section.
+
+    Safety bounds: min $10, max $500. Falls back to $100 on missing/corrupt config.
+    """
+    try:
+        config_path = Path(__file__).resolve().parent.parent.parent / "config" / "bots-config.json"
+        if config_path.exists():
+            cfg = json.loads(config_path.read_text())
+            cap_dollars = cfg.get("allocator", {}).get("absoluteDailyLossCap", 100)
+            cap_dollars = max(10, min(500, int(cap_dollars)))
+            return cap_dollars * 100
+    except Exception:
+        pass
+    return 10000  # $100 default
+
+ABSOLUTE_DAILY_LOSS_CAP_CENTS = _load_absolute_cap()
 
 
 # ─── City key extraction ───
@@ -99,6 +115,10 @@ def compute_signal_quality(bot_name, edge):
 CITY_REGIONS = {
     "SOUTH_TX": ["HOU", "AUS"],
     "NORTHEAST": ["NY", "PHIL"],
+    "SOUTHEAST": ["MIA"],
+    "WEST": ["LAX"],
+    "MIDWEST": ["CHI"],
+    "MOUNTAIN": ["DEN"],
 }
 # Reverse lookup: city -> region
 _CITY_TO_REGION = {}
@@ -179,6 +199,7 @@ class PortfolioAllocator:
         self._max_positions = max_positions
         self._position_count = None
         self._position_count_fetched_at = 0
+        self.log.info("Allocator: daily loss cap = $%.2f", ABSOLUTE_DAILY_LOSS_CAP_CENTS / 100)
 
     def _load_state(self):
         """Load shared state from disk with advisory file locking."""
@@ -414,7 +435,7 @@ class PortfolioAllocator:
 
         # 3b. Absolute daily risk cap ($100 hard cap regardless of balance)
         if self._risk_today_cents() >= ABSOLUTE_DAILY_LOSS_CAP_CENTS:
-            return BudgetResponse(False, reason="absolute daily risk cap ($100) reached")
+            return BudgetResponse(False, reason=f"absolute daily risk cap (${ABSOLUTE_DAILY_LOSS_CAP_CENTS/100:.0f}) reached")
 
         # 4. Per-bot daily spending check (based on available)
         priority = BOT_PRIORITY.get(bot_name, 0.2)

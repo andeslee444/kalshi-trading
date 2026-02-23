@@ -113,6 +113,17 @@ def brier_score(predictions):
     return sum((p - a) ** 2 for p, a in predictions) / len(predictions)
 
 
+def log_loss(predictions, eps=1e-7):
+    """Cross-entropy loss. Better objective for Kelly-based trading.
+
+    Returns None if empty. Lower is better.
+    """
+    if not predictions:
+        return None
+    return -sum(a * math.log(max(p, eps)) + (1 - a) * math.log(max(1 - p, eps))
+                for p, a in predictions) / len(predictions)
+
+
 def days_out_bucket(days):
     """Bucket days_out into groups for calibration."""
     if days <= 1:
@@ -177,7 +188,10 @@ def calibrate_weather(trades, settlement_map):
     if not matched:
         return {"n": 0}
 
-    # Global grid search: find (intercept, slope, df) minimizing Brier score
+    if len(matched) < 30:
+        print(f"Warning: Only {len(matched)} matched trades — calibration results may be unreliable", file=sys.stderr)
+
+    # Global grid search: find (intercept, slope, df) minimizing log loss
     best_brier = float("inf")
     best_intercept = 2.5
     best_slope = 0.5
@@ -194,47 +208,66 @@ def calibrate_weather(trades, settlement_map):
                     sigma = intercept + slope * math.sqrt(m["days_out"])
                     prob = weather_prob_with_sigma(m["forecast_temp"], m["threshold"], m["direction"], sigma, df=df)
                     preds.append((prob, m["actual"]))
-                bs = brier_score(preds)
+                bs = log_loss(preds)
                 if bs is not None and bs < best_brier:
                     best_brier = bs
                     best_intercept = intercept
                     best_slope = slope
                     best_df = df
 
-    # Per-city calibration
+    # Per-city calibration with Bayesian shrinkage toward global
+    SHRINKAGE_K = 15  # shrinkage prior strength
     by_city = defaultdict(list)
     for m in matched:
         by_city[m["city"]].append(m)
 
     per_city = {}
     for city, city_trades in by_city.items():
-        if len(city_trades) < 3:
+        if len(city_trades) < 5:
             continue
         city_best_brier = float("inf")
         city_intercept = best_intercept
         city_slope = best_slope
         city_df = best_df
-        for intercept_x10 in range(5, 60):
+
+        # Small-sample regularization: narrow search range to prevent overfitting
+        if len(city_trades) < 15:
+            intercept_range = range(10, 40)   # 1.0-3.9
+            slope_range = range(2, 20)        # 0.2-1.9
+            city_df_candidates = [5, 6, 7, 8]
+        else:
+            intercept_range = range(5, 60)    # 0.5-5.9
+            slope_range = range(2, 40)        # 0.2-3.9
+            city_df_candidates = df_candidates
+
+        for intercept_x10 in intercept_range:
             intercept = intercept_x10 / 10.0
-            for slope_x10 in range(2, 40):  # wider range for sqrt scaling
+            for slope_x10 in slope_range:
                 slope = slope_x10 / 10.0
-                for df in df_candidates:
+                for df in city_df_candidates:
                     preds = []
                     for m in city_trades:
                         sigma = intercept + slope * math.sqrt(m["days_out"])
                         prob = weather_prob_with_sigma(m["forecast_temp"], m["threshold"], m["direction"], sigma, df=df)
                         preds.append((prob, m["actual"]))
-                    bs = brier_score(preds)
+                    bs = log_loss(preds)
                     if bs is not None and bs < city_best_brier:
                         city_best_brier = bs
                         city_intercept = intercept
                         city_slope = slope
                         city_df = df
+
+        # Bayesian shrinkage: blend city-specific toward global
+        city_weight = len(city_trades) / (len(city_trades) + SHRINKAGE_K)
+        shrunk_intercept = city_weight * city_intercept + (1 - city_weight) * best_intercept
+        shrunk_slope = city_weight * city_slope + (1 - city_weight) * best_slope
+
         per_city[city] = {
-            "sigma_intercept": city_intercept,
-            "sigma_slope": city_slope,
+            "sigma_intercept": round(shrunk_intercept, 2),
+            "sigma_slope": round(shrunk_slope, 2),
             "df": city_df,
             "n": len(city_trades),
+            "shrinkage_weight": round(city_weight, 3),
         }
 
     return {
@@ -305,7 +338,7 @@ def calibrate_nws(trades, settlement_map):
 
     sigma_by_hour = {}
     for bucket, items in buckets.items():
-        if not items:
+        if len(items) < 3:
             continue
         best_sigma = {"17+": 0.5, "15-16": 1.5, "before_15": 3.0}[bucket]
         best_bs = float("inf")
@@ -321,7 +354,7 @@ def calibrate_nws(trades, settlement_map):
                     z_hi = (m["threshold"] + 1 - m["running_high"]) / sigma
                     prob = _student_t_cdf(z_hi, 6) - _student_t_cdf(z_lo, 6)
                 preds.append((prob, m["actual"]))
-            bs = brier_score(preds)
+            bs = log_loss(preds)
             if bs is not None and bs < best_bs:
                 best_bs = bs
                 best_sigma = sigma
@@ -380,7 +413,7 @@ def calibrate_info_arb(trades, settlement_map, label):
 
     sigma_by_day = {}
     for bucket, items in day_buckets.items():
-        if not items:
+        if len(items) < 3:
             continue
         bs = brier_score([(m["predicted"], m["actual"]) for m in items])
         # Heuristic: sigma ~ sqrt(brier_score) as rough calibration indicator
@@ -518,7 +551,7 @@ def main():
             settlements = fetch_settlements(client)
             n_settlements = len(settlements)
             for s in settlements:
-                ticker = s.get("ticker", "")
+                ticker = s.get("market_ticker", s.get("ticker", ""))
                 revenue = s.get("revenue", 0)
                 try:
                     revenue = int(revenue)

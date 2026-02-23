@@ -179,8 +179,9 @@ def compute_spread(kalshi_market, pm_market):
 
     # Spread = Polymarket YES bid - Kalshi YES ask (positive = Kalshi is cheap)
     spread = pm_yes_bid - k_yes_price
-    kalshi_fee = kalshi_fee_cents(k_yes_ask) / 100 if k_yes_ask > 0 else 0.007
-    net_spread = spread - (kalshi_fee + POLYMARKET_FEE)
+    kalshi_buy_fee = kalshi_fee_cents(k_yes_ask) / 100 if k_yes_ask > 0 else 0.007
+    kalshi_sell_fee = kalshi_fee_cents(k_yes_bid) / 100 if k_yes_bid > 0 else 0.007
+    net_spread = spread - (kalshi_buy_fee + kalshi_sell_fee + POLYMARKET_FEE)
 
     return {
         "kalshi_yes_ask": k_yes_ask,
@@ -297,8 +298,9 @@ def scan_spreads():
                 yes_bid = spread["kalshi_yes_bid"]
                 yes_ask = spread["kalshi_yes_ask"]
                 price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
+                fee = kalshi_fee_cents(price)
                 count, risk = half_kelly(edge, price, budget.max_cost_cents,
-                                          bankroll_cents=budget.bankroll_cents)
+                                          bankroll_cents=budget.bankroll_cents, fee_cents=fee)
                 if count > 0:
                     reasoning = (
                         f"Cross-platform arb: Kalshi {k_ticker} YES@{price}c vs "

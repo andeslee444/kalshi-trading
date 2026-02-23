@@ -2,7 +2,7 @@
   "mode": "demo",
   "maxTradeAmount": 15,
   "maxDailyTrades": 10,
-  "maxDailyLoss": 50,
+  "maxDailyLoss": 35,
   "scanIntervalMinutes": 30,
   "edgeThreshold": 0.08,
   "cities": {

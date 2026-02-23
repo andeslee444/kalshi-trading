@@ -31,7 +31,7 @@
     "scanIntervalMinutes": 5,
     "edgeThreshold": 0.08,
     "driftPct": 0.0,
-    "settlementBufferMinutes": 5,
+    "settlementBufferMinutes": 1,
     "useOrnsteinUhlenbeck": true,
     "ouHalfLifeMinutes": 120
   },
@@ -62,7 +62,8 @@
     "trailingMinProfitCents": 10
   },
   "allocator": {
-    "maxConcurrentPositions": 20
+    "maxConcurrentPositions": 20,
+    "absoluteDailyLossCap": 150
   },
   "market_maker": {
     "enabled": false,

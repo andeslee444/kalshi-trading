@@ -295,6 +295,12 @@ def scan_and_quote():
 
         # Only quote if our prices improve on existing bid/ask
         if bid_price >= yes_bid and ask_price <= yes_ask:
+            # Check allocator budget before quoting
+            budget = allocator.request_budget("market-maker", ticker, edge=0.0)
+            if not budget.approved:
+                log.info(f"  {ticker}: allocator denied: {budget.reason}")
+                continue
+
             log.info(f"  {ticker}: mid={mid:.0f}c inv={inventory} r={reservation}c spread={half_spread*2}c -> bid={bid_price} ask={ask_price}")
 
             # Cancel existing orders and place new quotes

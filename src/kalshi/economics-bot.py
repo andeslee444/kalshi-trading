@@ -782,7 +782,8 @@ def scan_and_trade():
                                             fee_cents=round(kalshi_fee_cents(price), 2), sizing_method="half_kelly",
                                             market_close_time=m.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
-                                            bankroll_used=kelly_details.get("bankroll_used"))
+                                            bankroll_used=kelly_details.get("bankroll_used"),
+                                            sigma_used=round(opp.get("sigma", 0), 4))
         if result:
             ss.trades_placed += 1
             allocator.record_trade("economics", ticker, risk, edge=edge)

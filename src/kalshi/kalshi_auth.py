@@ -615,6 +615,10 @@ class CircuitBreaker:
             self._failures += 1
             if self._failures >= self.max_failures and self._opened_at is None:
                 self._opened_at = time.time()
+                notify_webhook(
+                    f"Circuit breaker OPEN after {self._failures} consecutive failures",
+                    level="critical",
+                )
             if self.state_path:
                 self._save_shared()
         self._with_shared_lock(_do)
@@ -626,7 +630,14 @@ class CircuitBreaker:
                 self._load_shared()
             if self._failures < self.max_failures:
                 return False
-            if self._opened_at and isinstance(self._opened_at, (int, float)) and (time.time() - self._opened_at) >= self.reset_seconds:
+            # Breaker is tripped — check if we can auto-reset
+            if self._opened_at is None or not isinstance(self._opened_at, (int, float)):
+                # opened_at was lost or corrupted — set it now so timer starts
+                self._opened_at = time.time()
+                if self.state_path:
+                    self._save_shared()
+                return True
+            if (time.time() - self._opened_at) >= self.reset_seconds:
                 # Auto-reset after timeout
                 self._failures = 0
                 self._opened_at = None
@@ -906,6 +917,7 @@ class TradeManager:
         self._daily_trades = 0
         self._daily_spend_cents = 0
         self._daily_date = None
+        self._daily_loss_alerted = False
 
     def _reset_daily_if_needed(self):
         today = datetime.date.today().isoformat()
@@ -913,6 +925,7 @@ class TradeManager:
             self._daily_trades = 0
             self._daily_spend_cents = 0
             self._daily_date = today
+            self._daily_loss_alerted = False
             self._rebuild_daily_counters_from_log(today)
 
     def _rebuild_daily_counters_from_log(self, today_str):
@@ -1033,6 +1046,7 @@ class TradeManager:
         # 1. Kill switch
         if check_kill_switch(self.kill_switch_path):
             self.log.warning("KILL SWITCH ACTIVE — refusing trade on %s", ticker)
+            notify_webhook("Kill switch ACTIVE — trades blocked", level="critical")
             return None
 
         # 2. Circuit breaker
@@ -1046,11 +1060,11 @@ class TradeManager:
             self.log.warning("Daily trade limit (%d) reached — skipping %s", max_daily, ticker)
             return None
 
-        # 4. Daily loss/spend limit (risk-adjusted: YES risk = cost, NO risk = 100-price per contract)
+        # 4. Daily loss/spend limit (risk = purchase price per contract for both YES and NO)
         max_loss_cents = int(self.config["maxDailyLoss"] * 100)
         if side == "no":
-            # Buying NO: max loss per contract is (100 - no_price) cents
-            risk_per_contract = 100 - price_cents
+            # Buying NO: max loss per contract is the purchase price
+            risk_per_contract = price_cents
         else:
             # Buying YES: max loss per contract is price_cents
             risk_per_contract = price_cents
@@ -1062,6 +1076,12 @@ class TradeManager:
                 self._daily_spend_cents / 100, risk_cents / 100,
                 max_loss_cents / 100, ticker
             )
+            if not self._daily_loss_alerted:
+                notify_webhook(
+                    f"Daily loss limit (${self.config['maxDailyLoss']}) reached — trades blocked",
+                    level="warning",
+                )
+                self._daily_loss_alerted = True
             return None
 
         # 5. Dedup
@@ -1096,6 +1116,11 @@ class TradeManager:
             )
             return None
 
+        # 8b. Final kill switch re-check
+        if check_kill_switch(self.kill_switch_path):
+            self.log.warning("KILL SWITCH ACTIVE (late check) — refusing trade on %s", ticker)
+            return None
+
         # 9. Build and place order
         order_body = {
             "ticker": ticker,
@@ -1126,7 +1151,7 @@ class TradeManager:
         # 10. Update counters and save trade (track risk, not raw cost)
         self._daily_trades += 1
         if side == "no":
-            self._daily_spend_cents += (100 - price_cents) * count
+            self._daily_spend_cents += price_cents * count
         else:
             self._daily_spend_cents += cost_cents
 
@@ -1374,6 +1399,15 @@ class HealthCheckMonitor:
             if error_count >= 5:
                 issues.append(f"source/{source} failing: {error_count} consecutive errors")
 
+        # Webhook alert for critical health issues
+        if issues:
+            critical = [i for i in issues if "stale" in i or "failing" in i]
+            if critical:
+                notify_webhook(
+                    f"Health check: {'; '.join(critical[:3])}",
+                    level="warning",
+                )
+
         # Auto-halt on critical failure
         if self.auto_halt and issues:
             critical = [i for i in issues if "stale" in i or "failing" in i]
@@ -1428,4 +1462,68 @@ def notify_whatsapp(message, phone=None, logger=None):
         return False
     except Exception as e:
         _log.warning("WhatsApp error: %s", e)
+        return False
+
+
+# === Webhook Alerting ===
+
+_webhook_rate_limiter = {}  # message_prefix -> last_sent_timestamp
+_WEBHOOK_COOLDOWN_SECONDS = 1800  # 30 minutes
+
+
+def _reset_webhook_rate_limiter():
+    """Reset the webhook rate limiter (for testing)."""
+    _webhook_rate_limiter.clear()
+
+
+def notify_webhook(message, level="info", logger=None):
+    """Send an alert to a Slack or Discord webhook.
+
+    Auto-detects Slack vs Discord by URL pattern. Rate-limits duplicate
+    messages (same first 80 chars) to at most once per 30 minutes.
+
+    Args:
+        message: Alert message text.
+        level: "info", "warning", or "critical" — controls emoji prefix.
+        logger: Optional logger instance.
+
+    Returns:
+        True if sent, False if skipped (no URL, rate-limited, or error).
+    """
+    log = logger or _log
+    url = os.environ.get("ALERT_WEBHOOK_URL", "")
+    if not url:
+        return False
+
+    # Rate limiting: 30-minute cooldown per unique message prefix
+    prefix = message[:80]
+    now = time.time()
+    last_sent = _webhook_rate_limiter.get(prefix, 0)
+    if now - last_sent < _WEBHOOK_COOLDOWN_SECONDS:
+        return False
+
+    # Level-based emoji prefix
+    emoji = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨"}.get(level, "ℹ️")
+    full_message = f"{emoji} [{level.upper()}] {message}"
+
+    # Auto-detect Slack vs Discord by URL pattern
+    if "discord" in url.lower():
+        payload = {"content": full_message}
+    else:
+        payload = {"text": full_message}
+
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+        _webhook_rate_limiter[prefix] = now
+        log.info("Webhook alert sent: %s", message[:100])
+        return True
+    except requests.exceptions.ConnectionError:
+        log.warning("Webhook connection error — alert not delivered")
+        return False
+    except requests.exceptions.HTTPError as e:
+        log.warning("Webhook HTTP error %s — alert not delivered", e.response.status_code if e.response else "?")
+        return False
+    except Exception as e:
+        log.warning("Webhook error: %s", e)
         return False

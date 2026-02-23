@@ -16,6 +16,8 @@ from probability import (
     half_kelly_sell,
     _reset_calibration,
     gas_price_probability,
+    cpi_nowcast_sigma,
+    econ_nowcast_probability,
 )
 
 
@@ -256,13 +258,13 @@ class TestDaySigma:
         assert album_data_sigma(3) == 0.10
 
     def test_album_friday(self):
-        assert album_data_sigma(4) == 0.03
+        assert album_data_sigma(4) == 0.05
 
     def test_album_saturday(self):
-        assert album_data_sigma(5) == 0.03
+        assert album_data_sigma(5) == 0.05
 
     def test_album_sunday(self):
-        assert album_data_sigma(6) == 0.03
+        assert album_data_sigma(6) == 0.05
 
     def test_boxoffice_friday(self):
         assert boxoffice_data_sigma(4) == 0.12
@@ -274,7 +276,7 @@ class TestDaySigma:
         assert boxoffice_data_sigma(6) == 0.05
 
     def test_boxoffice_monday(self):
-        assert boxoffice_data_sigma(0) == 0.02
+        assert boxoffice_data_sigma(0) == 0.04
 
 
 # ===================================================================
@@ -402,12 +404,12 @@ class TestCalibration:
     def test_album_sigma_defaults(self):
         """Without calibration, album sigma returns hardcoded defaults."""
         assert album_data_sigma(0) == 0.15
-        assert album_data_sigma(4) == 0.03
+        assert album_data_sigma(4) == 0.05
 
     def test_boxoffice_sigma_defaults(self):
         """Without calibration, box office sigma returns hardcoded defaults."""
         assert boxoffice_data_sigma(4) == 0.12
-        assert boxoffice_data_sigma(0) == 0.02
+        assert boxoffice_data_sigma(0) == 0.04
 
 
 # ===================================================================
@@ -441,3 +443,48 @@ class TestGasPriceProbability:
         """Gas at $3.45, threshold $3.50 above -> below 50% but not extreme."""
         prob = gas_price_probability(3.45, 3.50, "above")
         assert 0.15 < prob < 0.50
+
+
+# ===================================================================
+# CPI Nowcast Sigma tests
+# ===================================================================
+
+class TestCpiNowcastSigma:
+
+    def setup_method(self):
+        _reset_calibration()
+
+    def teardown_method(self):
+        _reset_calibration()
+
+    def test_release_day_floor(self):
+        """At release day (days=0), sigma should be 0.10."""
+        assert cpi_nowcast_sigma(0) >= 0.10
+
+    def test_day_14_near_010(self):
+        """At 14 days out, sigma should be near 0.10."""
+        sigma = cpi_nowcast_sigma(14)
+        assert 0.09 <= sigma <= 0.11
+
+    def test_monotonically_decreasing_pre_release(self):
+        """Sigma should decrease (or stay flat) from 14d down to 1d before release."""
+        sigmas = [cpi_nowcast_sigma(d) for d in [14, 10, 7, 3, 1]]
+        for i in range(len(sigmas) - 1):
+            assert sigmas[i] >= sigmas[i + 1]
+
+    def test_release_day_higher_than_day_before(self):
+        """Release day (0) has wider sigma than day-before (uncertainty bump)."""
+        assert cpi_nowcast_sigma(0) >= cpi_nowcast_sigma(1)
+
+    def test_negative_days_use_floor(self):
+        """Negative days_to_release should return the floor."""
+        assert cpi_nowcast_sigma(-1) == 0.10
+        assert cpi_nowcast_sigma(-5) == 0.10
+
+    def test_integration_with_econ_nowcast(self):
+        """CPI sigma feeds into econ_nowcast_probability correctly."""
+        sigma = cpi_nowcast_sigma(0)
+        # 5bp gap with 10bp sigma -> z=0.5 -> moderate confidence
+        prob = econ_nowcast_probability(2.80, sigma, 2.85, "above")
+        # nowcast (2.80) is below threshold (2.85), so P(above 2.85) < 0.5
+        assert prob < 0.5

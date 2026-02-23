@@ -194,6 +194,25 @@ def weather_probability(forecast_temp, threshold, direction, days_out=0, city=No
         return _student_t_cdf(z_high, df) - _student_t_cdf(z_low, df)
 
 
+def weather_sigma(days_out=0, city=None):
+    """Return the sigma used by weather_probability for a given horizon and city.
+
+    Useful for logging sigma_used in trade records for calibration.
+    """
+    cal = _load_calibration()
+    intercept = 2.0
+    slope = 0.5
+    weather_cal = cal.get("weather", {})
+    if city and city in weather_cal.get("per_city", {}):
+        city_cal = weather_cal["per_city"][city]
+        intercept = city_cal.get("sigma_intercept", intercept)
+        slope = city_cal.get("sigma_slope", slope)
+    elif weather_cal.get("global_sigma_intercept") is not None:
+        intercept = weather_cal["global_sigma_intercept"]
+        slope = weather_cal.get("global_sigma_slope", slope)
+    return max(0.5, intercept + slope * math.sqrt(max(0, days_out)))
+
+
 def ensemble_weather_probability(forecasts, threshold, direction, days_out=0, city=None):
     """Weighted ensemble averaging (linear opinion pool) for KXHIGH weather markets.
 
@@ -316,7 +335,7 @@ def album_data_sigma(day_of_week):
 
     Mon/Tue (early projections): sigma = 15% of threshold
     Wed/Thu (mid-week updates):  sigma = 10%
-    Fri+ (actual data):          sigma = 3%
+    Fri+ (actual data):          sigma = 5%
 
     Overridden by calibration.json album_sales.sigma_by_day if present.
     """
@@ -328,7 +347,7 @@ def album_data_sigma(day_of_week):
     elif day_of_week <= 3:  # Wed, Thu
         return album_cal.get("wed_thu", 0.10)
     else:  # Fri, Sat, Sun
-        return album_cal.get("fri_sun", 0.03)
+        return album_cal.get("fri_sun", 0.05)
 
 
 def econ_nowcast_probability(nowcast_value, nowcast_sigma, threshold, direction="above"):
@@ -376,8 +395,8 @@ def cpi_nowcast_sigma(days_to_release):
 
     # Fallback heuristic
     if days_to_release <= 0:
-        return 0.03
-    return max(0.03, 0.10 * math.exp(-0.12 * (14 - min(14, days_to_release))))
+        return 0.10
+    return max(0.06, 0.10 * math.exp(-0.12 * (14 - min(14, days_to_release))))
 
 
 def boxoffice_data_sigma(day_of_week):
@@ -387,7 +406,7 @@ def boxoffice_data_sigma(day_of_week):
 
     Fri/Sat (estimates): sigma = 12%
     Sun (Sunday actuals): sigma = 5%
-    Mon+ (final):         sigma = 2%
+    Mon+ (final):         sigma = 4%
 
     Overridden by calibration.json box_office.sigma_by_day if present.
     """
@@ -399,7 +418,7 @@ def boxoffice_data_sigma(day_of_week):
     elif day_of_week == 6:  # Sun
         return box_cal.get("sun", 0.05)
     else:  # Mon-Thu
-        return box_cal.get("mon_thu", 0.02)
+        return box_cal.get("mon_thu", 0.04)
 
 
 # ─── Gas price probability model ───

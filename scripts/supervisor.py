@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"))
 
-from kalshi_auth import setup_logging, check_kill_switch
+from kalshi_auth import setup_logging, check_kill_switch, notify_webhook
 
 log = setup_logging("supervisor")
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -60,6 +60,31 @@ CRASH_WINDOW = 600  # 10 minutes
 
 CHECK_INTERVAL = 30  # seconds
 
+# Heartbeat staleness detection
+HEARTBEAT_NAMES = {
+    "weather": "weather",
+    "entertainment": "entertainment",
+    "crypto": "crypto",
+    "economics": "economics",
+    "positions": "position-monitor",
+    "monitor": "source-monitor",
+    "arb": "cross-platform-arb",
+    "mm": "market-maker",
+}
+
+# Expected scan intervals in minutes (from bots-config / kalshi-config)
+BOT_SCAN_INTERVALS = {
+    "weather": 30,
+    "entertainment": 15,
+    "crypto": 5,
+    "economics": 360,
+    "positions": 15,
+    "monitor": 10,
+    "arb": 10,
+}
+
+HEARTBEAT_GRACE_PERIOD = 300  # 5 min startup grace before checking heartbeats
+
 
 class BotProcess:
     """Tracks a single bot's process state."""
@@ -72,6 +97,48 @@ class BotProcess:
         self.started_at = None
         self.restart_count = 0
         self.recent_crashes = []  # timestamps
+
+    def is_heartbeat_stale(self, health_data):
+        """Check if bot's heartbeat is stale (indicates hung process).
+
+        Returns (is_stale, age_minutes) tuple.
+        Stale = age > 3x expected scan interval.
+        Returns (False, None) during grace period, for unknown bots, or if
+        the bot has no heartbeat mapping.
+        """
+        if self.name not in HEARTBEAT_NAMES:
+            return False, None
+
+        # Grace period: don't check heartbeat within first 5 minutes of start
+        if self.started_at is not None and (time.time() - self.started_at) < HEARTBEAT_GRACE_PERIOD:
+            return False, None
+
+        expected_interval = BOT_SCAN_INTERVALS.get(self.name, 30)
+        stale_threshold_min = expected_interval * 3
+
+        heartbeat_name = HEARTBEAT_NAMES[self.name]
+        bot_health = health_data.get("bots", {}).get(heartbeat_name, {})
+        hb = bot_health.get("last_heartbeat")
+
+        if not hb:
+            # No heartbeat recorded — stale if running > 2x interval
+            if self.started_at is not None:
+                running_min = (time.time() - self.started_at) / 60
+                if running_min > expected_interval * 2:
+                    return True, running_min
+            return False, None
+
+        try:
+            from datetime import datetime
+            hb_dt = datetime.fromisoformat(hb)
+            now_dt = datetime.now()
+            age_min = (now_dt - hb_dt).total_seconds() / 60
+            if age_min > stale_threshold_min:
+                return True, age_min
+        except (ValueError, TypeError):
+            pass
+
+        return False, None
 
     def is_running(self):
         """Check if bot is running via PID file + os.kill probe."""
@@ -145,27 +212,44 @@ class BotProcess:
         self.process = None
         log.info(f"  {self.name} stopped")
 
-    def check_and_restart(self):
-        """Check if daemon crashed and auto-restart with rate limiting.
+    def check_and_restart(self, health_data=None):
+        """Check if daemon crashed or hung and auto-restart with rate limiting.
+
+        Args:
+            health_data: Optional health-state.json dict for heartbeat checks.
 
         Returns True if restarted, False otherwise.
         """
         if self.name not in DAEMON_BOTS:
             return False
-        if self.is_running():
+
+        needs_restart = False
+
+        if not self.is_running():
+            needs_restart = True
+        elif health_data is not None:
+            is_stale, age_min = self.is_heartbeat_stale(health_data)
+            if is_stale:
+                log.warning(f"  {self.name} heartbeat stale ({age_min:.0f}min), killing zombie")
+                notify_webhook(f"Bot {self.name} heartbeat stale ({age_min:.0f}min) — killing zombie", level="warning")
+                self.stop()
+                needs_restart = True
+
+        if not needs_restart:
             return False
 
-        # Bot is down — check crash rate
+        # Check crash rate
         now = time.time()
         self.recent_crashes = [t for t in self.recent_crashes if now - t < CRASH_WINDOW]
 
         if len(self.recent_crashes) >= MAX_CRASHES:
             log.error(f"  {self.name}: {MAX_CRASHES} crashes in {CRASH_WINDOW}s, not restarting")
+            notify_webhook(f"Bot {self.name} crashed {MAX_CRASHES}x in {CRASH_WINDOW}s — auto-restart disabled", level="critical")
             return False
 
         self.recent_crashes.append(now)
         self.restart_count += 1
-        log.warning(f"  {self.name} crashed, restarting (attempt #{self.restart_count})")
+        log.warning(f"  {self.name} down, restarting (attempt #{self.restart_count})")
         return self.start()
 
     def uptime_str(self):
@@ -324,11 +408,12 @@ class Supervisor:
             if kill_switch_active:
                 continue
 
-            # Auto-restart crashed daemons
+            # Auto-restart crashed or hung daemons
+            health = self._load_health()
             for name, bot in self.bots.items():
                 if name in DISABLED_BY_DEFAULT:
                     continue
-                bot.check_and_restart()
+                bot.check_and_restart(health_data=health)
 
         # Graceful shutdown
         log.info("Stopping all bots...")

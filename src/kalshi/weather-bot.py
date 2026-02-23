@@ -7,7 +7,7 @@ import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary
-from probability import weather_probability, ensemble_weather_probability, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid
+from probability import weather_probability, weather_sigma, ensemble_weather_probability, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid
 from ticker_utils import parse_weather_ticker as parse_ticker
 from capital_allocator import PortfolioAllocator
 
@@ -211,30 +211,33 @@ def scan_and_trade():
         if our_prob > 0.5 and yes_ask and yes_ask < 99:
             edge_yes = our_prob - (yes_ask / 100.0)
         elif our_prob <= 0.5 and no_ask and no_ask < 99:
-            edge_yes = -((1 - our_prob) - (no_ask / 100.0))  # negative = NO signal
+            edge_yes = (1 - our_prob) - (no_ask / 100.0)  # positive = NO signal
         else:
             ss.skip("no_price")
             continue
 
-        if abs(edge_yes) >= config["edgeThreshold"]:
+        if edge_yes >= config["edgeThreshold"]:
+            side = "yes" if our_prob > 0.5 else "no"
             opportunities.append({
                 "ticker": ticker, "market": m, "parsed": parsed,
                 "forecast": forecast_temp, "our_prob": our_prob,
-                "market_price": (yes_ask / 100.0) if edge_yes > 0 else (no_ask / 100.0),
+                "market_price": (yes_ask / 100.0) if side == "yes" else (no_ask / 100.0),
                 "edge": edge_yes,
+                "side": side,
                 "city_name": city_name,
                 "yes_ask": yes_ask, "no_ask": no_ask,
+                "days_out": days_out, "city": city,
             })
         else:
             ss.skip("low_edge")
             trade_manager.log_decision(
-                ticker, "yes" if edge_yes > 0 else "no", "skipped",
-                "edge below threshold", edge=abs(edge_yes),
-                price_cents=yes_ask if edge_yes > 0 else no_ask,
+                ticker, "yes" if our_prob > 0.5 else "no", "skipped",
+                "edge below threshold", edge=edge_yes,
+                price_cents=yes_ask if our_prob > 0.5 else no_ask,
             )
 
     # Sort by edge magnitude
-    opportunities.sort(key=lambda x: abs(x["edge"]), reverse=True)
+    opportunities.sort(key=lambda x: x["edge"], reverse=True)
     log.info(f"Found {len(opportunities)} opportunities with edge >= {config['edgeThreshold']*100:.0f}%")
 
     for opp in opportunities:
@@ -250,40 +253,38 @@ def scan_and_trade():
         is_bracket = (direction == "B")
 
         # Rec 1: Brackets require 2x edge threshold (higher model uncertainty)
-        if is_bracket and abs(edge) < config["edgeThreshold"] * 2:
-            log.info(f"  Skipping bracket {ticker}: edge {abs(edge)*100:.1f}% < {config['edgeThreshold']*200:.0f}% (2x threshold)")
+        if is_bracket and edge < config["edgeThreshold"] * 2:
+            log.info(f"  Skipping bracket {ticker}: edge {edge*100:.1f}% < {config['edgeThreshold']*200:.0f}% (2x threshold)")
             continue
 
-        # Edge already computed against actual ask price in the filter above
-        actual_edge = abs(edge)
+        # Edge is always positive (computed against the ask for the side we'd trade)
+        side = opp["side"]
 
-        if edge > 0 and yes_ask and yes_ask < 99:
+        if side == "yes" and yes_ask and yes_ask < 99:
             # Config-level YES disable — if set, skip all weather YES trades
             if config.get("disableWeatherYes", False):
                 trade_manager.log_decision(ticker, "yes", "skipped", "weather YES disabled by config",
-                                            edge=actual_edge, price_cents=yes_ask)
+                                            edge=edge, price_cents=yes_ask)
                 continue
             # Rec 2: NO-only weather constraint — skip YES unless edge >= 15%
             # YES side has 0% historical win rate; only trade with very high conviction
-            if actual_edge < 0.15:
-                log.info(f"  Skipping YES on {ticker}: edge {actual_edge*100:.1f}% < 15% minimum for YES side")
+            if edge < 0.15:
+                log.info(f"  Skipping YES on {ticker}: edge {edge*100:.1f}% < 15% minimum for YES side")
                 continue
-            side = "yes"
-            price = compute_limit_price(yes_bid, yes_ask, "yes", edge=actual_edge)
+            price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge)
             if not price or price <= 0:
                 price = yes_ask
-            reasoning = f"{city_name} forecast: {forecast}F, {ticker} YES at {price}c -> our prob {opp['our_prob']*100:.0f}%, edge +{actual_edge*100:.1f}%, buying YES"
-        elif edge < 0 and no_ask and no_ask < 99:
-            side = "no"
-            price = compute_limit_price(yes_bid, yes_ask, "no", edge=actual_edge)
+            reasoning = f"{city_name} forecast: {forecast}F, {ticker} YES at {price}c -> our prob {opp['our_prob']*100:.0f}%, edge +{edge*100:.1f}%, buying YES"
+        elif side == "no" and no_ask and no_ask < 99:
+            price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge)
             if not price or price <= 0:
                 price = no_ask
-            reasoning = f"{city_name} forecast: {forecast}F, {ticker} NO at {price}c -> our prob {(1-opp['our_prob'])*100:.0f}%, edge +{actual_edge*100:.1f}%, buying NO"
+            reasoning = f"{city_name} forecast: {forecast}F, {ticker} NO at {price}c -> our prob {(1-opp['our_prob'])*100:.0f}%, edge +{edge*100:.1f}%, buying NO"
         else:
             continue
 
         # Request budget from portfolio allocator (includes Rec 6 dedup via global ticker check)
-        budget = allocator.request_budget("weather", ticker, edge=abs(actual_edge))
+        budget = allocator.request_budget("weather", ticker, edge=edge)
         if not budget.approved:
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             ss.skip("allocator_denied")
@@ -294,21 +295,21 @@ def scan_and_trade():
         if is_bracket:
             # Rec 3+10: Quarter-Kelly for brackets (cap scales with bankroll)
             count, risk, kelly_details = quarter_kelly(
-                abs(actual_edge), price, budget.max_cost_cents,
+                edge, price, budget.max_cost_cents,
                 bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True,
             )
             sizing_label = "quarter-Kelly"
         elif side == "no" and (1 - opp["our_prob"]) > 0.80:
             # Rec 4: High-conviction threshold-NO → 60% Kelly
             count, risk, kelly_details = high_conviction_kelly(
-                abs(actual_edge), price, budget.max_cost_cents,
+                edge, price, budget.max_cost_cents,
                 bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True,
             )
             sizing_label = "60%-Kelly (high-conviction)"
         else:
             # Standard half-Kelly
             count, risk, kelly_details = half_kelly(
-                abs(actual_edge), price, budget.max_cost_cents,
+                edge, price, budget.max_cost_cents,
                 bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True,
             )
             sizing_label = "half-Kelly"
@@ -329,10 +330,10 @@ def scan_and_trade():
 
         result = trade_manager.place_order(
             ticker, side, price, count, reasoning,
-            forecast_temp=forecast, threshold=threshold, edge=round(actual_edge, 4),
+            forecast_temp=forecast, threshold=threshold, edge=round(edge, 4),
             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
             model_prob=round(opp["our_prob"], 4),
-            raw_edge=round(actual_edge, 4),
+            raw_edge=round(edge, 4),
             fee_cents=round(kalshi_fee_cents(price), 2),
             sizing_method=sizing_label,
             market_close_time=opp["market"].get("close_time"),
@@ -340,10 +341,11 @@ def scan_and_trade():
             bankroll_used=kelly_details.get("bankroll_used"),
             ensemble_forecasts=ensemble_data,
             ensemble_models=list(ensemble_data.keys()) if ensemble_data else None,
+            sigma_used=round(weather_sigma(opp["days_out"], opp["city"]), 2),
         )
         if result:
             ss.trades_placed += 1
-            allocator.record_trade("weather", ticker, risk, edge=actual_edge)
+            allocator.record_trade("weather", ticker, risk, edge=edge)
 
     ss.finalize()
 

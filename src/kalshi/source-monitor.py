@@ -449,7 +449,8 @@ def check_nws(prefetched_markets=None):
                         obs_dt = datetime.datetime.fromisoformat(obs_ts.replace("Z", "+00:00"))
                         obs_age_hours = (datetime.datetime.now(datetime.timezone.utc) - obs_dt).total_seconds() / 3600
                         if obs_age_hours > 2:
-                            log.warning(f"  {city_code}: NWS observation is {obs_age_hours:.1f}h stale")
+                            log.warning(f"  {city_code}: NWS observation is {obs_age_hours:.1f}h stale — skipping trades")
+                            continue
                     except (ValueError, TypeError):
                         pass
             else:
@@ -576,8 +577,6 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                 base_min_edge = 0.20 if is_bracket else 0.10
                 # Lower threshold for high-confidence NWS (hour >= 17, non-bracket)
                 min_edge = base_min_edge * 0.5 if now.hour >= 17 and not is_bracket else base_min_edge
-                # Rec 2: YES side requires 15%+ edge (0% historical win rate)
-                min_edge = max(min_edge, 0.15)
                 if edge > min_edge:
                     budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=prob)
                     if not budget.approved:

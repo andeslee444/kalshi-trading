@@ -68,17 +68,21 @@ def find_longshot_sells(markets, bankroll):
         # Category-adjusted Becker model: returns additive edge
         # (implied_prob - true_prob), correctly accounting for category-specific
         # bias strength and time decay
-        est_edge = longshot_edge(yes_ask, ticker=ticker, hours_to_close=hours)
+        est_edge_prelim = longshot_edge(yes_ask, ticker=ticker, hours_to_close=hours)
 
         # Fee-aware minimum edge: need net edge after Kalshi fees
         fee_per_contract = kalshi_fee_cents(yes_ask)
         fee_as_edge = fee_per_contract / 100  # convert to probability edge
         min_edge = fee_as_edge + 0.005  # need 0.5% net edge after fees
-        if est_edge < min_edge:
+        if est_edge_prelim < min_edge:
             continue
 
         # Place limit within the spread instead of at full ask
-        sell_price = compute_limit_price(yes_bid, yes_ask, "yes", edge=est_edge) if yes_bid else yes_ask
+        sell_price = compute_limit_price(yes_bid, yes_ask, "yes", edge=est_edge_prelim) if yes_bid else yes_ask
+        # Recompute edge at the actual entry price (limit may differ from ask)
+        est_edge = longshot_edge(sell_price, ticker=ticker, hours_to_close=hours)
+        if est_edge < min_edge:
+            continue
         if sell_price <= 1:
             sell_price = max(yes_bid, yes_ask - 1) if yes_bid > 0 else yes_ask
         if sell_price <= 1:

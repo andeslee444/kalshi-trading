@@ -4,6 +4,7 @@ set -euo pipefail
 BUCKET="${S3_BUCKET:-kalshi-trading-logs}"
 REGION="${AWS_DEFAULT_REGION:-us-west-2}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+LOCK_KEY=".sync-lock"
 
 usage() {
   echo "Usage: $0 {setup|upload|download}"
@@ -24,6 +25,15 @@ sync_filters() {
   echo "--include=backtest-results.json"
 }
 
+acquire_lock() {
+  if aws s3 ls "s3://${BUCKET}/${LOCK_KEY}" 2>/dev/null; then
+    echo "Another sync in progress — aborting"
+    exit 1
+  fi
+  echo "$(hostname):$(date -u +%Y-%m-%dT%H:%M:%SZ)" | aws s3 cp - "s3://${BUCKET}/${LOCK_KEY}"
+  trap 'aws s3 rm "s3://${BUCKET}/${LOCK_KEY}" 2>/dev/null' EXIT
+}
+
 cmd_setup() {
   echo "Creating bucket s3://${BUCKET} in ${REGION}..."
   if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
@@ -38,6 +48,7 @@ cmd_setup() {
 }
 
 cmd_upload() {
+  acquire_lock
   echo "Uploading trade data to s3://${BUCKET}..."
 
   # Sync data/ trade logs
@@ -57,11 +68,13 @@ cmd_upload() {
 }
 
 cmd_download() {
+  acquire_lock
   echo "Downloading trade data from s3://${BUCKET}..."
 
-  # Sync data/ trade logs
+  # Sync data/ trade logs (--size-only prevents overwriting newer local files
+  # when sizes match; for trade logs, more trades = larger file = newer)
   aws s3 sync "s3://${BUCKET}/data/" "$PROJECT_DIR/data/" \
-    $(sync_filters)
+    $(sync_filters) --size-only
 
   # Sync bot log files
   aws s3 sync "s3://${BUCKET}/data/logs/" "$PROJECT_DIR/data/logs/" \

@@ -554,6 +554,9 @@ def scan_positions():
                     "peak_bid": 0,
                     "side": "yes" if yes_count > 0 else "no",
                 }
+            elif entry_price:
+                # Refresh entry price in case position was averaged up/down
+                peaks[ticker]["entry_price"] = entry_price
             exit_signal, peaks[ticker] = evaluate_trailing_stop(pos, market, peaks[ticker])
 
         # 4. Model shift

@@ -323,6 +323,16 @@ class TestTradeManager:
         assert "no_price" in call_body
         assert "yes_price" not in call_body
 
+    def test_no_side_daily_loss_uses_purchase_price(self, tmp_path):
+        """NO-side risk should be price_cents (purchase price), not 100-price."""
+        mgr, _, _ = _make_manager(tmp_path, {"maxTradeAmount": 5, "maxDailyTrades": 100, "maxDailyLoss": 1})
+        # Buy NO at 20c. Risk = 20c, not 80c.
+        mgr.place_order("T1", "no", 20, 1, "r1")
+        # Daily spend should be 20c, leaving 80c of the $1 limit
+        # Next trade at 70c should succeed (20+70=90 < 100)
+        result = mgr.place_order("T2", "no", 70, 1, "r2")
+        assert result is not None  # Would fail with old code (20→80c, 80+70=150>100)
+
     def test_daily_counters_reset_on_new_day(self, tmp_path):
         mgr, _, _ = _make_manager(tmp_path, {"maxTradeAmount": 5, "maxDailyTrades": 1, "maxDailyLoss": 100})
         mgr.place_order("T1", "yes", 10, 1, "r1")
@@ -740,6 +750,18 @@ class TestSharedCircuitBreaker:
         cb.record_failure()
         cb.record_failure()
         assert cb.is_open() is True
+        time.sleep(0.15)
+        assert cb.is_open() is False
+
+    def test_recovers_from_corrupted_opened_at(self):
+        """Breaker with None opened_at should not stay stuck permanently."""
+        cb = CircuitBreaker(max_failures=3, reset_seconds=0.1)
+        # Manually corrupt the breaker state
+        cb._failures = 10
+        cb._opened_at = None  # corrupted
+        # First call: breaker is open (sets opened_at to now)
+        assert cb.is_open() is True
+        # After reset_seconds, breaker should auto-reset
         time.sleep(0.15)
         assert cb.is_open() is False
 
