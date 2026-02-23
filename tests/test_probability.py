@@ -458,33 +458,33 @@ class TestCpiNowcastSigma:
         _reset_calibration()
 
     def test_release_day_floor(self):
-        """At release day (days=0), sigma should be 0.10."""
-        assert cpi_nowcast_sigma(0) >= 0.10
+        """At release day (days=0), sigma should be 0.03 (lowest uncertainty)."""
+        assert cpi_nowcast_sigma(0) == 0.03
 
     def test_day_14_near_010(self):
         """At 14 days out, sigma should be near 0.10."""
         sigma = cpi_nowcast_sigma(14)
         assert 0.09 <= sigma <= 0.11
 
-    def test_monotonically_decreasing_pre_release(self):
-        """Sigma should decrease (or stay flat) from 14d down to 1d before release."""
-        sigmas = [cpi_nowcast_sigma(d) for d in [14, 10, 7, 3, 1]]
+    def test_monotonically_decreasing_to_release(self):
+        """Sigma should decrease (or stay flat) from 14d down to 0d (release)."""
+        sigmas = [cpi_nowcast_sigma(d) for d in [14, 10, 7, 3, 1, 0]]
         for i in range(len(sigmas) - 1):
             assert sigmas[i] >= sigmas[i + 1]
 
-    def test_release_day_higher_than_day_before(self):
-        """Release day (0) has wider sigma than day-before (uncertainty bump)."""
-        assert cpi_nowcast_sigma(0) >= cpi_nowcast_sigma(1)
+    def test_release_day_not_higher_than_day_before(self):
+        """Release day (0) has tighter or equal sigma to day-before."""
+        assert cpi_nowcast_sigma(0) <= cpi_nowcast_sigma(1)
 
     def test_negative_days_use_floor(self):
-        """Negative days_to_release should return the floor."""
-        assert cpi_nowcast_sigma(-1) == 0.10
-        assert cpi_nowcast_sigma(-5) == 0.10
+        """Negative days_to_release should return the floor (0.03)."""
+        assert cpi_nowcast_sigma(-1) == 0.03
+        assert cpi_nowcast_sigma(-5) == 0.03
 
     def test_integration_with_econ_nowcast(self):
         """CPI sigma feeds into econ_nowcast_probability correctly."""
         sigma = cpi_nowcast_sigma(0)
-        # 5bp gap with 10bp sigma -> z=0.5 -> moderate confidence
+        # 5bp gap with 3bp sigma -> z=1.67 -> high confidence
         prob = econ_nowcast_probability(2.80, sigma, 2.85, "above")
         # nowcast (2.80) is below threshold (2.85), so P(above 2.85) < 0.5
         assert prob < 0.5

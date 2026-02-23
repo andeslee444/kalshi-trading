@@ -340,7 +340,7 @@ def scan_and_trade():
         rv = realized_vols.get(asset)
         default_vol = DEFAULT_VOLS.get(asset, 0.50)
         if iv is not None and rv is not None:
-            vol_to_use = 0.4 * iv + 0.6 * rv  # RV more predictive for short-term scans
+            vol_to_use = 0.6 * iv + 0.4 * rv  # IV more predictive for short-term crypto
         elif iv is not None:
             vol_to_use = iv
         elif rv is not None:

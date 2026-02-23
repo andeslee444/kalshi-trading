@@ -403,7 +403,21 @@ def main():
         sys.exit(1)
 
     if args.once:
-        run_scan()
+        trades_placed = 0
+        try:
+            trades_placed = run_scan() or 0
+            _atomic_write_json(PROJECT_DIR / "data" / "strategy-last-run.json", {
+                "timestamp": datetime.datetime.now().isoformat(),
+                "status": "ok",
+                "trades_placed": trades_placed,
+            })
+        except Exception as e:
+            _atomic_write_json(PROJECT_DIR / "data" / "strategy-last-run.json", {
+                "timestamp": datetime.datetime.now().isoformat(),
+                "status": "error",
+                "error": str(e),
+            })
+            raise
         return
 
     # Daemon loop

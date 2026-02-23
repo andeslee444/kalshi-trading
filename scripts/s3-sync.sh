@@ -26,9 +26,26 @@ sync_filters() {
 }
 
 acquire_lock() {
-  if aws s3 ls "s3://${BUCKET}/${LOCK_KEY}" 2>/dev/null; then
-    echo "Another sync in progress — aborting"
-    exit 1
+  # Check for existing lock
+  lock_info=$(aws s3 ls "s3://${BUCKET}/${LOCK_KEY}" 2>/dev/null || true)
+  if [ -n "$lock_info" ]; then
+    # Parse lock timestamp and check for staleness (>10 min)
+    lock_date=$(echo "$lock_info" | awk '{print $1, $2}')
+    if [ -n "$lock_date" ]; then
+      lock_epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$lock_date" +%s 2>/dev/null || date -d "$lock_date" +%s 2>/dev/null || echo 0)
+      now_epoch=$(date +%s)
+      lock_age=$(( now_epoch - lock_epoch ))
+      if [ "$lock_age" -gt 600 ]; then
+        echo "Stale lock detected (${lock_age}s old), removing..."
+        aws s3 rm "s3://${BUCKET}/${LOCK_KEY}" 2>/dev/null || true
+      else
+        echo "Another sync in progress (${lock_age}s ago) — aborting"
+        exit 1
+      fi
+    else
+      echo "Another sync in progress — aborting"
+      exit 1
+    fi
   fi
   echo "$(hostname):$(date -u +%Y-%m-%dT%H:%M:%SZ)" | aws s3 cp - "s3://${BUCKET}/${LOCK_KEY}"
   trap 'aws s3 rm "s3://${BUCKET}/${LOCK_KEY}" 2>/dev/null' EXIT
@@ -63,6 +80,19 @@ cmd_upload() {
   if [ -f "$PROJECT_DIR/config/calibration.json" ]; then
     aws s3 cp "$PROJECT_DIR/config/calibration.json" "s3://${BUCKET}/config/calibration.json"
   fi
+
+  # Verify key files by comparing local vs remote sizes
+  echo "Verifying upload..."
+  for f in kalshi-trades.json kalshi-monitor-trades.json kalshi-entertainment-trades.json kalshi-economics-trades.json kalshi-crypto-trades.json kalshi-strategy-trades.json beatrelease-trades.json; do
+    if [ -f "$PROJECT_DIR/data/$f" ]; then
+      local_size=$(stat -f%z "$PROJECT_DIR/data/$f" 2>/dev/null || stat -c%s "$PROJECT_DIR/data/$f" 2>/dev/null || echo 0)
+      remote_info=$(aws s3 ls "s3://${BUCKET}/data/$f" 2>/dev/null || true)
+      remote_size=$(echo "$remote_info" | awk '{print $3}')
+      if [ -n "$remote_size" ] && [ "$local_size" != "$remote_size" ]; then
+        echo "WARNING: Size mismatch for $f (local=$local_size, remote=$remote_size)"
+      fi
+    fi
+  done
 
   echo "Upload complete."
 }

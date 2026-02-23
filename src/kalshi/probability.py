@@ -393,10 +393,10 @@ def cpi_nowcast_sigma(days_to_release):
         if key in cpi_cal:
             return cpi_cal[key]
 
-    # Fallback heuristic
+    # Fallback heuristic: sigma decreases as release approaches
     if days_to_release <= 0:
-        return 0.10
-    return max(0.06, 0.10 * math.exp(-0.12 * (14 - min(14, days_to_release))))
+        return 0.03
+    return max(0.03, 0.10 * math.exp(-0.12 * (14 - min(14, days_to_release))))
 
 
 def boxoffice_data_sigma(day_of_week):

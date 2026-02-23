@@ -578,6 +578,7 @@ def scan_positions():
             )
             if result:
                 exits_today += 1
+                allocator.record_trade("position-monitor", ticker, risk=0, edge=0)
 
     # Clean up peaks for closed positions and save
     for stale_ticker in list(peaks.keys()):
@@ -608,6 +609,7 @@ def scan_positions():
                             )
                             if result:
                                 exits_today += 1
+                                allocator.record_trade("position-monitor", pending_ticker, risk=0, edge=0)
                     elif no_count > 0:
                         no_bid = market.get("no_bid", 0) or (100 - market.get("yes_ask", 100))
                         if no_bid > 0:
@@ -618,6 +620,7 @@ def scan_positions():
                             )
                             if result:
                                 exits_today += 1
+                                allocator.record_trade("position-monitor", pending_ticker, risk=0, edge=0)
 
     log.info(f"Scan complete. {exits_today} exit orders placed.")
 

@@ -194,7 +194,27 @@ def reeval_weather_trade(trade, settlement_revenue):
     except (ValueError, TypeError):
         days_out = 0
 
-    predicted = weather_probability(forecast_temp, parsed["threshold"], parsed["direction"], days_out)
+    # Use trade-time sigma if stored, otherwise fall back to current model
+    sigma_used = trade.get("sigma_used")
+    if sigma_used and sigma_used > 0:
+        # Re-derive probability using the sigma that was active at trade time
+        from probability import _student_t_cdf
+        cal_weather = {}
+        try:
+            from probability import _load_calibration
+            cal_weather = _load_calibration().get("weather", {})
+        except Exception:
+            pass
+        df = cal_weather.get("df", 6)
+        if parsed["direction"] == "T":
+            z = (parsed["threshold"] - forecast_temp) / sigma_used
+            predicted = 1.0 - _student_t_cdf(z, df)
+        else:
+            z_low = (parsed["threshold"] - forecast_temp) / sigma_used
+            z_high = (parsed["threshold"] + 1 - forecast_temp) / sigma_used
+            predicted = _student_t_cdf(z_high, df) - _student_t_cdf(z_low, df)
+    else:
+        predicted = weather_probability(forecast_temp, parsed["threshold"], parsed["direction"], days_out)
 
     # Re-compute Kelly sizing
     price = trade.get("price", 0) or trade.get("price_cents", 0)

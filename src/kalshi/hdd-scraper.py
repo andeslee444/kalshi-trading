@@ -397,6 +397,7 @@ def monitor_loop(interval_minutes: int = 15):
 
 if __name__ == "__main__":
     import argparse
+    from kalshi_auth import _atomic_write_json
     parser = argparse.ArgumentParser(description="HDD Scraper for Kalshi Arbitrage")
     parser.add_argument("command", nargs="?", default="scan",
                        choices=["scan", "monitor", "charts", "articles", "markets"],
@@ -405,7 +406,19 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.command == "scan":
-        run_full_scan()
+        try:
+            run_full_scan()
+            _atomic_write_json(PROJECT_DIR / "data" / "hdd-last-run.json", {
+                "timestamp": datetime.datetime.now().isoformat(),
+                "status": "ok",
+            })
+        except Exception as e:
+            _atomic_write_json(PROJECT_DIR / "data" / "hdd-last-run.json", {
+                "timestamp": datetime.datetime.now().isoformat(),
+                "status": "error",
+                "error": str(e),
+            })
+            raise
     elif args.command == "monitor":
         monitor_loop(args.interval)
     elif args.command == "charts":

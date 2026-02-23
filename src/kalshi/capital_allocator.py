@@ -277,6 +277,10 @@ class PortfolioAllocator:
 
     def _reset_daily_if_needed(self):
         self._load_state()
+        self._reset_daily_if_needed_inner()
+
+    def _reset_daily_if_needed_inner(self):
+        """Daily reset without re-loading state (for use inside locks)."""
         today = datetime.date.today().isoformat()
         if self._daily_date != today:
             if self._daily_date is not None:
@@ -384,6 +388,8 @@ class PortfolioAllocator:
                        bot_max_cost_cents=500):
         """Request a capital allocation for a trade.
 
+        Uses exclusive file lock to prevent TOCTOU races between concurrent bots.
+
         Args:
             bot_name: Identifier for the requesting bot.
             ticker: Market ticker to trade.
@@ -394,7 +400,24 @@ class PortfolioAllocator:
         Returns:
             BudgetResponse with approved flag, allocated max_cost, and bankroll.
         """
-        self._reset_daily_if_needed()
+        def _do_request():
+            self._load_state()
+            self._reset_daily_if_needed_inner()
+            return self._request_budget_inner(bot_name, ticker, edge, confidence, bot_max_cost_cents)
+
+        if self.state_path:
+            lock_path = self.state_path.with_suffix(".lock")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(lock_path, "w") as lock_fd:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                try:
+                    return _do_request()
+                finally:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        return _do_request()
+
+    def _request_budget_inner(self, bot_name, ticker, edge, confidence, bot_max_cost_cents):
+        """Inner budget logic (called under lock)."""
 
         # 1. Global dedup with "best signal wins" supersede logic
         if ticker in self._traded_tickers:

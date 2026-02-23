@@ -1110,12 +1110,12 @@ class TestEconNowcastProbability:
 class TestCpiNowcastSigma:
 
     def test_release_day(self):
-        assert cpi_nowcast_sigma(0) == 0.10
+        assert cpi_nowcast_sigma(0) == 0.03
 
     def test_one_day_out(self):
-        """Smooth exponential: day 1 should be around 0.06 (new floor)."""
+        """Smooth exponential: day 1 hits the 0.03 floor."""
         sigma = cpi_nowcast_sigma(1)
-        assert 0.06 <= sigma < 0.08
+        assert sigma == 0.03
 
     def test_one_week_out(self):
         """Smooth exponential: day 7 should be around 0.06."""

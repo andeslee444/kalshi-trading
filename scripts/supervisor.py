@@ -212,6 +212,19 @@ class BotProcess:
         self.process = None
         log.info(f"  {self.name} stopped")
 
+    def check_oneshot_completion(self):
+        """Check if one-shot bot wrote a completion/error marker."""
+        marker_path = PROJECT_DIR / "data" / f"{self.name}-last-run.json"
+        if not marker_path.exists():
+            return
+        try:
+            data = json.loads(marker_path.read_text())
+            status = data.get("status")
+            if status == "error":
+                notify_webhook(f"One-shot bot {self.name} failed: {data.get('error', '?')}", level="warning")
+        except Exception:
+            pass
+
     def check_and_restart(self, health_data=None):
         """Check if daemon crashed or hung and auto-restart with rate limiting.
 
@@ -221,6 +234,9 @@ class BotProcess:
         Returns True if restarted, False otherwise.
         """
         if self.name not in DAEMON_BOTS:
+            # Check one-shot bot completion markers
+            if self.name in ONESHOT_BOTS:
+                self.check_oneshot_completion()
             return False
 
         needs_restart = False
@@ -293,6 +309,7 @@ class Supervisor:
             for name, cmd in BOT_COMMANDS.items()
         }
         self._running = True
+        self._last_calibration_check = 0
 
     def _resolve_names(self, names=None):
         """Resolve bot names, defaulting to all enabled if none specified."""
@@ -415,10 +432,36 @@ class Supervisor:
                     continue
                 bot.check_and_restart(health_data=health)
 
+            # Check calibration staleness
+            self.check_calibration_staleness()
+
         # Graceful shutdown
         log.info("Stopping all bots...")
         self.stop_bots()
         log.info("Supervisor stopped.")
+
+    def check_calibration_staleness(self):
+        """Warn if calibration has zero samples but enough trades exist."""
+        # Only check once per hour
+        now = time.time()
+        if now - self._last_calibration_check < 3600:
+            return
+        self._last_calibration_check = now
+
+        cal_path = PROJECT_DIR / "config" / "calibration.json"
+        if not cal_path.exists():
+            return
+        try:
+            cal = json.loads(cal_path.read_text())
+            n_weather = cal.get("weather", {}).get("n", 0)
+            n_trades = cal.get("n_trades", 0)
+            if n_weather == 0 and n_trades > 30:
+                notify_webhook(
+                    f"Calibration stale: {n_trades} trades logged but n=0 calibrated. Run npm run calibrate.",
+                    level="warning"
+                )
+        except Exception:
+            pass
 
     def _load_health(self):
         """Load health-state.json for heartbeat info."""

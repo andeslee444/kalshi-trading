@@ -44,6 +44,7 @@ MAX_DAILY_TRADES = econ_config.get("maxDailyTrades", 5)
 MAX_DAILY_LOSS = econ_config.get("maxDailyLoss", 30)
 SCAN_INTERVAL = econ_config.get("scanIntervalMinutes", 360)
 EDGE_THRESHOLD = econ_config.get("edgeThreshold", 0.08)
+GAS_EDGE_THRESHOLD = econ_config.get("gasEdgeThreshold", 0.04)
 
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
@@ -672,7 +673,7 @@ def scan_and_trade():
 
             if prob > 0.5:
                 edge = prob - yes_ask / 100
-                if edge > EDGE_THRESHOLD:
+                if edge > GAS_EDGE_THRESHOLD:
                     opportunities.append({
                         "ticker": ticker, "market": gm, "side": "yes",
                         "prob": prob, "edge": edge, "threshold": threshold,
@@ -682,7 +683,7 @@ def scan_and_trade():
             else:
                 no_prob = 1.0 - prob
                 edge = no_prob - (no_ask / 100 if no_ask else 1.0)
-                if edge > EDGE_THRESHOLD:
+                if edge > GAS_EDGE_THRESHOLD:
                     opportunities.append({
                         "ticker": ticker, "market": gm, "side": "no",
                         "prob": no_prob, "edge": edge, "threshold": threshold,

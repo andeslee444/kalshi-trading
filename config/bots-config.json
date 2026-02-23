@@ -40,7 +40,8 @@
     "maxDailyTrades": 5,
     "maxDailyLoss": 30,
     "scanIntervalMinutes": 360,
-    "edgeThreshold": 0.08
+    "edgeThreshold": 0.08,
+    "gasEdgeThreshold": 0.04
   },
   "cross_platform_arb": {
     "scanIntervalMinutes": 10,

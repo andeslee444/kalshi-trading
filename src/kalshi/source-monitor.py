@@ -598,7 +598,9 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                                                         fee_cents=round(fee, 2), sizing_method="half_kelly",
                                                         market_close_time=m.get("close_time"),
                                                         kelly_fraction=kelly_details.get("kelly_fraction"),
-                                                        bankroll_used=kelly_details.get("bankroll_used"))
+                                                        bankroll_used=kelly_details.get("bankroll_used"),
+                                                        running_high=round(running_high, 1),
+                                                        hour_of_day=now.hour)
                     if result:
                         allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
@@ -631,7 +633,9 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                                                         fee_cents=round(fee, 2), sizing_method="half_kelly",
                                                         market_close_time=m.get("close_time"),
                                                         kelly_fraction=kelly_details.get("kelly_fraction"),
-                                                        bankroll_used=kelly_details.get("bankroll_used"))
+                                                        bankroll_used=kelly_details.get("bankroll_used"),
+                                                        running_high=round(running_high, 1),
+                                                        hour_of_day=now.hour)
                     if result:
                         allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
