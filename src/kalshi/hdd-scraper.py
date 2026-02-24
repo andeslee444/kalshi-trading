@@ -198,6 +198,7 @@ def evaluate_trade(market: dict, chart_entry: dict):
     if price and price < confidence * 100:
         edge = confidence - price / 100
         if edge > 0.10:
+            margin_pct = (units - threshold) / threshold if threshold else 0
             log.info(f"\n ARBITRAGE SIGNAL: HDD chart confirms {artist}")
             log.info(f"    Units: {units:,} vs threshold: {threshold:,} ({margin_pct*100:+.0f}%)")
             log.info(f"    Market: {ticker} {outcome.upper()} at {price}c (confidence: {confidence*100:.0f}%)")

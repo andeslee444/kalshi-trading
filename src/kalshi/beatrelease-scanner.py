@@ -14,7 +14,7 @@ import requests
 from pathlib import Path
 from bs4 import BeautifulSoup
 
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, notify_whatsapp, _atomic_write_json, HealthCheckMonitor, ScanSummary
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, notify_whatsapp, _atomic_write_json, HealthCheckMonitor, ScanSummary, load_trades
 from capital_allocator import PortfolioAllocator
 
 # Unbuffered output
@@ -29,6 +29,7 @@ PID_FILE = PROJECT_DIR / "data" / "pids" / "beatrelease-scanner.pid"
 PID_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+LLM_LOG_PATH = PROJECT_DIR / "data" / "beatrelease-llm-log.json"
 
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
 _bots_cfg = json.loads(BOTS_CONFIG_PATH.read_text())["beatrelease"]
@@ -103,6 +104,17 @@ def save_state(state):
 def content_hash(text):
     """Compute a short hash of article text for change detection."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _append_llm_log(record):
+    """Append a record to the LLM log file (capped at 500 entries)."""
+    try:
+        entries = json.loads(LLM_LOG_PATH.read_text()) if LLM_LOG_PATH.exists() else []
+    except (json.JSONDecodeError, ValueError):
+        entries = []
+    entries.append(record)
+    entries = entries[-500:]  # Keep last 500
+    _atomic_write_json(LLM_LOG_PATH, entries)
 
 
 # === Ticker Map ===
@@ -201,6 +213,7 @@ Blog post from {post_url}:
 """
 
     try:
+        start_time = time.time()
         r = retry_request("POST", DEEPSEEK_URL, headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -210,16 +223,24 @@ Blog post from {post_url}:
             "temperature": 0.3,
             "max_tokens": 4000,
         }, timeout=90)
+        elapsed = time.time() - start_time
 
-        content = r.json()["choices"][0]["message"]["content"].strip()
+        resp_json = r.json()
+        content = resp_json["choices"][0]["message"]["content"].strip()
+        usage = resp_json.get("usage", {})
+        log.info(f"  DeepSeek: {usage.get('prompt_tokens', '?')}+{usage.get('completion_tokens', '?')} tokens, "
+                 f"{elapsed:.1f}s")
+
         # Extract JSON from response (handle markdown code blocks)
         json_match = re.search(r'\[.*\]', content, re.DOTALL)
         if json_match:
             trades = json.loads(json_match.group())
             # Validate
             valid = []
+            rejected_count = 0
             for t in trades:
                 if not isinstance(t, dict):
+                    rejected_count += 1
                     continue
                 ticker = t.get("ticker", "")
                 direction = t.get("direction", "").upper()
@@ -230,15 +251,24 @@ Blog post from {post_url}:
                 # Reject tickers not in our valid set
                 if ticker not in valid_tickers:
                     log.warning(f"  Rejecting invalid ticker from LLM: {ticker}")
+                    rejected_count += 1
                     continue
 
-                if direction not in ("YES", "NO") or not (1 <= price <= 99) or qty < 1:
+                if direction not in ("YES", "NO"):
+                    log.info(f"  LLM trade rejected: invalid direction '{direction}' for {ticker}")
+                    rejected_count += 1
+                    continue
+
+                if not (1 <= price <= 99) or qty < 1:
+                    log.info(f"  LLM trade rejected: invalid price={price} or qty={qty} for {ticker}")
+                    rejected_count += 1
                     continue
 
                 # Enforce max cost: price * qty <= MAX_TRADE_CENTS
                 max_qty = MAX_TRADE_CENTS // price
                 qty = min(qty, max_qty, 10)  # Also cap at 10 contracts
                 if qty < 1:
+                    rejected_count += 1
                     continue
 
                 t["direction"] = direction
@@ -249,10 +279,36 @@ Blog post from {post_url}:
 
             entries = [t for t in valid if t["action"] == "enter"]
             exits = [t for t in valid if t["action"] == "exit"]
-            log.info(f"  DeepSeek extracted {len(entries)} entries + {len(exits)} exits from {len(trades)} raw")
+            log.info(f"  DeepSeek: {len(entries)} entries + {len(exits)} exits ({rejected_count} rejected) from {len(trades)} raw")
+
+            # Archive LLM response
+            _append_llm_log({
+                "timestamp": datetime.datetime.now().isoformat(),
+                "post_url": post_url,
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "latency_seconds": round(elapsed, 1),
+                "raw_trade_count": len(trades),
+                "valid_entries": len(entries),
+                "valid_exits": len(exits),
+                "rejected": rejected_count,
+            })
+
             return valid
         else:
             log.info(f"  DeepSeek returned no parseable JSON: {content[:200]}")
+            _append_llm_log({
+                "timestamp": datetime.datetime.now().isoformat(),
+                "post_url": post_url,
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "latency_seconds": round(elapsed, 1),
+                "raw_trade_count": 0,
+                "valid_entries": 0,
+                "valid_exits": 0,
+                "rejected": 0,
+                "error": "no_parseable_json",
+            })
             return []
 
     except Exception as e:
@@ -455,9 +511,11 @@ def scan_cycle():
     posts = fetch_blog_posts()
     if not posts:
         log.info("  No posts found (fetch error?)")
+        ss.source_fail("beatrelease_blog", "no posts found")
         save_state(state)
         ss.finalize()
         return
+    ss.source_ok("beatrelease_blog")
 
     # 2. Prefetch all post texts in parallel to check for new/updated content
     all_post_urls = [url for url, title in posts]
@@ -517,6 +575,7 @@ def scan_cycle():
         text_lower = text.lower()
         if "kalshi" not in text_lower and "prediction market" not in text_lower:
             log.info("  Not Kalshi-related, skipping trade extraction")
+            ss.skip("not_kalshi_related")
             seen_posts[url] = {"hash": new_hash, "last_processed": datetime.datetime.now().isoformat()}
             continue
 
@@ -525,6 +584,7 @@ def scan_cycle():
 
         if not trades:
             log.info("  No trades extracted")
+            ss.skip("no_trades_extracted")
             notification_lines.append(f"* {title} [{change_type}] — no trades extracted")
             seen_posts[url] = {"hash": new_hash, "last_processed": datetime.datetime.now().isoformat()}
             continue
@@ -552,9 +612,15 @@ def scan_cycle():
                 market = client.get(f"/markets/{ticker}")
                 if not market:
                     log.warning(f"  Ticker {ticker} not found on Kalshi — skipping")
+                    ss.skip("ticker_not_found")
+                    trade_manager.log_decision(ticker, side, "skipped", "ticker_not_found",
+                                               price_cents=t["price_cents"])
                     continue
             except Exception as e:
                 log.warning(f"  Could not validate ticker {ticker}: {e}")
+                ss.skip("ticker_validation_error")
+                trade_manager.log_decision(ticker, side, "skipped", "ticker_validation_error",
+                                           price_cents=t["price_cents"])
                 continue
 
             # Use the blog's recommended price as the limit price
@@ -569,6 +635,7 @@ def scan_cycle():
                 actual_price = yes_ask if yes_ask and yes_ask > 0 else limit_price
                 if actual_price > limit_price + 10:
                     log.info(f"  Skipping {ticker}: market ask {actual_price}c >> blog entry {limit_price}c")
+                    ss.skip("stale_blog_price")
                     trade_manager.log_decision(ticker, side, "skipped", "stale_blog_price",
                                                price_cents=actual_price, blog_price=limit_price)
                     continue
@@ -578,6 +645,7 @@ def scan_cycle():
                 actual_price = no_ask if no_ask and no_ask > 0 else limit_price
                 if actual_price > limit_price + 10:
                     log.info(f"  Skipping {ticker}: market no-ask {actual_price}c >> blog entry {limit_price}c")
+                    ss.skip("stale_blog_price")
                     trade_manager.log_decision(ticker, side, "skipped", "stale_blog_price",
                                                price_cents=actual_price, blog_price=limit_price)
                     continue
@@ -586,16 +654,18 @@ def scan_cycle():
 
             if edge <= 0.02:
                 log.info(f"  Skipping {ticker}: computed edge {edge*100:.1f}% too small")
+                ss.skip("edge_too_small")
                 trade_manager.log_decision(ticker, side, "skipped", "edge_too_small",
-                                           edge=edge, price_cents=actual_price)
+                                           edge=round(edge, 4), price_cents=actual_price)
                 continue
 
             # Check allocator for global dedup (prevents cross-bot double exposure)
             budget = allocator.request_budget("beatrelease", ticker, edge=edge, confidence=blog_confidence)
             if not budget.approved:
                 log.info(f"  Allocator denied {ticker}: {budget.reason}")
+                ss.skip("allocator_denied")
                 trade_manager.log_decision(ticker, side, "skipped", f"allocator denied: {budget.reason}",
-                                           edge=edge, price_cents=actual_price)
+                                           edge=round(edge, 4), price_cents=actual_price)
                 continue
 
             result = trade_manager.place_order(
@@ -606,6 +676,11 @@ def scan_cycle():
                 raw_edge=round(edge, 4),
             )
             if result:
+                trade_manager.log_decision(
+                    ticker, side, "placed", "llm_recommended",
+                    edge=round(edge, 4), price_cents=limit_price,
+                    confidence=round(blog_confidence, 4), source_url=url,
+                )
                 allocator.record_trade("beatrelease", ticker,
                                        limit_price * t["quantity"], edge=edge)
                 placed.append({
