@@ -16,7 +16,8 @@
       "enabled": true,
       "urls": ["https://www.boxofficemojo.com/", "https://www.the-numbers.com/"],
       "intervalMinutes": 30,
-      "activeDays": ["Friday", "Saturday", "Sunday", "Monday"]
+      "activeDays": ["Friday", "Saturday", "Sunday", "Monday"],
+      "tmdbEnabled": false
     },
     "nws": {
       "enabled": true,

@@ -301,6 +301,72 @@ def evaluate_album_trade(market, sale):
 # SOURCE 2: Box Office Data
 # ============================================================
 
+def _load_tmdb_api_key():
+    """Load TMDb API key from env var or config/keys/tmdb.txt."""
+    key = os.environ.get("TMDB_API_KEY", "")
+    if not key:
+        key_path = PROJECT_DIR / "config" / "keys" / "tmdb.txt"
+        if key_path.exists():
+            key = key_path.read_text().strip()
+    return key
+
+def _fetch_tmdb_boxoffice():
+    """Fetch current box office data from TMDb API. Returns list of {title, gross, source}.
+
+    NOTE: TMDb 'revenue' is lifetime worldwide gross, NOT current weekend domestic box office.
+    This function is disabled by default (tmdbEnabled: false) because the data does not match
+    what Kalshi box office markets settle on (weekend domestic gross). Preserved for future use
+    if a proper weekend box office API source is found.
+    """
+    api_key = _load_tmdb_api_key()
+    if not api_key:
+        return None  # No key configured, fall back to HTML scraping
+
+    auth_headers = {"Authorization": f"Bearer {api_key}", "accept": "application/json"}
+
+    try:
+        url = "https://api.themoviedb.org/3/movie/now_playing?region=US&page=1"
+        r = retry_request("GET", url, headers=auth_headers, timeout=15)
+        data = r.json()
+        movies = data.get("results", [])
+
+        # Build detail URLs and fetch in parallel
+        movie_map = {}  # detail_url -> movie dict
+        detail_urls = []
+        for movie in movies[:15]:
+            movie_id = movie.get("id")
+            if not movie_id:
+                continue
+            detail_url = f"https://api.themoviedb.org/3/movie/{movie_id}"
+            detail_urls.append(detail_url)
+            movie_map[detail_url] = movie
+
+        detail_responses = fetch_parallel(detail_urls, headers=auth_headers, timeout=10)
+
+        box_office_data = []
+        for detail_url, detail_r in detail_responses.items():
+            if detail_r is None or detail_r.status_code != 200:
+                continue
+            detail = detail_r.json()
+            revenue = detail.get("revenue", 0)
+            title = detail.get("title", movie_map[detail_url].get("title", ""))
+            if revenue and revenue > 100000:
+                box_office_data.append({
+                    "title": title,
+                    "gross": revenue,
+                    "source": "tmdb"
+                })
+
+        if box_office_data:
+            log.info(f"  TMDb: {len(box_office_data)} movies with revenue data")
+            for d in box_office_data[:5]:
+                log.info(f"    -> {d['title']}: ${d['gross']:,}")
+        return box_office_data
+
+    except Exception as e:
+        log.warning(f"  TMDb fetch failed: {e}, falling back to HTML scraping")
+        return None
+
 def check_boxoffice(prefetched_markets=None):
     """Check box office data from Box Office Mojo and The Numbers."""
     now = datetime.datetime.now()
@@ -314,58 +380,71 @@ def check_boxoffice(prefetched_markets=None):
     log.info(f"\n[BOX OFFICE] Checking box office data ({day_name})...")
 
     box_office_data = []
-    user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
-    # Check The Numbers
-    try:
-        url = "https://www.the-numbers.com/market/"
-        r = retry_request("GET", url, headers={"User-Agent": user_agent}, timeout=20)
-        save_snapshot("boxoffice_thenumbers", r.text)
+    # Try TMDb API first (structured data, more reliable than HTML scraping)
+    if config["sources"]["boxoffice"].get("tmdbEnabled", False):
+        tmdb_data = _fetch_tmdb_boxoffice()
+        if tmdb_data is None:
+            log.info("  TMDb: no API key or fetch failed, using HTML scraping")
+        elif not tmdb_data:
+            log.info("  TMDb: no revenue data returned, using HTML scraping")
+        else:
+            box_office_data = tmdb_data
 
-        gross_pattern = r'(?:>)([^<]{3,50})</a>\s*</td>\s*<td[^>]*>\s*\$?([\d,]+)'
-        matches = re.findall(gross_pattern, r.text)
+    # Fall back to HTML scraping if TMDb didn't return data
+    if not box_office_data:
+        user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
-        for title, gross in matches[:10]:
-            title = title.strip()
-            gross_val = int(gross.replace(",", ""))
-            if gross_val > 100000:
-                box_office_data.append({"title": title, "gross": gross_val, "source": "the-numbers.com"})
+        # Check The Numbers
+        try:
+            url = "https://www.the-numbers.com/market/"
+            r = retry_request("GET", url, headers={"User-Agent": user_agent}, timeout=20)
+            save_snapshot("boxoffice_thenumbers", r.text)
 
-        if box_office_data:
-            log.info(f"  The Numbers: {len(box_office_data)} movies found")
-            for d in box_office_data[:5]:
-                log.info(f"    -> {d['title']}: ${d['gross']:,}")
-    except Exception as e:
-        log.error(f"  The Numbers check failed: {e}")
+            gross_pattern = r'(?:>)([^<]{3,50})</a>\s*</td>\s*<td[^>]*>\s*\$?([\d,]+)'
+            matches = re.findall(gross_pattern, r.text)
 
-    # Check Box Office Mojo
-    try:
-        url = "https://www.boxofficemojo.com/"
-        r = retry_request("GET", url, headers={"User-Agent": user_agent}, timeout=20)
-        save_snapshot("boxoffice_mojo", r.text)
+            for title, gross in matches[:10]:
+                title = title.strip()
+                gross_val = int(gross.replace(",", ""))
+                if gross_val > 100000:
+                    box_office_data.append({"title": title, "gross": gross_val, "source": "the-numbers.com"})
 
-        movies = re.findall(r'(?:>)([^<]{3,50})</a>.*?\$([\d,.]+)\s*([MmBb])?', r.text, re.DOTALL)
+            if box_office_data:
+                log.info(f"  The Numbers: {len(box_office_data)} movies found")
+                for d in box_office_data[:5]:
+                    log.info(f"    -> {d['title']}: ${d['gross']:,}")
+        except Exception as e:
+            log.error(f"  The Numbers check failed: {e}")
 
-        mojo_data = []
-        for match in movies[:10]:
-            title = match[0].strip()
-            gross_clean = match[1].replace(",", "")
-            suffix = match[2].upper() if match[2] else ""
-            try:
-                gross_val = float(gross_clean)
-                if suffix == "B":
-                    gross_val *= 1_000_000_000
-                elif suffix == "M":
-                    gross_val *= 1_000_000
-                mojo_data.append({"title": title, "gross": int(gross_val), "source": "boxofficemojo.com"})
-            except (ValueError, TypeError):
-                pass
+        # Check Box Office Mojo
+        try:
+            url = "https://www.boxofficemojo.com/"
+            r = retry_request("GET", url, headers={"User-Agent": user_agent}, timeout=20)
+            save_snapshot("boxoffice_mojo", r.text)
 
-        if mojo_data:
-            log.info(f"  Box Office Mojo: {len(mojo_data)} movies found")
-            box_office_data.extend(mojo_data)
-    except Exception as e:
-        log.error(f"  Box Office Mojo check failed: {e}")
+            movies = re.findall(r'(?:>)([^<]{3,50})</a>.*?\$([\d,.]+)\s*([MmBb])?', r.text, re.DOTALL)
+
+            mojo_data = []
+            for match in movies[:10]:
+                title = match[0].strip()
+                gross_clean = match[1].replace(",", "")
+                suffix = match[2].upper() if match[2] else ""
+                try:
+                    gross_val = float(gross_clean)
+                    if suffix == "B":
+                        gross_val *= 1_000_000_000
+                    elif suffix == "M":
+                        gross_val *= 1_000_000
+                    mojo_data.append({"title": title, "gross": int(gross_val), "source": "boxofficemojo.com"})
+                except (ValueError, TypeError):
+                    pass
+
+            if mojo_data:
+                log.info(f"  Box Office Mojo: {len(mojo_data)} movies found")
+                box_office_data.extend(mojo_data)
+        except Exception as e:
+            log.error(f"  Box Office Mojo check failed: {e}")
 
     if box_office_data:
         match_boxoffice_to_markets(box_office_data, prefetched_markets=prefetched_markets)
