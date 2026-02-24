@@ -14,7 +14,7 @@ import requests
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary
-from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, half_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid
+from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, half_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, nws_sigma_for_hour
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
 from hdd_parser import get_album_sales
 from capital_allocator import PortfolioAllocator
@@ -629,10 +629,19 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
             if prob > 0.5 and yes_ask and yes_ask < 99:
                 # Buy YES (raw edge, fees handled in Kelly)
                 edge = prob - yes_ask / 100
-                # Rec 1: Brackets need 2x edge threshold (20% for NWS)
-                base_min_edge = 0.20 if is_bracket else 0.10
-                # Lower threshold for high-confidence NWS (hour >= 17, non-bracket)
-                min_edge = base_min_edge * 0.5 if now.hour >= 17 and not is_bracket else base_min_edge
+                # CI-based edge threshold: margin-aware instead of hour-17 step
+                if is_bracket:
+                    min_edge = 0.20
+                else:
+                    sigma = nws_sigma_for_hour(now.hour)
+                    margin = abs(running_high - threshold)
+                    ci_99 = 2.576 * sigma
+                    if margin > ci_99:
+                        min_edge = 0.05   # Very confident
+                    elif margin > ci_99 * 0.5:
+                        min_edge = 0.10   # Moderate
+                    else:
+                        min_edge = 0.15   # Uncertain
                 if edge > min_edge:
                     budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=prob)
                     if not budget.approved:
@@ -665,10 +674,19 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                 # Buy NO (raw edge, fees handled in Kelly)
                 no_prob = 1.0 - prob
                 edge = no_prob - no_ask / 100
-                # Rec 1: Brackets need 2x edge threshold (20% for NWS)
-                base_min_edge = 0.20 if is_bracket else 0.10
-                # Lower threshold for high-confidence NWS (hour >= 17, non-bracket)
-                min_edge = base_min_edge * 0.5 if now.hour >= 17 and not is_bracket else base_min_edge
+                # CI-based edge threshold: margin-aware instead of hour-17 step
+                if is_bracket:
+                    min_edge = 0.20
+                else:
+                    sigma = nws_sigma_for_hour(now.hour)
+                    margin = abs(running_high - threshold)
+                    ci_99 = 2.576 * sigma
+                    if margin > ci_99:
+                        min_edge = 0.05   # Very confident
+                    elif margin > ci_99 * 0.5:
+                        min_edge = 0.10   # Moderate
+                    else:
+                        min_edge = 0.15   # Uncertain
                 if edge > min_edge:
                     budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=no_prob)
                     if not budget.approved:
