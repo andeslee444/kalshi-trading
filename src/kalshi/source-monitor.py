@@ -75,6 +75,27 @@ def _compute_data_age_hours(chart_date_str):
     except (ValueError, TypeError):
         return 0
 
+def _check_with_retry(check_fn, source_name, prefetched, ss, max_retries=2):
+    """Retry a source check with exponential backoff on transient failures."""
+    for attempt in range(max_retries + 1):
+        try:
+            check_fn(prefetched_markets=prefetched)
+            health.record_source_success(source_name)
+            if ss:
+                ss.source_ok(source_name)
+            return
+        except Exception as e:
+            if attempt < max_retries:
+                delay = 2 ** attempt
+                log.warning(f"{source_name} attempt {attempt+1} failed: {e}, retrying in {delay}s")
+                time.sleep(delay)
+            else:
+                log.error(f"{source_name} failed after {max_retries+1} attempts: {e}")
+                health.record_source_error(source_name, str(e))
+                if ss:
+                    ss.source_fail(source_name, str(e))
+                traceback.print_exc()
+
 # === Kalshi Market Helpers ===
 def get_markets_by_prefix(prefix, status="open"):
     """Get all open markets matching a ticker prefix."""
@@ -749,45 +770,15 @@ def main():
                     prefetched["weather"] = get_markets_by_prefix("KXHIGH")
 
             if need_hdd:
-                try:
-                    check_hdd(prefetched_markets=prefetched)
-                    health.record_source_success("hdd")
-                    if ss:
-                        ss.source_ok("hdd")
-                except Exception as e:
-                    log.error(f"HDD source error: {e}")
-                    health.record_source_error("hdd", str(e))
-                    if ss:
-                        ss.source_fail("hdd", str(e))
-                    traceback.print_exc()
+                _check_with_retry(check_hdd, "hdd", prefetched, ss)
                 last_hdd = now
 
             if need_box:
-                try:
-                    check_boxoffice(prefetched_markets=prefetched)
-                    health.record_source_success("boxoffice")
-                    if ss:
-                        ss.source_ok("boxoffice")
-                except Exception as e:
-                    log.error(f"Box office source error: {e}")
-                    health.record_source_error("boxoffice", str(e))
-                    if ss:
-                        ss.source_fail("boxoffice", str(e))
-                    traceback.print_exc()
+                _check_with_retry(check_boxoffice, "boxoffice", prefetched, ss)
                 last_boxoffice = now
 
             if need_nws:
-                try:
-                    check_nws(prefetched_markets=prefetched)
-                    health.record_source_success("nws")
-                    if ss:
-                        ss.source_ok("nws")
-                except Exception as e:
-                    log.error(f"NWS source error: {e}")
-                    health.record_source_error("nws", str(e))
-                    if ss:
-                        ss.source_fail("nws", str(e))
-                    traceback.print_exc()
+                _check_with_retry(check_nws, "nws", prefetched, ss)
                 last_nws = now
 
             if ss:
