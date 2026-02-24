@@ -450,7 +450,7 @@ def evaluate_boxoffice_trade(market, movie):
     if outcome == "yes" and yes_ask and yes_ask < 99:
         edge = confidence - yes_ask / 100
         if edge > min_edge:
-            budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence)
+            budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence, source_type="info_arb")
             if not budget.approved:
                 return
             price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
@@ -476,7 +476,7 @@ def evaluate_boxoffice_trade(market, movie):
     elif outcome == "no" and no_ask and no_ask < 99:
         edge = confidence - no_ask / 100
         if edge > min_edge:
-            budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence)
+            budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence, source_type="info_arb")
             if not budget.approved:
                 return
             price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
@@ -719,7 +719,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                         else:
                             min_edge = 0.15   # Uncertain
                     if edge > min_edge:
-                        budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=prob)
+                        budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=prob, source_type="nws")
                         if not budget.approved:
                             continue
                         price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
@@ -764,7 +764,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                         else:
                             min_edge = 0.15   # Uncertain
                     if edge > min_edge:
-                        budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=no_prob)
+                        budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=no_prob, source_type="nws")
                         if not budget.approved:
                             continue
                         price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
