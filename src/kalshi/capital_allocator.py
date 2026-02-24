@@ -340,13 +340,32 @@ class PortfolioAllocator:
     def record_trade(self, bot_name, ticker, risk_cents, edge=0.0):
         """Record that a trade was executed.
 
+        Uses exclusive file lock to prevent TOCTOU race where two bots
+        could simultaneously exceed concentration limits.
+
         Args:
             bot_name: Name of the bot that placed the trade.
             ticker: Market ticker.
             risk_cents: Risk in cents for this trade.
             edge: The edge that was used for this trade (for signal quality).
         """
-        self._reset_daily_if_needed()
+        lock_path = self.state_path.with_suffix(".lock") if self.state_path else None
+        if lock_path:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(lock_path, "w") as lock_fd:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                try:
+                    self._load_state()  # refresh from disk
+                    self._record_trade_inner(bot_name, ticker, risk_cents, edge)
+                    self._save_state()
+                finally:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        else:
+            self._record_trade_inner(bot_name, ticker, risk_cents, edge)
+
+    def _record_trade_inner(self, bot_name, ticker, risk_cents, edge):
+        """Inner record_trade logic (call under lock)."""
+        self._reset_daily_if_needed_inner()
         quality = compute_signal_quality(bot_name, edge)
         self._traded_tickers[ticker] = {
             "bot": bot_name,
@@ -365,7 +384,6 @@ class PortfolioAllocator:
             region = _CITY_TO_REGION.get(city_code)
             if region:
                 self._region_risk[region] = self._region_risk.get(region, 0) + risk_cents
-        self._save_state()
 
     def _risk_today_cents(self):
         """Sum risk_cents from all today's entries in traded tickers."""
@@ -385,7 +403,7 @@ class PortfolioAllocator:
         return exits
 
     def request_budget(self, bot_name, ticker, edge=0.0, confidence=0.0,
-                       bot_max_cost_cents=500):
+                       bot_max_cost_cents=500, source_type=None):
         """Request a capital allocation for a trade.
 
         Uses exclusive file lock to prevent TOCTOU races between concurrent bots.
@@ -396,6 +414,9 @@ class PortfolioAllocator:
             edge: Estimated edge (probability difference).
             confidence: Model confidence (0-1).
             bot_max_cost_cents: Bot's own per-trade cost cap from config.
+            source_type: Optional signal source type (e.g. "info_arb" for
+                direct settlement data). Info-arb trades get relaxed
+                high-confidence thresholds since edge is observed, not modeled.
 
         Returns:
             BudgetResponse with approved flag, allocated max_cost, and bankroll.
@@ -403,7 +424,7 @@ class PortfolioAllocator:
         def _do_request():
             self._load_state()
             self._reset_daily_if_needed_inner()
-            return self._request_budget_inner(bot_name, ticker, edge, confidence, bot_max_cost_cents)
+            return self._request_budget_inner(bot_name, ticker, edge, confidence, bot_max_cost_cents, source_type)
 
         if self.state_path:
             lock_path = self.state_path.with_suffix(".lock")
@@ -416,7 +437,7 @@ class PortfolioAllocator:
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
         return _do_request()
 
-    def _request_budget_inner(self, bot_name, ticker, edge, confidence, bot_max_cost_cents):
+    def _request_budget_inner(self, bot_name, ticker, edge, confidence, bot_max_cost_cents, source_type=None):
         """Inner budget logic (called under lock)."""
 
         # 1. Global dedup with "best signal wins" supersede logic
@@ -504,9 +525,17 @@ class PortfolioAllocator:
         allocated = min(constraints.values())
         binding = min(constraints, key=constraints.get)
 
-        # 7. Scale up for high-confidence info-arb trades
-        # When confidence > 90%, allow up to 25% of bankroll per trade
-        if confidence > 0.90 and edge > 0.15:
+        # 7. Scale up for high-confidence trades
+        # Info-arb (source_type="info_arb") uses relaxed thresholds since
+        # edge is based on observed settlement data, not model predictions.
+        if source_type == "info_arb":
+            high_conf_threshold = 0.85
+            high_edge_threshold = 0.10
+        else:
+            high_conf_threshold = 0.90
+            high_edge_threshold = 0.15
+
+        if confidence > high_conf_threshold and edge > high_edge_threshold:
             high_conf_max = int(available_balance * 0.25)
             allocated = min(
                 high_conf_max,
@@ -516,8 +545,8 @@ class PortfolioAllocator:
                 remaining_city,     # NEVER bypass city limit
             )
             self.log.info(
-                "High-confidence trade: %s edge=%.1f%% conf=%.0f%% -> budget $%.2f",
-                ticker, edge * 100, confidence * 100, allocated / 100
+                "High-confidence trade: %s edge=%.1f%% conf=%.0f%% type=%s -> budget $%.2f",
+                ticker, edge * 100, confidence * 100, source_type or "default", allocated / 100
             )
 
         if allocated <= 0:
