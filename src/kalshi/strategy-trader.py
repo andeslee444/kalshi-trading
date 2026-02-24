@@ -7,7 +7,7 @@ import json, time, datetime, os, sys, math, argparse, traceback
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log, _atomic_write_json, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary
-from probability import half_kelly_sell, longshot_edge, compute_limit_price, kalshi_fee_cents
+from probability import half_kelly_sell, longshot_edge, compute_limit_price, kalshi_fee_cents, classify_ticker_category
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -70,10 +70,10 @@ def find_longshot_sells(markets, bankroll):
         # bias strength and time decay
         est_edge_prelim = longshot_edge(yes_ask, ticker=ticker, hours_to_close=hours)
 
-        # Fee-aware minimum edge: need net edge after Kalshi fees
+        # Minimum edge filter — half_kelly_sell already deducts fees from
+        # win_amount, so no need to subtract fees here (avoids double-counting)
         fee_per_contract = kalshi_fee_cents(yes_ask)
-        fee_as_edge = fee_per_contract / 100  # convert to probability edge
-        min_edge = fee_as_edge + 0.005  # need 0.5% net edge after fees
+        min_edge = 0.005  # 0.5% minimum edge (fees handled in Kelly sizing)
         if est_edge_prelim < min_edge:
             continue
 
@@ -98,6 +98,8 @@ def find_longshot_sells(markets, bankroll):
         budget = allocator.request_budget("strategy", ticker, edge=est_edge)
         if not budget.approved:
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
+            trade_manager.log_decision(ticker, "no", "skipped", f"allocator denied: {budget.reason}",
+                                       edge=est_edge, price_cents=sell_price)
             continue
 
         contracts, risk, kelly_details = half_kelly_sell(
@@ -106,6 +108,8 @@ def find_longshot_sells(markets, bankroll):
             return_details=True,
         )
         if contracts <= 0:
+            trade_manager.log_decision(ticker, "no", "skipped", "kelly_zero",
+                                       edge=est_edge, price_cents=sell_price)
             continue
 
         implied_prob = yes_ask / 100.0
@@ -296,6 +300,8 @@ def run_scan():
             market_close_time=c.get("close_time"),
             kelly_fraction=c.get("kelly_fraction"),
             bankroll_used=c.get("bankroll_used"),
+            hours_to_close=round(c.get("hours_to_close", 0), 2),
+            ticker_category=classify_ticker_category(ticker),
         )
         if result:
             allocator.record_trade("strategy", ticker, c["risk_cents"], edge=c.get("est_edge", 0))

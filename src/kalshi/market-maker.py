@@ -200,16 +200,19 @@ def cancel_existing_orders(ticker):
         log.error(f"  Failed to fetch orders for {ticker}: {e}")
 
 
-def place_quotes(ticker, bid_price, ask_price, size=1, yes_bid=None, yes_ask=None):
+def place_quotes(ticker, bid_price, ask_price, size=1, yes_bid=None, yes_ask=None,
+                 mm_params=None):
     """Place bid and ask limit orders for market making."""
     results = []
     snapshot = build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask)
+    extra = mm_params or {}
 
     # Place bid (buy YES)
     if bid_price > 0 and bid_price < 99:
         reasoning = f"MM bid: {ticker} YES@{bid_price}c (size={size})"
         result = trade_manager.place_order(ticker, "yes", bid_price, size, reasoning,
-                                            market_snapshot=snapshot, sizing_method="fixed_mm")
+                                            market_snapshot=snapshot, sizing_method="fixed_mm",
+                                            **extra)
         if result:
             results.append(("bid", result))
 
@@ -219,7 +222,8 @@ def place_quotes(ticker, bid_price, ask_price, size=1, yes_bid=None, yes_ask=Non
         if no_price > 0:
             reasoning = f"MM ask: {ticker} NO@{no_price}c (equiv YES ask@{ask_price}c, size={size})"
             result = trade_manager.place_order(ticker, "no", no_price, size, reasoning,
-                                                market_snapshot=snapshot, sizing_method="fixed_mm")
+                                                market_snapshot=snapshot, sizing_method="fixed_mm",
+                                                **extra)
             if result:
                 results.append(("ask", result))
 
@@ -305,7 +309,17 @@ def scan_and_quote():
 
             # Cancel existing orders and place new quotes
             cancel_existing_orders(ticker)
-            results = place_quotes(ticker, bid_price, ask_price, yes_bid=yes_bid, yes_ask=yes_ask)
+            mm_params = {
+                "inventory": inventory,
+                "gamma": round(gamma, 4),
+                "mm_sigma": sigma,
+                "reservation_price": round(reservation, 1),
+                "half_spread": round(half_spread, 1),
+                "mid_price": round(mid, 1),
+                "hours_to_settle": round(hours_to_settle, 2),
+            }
+            results = place_quotes(ticker, bid_price, ask_price, yes_bid=yes_bid, yes_ask=yes_ask,
+                                   mm_params=mm_params)
             if results:
                 quoted += 1
                 for side, result in results:

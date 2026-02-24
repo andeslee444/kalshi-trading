@@ -440,6 +440,8 @@ def scan_and_trade():
         if not budget.approved:
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             ss.skip("allocator_denied")
+            trade_manager.log_decision(ticker, side, "skipped", f"allocator denied: {budget.reason}",
+                                       edge=edge, price_cents=yes_ask if side == "yes" else no_ask)
             continue
 
         price = compute_limit_price(yes_bid, yes_ask, side, edge=edge) or (yes_ask if side == "yes" else no_ask)
@@ -451,6 +453,8 @@ def scan_and_trade():
         count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
             ss.skip("kelly_zero")
+            trade_manager.log_decision(ticker, side, "skipped", "kelly_zero: edge too small for price",
+                                       edge=edge, price_cents=price)
             continue
 
         # Determine vol_source for trade record
@@ -476,12 +480,17 @@ def scan_and_trade():
 
         result = trade_manager.place_order(ticker, side, price, count, reasoning,
                                             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
-                                            model_prob=round(opp["prob"], 4), raw_edge=round(edge, 4),
+                                            model_prob=round(opp["prob"] if side == "yes" else 1.0 - opp["prob"], 4), raw_edge=round(edge, 4),
                                             fee_cents=round(kalshi_fee_cents(price), 2), sizing_method="quarter_kelly",
                                             market_close_time=m.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
-                                            vol_source=vol_source)
+                                            vol_source=vol_source,
+                                            current_price=opp["current_price"],
+                                            threshold=opp["threshold"],
+                                            minutes_to_settle=opp["minutes_to_settle"],
+                                            asset=opp["asset"],
+                                            vol_used=round(opp["vol_used"], 4))
         if result:
             ss.trades_placed += 1
             allocator.record_trade("crypto", ticker, risk, edge=edge)

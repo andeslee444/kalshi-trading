@@ -329,7 +329,9 @@ def evaluate_album_opportunity(market, album, market_price):
                                                 fee_cents=round(fee, 2), sizing_method="half_kelly",
                                                 market_close_time=market.get("close_time"),
                                                 kelly_fraction=kelly_details.get("kelly_fraction"),
-                                                bankroll_used=kelly_details.get("bankroll_used"))
+                                                bankroll_used=kelly_details.get("bankroll_used"),
+                                                artist=artist, units=units, threshold=threshold,
+                                                data_sigma=round(sigma, 4), source_type="album")
             if result:
                 allocator.record_trade("entertainment", ticker, risk, edge=edge)
 
@@ -350,11 +352,13 @@ def evaluate_album_opportunity(market, album, market_price):
             log.info(f"    {ticker} NO@{price}c | edge={edge*100:.1f}% | conf={confidence*100:.0f}%")
             result = trade_manager.place_order(ticker, "no", price, count, reasoning, confidence=confidence,
                                                 market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
-                                                model_prob=round(confidence, 4), raw_edge=round(edge, 4),
+                                                model_prob=round(1.0 - confidence, 4), raw_edge=round(edge, 4),
                                                 fee_cents=round(fee, 2), sizing_method="half_kelly",
                                                 market_close_time=market.get("close_time"),
                                                 kelly_fraction=kelly_details.get("kelly_fraction"),
-                                                bankroll_used=kelly_details.get("bankroll_used"))
+                                                bankroll_used=kelly_details.get("bankroll_used"),
+                                                artist=artist, units=units, threshold=threshold,
+                                                data_sigma=round(sigma, 4), source_type="album")
             if result:
                 allocator.record_trade("entertainment", ticker, risk, edge=edge)
 
@@ -414,7 +418,9 @@ def evaluate_boxoffice_opportunity(market, movie, market_price):
                                                 fee_cents=round(fee, 2), sizing_method="half_kelly",
                                                 market_close_time=market.get("close_time"),
                                                 kelly_fraction=kelly_details.get("kelly_fraction"),
-                                                bankroll_used=kelly_details.get("bankroll_used"))
+                                                bankroll_used=kelly_details.get("bankroll_used"),
+                                                movie_title=movie_title, gross=gross, threshold=threshold,
+                                                data_sigma=round(sigma, 4), source_type="boxoffice")
             if result:
                 allocator.record_trade("entertainment", ticker, risk, edge=edge)
 
@@ -433,11 +439,13 @@ def evaluate_boxoffice_opportunity(market, movie, market_price):
             log.info(f"\nBOX OFFICE ARBITRAGE: {movie_title} ${gross/1e6:.1f}M < ${threshold/1e6:.0f}M")
             result = trade_manager.place_order(ticker, "no", price, count, reasoning, confidence=confidence,
                                                 market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
-                                                model_prob=round(confidence, 4), raw_edge=round(edge, 4),
+                                                model_prob=round(1.0 - confidence, 4), raw_edge=round(edge, 4),
                                                 fee_cents=round(fee, 2), sizing_method="half_kelly",
                                                 market_close_time=market.get("close_time"),
                                                 kelly_fraction=kelly_details.get("kelly_fraction"),
-                                                bankroll_used=kelly_details.get("bankroll_used"))
+                                                bankroll_used=kelly_details.get("bankroll_used"),
+                                                movie_title=movie_title, gross=gross, threshold=threshold,
+                                                data_sigma=round(sigma, 4), source_type="boxoffice")
             if result:
                 allocator.record_trade("entertainment", ticker, risk, edge=edge)
 

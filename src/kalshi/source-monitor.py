@@ -181,7 +181,9 @@ def evaluate_album_trade(market, sale):
                                                 fee_cents=round(fee, 2), sizing_method="half_kelly",
                                                 market_close_time=market.get("close_time"),
                                                 kelly_fraction=kelly_details.get("kelly_fraction"),
-                                                bankroll_used=kelly_details.get("bankroll_used"))
+                                                bankroll_used=kelly_details.get("bankroll_used"),
+                                                artist=artist, units=units, threshold=threshold,
+                                                data_sigma=round(sigma, 4), source_type="album")
             if result:
                 allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
@@ -203,11 +205,13 @@ def evaluate_album_trade(market, sale):
             log.info(f"    Edge: ~{edge*100:.0f}% | Trade: {count} contracts @ {price}c = ${count*price/100:.2f}")
             result = trade_manager.place_order(ticker, "no", price, count, reasoning,
                                                 market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
-                                                model_prob=round(confidence, 4), raw_edge=round(edge, 4),
+                                                model_prob=round(1.0 - confidence, 4), raw_edge=round(edge, 4),
                                                 fee_cents=round(fee, 2), sizing_method="half_kelly",
                                                 market_close_time=market.get("close_time"),
                                                 kelly_fraction=kelly_details.get("kelly_fraction"),
-                                                bankroll_used=kelly_details.get("bankroll_used"))
+                                                bankroll_used=kelly_details.get("bankroll_used"),
+                                                artist=artist, units=units, threshold=threshold,
+                                                data_sigma=round(sigma, 4), source_type="album")
             if result:
                 allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
@@ -366,7 +370,9 @@ def evaluate_boxoffice_trade(market, movie):
                                                 fee_cents=round(fee, 2), sizing_method="half_kelly",
                                                 market_close_time=market.get("close_time"),
                                                 kelly_fraction=kelly_details.get("kelly_fraction"),
-                                                bankroll_used=kelly_details.get("bankroll_used"))
+                                                bankroll_used=kelly_details.get("bankroll_used"),
+                                                movie_title=movie_title, gross=gross, threshold=threshold,
+                                                data_sigma=round(sigma, 4), source_type="boxoffice")
             if result:
                 allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
@@ -386,11 +392,13 @@ def evaluate_boxoffice_trade(market, movie):
             log.info(f"    Market: {ticker} NO at {price}c | conf={confidence*100:.0f}%")
             result = trade_manager.place_order(ticker, "no", price, count, reasoning,
                                                 market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
-                                                model_prob=round(confidence, 4), raw_edge=round(edge, 4),
+                                                model_prob=round(1.0 - confidence, 4), raw_edge=round(edge, 4),
                                                 fee_cents=round(fee, 2), sizing_method="half_kelly",
                                                 market_close_time=market.get("close_time"),
                                                 kelly_fraction=kelly_details.get("kelly_fraction"),
-                                                bankroll_used=kelly_details.get("bankroll_used"))
+                                                bankroll_used=kelly_details.get("bankroll_used"),
+                                                movie_title=movie_title, gross=gross, threshold=threshold,
+                                                data_sigma=round(sigma, 4), source_type="boxoffice")
             if result:
                 allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
@@ -450,6 +458,7 @@ def check_nws(prefetched_markets=None):
                         obs_age_hours = (datetime.datetime.now(datetime.timezone.utc) - obs_dt).total_seconds() / 3600
                         if obs_age_hours > 2:
                             log.warning(f"  {city_code}: NWS observation is {obs_age_hours:.1f}h stale — skipping trades")
+                            del actual_temps[city_code]
                             continue
                     except (ValueError, TypeError):
                         pass
@@ -600,7 +609,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                                                         kelly_fraction=kelly_details.get("kelly_fraction"),
                                                         bankroll_used=kelly_details.get("bankroll_used"),
                                                         running_high=round(running_high, 1),
-                                                        hour_of_day=now.hour)
+                                                        hour_of_day=now.hour,
+                                                        city=city, direction=direction, threshold=threshold)
                     if result:
                         allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
@@ -629,13 +639,14 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                     log.info(f"    NO at {price}c | Edge: ~{edge*100:.0f}% | Prob NO: {no_prob*100:.0f}%")
                     result = trade_manager.place_order(ticker, "no", price, count, reasoning,
                                                         market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
-                                                        model_prob=round(no_prob, 4), raw_edge=round(edge, 4),
+                                                        model_prob=round(prob, 4), raw_edge=round(edge, 4),
                                                         fee_cents=round(fee, 2), sizing_method="half_kelly",
                                                         market_close_time=m.get("close_time"),
                                                         kelly_fraction=kelly_details.get("kelly_fraction"),
                                                         bankroll_used=kelly_details.get("bankroll_used"),
                                                         running_high=round(running_high, 1),
-                                                        hour_of_day=now.hour)
+                                                        hour_of_day=now.hour,
+                                                        city=city, direction=direction, threshold=threshold)
                     if result:
                         allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 

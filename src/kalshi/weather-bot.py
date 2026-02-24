@@ -189,6 +189,10 @@ def scan_and_trade():
         if ENSEMBLE_ENABLED and isinstance(forecast_data, dict):
             our_prob = ensemble_weather_probability(forecast_data, parsed["threshold"], parsed["direction"], days_out, city=city)
             forecast_temp = sum(forecast_data.values()) / len(forecast_data)  # mean for logging
+            if our_prob is None:
+                # Ensemble failed (zero weight) — fall back to single-model
+                log.warning("Ensemble returned None for %s, falling back to single-model", ticker)
+                our_prob = compute_probability(forecast_temp, parsed["threshold"], parsed["direction"], days_out, city=city)
         else:
             forecast_temp = forecast_data if not isinstance(forecast_data, dict) else list(forecast_data.values())[0]
             our_prob = compute_probability(forecast_temp, parsed["threshold"], parsed["direction"], days_out, city=city)
@@ -269,7 +273,8 @@ def scan_and_trade():
             # Rec 2: NO-only weather constraint — skip YES unless edge >= 15%
             # YES side has 0% historical win rate; only trade with very high conviction
             if edge < 0.15:
-                log.info(f"  Skipping YES on {ticker}: edge {edge*100:.1f}% < 15% minimum for YES side")
+                trade_manager.log_decision(ticker, "yes", "skipped", f"YES edge {edge*100:.1f}% < 15% minimum",
+                                            edge=edge, price_cents=yes_ask)
                 continue
             price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge)
             if not price or price <= 0:
@@ -288,6 +293,8 @@ def scan_and_trade():
         if not budget.approved:
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             ss.skip("allocator_denied")
+            trade_manager.log_decision(ticker, side, "skipped", f"allocator denied: {budget.reason}",
+                                       edge=edge, price_cents=price)
             continue
 
         # Position sizing based on market type and conviction
@@ -317,6 +324,8 @@ def scan_and_trade():
         if count <= 0:
             log.info(f"  Kelly says 0 contracts for {ticker} (edge too small for price), skipping")
             ss.skip("kelly_zero")
+            trade_manager.log_decision(ticker, side, "skipped", "kelly_zero: edge too small for price",
+                                       edge=edge, price_cents=price)
             continue
 
         log.info(f"\n-> TRADE: {reasoning}")
@@ -342,6 +351,9 @@ def scan_and_trade():
             ensemble_forecasts=ensemble_data,
             ensemble_models=list(ensemble_data.keys()) if ensemble_data else None,
             sigma_used=round(weather_sigma(opp["days_out"], opp["city"]), 2),
+            days_out=opp["days_out"],
+            city=opp["city"],
+            market_type="bracket" if is_bracket else "threshold",
         )
         if result:
             ss.trades_placed += 1

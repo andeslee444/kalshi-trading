@@ -575,6 +575,8 @@ def scan_positions():
                 exit_signal["reasoning"],
                 exit_type=exit_signal["action"],
                 sizing_method="position_exit",
+                entry_price_cents=entry_price,
+                peak_bid=peaks.get(ticker, {}).get("peak_bid"),
             )
             if result:
                 exits_today += 1

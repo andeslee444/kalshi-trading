@@ -11,7 +11,7 @@ Usage:
     python3 src/kalshi/economics-bot.py --once    # single scan
 """
 
-import json, time, datetime, os, sys, re, argparse, traceback
+import json, time, datetime, os, sys, re, argparse, traceback, math
 import requests
 from bs4 import BeautifulSoup
 from pathlib import Path
@@ -56,6 +56,21 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxDailyLoss": MAX_DAILY_LOSS,
 }, logger=log, order_monitor=order_monitor)
 trim_trade_log(TRADES_PATH)
+
+def _classify_econ_market(ticker):
+    """Classify economics market type from ticker."""
+    t = ticker.upper()
+    if "CPI" in t or "INFLATION" in t:
+        return "CPI"
+    elif "GDP" in t:
+        return "GDP"
+    elif "JOBS" in t or "NFP" in t or "EMPLOYMENT" in t:
+        return "JOBS"
+    elif "GAS" in t:
+        return "GAS"
+    elif "FED" in t or "FOMC" in t:
+        return "FED"
+    return "other"
 
 # === Market ticker prefixes ===
 ECON_PREFIXES = ["KXCPI", "KXGDP", "KXJOBS", "KXFED", "KXINFLATION", "KXECON", "KXGAS"]
@@ -410,7 +425,17 @@ def estimate_days_to_release(market):
             except ValueError:
                 pass
 
-    # Default: assume mid-range uncertainty
+    # Fallback: use market close_time if available
+    close_time = market.get("close_time", "")
+    if close_time:
+        try:
+            close_dt = datetime.datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+            days = max(0, (close_dt.date() - datetime.date.today()).days)
+            return days
+        except (ValueError, TypeError):
+            pass
+
+    # Last resort default
     return 7
 
 
@@ -604,9 +629,22 @@ def scan_and_trade():
 
         ss.markets_evaluated += 1
 
-        # Estimate uncertainty
+        # Estimate uncertainty — use market-type-specific sigma
         days_to_release = estimate_days_to_release(m)
-        sigma = cpi_nowcast_sigma(days_to_release)
+        ticker_upper = ticker.upper()
+        if "CPI" in ticker_upper:
+            sigma = cpi_nowcast_sigma(days_to_release)
+        elif "GAS" in ticker_upper:
+            # Gas handled separately via gas_price_probability path
+            continue
+        elif "GDP" in ticker_upper or "JOBS" in ticker_upper or "NFP" in ticker_upper:
+            # GDP/Jobs: much wider sigma than CPI
+            sigma = max(0.5, 1.0 * math.exp(-0.08 * (14 - min(14, days_to_release))))
+        elif "FED" in ticker_upper or "FOMC" in ticker_upper:
+            # Fed markets handled via FedWatch path
+            continue
+        else:
+            sigma = cpi_nowcast_sigma(days_to_release)  # default fallback
 
         # Compute probability
         if direction_type == "T":
@@ -748,6 +786,8 @@ def scan_and_trade():
         if not budget.approved:
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             ss.skip("allocator_denied")
+            trade_manager.log_decision(ticker, side, "skipped", f"allocator denied: {budget.reason}",
+                                       edge=edge, price_cents=yes_ask if side == "yes" else no_ask)
             continue
 
         price = compute_limit_price(yes_bid, yes_ask, side, edge=edge) or (yes_ask if side == "yes" else no_ask)
@@ -758,6 +798,8 @@ def scan_and_trade():
         count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
             ss.skip("kelly_zero")
+            trade_manager.log_decision(ticker, side, "skipped", "kelly_zero: edge too small for price",
+                                       edge=edge, price_cents=price)
             continue
 
         # Format gas price markets differently (dollars, not percentages)
@@ -784,7 +826,10 @@ def scan_and_trade():
                                             market_close_time=m.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
-                                            sigma_used=round(opp.get("sigma", 0), 4))
+                                            sigma_used=round(opp.get("sigma", 0), 4),
+                                            nowcast_value=opp.get("nowcast_value"),
+                                            days_to_release=opp.get("days_to_release"),
+                                            market_type=_classify_econ_market(ticker))
         if result:
             ss.trades_placed += 1
             allocator.record_trade("economics", ticker, risk, edge=edge)
