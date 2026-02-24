@@ -1,5 +1,6 @@
 {
   "entertainment": {
+    "enabled": false,
     "maxTradeAmount": 5,
     "maxDailyTrades": 10,
     "maxDailyLoss": 25,
@@ -38,7 +39,7 @@
   "economics": {
     "maxTradeAmount": 15,
     "maxDailyTrades": 5,
-    "maxDailyLoss": 30,
+    "maxDailyLoss": 75,
     "scanIntervalMinutes": 360,
     "edgeThreshold": 0.08,
     "gasEdgeThreshold": 0.04

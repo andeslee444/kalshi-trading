@@ -1,7 +1,7 @@
 {
   "mode": "demo",
   "maxTradeAmount": 25,
-  "maxDailyTrades": 20,
+  "maxDailyTrades": 25,
   "maxDailyLoss": 50,
   "sources": {
     "hdd": {

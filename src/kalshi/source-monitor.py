@@ -238,12 +238,12 @@ def evaluate_album_trade(market, sale):
     yes_bid = market.get("yes_bid", 0)
 
     # Lower edge threshold for confirmed data (sigma <= 5%)
-    min_edge = 0.05 if sigma <= 0.05 else 0.10
+    min_edge = 0.04 if sigma <= 0.05 else 0.10
 
     if outcome == "yes" and yes_ask and yes_ask < 99:
         edge = confidence - yes_ask / 100
         if edge > min_edge:
-            budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence)
+            budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence, source_type="info_arb")
             if not budget.approved:
                 log.info(f"  Allocator denied {ticker}: {budget.reason}")
                 return
@@ -271,7 +271,7 @@ def evaluate_album_trade(market, sale):
     elif outcome == "no" and no_ask and no_ask < 99:
         edge = confidence - no_ask / 100
         if edge > min_edge:
-            budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence)
+            budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence, source_type="info_arb")
             if not budget.approved:
                 log.info(f"  Allocator denied {ticker}: {budget.reason}")
                 return
@@ -445,7 +445,7 @@ def evaluate_boxoffice_trade(market, movie):
     yes_bid = market.get("yes_bid", 0)
 
     # Lower edge threshold for confirmed data (sigma <= 5%)
-    min_edge = 0.05 if sigma <= 0.05 else 0.10
+    min_edge = 0.04 if sigma <= 0.05 else 0.10
 
     if outcome == "yes" and yes_ask and yes_ask < 99:
         edge = confidence - yes_ask / 100
