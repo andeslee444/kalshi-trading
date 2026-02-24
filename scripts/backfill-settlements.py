@@ -33,7 +33,8 @@ from kalshi_auth import KalshiClient, load_trades, _atomic_write_json, setup_log
 log = setup_logging("backfill")
 
 # All trade log files
-TRADE_FILES = list((PROJECT_DIR / "data").glob("kalshi-*-trades.json")) + [
+TRADE_FILES = [PROJECT_DIR / "data" / "kalshi-trades.json"] + \
+    list((PROJECT_DIR / "data").glob("kalshi-*-trades.json")) + [
     PROJECT_DIR / "data" / "beatrelease-trades.json",
 ]
 

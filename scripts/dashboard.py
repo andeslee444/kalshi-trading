@@ -534,20 +534,8 @@ async def api_risk():
                         break
                 fills_data = all_fills
             else:
-                # fills_data from cache is already processed — use raw API for risk
-                all_fills = []
-                cursor = None
-                for _ in range(3):
-                    path = "/portfolio/fills?limit=200"
-                    if cursor:
-                        path += f"&cursor={cursor}"
-                    data = client.get(path)
-                    batch = data.get("fills", [])
-                    all_fills.extend(batch)
-                    cursor = data.get("cursor")
-                    if not cursor or not batch:
-                        break
-                fills_data = all_fills
+                # Cache hit — reuse cached fills for risk computation too
+                all_fills = fills_data if isinstance(fills_data, list) else []
 
             _, ticker_bot = _build_local_index()
 

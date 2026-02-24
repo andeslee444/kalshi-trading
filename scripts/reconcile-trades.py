@@ -57,11 +57,11 @@ def _fetch_all_settlements(client):
             log.warning("Failed to fetch settlements: %s", e)
             break
         for s in data.get("settlements", []):
-            ticker = s.get("market_ticker", "")
+            ticker = s.get("ticker", s.get("market_ticker", ""))
             if ticker:
                 settlements[ticker] = {
                     "revenue_cents": s.get("revenue", 0),
-                    "yes_won": s.get("yes_price", 0) == 100,
+                    "yes_won": s.get("market_result", "") == "yes",
                     "settled_time": s.get("settled_time", ""),
                 }
         cursor = data.get("cursor")

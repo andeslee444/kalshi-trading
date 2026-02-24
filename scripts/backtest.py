@@ -26,8 +26,10 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 from probability import (
     weather_probability,
+    crypto_price_probability,
     half_kelly,
     half_kelly_sell,
+    quarter_kelly,
 )
 
 
@@ -35,7 +37,7 @@ from probability import (
 TRADE_FILES = [
     {"label": "weather", "path": PROJECT_DIR / "data" / "kalshi-trades.json"},
     {"label": "strategy", "path": PROJECT_DIR / "data" / "kalshi-strategy-trades.json"},
-    {"label": "entertainment", "path": PROJECT_DIR / "data" / "kalshi-entertainment-trades.json"},
+    {"label": "crypto", "path": PROJECT_DIR / "data" / "kalshi-crypto-trades.json"},
     {"label": "beatrelease", "path": PROJECT_DIR / "data" / "beatrelease-trades.json"},
 ]
 
@@ -301,6 +303,41 @@ def reeval_entertainment_trade(trade, settlement_revenue):
     }
 
 
+def reeval_crypto_trade(trade, settlement_revenue):
+    """Re-evaluate a crypto trade using stored model_prob. Returns dict or None."""
+    ticker = trade.get("ticker", "")
+    model_prob = trade.get("model_prob")
+    if model_prob is None:
+        return None
+
+    side = trade.get("side", "").lower()
+    if side == "yes":
+        actual = 1 if settlement_revenue > 0 else 0
+        predicted = model_prob
+    elif side == "no":
+        actual = 0 if settlement_revenue > 0 else 1
+        predicted = 1 - model_prob
+    else:
+        return None
+
+    price = trade.get("price_cents") or trade.get("price", 0)
+    if price and price > 0 and price < 100:
+        edge = abs(predicted - price / 100.0)
+        kelly_contracts, _ = quarter_kelly(edge, price, 500)
+    else:
+        kelly_contracts = 0
+
+    return {
+        "ticker": ticker,
+        "predicted": predicted,
+        "actual": actual,
+        "side": side,
+        "revenue": settlement_revenue,
+        "price": price,
+        "kelly_contracts": kelly_contracts,
+    }
+
+
 # ─── Sizing comparison ───
 
 def sizing_comparison(evaluated_trades):
@@ -345,7 +382,7 @@ def threshold_sweep(evaluated_trades, thresholds=None):
     results = []
     for thresh in thresholds:
         filtered = [t for t in evaluated_trades
-                    if abs(t["predicted"] - 0.5) >= thresh / 2]  # edge proxy
+                    if t.get("price") and abs(t["predicted"] - t["price"] / 100.0) >= thresh]
         if not filtered:
             results.append({
                 "threshold": thresh,
@@ -372,7 +409,7 @@ def threshold_sweep(evaluated_trades, thresholds=None):
 def main():
     parser = argparse.ArgumentParser(description="Backtest Kalshi probability models.")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
-    parser.add_argument("--bot", type=str, help="Filter by bot (weather, strategy, entertainment, beatrelease)")
+    parser.add_argument("--bot", type=str, help="Filter by bot (weather, strategy, crypto, beatrelease)")
     parser.add_argument("--no-api", action="store_true", help="Skip Kalshi API calls")
     parser.add_argument("--save", action="store_true", help="Save results to data/backtest-results.json")
     args = parser.parse_args()
@@ -398,7 +435,7 @@ def main():
             settlements = fetch_settlements(client)
             n_settlements = len(settlements)
             for s in settlements:
-                ticker = s.get("market_ticker", s.get("ticker", ""))
+                ticker = s.get("ticker", s.get("market_ticker", ""))
                 revenue = s.get("revenue", 0)
                 try:
                     revenue = int(revenue)
@@ -422,6 +459,8 @@ def main():
                 result = reeval_weather_trade(t, revenue)
             elif bot_label == "strategy":
                 result = reeval_strategy_trade(t, revenue)
+            elif bot_label == "crypto":
+                result = reeval_crypto_trade(t, revenue)
             elif bot_label in ("entertainment", "beatrelease"):
                 result = reeval_entertainment_trade(t, revenue)
             else:
