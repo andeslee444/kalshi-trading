@@ -96,6 +96,27 @@ def _check_with_retry(check_fn, source_name, prefetched, ss, max_retries=2):
                     ss.source_fail(source_name, str(e))
                 traceback.print_exc()
 
+def _validate_market_cluster(entity_key, market_signals):
+    """Check that markets for the same entity have monotonically decreasing
+    probabilities as thresholds increase.
+
+    market_signals: list of (market, threshold, probability) tuples
+    Returns filtered consistent list, or empty list if contradictory.
+    """
+    if len(market_signals) < 2:
+        return market_signals
+    sorted_signals = sorted(market_signals, key=lambda s: s[1])
+    for i in range(len(sorted_signals) - 1):
+        lower_prob = sorted_signals[i][2]
+        higher_prob = sorted_signals[i + 1][2]
+        if lower_prob < higher_prob - 0.05:  # 5% tolerance
+            log.warning(
+                f"Inconsistent {entity_key}: P(>{sorted_signals[i][1]})={lower_prob:.0%} "
+                f"< P(>{sorted_signals[i+1][1]})={higher_prob:.0%} — skipping all"
+            )
+            return []
+    return sorted_signals
+
 # === Kalshi Market Helpers ===
 def get_markets_by_prefix(prefix, status="open"):
     """Get all open markets matching a ticker prefix."""
@@ -139,15 +160,31 @@ def match_hdd_to_markets(sales_data, prefetched_markets=None):
             artist = sale["artist"].lower()
             units = sale["units"]
 
+            # Group all matching markets for consistency check
+            artist_markets = []
             for m in markets:
                 title = m.get("title", "").lower()
                 subtitle = m.get("subtitle", "").lower()
-
-                # Use word boundary matching to avoid false positives
                 if re.search(r'\b' + re.escape(artist) + r'\b', title) or re.search(r'\b' + re.escape(artist) + r'\b', subtitle):
                     if not is_market_liquid(m):
                         continue
-                    evaluate_album_trade(m, sale)
+                    # Parse threshold for consistency check
+                    threshold_match = re.search(r'(\d{1,3}(?:,\d{3})*)\s*(?:K|thousand|copies|units)', m.get("title", ""), re.I)
+                    if not threshold_match:
+                        threshold_match = re.search(r'T(\d+)', m.get("ticker", ""))
+                    if threshold_match:
+                        threshold = int(threshold_match.group(1).replace(",", ""))
+                        if threshold < 1000:
+                            threshold *= 1000
+                        data_age_hours = _compute_data_age_hours(sale.get("chart_date"))
+                        sigma = album_data_sigma(datetime.datetime.now().weekday(), hours_since_publication=data_age_hours)
+                        prob = info_arb_probability(units, threshold, sigma)
+                        artist_markets.append((m, threshold, prob))
+
+            # Validate consistency, then evaluate each
+            consistent = _validate_market_cluster(artist, artist_markets)
+            for m, _threshold, _prob in consistent:
+                evaluate_album_trade(m, sale)
 
     except Exception as e:
         log.error(f"  Market matching failed: {e}")
@@ -351,13 +388,26 @@ def match_boxoffice_to_markets(box_data, prefetched_markets=None):
 
         for movie in box_data:
             title_lower = movie["title"].lower()
+            movie_markets = []
             for m in markets:
                 market_title = m.get("title", "").lower()
                 title_words = [w for w in title_lower.split() if len(w) > 3]
                 if title_words and all(re.search(r'\b' + re.escape(w) + r'\b', market_title) for w in title_words):
                     if not is_market_liquid(m):
                         continue
-                    evaluate_boxoffice_trade(m, movie)
+                    # Parse threshold for consistency
+                    threshold_match = re.search(r'\$(\d+(?:\.\d+)?)\s*[MmBb](?:illion)?', m.get("title", ""))
+                    if threshold_match:
+                        threshold = float(threshold_match.group(1)) * 1_000_000
+                        dow = datetime.datetime.now().weekday()
+                        box_age_hours = {4: 0, 5: 0, 6: 24, 0: 48, 1: 72, 2: 96, 3: 120}.get(dow, 0)
+                        sigma = boxoffice_data_sigma(dow, hours_since_publication=box_age_hours)
+                        prob = info_arb_probability(movie["gross"], threshold, sigma)
+                        movie_markets.append((m, threshold, prob))
+
+            consistent = _validate_market_cluster(movie["title"], movie_markets)
+            for m, _threshold, _prob in consistent:
+                evaluate_boxoffice_trade(m, movie)
 
     except Exception as e:
         log.error(f"  Box office market matching failed: {e}")
@@ -599,121 +649,147 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
 
         now = datetime.datetime.now()
 
+        # Group by city for consistency validation
+        by_city = {}
         for m, parsed in today_markets:
             city = parsed["city"]
+            if city not in by_city:
+                by_city[city] = []
+            by_city[city].append((m, parsed))
+
+        for city, city_markets in by_city.items():
             if city not in temp_data or "running_high_f" not in temp_data[city]:
                 continue
 
             running_high = temp_data[city]["running_high_f"]
-            threshold = parsed["threshold"]
-            direction = parsed["direction"]
-            ticker = m.get("ticker", "")
-            max_cost = config["maxTradeAmount"] * 100
-            is_bracket = (direction == "B")
 
-            prob = nws_probability(running_high, threshold, direction, now.hour)
+            # Validate threshold market consistency for this city
+            threshold_signals = []
+            for m, parsed in city_markets:
+                if parsed["direction"] == "T":
+                    threshold = parsed["threshold"]
+                    prob = nws_probability(running_high, threshold, "T", now.hour)
+                    threshold_signals.append((m, threshold, prob))
 
-            yes_ask = m.get("yes_ask", 0)
-            no_ask = m.get("no_ask", 0)
-            yes_bid = m.get("yes_bid", 0)
+            consistent_tickers = set()
+            if threshold_signals:
+                consistent = _validate_market_cluster(f"NWS-{city}", threshold_signals)
+                consistent_tickers = {m.get("ticker") for m, _, _ in consistent}
 
-            if not is_market_liquid(m):
-                continue
+            # Evaluate all markets (brackets skip consistency, thresholds must be consistent)
+            for m, parsed in city_markets:
+                ticker = m.get("ticker", "")
+                if parsed["direction"] == "T" and ticker not in consistent_tickers:
+                    continue  # Skip inconsistent threshold market
 
-            # Determine trade side and edge
-            if direction == "T":
-                margin = running_high - threshold
-            else:
-                margin = 0  # bracket
+                threshold = parsed["threshold"]
+                direction = parsed["direction"]
+                max_cost = config["maxTradeAmount"] * 100
+                is_bracket = (direction == "B")
 
-            if prob > 0.5 and yes_ask and yes_ask < 99:
-                # Buy YES (raw edge, fees handled in Kelly)
-                edge = prob - yes_ask / 100
-                # CI-based edge threshold: margin-aware instead of hour-17 step
-                if is_bracket:
-                    min_edge = 0.20
+                prob = nws_probability(running_high, threshold, direction, now.hour)
+
+                yes_ask = m.get("yes_ask", 0)
+                no_ask = m.get("no_ask", 0)
+                yes_bid = m.get("yes_bid", 0)
+
+                if not is_market_liquid(m):
+                    continue
+
+                # Determine trade side and edge
+                if direction == "T":
+                    margin = running_high - threshold
                 else:
-                    sigma = nws_sigma_for_hour(now.hour)
-                    margin = abs(running_high - threshold)
-                    ci_99 = 2.576 * sigma
-                    if margin > ci_99:
-                        min_edge = 0.05   # Very confident
-                    elif margin > ci_99 * 0.5:
-                        min_edge = 0.10   # Moderate
-                    else:
-                        min_edge = 0.15   # Uncertain
-                if edge > min_edge:
-                    budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=prob)
-                    if not budget.approved:
-                        continue
-                    price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
-                    fee = kalshi_fee_cents(price)
-                    count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
-                    if count <= 0:
-                        continue
-                    if direction == "T":
-                        reasoning = f"NWS {city} running high {running_high:.1f}F > {threshold}F by {margin:.1f}F, prob {prob*100:.0f}% (hour {now.hour})"
-                    else:
-                        reasoning = f"NWS {city} running high {running_high:.1f}F in bracket [{threshold}, {threshold+1})F, prob {prob*100:.0f}%"
-                    log.info(f"\nARBITRAGE FOUND: NWS {city} high {running_high:.1f}F -> YES on {ticker}")
-                    log.info(f"    YES at {price}c | Edge: ~{edge*100:.0f}% | Prob: {prob*100:.0f}%")
-                    result = trade_manager.place_order(ticker, "yes", price, count, reasoning,
-                                                        market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
-                                                        model_prob=round(prob, 4), raw_edge=round(edge, 4),
-                                                        fee_cents=round(fee, 2), sizing_method="half_kelly",
-                                                        market_close_time=m.get("close_time"),
-                                                        kelly_fraction=kelly_details.get("kelly_fraction"),
-                                                        bankroll_used=kelly_details.get("bankroll_used"),
-                                                        running_high=round(running_high, 1),
-                                                        hour_of_day=now.hour,
-                                                        city=city, direction=direction, threshold=threshold)
-                    if result:
-                        allocator.record_trade("source-monitor", ticker, risk, edge=edge)
+                    margin = 0  # bracket
 
-            elif prob <= 0.5 and no_ask and no_ask < 99:
-                # Buy NO (raw edge, fees handled in Kelly)
-                no_prob = 1.0 - prob
-                edge = no_prob - no_ask / 100
-                # CI-based edge threshold: margin-aware instead of hour-17 step
-                if is_bracket:
-                    min_edge = 0.20
-                else:
-                    sigma = nws_sigma_for_hour(now.hour)
-                    margin = abs(running_high - threshold)
-                    ci_99 = 2.576 * sigma
-                    if margin > ci_99:
-                        min_edge = 0.05   # Very confident
-                    elif margin > ci_99 * 0.5:
-                        min_edge = 0.10   # Moderate
+                if prob > 0.5 and yes_ask and yes_ask < 99:
+                    # Buy YES (raw edge, fees handled in Kelly)
+                    edge = prob - yes_ask / 100
+                    # CI-based edge threshold: margin-aware instead of hour-17 step
+                    if is_bracket:
+                        min_edge = 0.20
                     else:
-                        min_edge = 0.15   # Uncertain
-                if edge > min_edge:
-                    budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=no_prob)
-                    if not budget.approved:
-                        continue
-                    price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
-                    fee = kalshi_fee_cents(price)
-                    count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
-                    if count <= 0:
-                        continue
-                    if direction == "T":
-                        reasoning = f"NWS {city} running high {running_high:.1f}F < {threshold}F by {abs(margin):.1f}F, prob NO {no_prob*100:.0f}% (hour {now.hour})"
+                        sigma = nws_sigma_for_hour(now.hour)
+                        margin = abs(running_high - threshold)
+                        ci_99 = 2.576 * sigma
+                        if margin > ci_99:
+                            min_edge = 0.05   # Very confident
+                        elif margin > ci_99 * 0.5:
+                            min_edge = 0.10   # Moderate
+                        else:
+                            min_edge = 0.15   # Uncertain
+                    if edge > min_edge:
+                        budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=prob)
+                        if not budget.approved:
+                            continue
+                        price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
+                        fee = kalshi_fee_cents(price)
+                        count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+                        if count <= 0:
+                            continue
+                        if direction == "T":
+                            reasoning = f"NWS {city} running high {running_high:.1f}F > {threshold}F by {margin:.1f}F, prob {prob*100:.0f}% (hour {now.hour})"
+                        else:
+                            reasoning = f"NWS {city} running high {running_high:.1f}F in bracket [{threshold}, {threshold+1})F, prob {prob*100:.0f}%"
+                        log.info(f"\nARBITRAGE FOUND: NWS {city} high {running_high:.1f}F -> YES on {ticker}")
+                        log.info(f"    YES at {price}c | Edge: ~{edge*100:.0f}% | Prob: {prob*100:.0f}%")
+                        result = trade_manager.place_order(ticker, "yes", price, count, reasoning,
+                                                            market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+                                                            model_prob=round(prob, 4), raw_edge=round(edge, 4),
+                                                            fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                                            market_close_time=m.get("close_time"),
+                                                            kelly_fraction=kelly_details.get("kelly_fraction"),
+                                                            bankroll_used=kelly_details.get("bankroll_used"),
+                                                            running_high=round(running_high, 1),
+                                                            hour_of_day=now.hour,
+                                                            city=city, direction=direction, threshold=threshold)
+                        if result:
+                            allocator.record_trade("source-monitor", ticker, risk, edge=edge)
+
+                elif prob <= 0.5 and no_ask and no_ask < 99:
+                    # Buy NO (raw edge, fees handled in Kelly)
+                    no_prob = 1.0 - prob
+                    edge = no_prob - no_ask / 100
+                    # CI-based edge threshold: margin-aware instead of hour-17 step
+                    if is_bracket:
+                        min_edge = 0.20
                     else:
-                        reasoning = f"NWS {city} running high {running_high:.1f}F outside bracket [{threshold}, {threshold+1})F, prob NO {no_prob*100:.0f}%"
-                    log.info(f"\nARBITRAGE FOUND: NWS {city} high {running_high:.1f}F -> NO on {ticker}")
-                    log.info(f"    NO at {price}c | Edge: ~{edge*100:.0f}% | Prob NO: {no_prob*100:.0f}%")
-                    result = trade_manager.place_order(ticker, "no", price, count, reasoning,
-                                                        market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
-                                                        model_prob=round(prob, 4), raw_edge=round(edge, 4),
-                                                        fee_cents=round(fee, 2), sizing_method="half_kelly",
-                                                        market_close_time=m.get("close_time"),
-                                                        kelly_fraction=kelly_details.get("kelly_fraction"),
-                                                        bankroll_used=kelly_details.get("bankroll_used"),
-                                                        running_high=round(running_high, 1),
-                                                        hour_of_day=now.hour,
-                                                        city=city, direction=direction, threshold=threshold)
-                    if result:
-                        allocator.record_trade("source-monitor", ticker, risk, edge=edge)
+                        sigma = nws_sigma_for_hour(now.hour)
+                        margin = abs(running_high - threshold)
+                        ci_99 = 2.576 * sigma
+                        if margin > ci_99:
+                            min_edge = 0.05   # Very confident
+                        elif margin > ci_99 * 0.5:
+                            min_edge = 0.10   # Moderate
+                        else:
+                            min_edge = 0.15   # Uncertain
+                    if edge > min_edge:
+                        budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=no_prob)
+                        if not budget.approved:
+                            continue
+                        price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
+                        fee = kalshi_fee_cents(price)
+                        count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+                        if count <= 0:
+                            continue
+                        if direction == "T":
+                            reasoning = f"NWS {city} running high {running_high:.1f}F < {threshold}F by {abs(margin):.1f}F, prob NO {no_prob*100:.0f}% (hour {now.hour})"
+                        else:
+                            reasoning = f"NWS {city} running high {running_high:.1f}F outside bracket [{threshold}, {threshold+1})F, prob NO {no_prob*100:.0f}%"
+                        log.info(f"\nARBITRAGE FOUND: NWS {city} high {running_high:.1f}F -> NO on {ticker}")
+                        log.info(f"    NO at {price}c | Edge: ~{edge*100:.0f}% | Prob NO: {no_prob*100:.0f}%")
+                        result = trade_manager.place_order(ticker, "no", price, count, reasoning,
+                                                            market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+                                                            model_prob=round(prob, 4), raw_edge=round(edge, 4),
+                                                            fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                                            market_close_time=m.get("close_time"),
+                                                            kelly_fraction=kelly_details.get("kelly_fraction"),
+                                                            bankroll_used=kelly_details.get("bankroll_used"),
+                                                            running_high=round(running_high, 1),
+                                                            hour_of_day=now.hour,
+                                                            city=city, direction=direction, threshold=threshold)
+                        if result:
+                            allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
     except Exception as e:
         log.error(f"  NWS market matching failed: {e}")
