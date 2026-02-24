@@ -60,6 +60,21 @@ def save_snapshot(source_name, content, ext="html"):
         pass
     return fname
 
+MAX_DATA_AGE_HOURS = 168  # 7 days — same as entertainment-bot
+
+def _compute_data_age_hours(chart_date_str):
+    """Compute hours since chart data was published. Returns 0 if unparseable (fail-open)."""
+    if not chart_date_str:
+        return 0
+    try:
+        dt = datetime.datetime.fromisoformat(chart_date_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return (now - dt).total_seconds() / 3600
+    except (ValueError, TypeError):
+        return 0
+
 # === Kalshi Market Helpers ===
 def get_markets_by_prefix(prefix, status="open"):
     """Get all open markets matching a ticker prefix."""
@@ -135,7 +150,15 @@ def evaluate_album_trade(market, sale):
     if threshold < 1000:
         threshold *= 1000
 
-    sigma = album_data_sigma(datetime.datetime.now().weekday())
+    data_age_hours = _compute_data_age_hours(sale.get("chart_date"))
+    if data_age_hours > MAX_DATA_AGE_HOURS:
+        log.info(f"  {artist}: data {data_age_hours:.0f}h stale (>{MAX_DATA_AGE_HOURS}h), skipping")
+        trade_manager.log_decision(
+            ticker, "skip", "skipped", f"data {data_age_hours:.0f}h stale",
+            edge=0, price_cents=market.get("yes_ask", 0),
+        )
+        return
+    sigma = album_data_sigma(datetime.datetime.now().weekday(), hours_since_publication=data_age_hours)
     confidence = info_arb_probability(units, threshold, sigma)
 
     if confidence > 0.5:
@@ -331,7 +354,10 @@ def evaluate_boxoffice_trade(market, movie):
 
     threshold = float(threshold_match.group(1)) * 1_000_000
 
-    sigma = boxoffice_data_sigma(datetime.datetime.now().weekday())
+    # Box office: estimate hours since data publication based on day of week
+    dow = datetime.datetime.now().weekday()
+    box_age_hours = {4: 0, 5: 0, 6: 24, 0: 48, 1: 72, 2: 96, 3: 120}.get(dow, 0)
+    sigma = boxoffice_data_sigma(dow, hours_since_publication=box_age_hours)
     confidence = info_arb_probability(gross, threshold, sigma)
 
     if confidence > 0.5:
