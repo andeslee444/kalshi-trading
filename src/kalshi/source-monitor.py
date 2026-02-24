@@ -821,7 +821,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                                                             bankroll_used=kelly_details.get("bankroll_used"),
                                                             running_high=round(running_high, 1),
                                                             hour_of_day=now.hour,
-                                                            city=city, direction=direction, threshold=threshold)
+                                                            city=city, direction=direction, threshold=threshold,
+                                                            source_type="nws")
                         if result:
                             allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
@@ -866,7 +867,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None):
                                                             bankroll_used=kelly_details.get("bankroll_used"),
                                                             running_high=round(running_high, 1),
                                                             hour_of_day=now.hour,
-                                                            city=city, direction=direction, threshold=threshold)
+                                                            city=city, direction=direction, threshold=threshold,
+                                                            source_type="nws")
                         if result:
                             allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 

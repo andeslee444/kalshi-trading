@@ -33,6 +33,9 @@ TRADE_FILES = [
     {"label": "Strategy Trader", "path": PROJECT_DIR / "data" / "kalshi-strategy-trades.json"},
     {"label": "Entertainment Bot", "path": PROJECT_DIR / "data" / "kalshi-entertainment-trades.json"},
     {"label": "BeatRelease Scanner", "path": PROJECT_DIR / "data" / "beatrelease-trades.json"},
+    {"label": "Source Monitor", "path": PROJECT_DIR / "data" / "kalshi-monitor-trades.json"},
+    {"label": "Economics Bot", "path": PROJECT_DIR / "data" / "kalshi-economics-trades.json"},
+    {"label": "Crypto Bot", "path": PROJECT_DIR / "data" / "kalshi-crypto-trades.json"},
 ]
 
 CALIBRATION_PATH = PROJECT_DIR / "config" / "calibration.json"
@@ -364,7 +367,12 @@ def calibrate_nws(trades, settlement_map):
 
 
 def calibrate_info_arb(trades, settlement_map, label):
-    """Calibrate info-arb sigma for album or box office trades."""
+    """Calibrate info-arb sigma for album or box office trades.
+
+    Uses source_type field from source-monitor trades to filter correctly,
+    prefers model_prob over confidence, and performs proper grid search
+    with log_loss objective and Bayesian shrinkage.
+    """
     matched = []
     for t in trades:
         ticker = t.get("ticker", "")
@@ -372,8 +380,17 @@ def calibrate_info_arb(trades, settlement_map, label):
         if revenue is None:
             continue
 
-        confidence = t.get("confidence") or t.get("est_edge")
-        if confidence is None:
+        # Require exact source_type match to prevent NWS trades (which lack
+        # source_type) from contaminating album/box_office calibration
+        source_type = t.get("source_type", "")
+        if label == "album_sales" and source_type != "album":
+            continue
+        if label == "box_office" and source_type != "boxoffice":
+            continue
+
+        # Prefer model_prob (source-monitor), fall back to confidence (entertainment)
+        model_prob = t.get("model_prob") or t.get("confidence") or t.get("est_edge")
+        if model_prob is None:
             continue
 
         side = t.get("side", "").lower()
@@ -384,15 +401,14 @@ def calibrate_info_arb(trades, settlement_map, label):
         else:
             continue
 
-        # Get day of week from timestamp
         ts = t.get("timestamp", "")
         try:
             dow = datetime.fromisoformat(ts.replace("Z", "+00:00")).weekday()
         except (ValueError, TypeError):
-            dow = 2  # default Wednesday
+            dow = 2
 
         try:
-            conf_val = float(str(confidence).rstrip("%")) / 100 if "%" in str(confidence) else float(confidence)
+            conf_val = float(str(model_prob).rstrip("%")) / 100 if "%" in str(model_prob) else float(model_prob)
         except (ValueError, TypeError):
             continue
 
@@ -401,23 +417,60 @@ def calibrate_info_arb(trades, settlement_map, label):
     if not matched:
         return {"n": 0}
 
-    # Group by day bucket and compute calibration
+    # Group by day bucket based on label
     day_buckets = defaultdict(list)
     for m in matched:
-        if m["dow"] <= 1:
-            day_buckets["mon_tue"].append(m)
-        elif m["dow"] <= 3:
-            day_buckets["wed_thu"].append(m)
+        if label == "box_office":
+            # Match boxoffice_data_sigma() buckets: fri_sat, sun, mon_thu
+            if m["dow"] in (4, 5):       # Fri, Sat
+                day_buckets["fri_sat"].append(m)
+            elif m["dow"] == 6:           # Sun
+                day_buckets["sun"].append(m)
+            else:                         # Mon-Thu
+                day_buckets["mon_thu"].append(m)
         else:
-            day_buckets["fri_sun"].append(m)
+            # Match album_data_sigma() buckets: mon_tue, wed_thu, fri_sun
+            if m["dow"] <= 1:
+                day_buckets["mon_tue"].append(m)
+            elif m["dow"] <= 3:
+                day_buckets["wed_thu"].append(m)
+            else:
+                day_buckets["fri_sun"].append(m)
+
+    # Default sigma values (match production code defaults)
+    if label == "box_office":
+        default_sigmas = {"fri_sat": 0.12, "sun": 0.05, "mon_thu": 0.04}
+    else:
+        default_sigmas = {"mon_tue": 0.15, "wed_thu": 0.10, "fri_sun": 0.05}
 
     sigma_by_day = {}
     for bucket, items in day_buckets.items():
-        if len(items) < 3:
+        if len(items) < 10:  # Increased from 3 to 10 for reliability
             continue
-        bs = brier_score([(m["predicted"], m["actual"]) for m in items])
-        # Heuristic: sigma ~ sqrt(brier_score) as rough calibration indicator
-        sigma_by_day[bucket] = round(math.sqrt(bs) if bs else 0.05, 2)
+
+        # Grid search for optimal sigma
+        default_sigma = default_sigmas[bucket]
+        best_sigma = default_sigma
+        best_loss = float("inf")
+
+        for sigma_x100 in range(1, 51):  # 0.01 to 0.50
+            sigma = sigma_x100 / 100.0
+            preds = []
+            for m in items:
+                # Platt-style recalibration: test how sharpening/softening
+                # the model's probability outputs affects log loss
+                z = (m["predicted"] - 0.5) / sigma if sigma > 0 else 0
+                prob = 0.5 * (1 + math.erf(z / math.sqrt(2)))
+                preds.append((prob, m["actual"]))
+            loss = log_loss(preds)
+            if loss is not None and loss < best_loss:
+                best_loss = loss
+                best_sigma = sigma
+
+        # Bayesian shrinkage toward default
+        weight = len(items) / (len(items) + 15)
+        shrunk_sigma = weight * best_sigma + (1 - weight) * default_sigma
+        sigma_by_day[bucket] = round(shrunk_sigma, 3)
 
     return {"sigma_by_day": sigma_by_day, "n": len(matched)}
 
@@ -573,11 +626,10 @@ def main():
         all_bot_trades.extend(trades)
     nws_cal = calibrate_nws(all_bot_trades, settlement_map)
 
-    ent_trades = all_trades.get("Entertainment Bot", [])
-    album_cal = calibrate_info_arb(ent_trades, settlement_map, "album_sales")
-
-    beat_trades = all_trades.get("BeatRelease Scanner", [])
-    box_cal = calibrate_info_arb(beat_trades, settlement_map, "box_office")
+    # Info-arb calibration: combine entertainment + source-monitor trades
+    info_arb_trades = all_trades.get("Entertainment Bot", []) + all_trades.get("Source Monitor", [])
+    album_cal = calibrate_info_arb(info_arb_trades, settlement_map, "album_sales")
+    box_cal = calibrate_info_arb(info_arb_trades, settlement_map, "box_office")
 
     # Ensemble weight calibration
     ensemble_cal = calibrate_ensemble_weights(all_bot_trades, settlement_map)
