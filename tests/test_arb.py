@@ -37,6 +37,14 @@ def _load_arb_module():
         "__init__": lambda self, *a, **kw: None,
         "record_bot_heartbeat": lambda self, *a, **kw: None,
     })
+    fake_auth.ScanSummary = type("ScanSummary", (), {
+        "__init__": lambda self, *a, **kw: None,
+        "skip": lambda self, *a, **kw: None,
+        "finalize": lambda self, *a, **kw: None,
+        "markets_fetched": 0,
+        "markets_evaluated": 0,
+        "trades_placed": 0,
+    })
     sys.modules["kalshi_auth"] = fake_auth
 
     fake_prob = types.ModuleType("probability")

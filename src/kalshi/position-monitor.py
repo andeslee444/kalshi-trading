@@ -19,7 +19,7 @@ from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, TradeManager, trim_trade_log, CITY_TIMEZONES, _local_today,
     round_half_up, retry_request, fetch_parallel, HealthCheckMonitor,
-    load_trades, _atomic_write_json,
+    load_trades, _atomic_write_json, ScanSummary,
 )
 from probability import weather_probability, nws_probability, half_kelly, kalshi_fee_cents
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
@@ -479,6 +479,7 @@ def _count_exits_today():
 
 def scan_positions():
     """Scan all open positions and evaluate exit opportunities."""
+    ss = ScanSummary("position-monitor", log)
     now = datetime.datetime.now()
     log.info(f"\n{'='*60}")
     log.info(f"[{now.isoformat()}] Position scan starting...")
@@ -497,6 +498,7 @@ def scan_positions():
     positions = get_open_positions()
     if not positions:
         log.info("No open positions found.")
+        ss.finalize()
         return
 
     log.info(f"Found {len(positions)} positions to evaluate")
@@ -580,7 +582,19 @@ def scan_positions():
             )
             if result:
                 exits_today += 1
+                ss.trades_placed += 1
                 allocator.record_trade("position-monitor", ticker, risk=0, edge=0)
+                trade_manager.log_decision(ticker, exit_signal["side"], "placed", exit_signal["action"],
+                                           price_cents=exit_signal["price"])
+            else:
+                trade_manager.log_decision(ticker, exit_signal["side"], "rejected", "sell_failed",
+                                           price_cents=exit_signal["price"])
+        elif exit_signal and exits_today >= MAX_DAILY_EXITS:
+            trade_manager.log_decision(ticker, exit_signal["side"], "skipped", "daily_exit_limit",
+                                       price_cents=exit_signal["price"])
+        else:
+            # No exit signal — position held
+            ss.skip("no_exit_signal")
 
     # Clean up peaks for closed positions and save
     for stale_ticker in list(peaks.keys()):
@@ -624,6 +638,9 @@ def scan_positions():
                                 exits_today += 1
                                 allocator.record_trade("position-monitor", pending_ticker, risk=0, edge=0)
 
+    ss.markets_fetched = len(positions)
+    ss.markets_evaluated = len(open_tickers)
+    ss.finalize()
     log.info(f"Scan complete. {exits_today} exit orders placed.")
 
 

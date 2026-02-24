@@ -20,7 +20,7 @@ from difflib import SequenceMatcher
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, TradeManager, trim_trade_log, build_market_snapshot,
-    _atomic_write_json, HealthCheckMonitor,
+    _atomic_write_json, HealthCheckMonitor, ScanSummary,
 )
 from polymarket_client import PolymarketClient
 from capital_allocator import PortfolioAllocator
@@ -220,6 +220,7 @@ def log_spread(kalshi_ticker, pm_question, spread_info):
 
 def scan_spreads():
     """Scan for cross-platform arbitrage opportunities."""
+    ss = ScanSummary("cross-platform-arb", log)
     now = datetime.datetime.now()
     log.info(f"\n{'='*60}")
     log.info(f"[{now.isoformat()}] Cross-platform arb scan starting...")
@@ -241,6 +242,7 @@ def scan_spreads():
 
     if not kalshi_markets:
         log.info("No Kalshi markets found.")
+        ss.finalize()
         return
 
     log.info(f"Fetched {len(kalshi_markets)} Kalshi markets")
@@ -258,6 +260,8 @@ def scan_spreads():
 
     if not pm_markets:
         log.info("No Polymarket markets found.")
+        ss.markets_fetched = len(kalshi_markets)
+        ss.finalize()
         return
 
     log.info(f"Fetched {len(pm_markets)} Polymarket markets")
@@ -293,6 +297,8 @@ def scan_spreads():
                                                    edge=edge, confidence=0.5 + edge)
                 if not budget.approved:
                     log.info(f"    Allocator denied: {budget.reason}")
+                    trade_manager.log_decision(k_ticker, "yes", "skipped", f"allocator denied: {budget.reason}",
+                                               edge=edge, price_cents=spread["kalshi_yes_ask"])
                     continue
 
                 yes_bid = spread["kalshi_yes_bid"]
@@ -312,11 +318,21 @@ def scan_spreads():
                                                         model_prob=round(0.5 + edge, 4), raw_edge=round(edge, 4),
                                                         fee_cents=round(kalshi_fee_cents(price), 2), sizing_method="half_kelly")
                     if result:
+                        ss.trades_placed += 1
                         allocator.record_trade("cross-platform-arb", k_ticker, risk, edge=edge)
+                else:
+                    trade_manager.log_decision(k_ticker, "yes", "skipped", "kelly_zero",
+                                               edge=edge, price_cents=spread["kalshi_yes_ask"])
+            elif spread["is_tradeable"] and not EXECUTION_ENABLED:
+                trade_manager.log_decision(k_ticker, "yes", "skipped", "execution_disabled",
+                                           edge=spread["net_spread"], price_cents=spread["kalshi_yes_ask"])
         else:
             if abs(spread["raw_spread"]) > 0.01:
                 log.info(f"  {k_ticker} vs PM: raw spread {spread['raw_spread']*100:.1f}% (below threshold after fees)")
 
+    ss.markets_fetched = len(kalshi_markets)
+    ss.markets_evaluated = len(matches)
+    ss.finalize()
     log.info(f"\nScan complete. {tradeable} tradeable spreads found (of {len(matches)} matched pairs).")
 
 

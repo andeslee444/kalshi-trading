@@ -14,7 +14,7 @@ import requests
 from pathlib import Path
 from bs4 import BeautifulSoup
 
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, notify_whatsapp, _atomic_write_json, HealthCheckMonitor
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, notify_whatsapp, _atomic_write_json, HealthCheckMonitor, ScanSummary
 from capital_allocator import PortfolioAllocator
 
 # Unbuffered output
@@ -437,6 +437,7 @@ def cancel_stale_orders():
 # === Main Scan Cycle ===
 def scan_cycle():
     """One full scan cycle."""
+    ss = ScanSummary("beatrelease", log)
     log.info("=" * 60)
     log.info("BeatRelease scan starting...")
 
@@ -455,6 +456,7 @@ def scan_cycle():
     if not posts:
         log.info("  No posts found (fetch error?)")
         save_state(state)
+        ss.finalize()
         return
 
     # 2. Prefetch all post texts in parallel to check for new/updated content
@@ -498,6 +500,8 @@ def scan_cycle():
     if not posts_to_process:
         log.info("  No new or updated posts — sleeping")
         save_state(state)
+        ss.markets_fetched = len(posts)
+        ss.finalize()
         return
 
     all_new_trades = []
@@ -565,6 +569,8 @@ def scan_cycle():
                 actual_price = yes_ask if yes_ask and yes_ask > 0 else limit_price
                 if actual_price > limit_price + 10:
                     log.info(f"  Skipping {ticker}: market ask {actual_price}c >> blog entry {limit_price}c")
+                    trade_manager.log_decision(ticker, side, "skipped", "stale_blog_price",
+                                               price_cents=actual_price, blog_price=limit_price)
                     continue
                 blog_confidence = min(0.95, limit_price / 100.0 + 0.15)
                 edge = blog_confidence - actual_price / 100.0
@@ -572,18 +578,24 @@ def scan_cycle():
                 actual_price = no_ask if no_ask and no_ask > 0 else limit_price
                 if actual_price > limit_price + 10:
                     log.info(f"  Skipping {ticker}: market no-ask {actual_price}c >> blog entry {limit_price}c")
+                    trade_manager.log_decision(ticker, side, "skipped", "stale_blog_price",
+                                               price_cents=actual_price, blog_price=limit_price)
                     continue
                 blog_confidence = min(0.95, limit_price / 100.0 + 0.15)
                 edge = blog_confidence - actual_price / 100.0
 
             if edge <= 0.02:
                 log.info(f"  Skipping {ticker}: computed edge {edge*100:.1f}% too small")
+                trade_manager.log_decision(ticker, side, "skipped", "edge_too_small",
+                                           edge=edge, price_cents=actual_price)
                 continue
 
             # Check allocator for global dedup (prevents cross-bot double exposure)
             budget = allocator.request_budget("beatrelease", ticker, edge=edge, confidence=blog_confidence)
             if not budget.approved:
                 log.info(f"  Allocator denied {ticker}: {budget.reason}")
+                trade_manager.log_decision(ticker, side, "skipped", f"allocator denied: {budget.reason}",
+                                           edge=edge, price_cents=actual_price)
                 continue
 
             result = trade_manager.place_order(
@@ -621,6 +633,10 @@ def scan_cycle():
         log.info(f"\nNotification:\n{msg}")
         notify_whatsapp(msg, logger=log)
 
+    ss.markets_fetched = len(posts)
+    ss.markets_evaluated = len(posts_to_process)
+    ss.trades_placed = len(all_new_trades) + len(all_exit_trades)
+    ss.finalize()
     log.info(f"\nScan complete — {len(posts_to_process)} posts processed, {len(all_new_trades)} entries + {len(all_exit_trades)} exits placed")
 
 
