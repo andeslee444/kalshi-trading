@@ -195,10 +195,18 @@ class KalshiClient:
         }
 
     def _request(self, method: str, path: str, body=None, timeout=15):
-        """Make an authenticated API request with retry on transient errors."""
+        """Make an authenticated API request with retry on transient errors.
+
+        Only idempotent methods (GET, HEAD, OPTIONS) are retried on
+        ConnectionError/Timeout.  POST/DELETE are NOT retried because the
+        server may have already processed the request — retrying could
+        create duplicate orders.  Rate-limit 429 responses are safe to
+        retry for all methods.
+        """
         url = self.base_url + path
         full_path = "/trade-api/v2" + path
         headers = self._sign(method, full_path)
+        is_idempotent = method in ("GET", "HEAD", "OPTIONS")
 
         last_err = None
         for attempt in range(MAX_RETRIES):
@@ -217,12 +225,18 @@ class KalshiClient:
                 return r.json()
 
             except requests.exceptions.ConnectionError as e:
+                if not is_idempotent:
+                    _log.error("Non-retryable %s %s failed (ConnectionError): %s", method, path, e)
+                    raise
                 last_err = e
                 wait = RETRY_BACKOFF_BASE * (2 ** attempt)
                 _log.warning("Connection error, retrying in %.1fs... (%s)", wait, e)
                 time.sleep(wait)
                 headers = self._sign(method, full_path)
             except requests.exceptions.Timeout as e:
+                if not is_idempotent:
+                    _log.error("Non-retryable %s %s failed (Timeout): %s", method, path, e)
+                    raise
                 last_err = e
                 wait = RETRY_BACKOFF_BASE * (2 ** attempt)
                 _log.warning("Timeout, retrying in %.1fs...", wait)
@@ -765,15 +779,26 @@ class ScanSummary:
 
 
 def _append_scan_summary(summary):
-    """Append scan summary to rotating JSON log (max 2000 entries)."""
+    """Append scan summary to rotating JSON log (max 2000 entries).
+
+    Uses fcntl.LOCK_EX to prevent concurrent writes from multiple bots
+    clobbering each other's data.
+    """
     try:
-        existing = []
-        if SCAN_SUMMARIES_PATH.exists():
-            existing = json.loads(SCAN_SUMMARIES_PATH.read_text())
-        existing.append(summary)
-        if len(existing) > 2000:
-            existing = existing[-1500:]
-        _atomic_write_json(SCAN_SUMMARIES_PATH, existing)
+        SCAN_SUMMARIES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = SCAN_SUMMARIES_PATH.with_suffix(".lock")
+        with open(lock_path, "w") as lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                existing = []
+                if SCAN_SUMMARIES_PATH.exists():
+                    existing = json.loads(SCAN_SUMMARIES_PATH.read_text())
+                existing.append(summary)
+                if len(existing) > 2000:
+                    existing = existing[-1500:]
+                _atomic_write_json(SCAN_SUMMARIES_PATH, existing)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
     except Exception:
         pass
 
@@ -912,6 +937,10 @@ class TradeManager:
         self.tracker = RecentTradeTracker(self.trades_path, cooldown_hours=cooldown_hours)
         self.breaker = CircuitBreaker(state_path=breaker_state_path)
         self.order_monitor = order_monitor
+
+        # Sell cooldown: prevent unlimited sell orders from malfunctioning monitors
+        self._sell_cooldown = {}  # (ticker, side) -> timestamp
+        self._sell_cooldown_seconds = 600  # 10 minutes between sells on same position
 
         # Daily counters
         self._daily_trades = 0
@@ -1177,7 +1206,8 @@ class TradeManager:
         """Sell/exit an existing position with lighter safety checks.
 
         Exits free capital rather than consuming it, so daily trade limits
-        and dedup are skipped. Only kill switch + circuit breaker enforced.
+        and dedup are skipped. Kill switch, circuit breaker, and sell
+        cooldown (10 min per ticker+side) are enforced.
 
         Args:
             ticker: Market ticker string.
@@ -1202,6 +1232,14 @@ class TradeManager:
         # 2. Circuit breaker
         if self.breaker.is_open():
             self.log.warning("Circuit breaker OPEN — skipping exit on %s", ticker)
+            return None
+
+        # 3. Sell cooldown — prevent unlimited sells on same position
+        cooldown_key = (ticker, side)
+        last_sell = self._sell_cooldown.get(cooldown_key)
+        if last_sell and (time.time() - last_sell) < self._sell_cooldown_seconds:
+            remaining = self._sell_cooldown_seconds - (time.time() - last_sell)
+            self.log.warning("Sell cooldown: %s %s — %.0fs remaining", ticker, side, remaining)
             return None
 
         # Build sell order
@@ -1241,6 +1279,9 @@ class TradeManager:
         )
         trade_record["action"] = "sell"
         save_trade(self.trades_path, trade_record)
+
+        # Record sell cooldown timestamp
+        self._sell_cooldown[cooldown_key] = time.time()
 
         self.log.info("EXIT placed: sell %dx %s @ %dc on %s (ID: %s, Status: %s)",
                        count, side, price_cents, ticker,
@@ -1295,13 +1336,26 @@ def build_market_snapshot(yes_bid=None, yes_ask=None, volume=None, open_interest
 # === Scan decision log ===
 
 def save_decision(decisions_path: Path, decision: dict):
-    """Append a scan decision to the decisions log (atomic write)."""
-    decisions = load_trades(decisions_path)  # reuse same JSON array format
-    # Keep log bounded — retain last 5000 decisions
-    if len(decisions) >= 5000:
-        decisions = decisions[-4000:]
-    decisions.append(decision)
-    _atomic_write_json(decisions_path, decisions)
+    """Append a scan decision to the decisions log (atomic write).
+
+    Uses fcntl.LOCK_EX to prevent concurrent writes from multiple bots.
+    """
+    decisions_path = Path(decisions_path)
+    decisions_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = decisions_path.with_suffix(".lock")
+    try:
+        with open(lock_path, "w") as lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                decisions = load_trades(decisions_path)
+                if len(decisions) >= 5000:
+                    decisions = decisions[-4000:]
+                decisions.append(decision)
+                _atomic_write_json(decisions_path, decisions)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    except Exception as e:
+        _log.warning("Failed to save decision: %s", e)
 
 
 # === Notification ===
@@ -1343,9 +1397,28 @@ class HealthCheckMonitor:
                 pass
 
     def _save(self):
+        """Save health state, merging this bot's data with other bots' on-disk state.
+
+        Uses fcntl.LOCK_EX to prevent concurrent writes from erasing
+        other bots' heartbeats.
+        """
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.state_path.with_suffix(".lock")
         try:
-            _atomic_write_json(self.state_path, self._state)
+            with open(lock_path, "w") as lock_fd:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                try:
+                    on_disk = {"bots": {}, "sources": {}}
+                    if self.state_path.exists():
+                        try:
+                            on_disk = json.loads(self.state_path.read_text())
+                        except (json.JSONDecodeError, OSError):
+                            pass
+                    on_disk.setdefault("bots", {}).update(self._state.get("bots", {}))
+                    on_disk.setdefault("sources", {}).update(self._state.get("sources", {}))
+                    _atomic_write_json(self.state_path, on_disk)
+                finally:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
         except Exception as e:
             self.log.warning("Failed to save health state: %s", e)
 
