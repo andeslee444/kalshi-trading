@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, half_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, nws_sigma_for_hour
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
-from hdd_parser import get_album_sales
+from hdd_parser import get_album_sales, compute_data_age_hours
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -62,18 +62,7 @@ def save_snapshot(source_name, content, ext="html"):
 
 MAX_DATA_AGE_HOURS = 168  # 7 days — same as entertainment-bot
 
-def _compute_data_age_hours(chart_date_str):
-    """Compute hours since chart data was published. Returns 0 if unparseable (fail-open)."""
-    if not chart_date_str:
-        return 0
-    try:
-        dt = datetime.datetime.fromisoformat(chart_date_str.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
-        now = datetime.datetime.now(datetime.timezone.utc)
-        return (now - dt).total_seconds() / 3600
-    except (ValueError, TypeError):
-        return 0
+_compute_data_age_hours = compute_data_age_hours  # backward compat alias
 
 def _check_with_retry(check_fn, source_name, prefetched, ss, max_retries=2):
     """Retry a source check with exponential backoff on transient failures."""
@@ -176,8 +165,8 @@ def match_hdd_to_markets(sales_data, prefetched_markets=None):
                         threshold = int(threshold_match.group(1).replace(",", ""))
                         if threshold < 1000:
                             threshold *= 1000
-                        data_age_hours = _compute_data_age_hours(sale.get("chart_date"))
-                        sigma = album_data_sigma(datetime.datetime.now().weekday(), hours_since_publication=data_age_hours)
+                        data_age_hours = compute_data_age_hours(sale.get("chart_date"))
+                        sigma = album_data_sigma(datetime.datetime.now().weekday(), hours_since_publication=data_age_hours, source=sale.get("source", ""))
                         prob = info_arb_probability(units, threshold, sigma)
                         artist_markets.append((m, threshold, prob))
 
@@ -208,7 +197,7 @@ def evaluate_album_trade(market, sale):
     if threshold < 1000:
         threshold *= 1000
 
-    data_age_hours = _compute_data_age_hours(sale.get("chart_date"))
+    data_age_hours = compute_data_age_hours(sale.get("chart_date"))
     if data_age_hours > MAX_DATA_AGE_HOURS:
         log.info(f"  {artist}: data {data_age_hours:.0f}h stale (>{MAX_DATA_AGE_HOURS}h), skipping")
         trade_manager.log_decision(
@@ -216,7 +205,7 @@ def evaluate_album_trade(market, sale):
             edge=0, price_cents=market.get("yes_ask", 0),
         )
         return
-    sigma = album_data_sigma(datetime.datetime.now().weekday(), hours_since_publication=data_age_hours)
+    sigma = album_data_sigma(datetime.datetime.now().weekday(), hours_since_publication=data_age_hours, source=sale.get("source", ""))
     confidence = info_arb_probability(units, threshold, sigma)
 
     if confidence > 0.5:

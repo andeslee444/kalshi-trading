@@ -3,12 +3,19 @@
 Provides Sanity CMS access and chart/article parsing for album sales data.
 Used by entertainment-bot, source-monitor, and hdd-scraper.
 
+Kalshi KXALBUMSALES markets settle directly on the HDD Hits Top 50
+"Albums" column (pure album sales). When this chart publishes, the
+settlement value is known. The "Activity" column (total equivalent units
+including streaming) is NOT what Kalshi settles on — it's only used as
+a fallback when the Albums column is unavailable.
+
 Key discovery: HDD uses Sanity.io CMS (project: 8aky18h3).
 We can query their API directly for structured chart data.
 """
 
 import re
 import logging
+import datetime
 import requests
 
 _log = logging.getLogger("hdd_parser")
@@ -199,11 +206,29 @@ def extract_sales_from_text(text):
 # HIGH-LEVEL DATA FUNCTIONS
 # ============================================================
 
+def compute_data_age_hours(chart_date_str):
+    """Compute hours since chart data was published. Returns 0 if unparseable (fail-open)."""
+    if not chart_date_str:
+        return 0
+    try:
+        dt = datetime.datetime.fromisoformat(chart_date_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return (now - dt).total_seconds() / 3600
+    except (ValueError, TypeError):
+        return 0
+
+
 def get_album_sales(logger=None):
     """Fetch album sales data from HDD charts and articles.
 
     Returns a list of dicts: [{"artist": str, "units": int, "source": str}]
     Combines data from Hits Top 50, Midweek 20 charts, and articles.
+
+    Units come from the "Albums" column (pure album sales) which is what
+    Kalshi KXALBUMSALES markets settle on. Falls back to "Activity" (total
+    equivalent units) only when Albums is unavailable.
     """
     log = logger or _log
     results = []
@@ -220,8 +245,8 @@ def get_album_sales(logger=None):
             entries = parse_chart_data(chart.get("chart_data", ""))
             for entry in entries:
                 artist = entry.get("artist", "")
-                # Use activity (total equiv units) as primary, albums as fallback
-                units = entry.get("activity", 0) or entry.get("albums", 0)
+                # Kalshi settles on Albums column (pure sales), Activity is fallback
+                units = entry.get("albums", 0) or entry.get("activity", 0)
                 if artist and units > 0:
                     key = artist.lower()
                     if key not in seen_artists:

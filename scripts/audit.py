@@ -1118,7 +1118,7 @@ class AuditEngine:
         findings = []
 
         # 5B.1: Album data sigma schedule
-        expected = {0: 0.15, 1: 0.15, 2: 0.10, 3: 0.10, 4: 0.03, 5: 0.03, 6: 0.03}
+        expected = {0: 0.15, 1: 0.15, 2: 0.10, 3: 0.10, 4: 0.05, 5: 0.05, 6: 0.05}
         issues = []
         for dow, exp_sigma in expected.items():
             actual = album_data_sigma(dow)

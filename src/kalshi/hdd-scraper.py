@@ -15,8 +15,8 @@ Publication schedule:
   - Hits Top 50: published weekly (usually Thu/Fri) with final numbers
   - Articles mentioning sales appear throughout the week
 
-The arbitrage window: HDD publishes chart finals BEFORE Billboard/Luminate
-official numbers, which is what Kalshi uses to settle markets.
+Kalshi KXALBUMSALES markets settle directly on the HDD Hits Top 50
+"Albums" column. When this chart publishes, the settlement value is known.
 """
 
 import json, time, datetime, os, sys, re, traceback
@@ -143,8 +143,9 @@ def match_chart_to_markets(chart_entries: list, markets: list):
     for entry in chart_entries[:20]:  # Top 20
         artist = entry["artist"].lower()
         album = entry.get("album", "").lower()
-        activity = entry.get("activity", 0)
+        # Kalshi settles on Albums column; Activity is fallback
         albums_sold = entry.get("albums", 0)
+        activity = entry.get("activity", 0)
 
         for m in markets:
             title_lower = m.get("title", "").lower()
@@ -177,8 +178,8 @@ def evaluate_trade(market: dict, chart_entry: dict):
     if threshold < 1000:
         threshold *= 1000
 
-    # Use activity (total equiv units) as primary metric
-    units = activity if activity > 0 else albums_sold
+    # Kalshi settles on Albums column; Activity is fallback
+    units = albums_sold if albums_sold > 0 else activity
     if units == 0:
         return
 

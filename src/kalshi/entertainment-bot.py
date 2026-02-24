@@ -9,7 +9,7 @@ import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, half_kelly, compute_limit_price, is_market_liquid, kalshi_fee_cents
-from hdd_parser import get_album_sales
+from hdd_parser import get_album_sales, compute_data_age_hours
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -283,7 +283,10 @@ def evaluate_album_opportunity(market, album, market_price):
         log.info(f"     Could not parse threshold from: {title}")
         return
 
-    sigma = album_data_sigma(datetime.datetime.now().weekday())
+    data_age_hours = compute_data_age_hours(album.get("chart_date", ""))
+    sigma = album_data_sigma(datetime.datetime.now().weekday(),
+                             hours_since_publication=data_age_hours,
+                             source=album.get("source", ""))
     confidence = info_arb_probability(units, threshold, sigma)
 
     # Determine side: confidence > 0.5 means above threshold (YES), < 0.5 means below (NO)

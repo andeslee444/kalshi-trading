@@ -1,7 +1,7 @@
 """Tests for HDD chart parsing and sales extraction."""
 
 import pytest
-from hdd_parser import parse_chart_data, clean_number, extract_sales_from_text
+from hdd_parser import parse_chart_data, clean_number, extract_sales_from_text, get_album_sales, compute_data_age_hours
 
 
 # ===================================================================
@@ -140,3 +140,42 @@ class TestParseChartData:
         assert len(entries) == 1
         assert entries[0]["last_week"] is None
         assert entries[0]["rank"] == 5
+
+    def test_albums_is_second_number(self):
+        """Albums column should be the second number in chart data (after Activity)."""
+        line = "1\t1\tArtist | Album\tLabel\t290,861\t175,345\t50,000"
+        entries = parse_chart_data(line)
+        assert len(entries) == 1
+        assert entries[0]["activity"] == 290861
+        assert entries[0]["albums"] == 175345
+
+    def test_single_number_no_albums_key(self):
+        """When only one number present, albums key doesn't exist (only activity)."""
+        line = "1\t1\tArtist | Album\tLabel\t290,861"
+        entries = parse_chart_data(line)
+        assert len(entries) == 1
+        assert entries[0]["activity"] == 290861
+        assert "albums" not in entries[0]
+
+
+# ===================================================================
+# compute_data_age_hours tests
+# ===================================================================
+
+class TestComputeDataAgeHours:
+
+    def test_empty_string_returns_zero(self):
+        assert compute_data_age_hours("") == 0
+
+    def test_none_returns_zero(self):
+        assert compute_data_age_hours(None) == 0
+
+    def test_unparseable_returns_zero(self):
+        assert compute_data_age_hours("not-a-date") == 0
+
+    def test_recent_date_returns_positive(self):
+        """A date from 1 hour ago should return ~1."""
+        import datetime
+        one_hour_ago = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)).isoformat()
+        age = compute_data_age_hours(one_hour_ago)
+        assert 0.9 < age < 1.5

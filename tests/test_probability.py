@@ -488,3 +488,61 @@ class TestCpiNowcastSigma:
         prob = econ_nowcast_probability(2.80, sigma, 2.85, "above")
         # nowcast (2.80) is below threshold (2.85), so P(above 2.85) < 0.5
         assert prob < 0.5
+
+
+# ===================================================================
+# Source-aware album sigma tests
+# ===================================================================
+
+class TestAlbumSigmaSourceAware:
+
+    def setup_method(self):
+        _reset_calibration()
+
+    def teardown_method(self):
+        _reset_calibration()
+
+    def test_hdd_hits_top_50_returns_2pct(self):
+        """hdd-hits-top-50 is the settlement source -> 2% sigma regardless of day."""
+        for day in range(7):
+            assert album_data_sigma(day, source="hdd-hits-top-50") == 0.02
+
+    def test_hdd_midweek_20_day_based(self):
+        """hdd-midweek-20 uses day-based sigma like legacy."""
+        assert album_data_sigma(0, source="hdd-midweek-20") == 0.15  # Mon
+        assert album_data_sigma(2, source="hdd-midweek-20") == 0.10  # Wed
+        assert album_data_sigma(4, source="hdd-midweek-20") == 0.05  # Fri
+
+    def test_hdd_article_returns_18pct(self):
+        """hdd-article has high uncertainty -> 18% sigma."""
+        for day in range(7):
+            assert album_data_sigma(day, source="hdd-article") == 0.18
+
+    def test_source_none_legacy_behavior(self):
+        """source=None returns legacy day-based sigma (backward compatible)."""
+        assert album_data_sigma(0, source=None) == 0.15
+        assert album_data_sigma(2, source=None) == 0.10
+        assert album_data_sigma(4, source=None) == 0.05
+
+    def test_no_source_param_legacy_behavior(self):
+        """Calling without source param at all returns legacy day-based sigma."""
+        assert album_data_sigma(0) == 0.15
+        assert album_data_sigma(4) == 0.05
+
+    def test_unknown_source_falls_through_to_day_based(self):
+        """Unknown source string falls through to day-based sigma."""
+        assert album_data_sigma(0, source="some-unknown-source") == 0.15
+        assert album_data_sigma(4, source="some-unknown-source") == 0.05
+
+    def test_time_decay_applies_to_all_sources(self):
+        """Time decay still applies regardless of source."""
+        fresh = album_data_sigma(4, hours_since_publication=0, source="hdd-hits-top-50")
+        stale = album_data_sigma(4, hours_since_publication=96, source="hdd-hits-top-50")
+        assert stale > fresh
+
+    def test_time_decay_on_article_source(self):
+        """Time decay applies to article source too."""
+        fresh = album_data_sigma(0, hours_since_publication=0, source="hdd-article")
+        stale = album_data_sigma(0, hours_since_publication=48, source="hdd-article")
+        assert stale > fresh
+        assert fresh == 0.18
