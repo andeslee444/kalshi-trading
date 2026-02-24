@@ -1,7 +1,8 @@
 """Tests for HDD chart parsing and sales extraction."""
 
+import logging
 import pytest
-from hdd_parser import parse_chart_data, clean_number, extract_sales_from_text, get_album_sales, compute_data_age_hours
+from hdd_parser import parse_chart_data, clean_number, extract_sales_from_text, get_album_sales, compute_data_age_hours, parse_album_threshold
 
 
 # ===================================================================
@@ -179,3 +180,48 @@ class TestComputeDataAgeHours:
         one_hour_ago = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)).isoformat()
         age = compute_data_age_hours(one_hour_ago)
         assert 0.9 < age < 1.5
+
+    def test_unparseable_date_logs_warning(self, caplog):
+        """Unparseable dates should log a warning and return 0."""
+        with caplog.at_level(logging.WARNING, logger="hdd_parser"):
+            result = compute_data_age_hours("garbage-date-string")
+        assert result == 0
+        assert "Unparseable chart_date" in caplog.text
+
+
+# ===================================================================
+# parse_album_threshold tests
+# ===================================================================
+
+class TestParseAlbumThreshold:
+
+    def test_k_units_pattern(self):
+        """'200K copies' should parse to 200000."""
+        assert parse_album_threshold("Will Artist sell 200K copies?") == 200000
+
+    def test_comma_separated_units(self):
+        """'150,000 units' should parse to 150000."""
+        assert parse_album_threshold("Will it sell more than 150,000 units?") == 150000
+
+    def test_more_than_pattern(self):
+        """'more than 200' should parse (with *1000 normalization)."""
+        assert parse_album_threshold("Sell more than 200") == 200000
+
+    def test_over_pattern(self):
+        """'over 200' should parse (with *1000 normalization)."""
+        assert parse_album_threshold("Will sales go over 200") == 200000
+
+    def test_ticker_fallback(self):
+        """Ticker T200 should parse to 200000."""
+        assert parse_album_threshold("Some unparseable title", "KXALBUMSALES-ART-T200") == 200000
+
+    def test_ticker_large_number(self):
+        """Ticker T150000 should stay at 150000 (no *1000)."""
+        assert parse_album_threshold("No match", "KXALBUMSALES-T150000") == 150000
+
+    def test_returns_none_on_no_match(self):
+        assert parse_album_threshold("No numbers here", "NOTHRESHOLD") is None
+
+    def test_thousand_word_pattern(self):
+        """'200 thousand' should parse to 200000."""
+        assert parse_album_threshold("Will sales reach 200 thousand") == 200000

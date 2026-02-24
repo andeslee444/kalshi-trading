@@ -206,6 +206,32 @@ def extract_sales_from_text(text):
 # HIGH-LEVEL DATA FUNCTIONS
 # ============================================================
 
+def parse_album_threshold(title, ticker=""):
+    """Parse album sales threshold from market title/ticker.
+
+    Returns threshold in units (e.g. 150000), or None if unparseable.
+    """
+    for pattern in [
+        r'(\d{1,3}(?:,\d{3})*)\s*(?:K|thousand|copies|units)',
+        r'more than\s+(\d{1,3}(?:,\d{3})*)',
+        r'over\s+(\d{1,3}(?:,\d{3})*)',
+    ]:
+        match = re.search(pattern, title, re.I)
+        if match:
+            threshold = int(match.group(1).replace(",", ""))
+            if threshold < 1000:
+                threshold *= 1000
+            return threshold
+    # Fallback: ticker pattern like T200
+    match = re.search(r'T(\d+)', ticker)
+    if match:
+        threshold = int(match.group(1))
+        if threshold < 1000:
+            threshold *= 1000
+        return threshold
+    return None
+
+
 def compute_data_age_hours(chart_date_str):
     """Compute hours since chart data was published. Returns 0 if unparseable (fail-open)."""
     if not chart_date_str:
@@ -217,6 +243,7 @@ def compute_data_age_hours(chart_date_str):
         now = datetime.datetime.now(datetime.timezone.utc)
         return (now - dt).total_seconds() / 3600
     except (ValueError, TypeError):
+        _log.warning("Unparseable chart_date: %r, treating as fresh (fail-open)", chart_date_str)
         return 0
 
 

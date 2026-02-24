@@ -23,10 +23,12 @@ import json, time, datetime, os, sys, re, traceback
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR
+from probability import info_arb_probability, album_data_sigma
 from hdd_parser import (
     sanity_query, fetch_latest_chart, fetch_recent_articles,
     fetch_articles_with_sales_keywords, parse_chart_data, clean_number,
-    extract_sales_from_text, SANITY_PROJECT, SANITY_DATASET, SANITY_BASE,
+    extract_sales_from_text, parse_album_threshold,
+    SANITY_PROJECT, SANITY_DATASET, SANITY_BASE,
 )
 
 # Unbuffered output
@@ -166,33 +168,27 @@ def evaluate_trade(market: dict, chart_entry: dict):
     albums_sold = chart_entry.get("albums", 0)
 
     # Parse threshold from market title
-    threshold_match = re.search(r'(\d{1,3}(?:,\d{3})*)\s*(?:K|thousand|copies|units)', title, re.I)
-    if not threshold_match:
-        threshold_match = re.search(r'T(\d+)', ticker)
-
-    if not threshold_match:
+    threshold = parse_album_threshold(title, ticker)
+    if not threshold:
         log.warning(f"    Cannot parse threshold: {title[:80]}")
         return
-
-    threshold = clean_number(threshold_match.group(1))
-    if threshold < 1000:
-        threshold *= 1000
 
     # Kalshi settles on Albums column; Activity is fallback
     units = albums_sold if albums_sold > 0 else activity
     if units == 0:
         return
 
-    margin_pct = (units - threshold) / threshold if threshold > 0 else 0
+    sigma = album_data_sigma(datetime.datetime.now().weekday())
+    confidence = info_arb_probability(units, threshold, sigma)
 
-    if margin_pct > 0.05:
+    if confidence > 0.5:
         outcome = "yes"
-        confidence = min(0.95, 0.75 + margin_pct * 0.4)
-    elif margin_pct < -0.05:
-        outcome = "no"
-        confidence = min(0.95, 0.75 + abs(margin_pct) * 0.4)
     else:
-        log.warning(f"    {artist}: {units:,} units too close to threshold {threshold:,}")
+        outcome = "no"
+        confidence = 1.0 - confidence
+
+    if confidence < 0.60:
+        log.warning(f"    {artist}: {units:,} units vs {threshold:,} threshold, confidence {confidence*100:.0f}% too low")
         return
 
     yes_ask = market.get("yes_ask", 0)

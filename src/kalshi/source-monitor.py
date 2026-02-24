@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, half_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, nws_sigma_for_hour
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
-from hdd_parser import get_album_sales, compute_data_age_hours
+from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_threshold
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -158,13 +158,8 @@ def match_hdd_to_markets(sales_data, prefetched_markets=None):
                     if not is_market_liquid(m):
                         continue
                     # Parse threshold for consistency check
-                    threshold_match = re.search(r'(\d{1,3}(?:,\d{3})*)\s*(?:K|thousand|copies|units)', m.get("title", ""), re.I)
-                    if not threshold_match:
-                        threshold_match = re.search(r'T(\d+)', m.get("ticker", ""))
-                    if threshold_match:
-                        threshold = int(threshold_match.group(1).replace(",", ""))
-                        if threshold < 1000:
-                            threshold *= 1000
+                    threshold = parse_album_threshold(m.get("title", ""), m.get("ticker", ""))
+                    if threshold:
                         data_age_hours = compute_data_age_hours(sale.get("chart_date"))
                         sigma = album_data_sigma(datetime.datetime.now().weekday(), hours_since_publication=data_age_hours, source=sale.get("source", ""))
                         prob = info_arb_probability(units, threshold, sigma)
@@ -185,17 +180,10 @@ def evaluate_album_trade(market, sale):
     units = sale["units"]
     artist = sale["artist"]
 
-    threshold_match = re.search(r'(\d{1,3}(?:,\d{3})*)\s*(?:K|thousand|copies|units)', title, re.I)
-    if not threshold_match:
-        threshold_match = re.search(r'T(\d+)', ticker)
-
-    if not threshold_match:
+    threshold = parse_album_threshold(title, ticker)
+    if not threshold:
         log.info(f"  Could not parse threshold from market: {title}")
         return
-
-    threshold = int(threshold_match.group(1).replace(",", ""))
-    if threshold < 1000:
-        threshold *= 1000
 
     data_age_hours = compute_data_age_hours(sale.get("chart_date"))
     if data_age_hours > MAX_DATA_AGE_HOURS:

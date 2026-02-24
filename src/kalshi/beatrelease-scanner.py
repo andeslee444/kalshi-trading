@@ -285,7 +285,7 @@ def fetch_blog_posts():
                     href = "https://www.beatrelease.com" + href
 
                 # Only blog posts
-                if "/post/" not in href and "/blog/" not in href:
+                if not any(seg in href for seg in ["/post/", "/blog/", "/article/", "/p/"]):
                     continue
                 # Skip category/tag pages
                 if "/categories/" in href or "/tags/" in href:
@@ -306,30 +306,9 @@ def fetch_blog_posts():
         except Exception as e:
             log.error(f"  Error parsing {blog_url}: {e}")
 
+    if not posts:
+        log.warning("No blog post links found via HTML parsing — BeatRelease may have changed URL structure")
     return posts
-
-
-def fetch_post_text(url):
-    """Fetch full text of a blog post."""
-    try:
-        r = retry_request("GET", url, timeout=20, headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-        })
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        # Remove scripts, styles, nav
-        for tag in soup.find_all(["script", "style", "nav", "header", "footer"]):
-            tag.decompose()
-
-        # Try to find main content
-        content = soup.find("article") or soup.find("main") or soup.find(class_=re.compile(r"post|content|blog|article", re.I))
-        if content:
-            return content.get_text(separator="\n", strip=True)
-        return soup.get_text(separator="\n", strip=True)
-
-    except Exception as e:
-        log.error(f"  Error fetching post {url}: {e}")
-        return ""
 
 
 # === Position Management (Exit Trades) ===
@@ -577,8 +556,32 @@ def scan_cycle():
             # Use the blog's recommended price as the limit price
             limit_price = t["price_cents"]
 
+            # Compute real edge from blog confidence vs market price
+            yes_ask = market.get("yes_ask", 0)
+            yes_bid = market.get("yes_bid", 0)
+            no_ask = 100 - yes_bid if yes_bid else 0
+
+            if side == "yes":
+                actual_price = yes_ask if yes_ask and yes_ask > 0 else limit_price
+                if actual_price > limit_price + 10:
+                    log.info(f"  Skipping {ticker}: market ask {actual_price}c >> blog entry {limit_price}c")
+                    continue
+                blog_confidence = min(0.95, limit_price / 100.0 + 0.15)
+                edge = blog_confidence - actual_price / 100.0
+            else:  # no
+                actual_price = no_ask if no_ask and no_ask > 0 else limit_price
+                if actual_price > limit_price + 10:
+                    log.info(f"  Skipping {ticker}: market no-ask {actual_price}c >> blog entry {limit_price}c")
+                    continue
+                blog_confidence = min(0.95, limit_price / 100.0 + 0.15)
+                edge = blog_confidence - actual_price / 100.0
+
+            if edge <= 0.02:
+                log.info(f"  Skipping {ticker}: computed edge {edge*100:.1f}% too small")
+                continue
+
             # Check allocator for global dedup (prevents cross-bot double exposure)
-            budget = allocator.request_budget("beatrelease", ticker, edge=0.10)
+            budget = allocator.request_budget("beatrelease", ticker, edge=edge, confidence=blog_confidence)
             if not budget.approved:
                 log.info(f"  Allocator denied {ticker}: {budget.reason}")
                 continue
@@ -587,10 +590,12 @@ def scan_cycle():
                 ticker, side, limit_price, t["quantity"],
                 t.get("reasoning", ""), source_url=url,
                 sizing_method="llm_recommended",
+                confidence=round(blog_confidence, 4),
+                raw_edge=round(edge, 4),
             )
             if result:
                 allocator.record_trade("beatrelease", ticker,
-                                       limit_price * t["quantity"], edge=0.10)
+                                       limit_price * t["quantity"], edge=edge)
                 placed.append({
                     "ticker": ticker,
                     "side": side,

@@ -45,10 +45,11 @@ BOT_COMMANDS = {
     "hdd":           ["python3", "src/kalshi/hdd-scraper.py"],
     "arb":           ["python3", "src/kalshi/cross-platform-arb.py"],
     "mm":            ["python3", "src/kalshi/market-maker.py"],
+    "beatrelease":   ["python3", "src/kalshi/beatrelease-scanner.py"],
 }
 
 # Daemon bots auto-restart on crash; one-shot bots do not
-DAEMON_BOTS = {"weather", "entertainment", "crypto", "economics", "positions", "monitor"}
+DAEMON_BOTS = {"weather", "entertainment", "crypto", "economics", "positions", "monitor", "beatrelease"}
 ONESHOT_BOTS = {"strategy", "hdd"}
 
 # Disabled by default (can be started explicitly)
@@ -70,6 +71,7 @@ HEARTBEAT_NAMES = {
     "monitor": "source-monitor",
     "arb": "cross-platform-arb",
     "mm": "market-maker",
+    "beatrelease": "beatrelease",
 }
 
 # Expected scan intervals in minutes (from bots-config / kalshi-config)
@@ -81,6 +83,7 @@ BOT_SCAN_INTERVALS = {
     "positions": 15,
     "monitor": 10,
     "arb": 10,
+    "beatrelease": 60,
 }
 
 HEARTBEAT_GRACE_PERIOD = 300  # 5 min startup grace before checking heartbeats
@@ -131,7 +134,10 @@ class BotProcess:
         try:
             from datetime import datetime
             hb_dt = datetime.fromisoformat(hb)
-            now_dt = datetime.now()
+            if hb_dt.tzinfo is not None:
+                now_dt = datetime.now(tz=hb_dt.tzinfo)
+            else:
+                now_dt = datetime.now()
             age_min = (now_dt - hb_dt).total_seconds() / 60
             if age_min > stale_threshold_min:
                 return True, age_min
@@ -165,13 +171,16 @@ class BotProcess:
             log_dir.mkdir(parents=True, exist_ok=True)
             stdout_file = open(log_dir / f"{self.name}.log", "a")
 
-            self.process = subprocess.Popen(
-                self.cmd,
-                cwd=str(PROJECT_DIR),
-                stdout=stdout_file,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+            try:
+                self.process = subprocess.Popen(
+                    self.cmd,
+                    cwd=str(PROJECT_DIR),
+                    stdout=stdout_file,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            finally:
+                stdout_file.close()  # child inherited the fd; close parent's copy
             self._write_pid(self.process.pid)
             self.started_at = time.time()
             log.info(f"  {self.name} started (PID {self.process.pid})")

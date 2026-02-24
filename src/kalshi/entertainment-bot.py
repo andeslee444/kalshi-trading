@@ -9,7 +9,7 @@ import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, half_kelly, compute_limit_price, is_market_liquid, kalshi_fee_cents
-from hdd_parser import get_album_sales, compute_data_age_hours
+from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_threshold
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -36,7 +36,8 @@ CONFIDENCE_THRESHOLD = _bots_cfg["confidenceThreshold"]
 SCAN_INTERVAL_MINUTES = _bots_cfg["scanIntervalMinutes"]
 ENTERTAINMENT_TICKERS = _bots_cfg["tickers"]
 
-MIN_EDGE = 0.03  # 3% minimum edge to cover fees + noise
+MIN_EDGE_CONFIRMED = 0.04  # 4% when sigma <= 5% (confirmed data)
+MIN_EDGE_UNCERTAIN = 0.10  # 10% when sigma > 5% (projections/articles)
 MAX_DATA_AGE_HOURS = 168  # HDD charts publish weekly; keep data fresh for 7 days
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -258,27 +259,7 @@ def evaluate_album_opportunity(market, album, market_price):
     artist = album["artist"]
 
     # Parse threshold from market title
-    threshold = None
-    for pattern in [
-        r'(\d{1,3}(?:,\d{3})*)\s*(?:K|thousand|copies|units)',
-        r'more than\s+(\d{1,3}(?:,\d{3})*)',
-        r'over\s+(\d{1,3}(?:,\d{3})*)',
-        r'T(\d+)',
-    ]:
-        match = re.search(pattern, title, re.I)
-        if match:
-            threshold = int(match.group(1).replace(",", ""))
-            if threshold < 1000:
-                threshold *= 1000
-            break
-
-    if not threshold:
-        match = re.search(r'T(\d+)', ticker)
-        if match:
-            threshold = int(match.group(1))
-            if threshold < 1000:
-                threshold *= 1000
-
+    threshold = parse_album_threshold(title, ticker)
     if not threshold:
         log.info(f"     Could not parse threshold from: {title}")
         return
@@ -312,9 +293,10 @@ def evaluate_album_opportunity(market, album, market_price):
 
     if side == "yes" and yes_ask and yes_ask < 99:
         edge = confidence - yes_ask / 100
-        if edge >= MIN_EDGE:
+        min_edge = MIN_EDGE_CONFIRMED if sigma <= 0.05 else MIN_EDGE_UNCERTAIN
+        if edge >= min_edge:
             # Request budget — info-arb with high confidence gets larger allocation
-            budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence)
+            budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence, source_type="info_arb")
             if not budget.approved:
                 log.info(f"     Allocator denied {ticker}: {budget.reason}")
                 return
@@ -340,8 +322,9 @@ def evaluate_album_opportunity(market, album, market_price):
 
     elif side == "no" and no_ask and no_ask < 99:
         edge = confidence - no_ask / 100
-        if edge >= MIN_EDGE:
-            budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence)
+        min_edge = MIN_EDGE_CONFIRMED if sigma <= 0.05 else MIN_EDGE_UNCERTAIN
+        if edge >= min_edge:
+            budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence, source_type="info_arb")
             if not budget.approved:
                 log.info(f"     Allocator denied {ticker}: {budget.reason}")
                 return
@@ -404,8 +387,9 @@ def evaluate_boxoffice_opportunity(market, movie, market_price):
 
     if side == "yes" and yes_ask and yes_ask < 99:
         edge = confidence - yes_ask / 100
-        if edge >= MIN_EDGE:
-            budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence)
+        min_edge = MIN_EDGE_CONFIRMED if sigma <= 0.05 else MIN_EDGE_UNCERTAIN
+        if edge >= min_edge:
+            budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence, source_type="info_arb")
             if not budget.approved:
                 return
             price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
@@ -429,8 +413,9 @@ def evaluate_boxoffice_opportunity(market, movie, market_price):
 
     elif side == "no" and no_ask and no_ask < 99:
         edge = confidence - no_ask / 100
-        if edge >= MIN_EDGE:
-            budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence)
+        min_edge = MIN_EDGE_CONFIRMED if sigma <= 0.05 else MIN_EDGE_UNCERTAIN
+        if edge >= min_edge:
+            budget = allocator.request_budget("entertainment", ticker, edge=edge, confidence=confidence, source_type="info_arb")
             if not budget.approved:
                 return
             price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
