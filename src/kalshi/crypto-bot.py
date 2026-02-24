@@ -410,7 +410,7 @@ def scan_and_trade():
             if edge > EDGE_THRESHOLD:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "no",
-                    "prob": no_prob, "edge": edge, "asset": asset,
+                    "prob": prob, "edge": edge, "asset": asset,
                     "current_price": current_price, "threshold": threshold,
                     "minutes_to_settle": minutes_to_settle,
                     "vol_used": vol_to_use,
@@ -434,7 +434,9 @@ def scan_and_trade():
         yes_bid = m.get("yes_bid", 0)
         no_ask = m.get("no_ask", 0)
 
-        budget = allocator.request_budget("crypto", ticker, edge=edge, confidence=opp["prob"])
+        # opp["prob"] is always P(YES); compute side-appropriate confidence
+        side_confidence = opp["prob"] if side == "yes" else 1.0 - opp["prob"]
+        budget = allocator.request_budget("crypto", ticker, edge=edge, confidence=side_confidence)
         if not budget.approved:
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             ss.skip("allocator_denied")
@@ -466,7 +468,7 @@ def scan_and_trade():
         reasoning = (
             f"Crypto {opp['asset']}: spot ${opp['current_price']:,.0f} vs threshold ${opp['threshold']:,.0f}, "
             f"vol={opp['vol_used']*100:.0f}%, T={opp['minutes_to_settle']}min, "
-            f"prob={opp['prob']*100:.0f}%, edge={edge*100:.1f}%"
+            f"P(YES)={opp['prob']*100:.0f}%, {side} edge={edge*100:.1f}%"
         )
 
         log.info(f"\n-> TRADE: {reasoning}")

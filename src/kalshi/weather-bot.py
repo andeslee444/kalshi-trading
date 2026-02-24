@@ -47,7 +47,7 @@ ENSEMBLE_ENABLED = config.get("ensemble", {}).get("enabled", False)
 
 def get_forecast(lat, lon):
     """Single-model GFS forecast (fallback)."""
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max&temperature_unit=fahrenheit&timezone=America%2FNew_York&forecast_days=7"
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max&temperature_unit=fahrenheit&timezone=America%2FNew_York&forecast_days=14"
     r = retry_request("GET", url, timeout=10)
     d = r.json()["daily"]
     return dict(zip(d["time"], d["temperature_2m_max"]))
@@ -67,7 +67,7 @@ def get_ensemble_forecast(lat, lon):
             f"https://api.open-meteo.com/v1/forecast?"
             f"latitude={lat}&longitude={lon}"
             f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
-            f"&timezone=America%2FNew_York&forecast_days=7"
+            f"&timezone=America%2FNew_York&forecast_days=14"
             f"&models={model_name}"
         )
         urls[url] = model_key

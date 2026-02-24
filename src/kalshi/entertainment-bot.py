@@ -37,7 +37,7 @@ SCAN_INTERVAL_MINUTES = _bots_cfg["scanIntervalMinutes"]
 ENTERTAINMENT_TICKERS = _bots_cfg["tickers"]
 
 MIN_EDGE = 0.03  # 3% minimum edge to cover fees + noise
-MAX_DATA_AGE_HOURS = 48  # HDD data older than 48h is considered stale
+MAX_DATA_AGE_HOURS = 168  # HDD charts publish weekly; keep data fresh for 7 days
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 

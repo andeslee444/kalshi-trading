@@ -9,15 +9,22 @@ from pathlib import Path
 # The project is not an installable package, so we add src/kalshi/ to
 # sys.path directly so that ``from kalshi_auth import ...`` works.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"))
-from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_logging, PROJECT_DIR
+from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log
 from probability import half_kelly_sell, longshot_edge, kalshi_fee_cents
 
 setup_unbuffered()
+log = setup_logging("trade-cycle")
 
 TRADES_JSON = PROJECT_DIR / "data" / "kalshi-strategy-trades.json"
 PERF_MD = PROJECT_DIR / "data" / "kalshi-trade-performance.md"
 
 client = KalshiClient()
+trade_manager = TradeManager(client, TRADES_JSON, {
+    "maxTradeAmount": 10,
+    "maxDailyTrades": 10,
+    "maxDailyLoss": 25,
+}, logger=log)
+trim_trade_log(TRADES_JSON)
 
 # ─── 1. Check balance ───
 now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M EST")
@@ -222,45 +229,27 @@ for m in all_longshots:
     est_true_prob = max(0.001, implied_prob - est_edge)
     edge = est_edge
 
-    order = {
-        "ticker": ticker,
-        "action": "buy",
-        "side": "no",
-        "type": "limit",
-        "count": contracts,
-        "no_price": no_ask,
-    }
+    reasoning = f"Longshot bias: YES@{yes_ask}c implies {implied_prob*100:.0f}% prob, Becker model est true prob ~{est_true_prob*100:.1f}%. Sell YES (buy NO@{no_ask}c) for ~{edge*100:.1f}% edge."
 
     try:
-        result = client.post("/portfolio/orders", body=order)
-        oi = result.get("order", {})
-        status = oi.get("status", "unknown")
-        oid = oi.get("order_id", "unknown")
-        print(f"  ✅ #{trade_count+1} SELL LONGSHOT: {ticker} — BUY {contracts}x NO@{no_ask}¢ — {title}")
-        print(f"     Order {oid}: {status} | Risk: ${contracts*no_ask/100:.2f} | Edge: {edge*100:.1f}%")
-
-        new_trades.append({
-            "timestamp": datetime.datetime.now().isoformat(),
-            "ticker": ticker,
-            "title": title,
-            "subtitle": subtitle,
-            "strategy": "longshot_sell",
-            "direction": "BUY NO (= SELL YES)",
-            "no_price": no_ask,
-            "yes_price_at_entry": yes_ask,
-            "contracts": contracts,
-            "risk_cents": contracts * no_ask,
-            "est_edge": f"{edge*100:.1f}%",
-            "reasoning": f"Longshot bias: YES@{yes_ask}¢ implies {implied_prob*100:.0f}% prob, Becker model est true prob ~{est_true_prob*100:.1f}%. Sell YES (buy NO@{no_ask}¢) for ~{edge*100:.1f}% edge.",
-            "order_id": oid,
-            "status": status,
-        })
-        existing_tickers.add(ticker)
-        trade_count += 1
-    except requests.exceptions.HTTPError as e:
-        print(f"  ❌ Failed {ticker}: {e.response.status_code} {e.response.text[:200]}")
+        result = trade_manager.place_order(ticker, "no", no_ask, contracts, reasoning,
+                                            strategy="longshot_sell", raw_edge=round(edge, 4))
+        if result:
+            print(f"  #{trade_count+1} SELL LONGSHOT: {ticker} — BUY {contracts}x NO@{no_ask}c — {title}")
+            new_trades.append({
+                "timestamp": datetime.datetime.now().isoformat(),
+                "ticker": ticker, "title": title, "subtitle": subtitle,
+                "strategy": "longshot_sell", "direction": "BUY NO (= SELL YES)",
+                "no_price": no_ask, "yes_price_at_entry": yes_ask,
+                "contracts": contracts, "risk_cents": contracts * no_ask,
+                "est_edge": f"{edge*100:.1f}%", "reasoning": reasoning,
+            })
+            existing_tickers.add(ticker)
+            trade_count += 1
+        else:
+            print(f"  TradeManager rejected {ticker} (check risk limits)")
     except Exception as e:
-        print(f"  ❌ Failed {ticker}: {e}")
+        print(f"  Failed {ticker}: {e}")
 
 # Strategy B: Near-settlement opportunities — up to 2 trades
 # Look for weather markets settling today where we can check forecast
@@ -282,70 +271,55 @@ for m in near_settlement:
         contracts = min(500 // no_ask, 5)
         if contracts < 1:
             continue
-        order = {"ticker": ticker, "action": "buy", "side": "no", "type": "limit", "count": contracts, "no_price": no_ask}
+        reasoning = f"Near settlement: YES@{yes_ask}c suggests likely NO. Buy NO@{no_ask}c for quick resolution."
         try:
-            result = client.post("/portfolio/orders", body=order)
-            oi = result.get("order", {})
-            status = oi.get("status", "unknown")
-            oid = oi.get("order_id", "unknown")
-            print(f"  ✅ #{trade_count+1} NEAR-SETTLE: {ticker} — BUY {contracts}x NO@{no_ask}¢ — {title}")
-            print(f"     Order {oid}: {status}")
-            new_trades.append({
-                "timestamp": datetime.datetime.now().isoformat(),
-                "ticker": ticker, "title": title, "subtitle": subtitle,
-                "strategy": "near_settlement",
-                "direction": "BUY NO",
-                "no_price": no_ask, "yes_price_at_entry": yes_ask,
-                "contracts": contracts, "risk_cents": contracts * no_ask,
-                "est_edge": "near-settlement lean",
-                "reasoning": f"Near settlement: YES@{yes_ask}¢ suggests likely NO. Buy NO@{no_ask}¢ for quick resolution.",
-                "order_id": oid, "status": status,
-            })
-            existing_tickers.add(ticker)
-            trade_count += 1
-        except requests.exceptions.HTTPError as e:
-            print(f"  ❌ Failed {ticker}: {e.response.status_code} {e.response.text[:200]}")
+            result = trade_manager.place_order(ticker, "no", no_ask, contracts, reasoning,
+                                                strategy="near_settlement")
+            if result:
+                print(f"  #{trade_count+1} NEAR-SETTLE: {ticker} — BUY {contracts}x NO@{no_ask}c — {title}")
+                new_trades.append({
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "ticker": ticker, "title": title, "subtitle": subtitle,
+                    "strategy": "near_settlement", "direction": "BUY NO",
+                    "no_price": no_ask, "yes_price_at_entry": yes_ask,
+                    "contracts": contracts, "risk_cents": contracts * no_ask,
+                    "est_edge": "near-settlement lean", "reasoning": reasoning,
+                })
+                existing_tickers.add(ticker)
+                trade_count += 1
         except Exception as e:
-            print(f"  ❌ Failed {ticker}: {e}")
+            print(f"  Failed {ticker}: {e}")
 
     elif yes_ask and 90 <= yes_ask <= 99 and no_ask and 1 <= no_ask <= 10:
         # Likely YES outcome — buy YES
         contracts = min(500 // yes_ask, 5)
         if contracts < 1:
             continue
-        order = {"ticker": ticker, "action": "buy", "side": "yes", "type": "limit", "count": contracts, "yes_price": yes_ask}
+        reasoning = f"Near settlement: YES@{yes_ask}c suggests likely YES. Buy YES@{yes_ask}c for quick resolution."
         try:
-            result = client.post("/portfolio/orders", body=order)
-            oi = result.get("order", {})
-            status = oi.get("status", "unknown")
-            oid = oi.get("order_id", "unknown")
-            print(f"  ✅ #{trade_count+1} NEAR-SETTLE: {ticker} — BUY {contracts}x YES@{yes_ask}¢ — {title}")
-            print(f"     Order {oid}: {status}")
-            new_trades.append({
-                "timestamp": datetime.datetime.now().isoformat(),
-                "ticker": ticker, "title": title, "subtitle": subtitle,
-                "strategy": "near_settlement",
-                "direction": "BUY YES",
-                "yes_price": yes_ask, "no_price_at_entry": no_ask,
-                "contracts": contracts, "risk_cents": contracts * yes_ask,
-                "est_edge": "near-settlement lean",
-                "reasoning": f"Near settlement: YES@{yes_ask}¢ suggests likely YES. Buy YES@{yes_ask}¢ for quick resolution.",
-                "order_id": oid, "status": status,
-            })
-            existing_tickers.add(ticker)
-            trade_count += 1
-        except requests.exceptions.HTTPError as e:
-            print(f"  ❌ Failed {ticker}: {e.response.status_code} {e.response.text[:200]}")
+            result = trade_manager.place_order(ticker, "yes", yes_ask, contracts, reasoning,
+                                                strategy="near_settlement")
+            if result:
+                print(f"  #{trade_count+1} NEAR-SETTLE: {ticker} — BUY {contracts}x YES@{yes_ask}c — {title}")
+                new_trades.append({
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "ticker": ticker, "title": title, "subtitle": subtitle,
+                    "strategy": "near_settlement", "direction": "BUY YES",
+                    "yes_price": yes_ask, "no_price_at_entry": no_ask,
+                    "contracts": contracts, "risk_cents": contracts * yes_ask,
+                    "est_edge": "near-settlement lean", "reasoning": reasoning,
+                })
+                existing_tickers.add(ticker)
+                trade_count += 1
         except Exception as e:
-            print(f"  ❌ Failed {ticker}: {e}")
+            print(f"  Failed {ticker}: {e}")
 
 print(f"\n📊 Summary: Placed {trade_count} new trades")
 
-# ─── 7. Update trades JSON ───
-all_trades = existing + new_trades
-TRADES_JSON.parent.mkdir(parents=True, exist_ok=True)
-TRADES_JSON.write_text(json.dumps(all_trades, indent=2))
-print(f"✅ Updated {TRADES_JSON} ({len(all_trades)} total trades)")
+# ─── 7. Trade log ───
+# TradeManager already writes trades to TRADES_JSON atomically.
+# No manual file write needed.
+print(f"Trades logged to {TRADES_JSON} via TradeManager")
 
 # ─── 8. Update performance markdown ───
 # Re-check balance after trades
@@ -376,7 +350,7 @@ perf_entry += "|---|--------|-----------|-------|-----|------|------|--------|--
 for i, t in enumerate(new_trades):
     direction = t.get("direction", "?")
     price = t.get("no_price", t.get("yes_price", "?"))
-    perf_entry += f"| {i+1} | `{t['ticker']}` | {direction} | {price}¢ | {t['contracts']} | {t['est_edge']} | ${t['risk_cents']/100:.2f} | {t['status']} | {t['reasoning'][:60]}... |\n"
+    perf_entry += f"| {i+1} | `{t['ticker']}` | {direction} | {price}c | {t['contracts']} | {t['est_edge']} | ${t['risk_cents']/100:.2f} | placed | {t['reasoning'][:60]}... |\n"
 
 if not new_trades:
     perf_entry += "| — | No new trades placed | — | — | — | — | — | — | — |\n"

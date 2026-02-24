@@ -6,7 +6,7 @@ Authenticates, lists markets, places test trades, verifies positions.
 import json, time, datetime, os, sys, uuid
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log
 
 setup_unbuffered()
 setup_signal_handlers()
@@ -15,8 +15,15 @@ log = setup_logging("demo-trader")
 # === Config ===
 DATA_DIR = PROJECT_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+TRADES_PATH = DATA_DIR / "demo-trades.json"
 
 client = KalshiClient()
+trade_manager = TradeManager(client, TRADES_PATH, {
+    "maxTradeAmount": 5,
+    "maxDailyTrades": 10,
+    "maxDailyLoss": 10,
+}, logger=log)
+trim_trade_log(TRADES_PATH)
 
 # === Market Discovery ===
 def get_all_markets(limit=200):
@@ -117,24 +124,15 @@ def find_tradeable_markets(markets, max_results=10):
 
 # === Trading ===
 def place_trade(ticker, side="yes", action="buy", count=1, price=None):
-    """Place a limit order."""
-    body = {
-        "ticker": ticker,
-        "action": action,
-        "side": side,
-        "type": "limit",
-        "count": count,
-    }
-    if side == "yes" and price:
-        body["yes_price"] = price
-    elif side == "no" and price:
-        body["no_price"] = price
-
+    """Place a limit order via TradeManager (logged + risk-checked)."""
+    reasoning = f"Demo trade: {action} {count}x {side} @ {price}c on {ticker}"
     log.info("Placing order: %s %dx %s @ %sc on %s", action, count, side, price, ticker)
-    result = client.post("/portfolio/orders", body=body)
-    order = result.get("order", {})
-    log.info("Order ID: %s, Status: %s", order.get('order_id', '?'), order.get('status', '?'))
-    return result
+    result = trade_manager.place_order(ticker, side, price, count, reasoning)
+    if result:
+        log.info("Order placed successfully via TradeManager")
+    else:
+        log.warning("TradeManager rejected order (check risk limits)")
+    return result or {}
 
 def get_positions():
     """Get current positions."""
