@@ -267,49 +267,54 @@ def ensemble_weather_probability(forecasts, threshold, direction, days_out=0, ci
     return weighted_prob / total_weight
 
 
+def nws_sigma_for_hour(hour_of_day):
+    """NWS temperature uncertainty (sigma in degrees F) for a given hour.
+
+    Continuous exponential decay model:
+      sigma = max(0.5, 4.0 * exp(-0.18 * (hour - 6)))
+
+    Falls back to legacy step-function if calibration.json has nws.sigma_by_hour.
+
+    Exported for use in source-monitor CI-based edge gating.
+    """
+    cal = _load_calibration()
+    nws_section = cal.get("nws", {})
+    nws_cal = nws_section.get("sigma_by_hour", {})
+
+    if nws_cal:
+        # Legacy step-function: use calibrated values
+        if hour_of_day < 6:
+            return max(0.5, nws_cal.get("overnight", 5.0))
+        elif hour_of_day >= 17:
+            return max(0.5, nws_cal.get("17+", 0.5))
+        elif hour_of_day >= 15:
+            return max(0.5, nws_cal.get("15-16", 1.5))
+        else:
+            return max(0.5, nws_cal.get("before_15", 3.0))
+    else:
+        # Continuous model: exponential decay from morning uncertainty
+        if hour_of_day < 6:
+            return max(0.5, 5.0)
+        else:
+            return max(0.5, 4.0 * math.exp(-0.18 * (hour_of_day - 6)))
+
+
 def nws_probability(running_high, threshold, direction, hour_of_day):
     """Probability for NWS actual-temp arbitrage (source-monitor).
 
-    Uses a continuous exponential decay model for residual uncertainty:
-      sigma = max(0.5, 4.0 * exp(-0.18 * (hour - 6)))
-
-    This gives smooth transitions instead of discontinuous steps:
-      hour  6: sigma ~4.0F (morning, full uncertainty)
-      hour 12: sigma ~1.4F (midday)
-      hour 15: sigma ~0.7F (afternoon, mostly locked)
-      hour 17: sigma ~0.4F (evening, essentially final)
-      hour 20: sigma ~0.5F (floor)
-
-    If config/calibration.json has nws sigma_by_hour overrides, falls back
-    to the legacy 3-step model for backwards compatibility.
+    Uses nws_sigma_for_hour() for residual uncertainty estimation.
+    Student-t CDF (df from calibration, default 6) for fat-tail modeling.
 
     direction="T": P(final_high > threshold)
     direction="B": P(threshold <= final_high < threshold+1)
     """
     cal = _load_calibration()
-    nws_section = cal.get("nws", {})
-    nws_cal = nws_section.get("sigma_by_hour", {})
-    nws_df = nws_section.get("df", 6)
+    nws_df = cal.get("nws", {}).get("df", 6)
     if not isinstance(nws_df, (int, float)) or nws_df < 2:
         _log.warning("Invalid nws_df=%s in calibration, using default df=6", nws_df)
         nws_df = 6
 
-    if nws_cal:
-        # Legacy step-function: use calibrated values (with overnight bucket)
-        if hour_of_day < 6:
-            sigma = max(0.5, nws_cal.get("overnight", 5.0))
-        elif hour_of_day >= 17:
-            sigma = max(0.5, nws_cal.get("17+", 0.5))
-        elif hour_of_day >= 15:
-            sigma = max(0.5, nws_cal.get("15-16", 1.5))
-        else:
-            sigma = max(0.5, nws_cal.get("before_15", 3.0))
-    else:
-        # Continuous model: exponential decay from morning uncertainty
-        if hour_of_day < 6:
-            sigma = max(0.5, nws_cal.get("overnight", 5.0) if nws_cal else 5.0)
-        else:
-            sigma = max(0.5, 4.0 * math.exp(-0.18 * (hour_of_day - 6)))
+    sigma = nws_sigma_for_hour(hour_of_day)
 
     if direction == "T":
         z = (threshold - running_high) / sigma
