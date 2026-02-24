@@ -182,6 +182,9 @@ def weather_probability(forecast_temp, threshold, direction, days_out=0, city=No
 
     # Degrees of freedom for Student's t (fat tails for forecast errors)
     df = weather_cal.get("df", 6)
+    if not isinstance(df, (int, float)) or df < 2:
+        _log.warning("Invalid df=%s in calibration, using default df=6", df)
+        df = 6
 
     if direction == "T":
         # P(actual > threshold)
@@ -257,8 +260,9 @@ def ensemble_weather_probability(forecasts, threshold, direction, days_out=0, ci
         total_weight += w
 
     if total_weight <= 0:
-        # No valid models — can't produce a probability
-        return 0.5
+        # No valid models — return None so callers can fall back to single-model
+        _log.error("ensemble_weather_probability: zero total weight for models %s", list(forecasts.keys()))
+        return None
 
     return weighted_prob / total_weight
 
@@ -286,10 +290,15 @@ def nws_probability(running_high, threshold, direction, hour_of_day):
     nws_section = cal.get("nws", {})
     nws_cal = nws_section.get("sigma_by_hour", {})
     nws_df = nws_section.get("df", 6)
+    if not isinstance(nws_df, (int, float)) or nws_df < 2:
+        _log.warning("Invalid nws_df=%s in calibration, using default df=6", nws_df)
+        nws_df = 6
 
     if nws_cal:
-        # Legacy step-function: use calibrated values
-        if hour_of_day >= 17:
+        # Legacy step-function: use calibrated values (with overnight bucket)
+        if hour_of_day < 6:
+            sigma = max(0.5, nws_cal.get("overnight", 5.0))
+        elif hour_of_day >= 17:
             sigma = max(0.5, nws_cal.get("17+", 0.5))
         elif hour_of_day >= 15:
             sigma = max(0.5, nws_cal.get("15-16", 1.5))
@@ -298,7 +307,7 @@ def nws_probability(running_high, threshold, direction, hour_of_day):
     else:
         # Continuous model: exponential decay from morning uncertainty
         if hour_of_day < 6:
-            sigma = 5.0  # overnight, no heating yet
+            sigma = max(0.5, nws_cal.get("overnight", 5.0) if nws_cal else 5.0)
         else:
             sigma = max(0.5, 4.0 * math.exp(-0.18 * (hour_of_day - 6)))
 
@@ -328,10 +337,12 @@ def info_arb_probability(observed, threshold, data_sigma_pct=0.05):
     return _norm_cdf(z)
 
 
-def album_data_sigma(day_of_week):
-    """Day-dependent uncertainty for album sales data.
+def album_data_sigma(day_of_week, hours_since_publication=0):
+    """Day-dependent + time-decay uncertainty for album sales data.
 
     day_of_week: 0=Monday ... 6=Sunday
+    hours_since_publication: hours since data was published (0=fresh).
+        Increases sigma by 50% per 48 hours of staleness, capped at 3x.
 
     Mon/Tue (early projections): sigma = 15% of threshold
     Wed/Thu (mid-week updates):  sigma = 10%
@@ -343,11 +354,18 @@ def album_data_sigma(day_of_week):
     album_cal = cal.get("album_sales", {}).get("sigma_by_day", {})
 
     if day_of_week <= 1:  # Mon, Tue
-        return album_cal.get("mon_tue", 0.15)
+        base_sigma = album_cal.get("mon_tue", 0.15)
     elif day_of_week <= 3:  # Wed, Thu
-        return album_cal.get("wed_thu", 0.10)
+        base_sigma = album_cal.get("wed_thu", 0.10)
     else:  # Fri, Sat, Sun
-        return album_cal.get("fri_sun", 0.05)
+        base_sigma = album_cal.get("fri_sun", 0.05)
+
+    # Time decay: data uncertainty grows 50% per 48 hours of staleness
+    if hours_since_publication > 0:
+        decay_factor = 1.0 + 0.5 * (hours_since_publication / 48.0)
+        base_sigma *= min(decay_factor, 3.0)  # cap at 3x
+
+    return base_sigma
 
 
 def econ_nowcast_probability(nowcast_value, nowcast_sigma, threshold, direction="above"):
@@ -393,16 +411,28 @@ def cpi_nowcast_sigma(days_to_release):
         if key in cpi_cal:
             return cpi_cal[key]
 
-    # Fallback heuristic: sigma decreases as release approaches
+    # Fallback heuristic: step function matching documented behavior
+    # ~0.10% at 14d, ~0.06% at 7d, ~0.04% at 3d, 0.03% at 1d/release
     if days_to_release <= 0:
         return 0.03
-    return max(0.03, 0.10 * math.exp(-0.12 * (14 - min(14, days_to_release))))
+    elif days_to_release <= 1:
+        return 0.03
+    elif days_to_release <= 3:
+        return 0.04
+    elif days_to_release <= 7:
+        return 0.06
+    elif days_to_release <= 14:
+        return 0.10
+    else:
+        return 0.10
 
 
-def boxoffice_data_sigma(day_of_week):
-    """Day-dependent uncertainty for box office data.
+def boxoffice_data_sigma(day_of_week, hours_since_publication=0):
+    """Day-dependent + time-decay uncertainty for box office data.
 
     day_of_week: 0=Monday ... 6=Sunday
+    hours_since_publication: hours since data was published (0=fresh).
+        Increases sigma by 50% per 48 hours of staleness, capped at 3x.
 
     Fri/Sat (estimates): sigma = 12%
     Sun (Sunday actuals): sigma = 5%
@@ -414,30 +444,40 @@ def boxoffice_data_sigma(day_of_week):
     box_cal = cal.get("box_office", {}).get("sigma_by_day", {})
 
     if day_of_week in (4, 5):  # Fri, Sat
-        return box_cal.get("fri_sat", 0.12)
+        base_sigma = box_cal.get("fri_sat", 0.12)
     elif day_of_week == 6:  # Sun
-        return box_cal.get("sun", 0.05)
+        base_sigma = box_cal.get("sun", 0.05)
     else:  # Mon-Thu
-        return box_cal.get("mon_thu", 0.04)
+        base_sigma = box_cal.get("mon_thu", 0.04)
+
+    # Time decay: data uncertainty grows 50% per 48 hours of staleness
+    if hours_since_publication > 0:
+        decay_factor = 1.0 + 0.5 * (hours_since_publication / 48.0)
+        base_sigma *= min(decay_factor, 3.0)  # cap at 3x
+
+    return base_sigma
 
 
 # ─── Gas price probability model ───
 
-def gas_price_probability(current_price, threshold, direction="above", weekly_sigma_pct=0.02):
+def gas_price_probability(current_price, threshold, direction="above",
+                          weekly_sigma_pct=0.015, days_to_settle=7):
     """CDF probability for gas price markets.
 
-    Uses current national avg price and historical weekly volatility (~2%).
+    Uses current national avg price and historical weekly volatility (~1.5%).
+    Sigma scales with sqrt(time) for different settlement horizons.
 
     Args:
         current_price: current AAA national average (dollars).
         threshold: market threshold (dollars).
         direction: "above" or "below".
-        weekly_sigma_pct: weekly price std dev as fraction (default 2%).
+        weekly_sigma_pct: weekly price std dev as fraction (default 1.5%).
+        days_to_settle: days until market settlement (default 7).
 
     Returns:
         Probability (0-1).
     """
-    sigma = current_price * weekly_sigma_pct
+    sigma = current_price * weekly_sigma_pct * math.sqrt(max(1, days_to_settle) / 7.0)
     if sigma <= 0:
         return 1.0 if current_price > threshold else 0.0
     z = (threshold - current_price) / sigma
