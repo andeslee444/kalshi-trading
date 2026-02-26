@@ -28,15 +28,13 @@ _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src" / "kalshi")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from kalshi_auth import KalshiClient, load_trades, _atomic_write_json, setup_logging, PROJECT_DIR
+from kalshi_auth import KalshiClient, load_trades, _atomic_write_json, setup_logging
+from trade_files import ALL_TRADE_PATHS
 
 log = setup_logging("backfill")
 
-# All trade log files
-TRADE_FILES = [PROJECT_DIR / "data" / "kalshi-trades.json"] + \
-    list((PROJECT_DIR / "data").glob("kalshi-*-trades.json")) + [
-    PROJECT_DIR / "data" / "beatrelease-trades.json",
-]
+# Use canonical trade file list from trade_files module
+TRADE_FILES = ALL_TRADE_PATHS
 
 
 def _query_market(client, ticker):

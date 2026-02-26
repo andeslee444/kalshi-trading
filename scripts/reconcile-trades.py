@@ -23,21 +23,13 @@ _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src" / "kalshi")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from kalshi_auth import KalshiClient, load_trades, _atomic_write_json, setup_logging, PROJECT_DIR
+from kalshi_auth import KalshiClient, load_trades, _atomic_write_json, setup_logging
+from trade_files import ALL_TRADE_PATHS
 
 log = setup_logging("reconcile")
 
-# All trade log files produced by bots
-TRADE_FILES = [
-    PROJECT_DIR / "data" / "kalshi-trades.json",
-    PROJECT_DIR / "data" / "kalshi-strategy-trades.json",
-    PROJECT_DIR / "data" / "kalshi-entertainment-trades.json",
-    PROJECT_DIR / "data" / "kalshi-monitor-trades.json",
-    PROJECT_DIR / "data" / "kalshi-economics-trades.json",
-    PROJECT_DIR / "data" / "kalshi-crypto-trades.json",
-    PROJECT_DIR / "data" / "kalshi-position-trades.json",
-    PROJECT_DIR / "data" / "beatrelease-trades.json",
-]
+# Use canonical trade file list from trade_files module
+TRADE_FILES = ALL_TRADE_PATHS
 
 
 def _fetch_all_settlements(client):
