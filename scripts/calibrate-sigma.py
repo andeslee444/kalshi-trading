@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """Calibrate sigma parameters for probability models using historical trade settlements.
 
-Reads trade logs from all bots, matches them against Kalshi settlement data,
-and grid-searches for optimal sigma values that minimize Brier score.
+Reads trade logs from all bots (via canonical TRADE_FILES module), matches them
+against Kalshi settlement data, and grid-searches for optimal sigma values that
+minimize Brier score (primary) with realized P&L as tiebreaker.
 
 Usage:
     python3 scripts/calibrate-sigma.py              # Display calibration report
     python3 scripts/calibrate-sigma.py --save       # Save to config/calibration.json
     python3 scripts/calibrate-sigma.py --json       # JSON output
     python3 scripts/calibrate-sigma.py --no-api     # Local-only (skip settlement fetch)
+    python3 scripts/calibrate-sigma.py --dry-run    # Report data availability without modifying anything
 """
 
 import argparse
 import json
 import math
 import re
+import shutil
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -24,21 +27,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"))
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
-from probability import _norm_cdf, _student_t_cdf
-
-
-# ─── Trade file definitions (mirrors analyze-performance.py) ───
-TRADE_FILES = [
-    {"label": "Weather Bot", "path": PROJECT_DIR / "data" / "kalshi-trades.json"},
-    {"label": "Strategy Trader", "path": PROJECT_DIR / "data" / "kalshi-strategy-trades.json"},
-    {"label": "Entertainment Bot", "path": PROJECT_DIR / "data" / "kalshi-entertainment-trades.json"},
-    {"label": "BeatRelease Scanner", "path": PROJECT_DIR / "data" / "beatrelease-trades.json"},
-    {"label": "Source Monitor", "path": PROJECT_DIR / "data" / "kalshi-monitor-trades.json"},
-    {"label": "Economics Bot", "path": PROJECT_DIR / "data" / "kalshi-economics-trades.json"},
-    {"label": "Crypto Bot", "path": PROJECT_DIR / "data" / "kalshi-crypto-trades.json"},
-]
+from probability import _norm_cdf, _student_t_cdf, half_kelly
+from trade_files import TRADE_FILES, ALL_TRADE_PATHS
 
 CALIBRATION_PATH = PROJECT_DIR / "config" / "calibration.json"
+CALIBRATION_BACKUP_PATH = PROJECT_DIR / "config" / "calibration-backup.json"
+
+# Minimum sample sizes for reliable calibration
+MIN_TRADES_PER_CITY = 10
+MIN_TRADES_GLOBAL = 30
 
 MONTHS = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
           "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
@@ -127,6 +124,60 @@ def log_loss(predictions, eps=1e-7):
                 for p, a in predictions) / len(predictions)
 
 
+def simulated_pnl(matched_trades, intercept, slope, df):
+    """Compute simulated P&L for a set of matched trades given sigma parameters.
+
+    For each trade, recompute what half_kelly sizing would have been with the
+    candidate sigma, then compute profit/loss based on settlement outcome.
+
+    Returns total P&L in cents.
+    """
+    total_pnl = 0
+    for m in matched_trades:
+        sigma = intercept + slope * math.sqrt(m["days_out"])
+        sigma = max(0.5, sigma)
+        prob = weather_prob_with_sigma(m["forecast_temp"], m["threshold"],
+                                       m["direction"], sigma, df=df)
+
+        # Use the trade's original price to compute edge and sizing
+        price_cents = m.get("price_cents")
+        if price_cents is None or price_cents <= 0 or price_cents >= 100:
+            continue
+
+        implied_prob = price_cents / 100.0
+
+        # Determine side from trade
+        side = m.get("side", "yes")
+        if side == "yes":
+            edge = prob - implied_prob
+        else:
+            edge = (1.0 - prob) - (1.0 - implied_prob)
+
+        if edge <= 0:
+            continue
+
+        # half_kelly returns (contracts, risk_cents)
+        contracts, risk_cents = half_kelly(edge, price_cents, max_cost_cents=500,
+                                           bankroll_cents=50000)
+        if contracts <= 0:
+            continue
+
+        # Compute P&L: if outcome matches our side, we win (100-price)*contracts
+        # otherwise we lose price*contracts
+        if side == "yes":
+            if m["actual"] == 1:
+                total_pnl += (100 - price_cents) * contracts
+            else:
+                total_pnl -= price_cents * contracts
+        else:
+            if m["actual"] == 0:
+                total_pnl += price_cents * contracts
+            else:
+                total_pnl -= (100 - price_cents) * contracts
+
+    return total_pnl
+
+
 def days_out_bucket(days):
     """Bucket days_out into groups for calibration."""
     if days <= 1:
@@ -137,10 +188,64 @@ def days_out_bucket(days):
         return "4+"
 
 
+def _backup_calibration():
+    """Create a backup of calibration.json before overwriting."""
+    if CALIBRATION_PATH.exists():
+        shutil.copy2(CALIBRATION_PATH, CALIBRATION_BACKUP_PATH)
+        print(f"Backup saved to {CALIBRATION_BACKUP_PATH}")
+
+
+def _print_diff(old_cal, new_cal):
+    """Print a diff summary comparing old vs new calibration parameters."""
+    print("\n--- Parameter Changes ---")
+
+    # Weather global
+    old_w = old_cal.get("weather", {})
+    new_w = new_cal.get("weather", {})
+    if new_w.get("n", 0) > 0:
+        old_intercept = old_w.get("global_sigma_intercept", "N/A")
+        new_intercept = new_w.get("global_sigma_intercept", "N/A")
+        old_slope = old_w.get("global_sigma_slope", "N/A")
+        new_slope = new_w.get("global_sigma_slope", "N/A")
+        print(f"  Weather global intercept: {old_intercept} -> {new_intercept}")
+        print(f"  Weather global slope:     {old_slope} -> {new_slope}")
+
+        # Per-city changes
+        old_cities = old_w.get("per_city", {})
+        new_cities = new_w.get("per_city", {})
+        all_cities = sorted(set(list(old_cities.keys()) + list(new_cities.keys())))
+        for city in all_cities:
+            old_c = old_cities.get(city, {})
+            new_c = new_cities.get(city, {})
+            old_si = old_c.get("sigma_intercept", "N/A")
+            new_si = new_c.get("sigma_intercept", "N/A")
+            old_ss = old_c.get("sigma_slope", "N/A")
+            new_ss = new_c.get("sigma_slope", "N/A")
+            if old_si != new_si or old_ss != new_ss:
+                print(f"  {city}: intercept {old_si}->{new_si}, slope {old_ss}->{new_ss}")
+
+    # NWS
+    old_nws = old_cal.get("nws", {}).get("sigma_by_hour", {})
+    new_nws = new_cal.get("nws", {}).get("sigma_by_hour", {})
+    if new_nws:
+        for bucket in sorted(set(list(old_nws.keys()) + list(new_nws.keys()))):
+            old_v = old_nws.get(bucket, "N/A")
+            new_v = new_nws.get(bucket, "N/A")
+            if old_v != new_v:
+                print(f"  NWS {bucket}: {old_v} -> {new_v}")
+
+    if not new_w.get("n", 0) and not new_nws:
+        print("  No parameter changes (no matched trades).")
+
+
 # ─── Calibration logic ───
 
 def calibrate_weather(trades, settlement_map):
     """Calibrate weather sigma from matched trades.
+
+    Uses multi-objective optimization:
+    - Primary: minimize Brier score
+    - Tiebreaker: maximize realized P&L (within 0.001 Brier tolerance)
 
     Returns dict with global and per-city sigma parameters.
     """
@@ -179,6 +284,14 @@ def calibrate_weather(trades, settlement_map):
         except (ValueError, TypeError):
             days = 0
 
+        # Extract price for P&L tiebreaker computation
+        price_cents = t.get("price_cents") or t.get("price")
+        if price_cents is not None:
+            try:
+                price_cents = int(price_cents)
+            except (TypeError, ValueError):
+                price_cents = None
+
         matched.append({
             "forecast_temp": forecast_temp,
             "threshold": parsed["threshold"],
@@ -186,19 +299,35 @@ def calibrate_weather(trades, settlement_map):
             "days_out": days,
             "city": parsed["city"],
             "actual": actual,
+            "side": side,
+            "price_cents": price_cents,
         })
 
     if not matched:
         return {"n": 0}
 
-    if len(matched) < 30:
-        print(f"Warning: Only {len(matched)} matched trades — calibration results may be unreliable", file=sys.stderr)
+    if len(matched) < MIN_TRADES_GLOBAL:
+        print(f"Warning: Only {len(matched)} matched trades (minimum {MIN_TRADES_GLOBAL} recommended) "
+              f"-- calibration results may be unreliable", file=sys.stderr)
 
-    # Global grid search: find (intercept, slope, df) minimizing log loss
+    # Log per-city trade counts
+    city_counts = defaultdict(int)
+    for m in matched:
+        city_counts[m["city"]] += 1
+    for city, count in sorted(city_counts.items()):
+        if count < MIN_TRADES_PER_CITY:
+            print(f"Warning: {city} has only {count} trades (minimum {MIN_TRADES_PER_CITY} for per-city calibration)",
+                  file=sys.stderr)
+
+    # Global grid search: find (intercept, slope, df) minimizing Brier score
+    # with P&L as tiebreaker when Brier scores are within tolerance
+    BRIER_TOLERANCE = 0.001
     best_brier = float("inf")
+    best_pnl = float("-inf")
     best_intercept = 2.5
     best_slope = 0.5
     best_df = 6
+    best_log_loss_val = None
     df_candidates = [4, 5, 6, 7, 8, 10, 15, 30]
 
     for intercept_x10 in range(5, 60):  # 0.5 to 5.9
@@ -211,12 +340,38 @@ def calibrate_weather(trades, settlement_map):
                     sigma = intercept + slope * math.sqrt(m["days_out"])
                     prob = weather_prob_with_sigma(m["forecast_temp"], m["threshold"], m["direction"], sigma, df=df)
                     preds.append((prob, m["actual"]))
-                bs = log_loss(preds)
-                if bs is not None and bs < best_brier:
+                bs = brier_score(preds)
+                if bs is None:
+                    continue
+
+                # Multi-objective: Brier primary, P&L tiebreaker
+                if bs < best_brier - BRIER_TOLERANCE:
+                    # Clearly better Brier -- use this
                     best_brier = bs
                     best_intercept = intercept
                     best_slope = slope
                     best_df = df
+                    best_pnl = simulated_pnl(matched, intercept, slope, df)
+                    best_log_loss_val = log_loss(preds)
+                elif abs(bs - best_brier) <= BRIER_TOLERANCE:
+                    # Brier within tolerance -- use P&L as tiebreaker
+                    pnl = simulated_pnl(matched, intercept, slope, df)
+                    if pnl > best_pnl:
+                        best_brier = bs
+                        best_pnl = pnl
+                        best_intercept = intercept
+                        best_slope = slope
+                        best_df = df
+                        best_log_loss_val = log_loss(preds)
+
+    # Compute final Brier and log_loss for reporting
+    final_preds = []
+    for m in matched:
+        sigma = best_intercept + best_slope * math.sqrt(m["days_out"])
+        prob = weather_prob_with_sigma(m["forecast_temp"], m["threshold"], m["direction"], sigma, df=best_df)
+        final_preds.append((prob, m["actual"]))
+    final_brier = brier_score(final_preds)
+    final_log_loss = log_loss(final_preds)
 
     # Per-city calibration with Bayesian shrinkage toward global
     SHRINKAGE_K = 15  # shrinkage prior strength
@@ -226,9 +381,10 @@ def calibrate_weather(trades, settlement_map):
 
     per_city = {}
     for city, city_trades in by_city.items():
-        if len(city_trades) < 5:
+        if len(city_trades) < MIN_TRADES_PER_CITY:
             continue
         city_best_brier = float("inf")
+        city_best_pnl = float("-inf")
         city_intercept = best_intercept
         city_slope = best_slope
         city_df = best_df
@@ -253,12 +409,24 @@ def calibrate_weather(trades, settlement_map):
                         sigma = intercept + slope * math.sqrt(m["days_out"])
                         prob = weather_prob_with_sigma(m["forecast_temp"], m["threshold"], m["direction"], sigma, df=df)
                         preds.append((prob, m["actual"]))
-                    bs = log_loss(preds)
-                    if bs is not None and bs < city_best_brier:
+                    bs = brier_score(preds)
+                    if bs is None:
+                        continue
+
+                    if bs < city_best_brier - BRIER_TOLERANCE:
                         city_best_brier = bs
                         city_intercept = intercept
                         city_slope = slope
                         city_df = df
+                        city_best_pnl = simulated_pnl(city_trades, intercept, slope, df)
+                    elif abs(bs - city_best_brier) <= BRIER_TOLERANCE:
+                        pnl = simulated_pnl(city_trades, intercept, slope, df)
+                        if pnl > city_best_pnl:
+                            city_best_brier = bs
+                            city_best_pnl = pnl
+                            city_intercept = intercept
+                            city_slope = slope
+                            city_df = df
 
         # Bayesian shrinkage: blend city-specific toward global
         city_weight = len(city_trades) / (len(city_trades) + SHRINKAGE_K)
@@ -277,7 +445,9 @@ def calibrate_weather(trades, settlement_map):
         "global_sigma_intercept": best_intercept,
         "global_sigma_slope": best_slope,
         "df": best_df,
-        "global_brier": round(best_brier, 6) if best_brier < float("inf") else None,
+        "global_brier": round(final_brier, 6) if final_brier is not None else None,
+        "global_log_loss": round(final_log_loss, 6) if final_log_loss is not None else None,
+        "global_pnl_cents": best_pnl if best_pnl > float("-inf") else None,
         "per_city": per_city,
         "n": len(matched),
     }
@@ -357,7 +527,7 @@ def calibrate_nws(trades, settlement_map):
                     z_hi = (m["threshold"] + 1 - m["running_high"]) / sigma
                     prob = _student_t_cdf(z_hi, 6) - _student_t_cdf(z_lo, 6)
                 preds.append((prob, m["actual"]))
-            bs = log_loss(preds)
+            bs = brier_score(preds)
             if bs is not None and bs < best_bs:
                 best_bs = bs
                 best_sigma = sigma
@@ -371,7 +541,7 @@ def calibrate_info_arb(trades, settlement_map, label):
 
     Uses source_type field from source-monitor trades to filter correctly,
     prefers model_prob over confidence, and performs proper grid search
-    with log_loss objective and Bayesian shrinkage.
+    with Brier score objective and Bayesian shrinkage.
     """
     matched = []
     for t in trades:
@@ -445,10 +615,10 @@ def calibrate_info_arb(trades, settlement_map, label):
 
     sigma_by_day = {}
     for bucket, items in day_buckets.items():
-        if len(items) < 10:  # Increased from 3 to 10 for reliability
+        if len(items) < 10:  # Minimum 10 for reliability
             continue
 
-        # Grid search for optimal sigma
+        # Grid search for optimal sigma using Brier score
         default_sigma = default_sigmas[bucket]
         best_sigma = default_sigma
         best_loss = float("inf")
@@ -458,11 +628,11 @@ def calibrate_info_arb(trades, settlement_map, label):
             preds = []
             for m in items:
                 # Platt-style recalibration: test how sharpening/softening
-                # the model's probability outputs affects log loss
+                # the model's probability outputs affects calibration
                 z = (m["predicted"] - 0.5) / sigma if sigma > 0 else 0
                 prob = 0.5 * (1 + math.erf(z / math.sqrt(2)))
                 preds.append((prob, m["actual"]))
-            loss = log_loss(preds)
+            loss = brier_score(preds)
             if loss is not None and loss < best_loss:
                 best_loss = loss
                 best_sigma = sigma
@@ -584,15 +754,45 @@ def main():
     parser.add_argument("--save", action="store_true", help="Save calibration to config/calibration.json")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--no-api", action="store_true", help="Skip Kalshi API calls (local data only)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Report data availability without modifying anything")
     args = parser.parse_args()
 
-    # Load all trade logs
+    # Load all trade logs from canonical TRADE_FILES
+    DATA_DIR = PROJECT_DIR / "data"
     all_trades = {}
     for tf in TRADE_FILES:
-        trades = load_trades_safe(tf["path"])
+        filepath = DATA_DIR / tf["filename"]
+        trades = load_trades_safe(filepath)
         all_trades[tf["label"]] = trades
 
     total_trades = sum(len(t) for t in all_trades.values())
+
+    # Count trades with settlement_result annotations
+    n_with_settlement = 0
+    for trades in all_trades.values():
+        for t in trades:
+            if t.get("settlement_result") is not None:
+                n_with_settlement += 1
+
+    if args.dry_run:
+        print("=" * 60)
+        print("CALIBRATION DRY RUN")
+        print("=" * 60)
+        print(f"\nTrade files read (canonical TRADE_FILES, {len(TRADE_FILES)} files):")
+        for tf in TRADE_FILES:
+            filepath = DATA_DIR / tf["filename"]
+            count = len(all_trades.get(tf["label"], []))
+            exists = filepath.exists()
+            print(f"  {tf['label']:25s} {count:4d} trades  {'(found)' if exists else '(missing)'}")
+        print(f"\nTotal trades loaded: {total_trades}")
+        print(f"Trades with settlement_result: {n_with_settlement}")
+        if n_with_settlement == 0:
+            print("\nNo reconciled trades found. Run 'npm run reconcile' first to annotate")
+            print("trade logs with settlement outcomes, then re-run calibration.")
+        else:
+            print(f"\n{n_with_settlement} trades have settlement data -- ready for calibration.")
+        return
 
     # Fetch settlements
     settlement_map = {}  # ticker -> revenue
@@ -615,6 +815,16 @@ def main():
         except Exception as e:
             print(f"Warning: Could not fetch settlements: {e}", file=sys.stderr)
             print("Run with --no-api to skip API calls.", file=sys.stderr)
+
+    # Check if we have any data to work with
+    if not settlement_map and n_with_settlement == 0:
+        print("0 settled trades found. No settlement data available.", file=sys.stderr)
+        print("Run 'npm run reconcile' first to annotate trade logs with settlement outcomes.",
+              file=sys.stderr)
+        if args.save:
+            print("Skipping save -- will not overwrite calibration.json with empty data.",
+                  file=sys.stderr)
+        return
 
     # Run calibrations
     weather_trades = all_trades.get("Weather Bot", [])
@@ -646,14 +856,40 @@ def main():
         "ensemble": ensemble_cal,
     }
 
+    # Check if calibration produced any non-zero results
+    has_data = any([
+        weather_cal.get("n", 0) > 0,
+        nws_cal.get("n", 0) > 0,
+        album_cal.get("n", 0) > 0,
+        box_cal.get("n", 0) > 0,
+        ensemble_cal.get("n", 0) > 0,
+    ])
+
     if args.save:
-        CALIBRATION_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CALIBRATION_PATH.write_text(json.dumps(calibration, indent=2) + "\n")
+        if not has_data:
+            print("Warning: No categories have matched trades. Skipping save to avoid "
+                  "overwriting calibration.json with empty data.", file=sys.stderr)
+        else:
+            # Backup existing calibration before overwriting
+            old_cal = {}
+            if CALIBRATION_PATH.exists():
+                try:
+                    old_cal = json.loads(CALIBRATION_PATH.read_text())
+                except (json.JSONDecodeError, OSError):
+                    old_cal = {}
+                _backup_calibration()
+
+            CALIBRATION_PATH.parent.mkdir(parents=True, exist_ok=True)
+            CALIBRATION_PATH.write_text(json.dumps(calibration, indent=2) + "\n")
+
+            # Print diff summary
+            if old_cal:
+                _print_diff(old_cal, calibration)
 
     if args.json:
         print(json.dumps(calibration, indent=2))
     else:
-        _print_report(calibration, args.save)
+        _print_report(calibration, args.save and has_data)
 
 
 def _print_report(cal, saved):
@@ -672,6 +908,11 @@ def _print_report(cal, saved):
         print(f"  Global: sigma = {w['global_sigma_intercept']:.1f} + {w['global_sigma_slope']:.1f} * sqrt(days_out)")
         if w.get("global_brier") is not None:
             print(f"  Brier score: {w['global_brier']:.4f}")
+        if w.get("global_log_loss") is not None:
+            print(f"  Log loss:    {w['global_log_loss']:.4f}")
+        if w.get("global_pnl_cents") is not None:
+            pnl_dollars = w["global_pnl_cents"] / 100.0
+            print(f"  Simulated P&L: ${pnl_dollars:+.2f}")
         for city, cc in w.get("per_city", {}).items():
             print(f"  {city}: sigma = {cc['sigma_intercept']:.1f} + {cc['sigma_slope']:.1f} * sqrt(days_out) (n={cc['n']})")
     else:
