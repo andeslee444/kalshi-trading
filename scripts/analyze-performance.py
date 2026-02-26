@@ -6,6 +6,7 @@ Usage:
     python3 scripts/analyze-performance.py --json     # Machine-readable JSON output
     python3 scripts/analyze-performance.py --reconcile        # Include win rate & P&L from Kalshi API
     python3 scripts/analyze-performance.py --reconcile --json # Reconciliation as JSON
+    python3 scripts/analyze-performance.py --save             # Save metrics to data/performance-metrics.json
 """
 
 import argparse
@@ -13,6 +14,7 @@ import json
 import math
 import sys
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ─── Shared project root ───
@@ -25,48 +27,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 # ─── Trade file definitions ───
-# Each entry: (label, relative path from PROJECT_DIR, field mapping notes)
+# Import from canonical trade_files module (shared across all scripts)
+from trade_files import TRADE_FILES as _CANONICAL_TRADE_FILES
+
+DATA_DIR = PROJECT_DIR / "data"
 TRADE_FILES = [
-    {
-        "label": "Weather Bot",
-        "path": PROJECT_DIR / "data" / "kalshi-trades.json",
-    },
-    {
-        "label": "Strategy Trader",
-        "path": PROJECT_DIR / "data" / "kalshi-strategy-trades.json",
-    },
-    {
-        "label": "Entertainment Bot",
-        "path": PROJECT_DIR / "data" / "kalshi-entertainment-trades.json",
-    },
-    {
-        "label": "BeatRelease Scanner",
-        "path": PROJECT_DIR / "data" / "beatrelease-trades.json",
-    },
-    {
-        "label": "Source Monitor",
-        "path": PROJECT_DIR / "data" / "kalshi-monitor-trades.json",
-    },
-    {
-        "label": "Position Monitor",
-        "path": PROJECT_DIR / "data" / "kalshi-position-trades.json",
-    },
-    {
-        "label": "Economics Bot",
-        "path": PROJECT_DIR / "data" / "kalshi-economics-trades.json",
-    },
-    {
-        "label": "Crypto Bot",
-        "path": PROJECT_DIR / "data" / "kalshi-crypto-trades.json",
-    },
-    {
-        "label": "Cross-Platform Arb",
-        "path": PROJECT_DIR / "data" / "kalshi-arb-trades.json",
-    },
-    {
-        "label": "Market Maker",
-        "path": PROJECT_DIR / "data" / "kalshi-mm-trades.json",
-    },
+    {"label": tf["label"], "bot": tf["bot"], "path": DATA_DIR / tf["filename"]}
+    for tf in _CANONICAL_TRADE_FILES
 ]
 
 
@@ -573,6 +540,189 @@ def reconcile_trades(
     }
 
 
+# ─── Performance metrics computation ───
+
+def _compute_sharpe(daily_pnl_values):
+    """Compute annualized Sharpe ratio from a list of daily P&L values (cents)."""
+    if len(daily_pnl_values) < 2:
+        return None
+    mean_pnl = sum(daily_pnl_values) / len(daily_pnl_values)
+    variance = sum((v - mean_pnl) ** 2 for v in daily_pnl_values) / (len(daily_pnl_values) - 1)
+    std_pnl = math.sqrt(variance)
+    if std_pnl <= 0:
+        return None
+    return round((mean_pnl / std_pnl) * math.sqrt(252), 4)
+
+
+def _iso_week(date_str):
+    """Convert a YYYY-MM-DD date string to ISO week string YYYY-WNN."""
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d")
+        iso = d.isocalendar()
+        return f"{iso[0]}-W{iso[1]:02d}"
+    except (ValueError, TypeError):
+        return None
+
+
+def compute_performance_metrics(reconciliation):
+    """Compute comprehensive P&L metrics from reconciliation data.
+
+    Returns a dict suitable for saving to data/performance-metrics.json with:
+    - per_bot: per-bot metrics with daily P&L, rolling Sharpe, gross/net breakdown
+    - aggregate: aggregate metrics across all bots
+    - timestamp: ISO timestamp
+    """
+    if not reconciliation:
+        return None
+
+    per_bot_metrics = {}
+    agg_daily_gross = defaultdict(int)  # date -> gross P&L cents
+    agg_daily_fees = defaultdict(int)   # date -> fee cents
+    agg_total_gross = 0
+    agg_total_fees = 0
+    agg_total_trades = 0
+    agg_wins = 0
+    agg_losses = 0
+
+    for bot_entry in reconciliation.get("per_bot", []):
+        label = bot_entry["label"]
+        wins = bot_entry.get("wins", 0)
+        losses = bot_entry.get("losses", 0)
+        pnl_cents = bot_entry.get("pnl_cents", 0)
+        fee_cents = bot_entry.get("fee_cents", 0)
+        trade_count = wins + losses
+        win_rate = round(wins / trade_count, 4) if trade_count > 0 else 0.0
+
+        # Daily P&L from per-bot daily_pnl if available
+        daily_pnl = bot_entry.get("daily_pnl", {})
+
+        # Gross = pnl_cents (revenue - cost), Net = gross - fees
+        gross_pnl = pnl_cents
+        net_pnl = pnl_cents - fee_cents
+
+        # All-time Sharpe from daily P&L
+        daily_values = list(daily_pnl.values()) if daily_pnl else []
+        sharpe_all_time = _compute_sharpe(daily_values) if daily_values else None
+
+        # Rolling 30-day Sharpe
+        sharpe_rolling_30d = None
+        if daily_pnl:
+            sorted_days = sorted(daily_pnl.keys())
+            if len(sorted_days) >= 2:
+                last_30 = sorted_days[-30:] if len(sorted_days) >= 30 else sorted_days
+                last_30_values = [daily_pnl[d] for d in last_30]
+                sharpe_rolling_30d = _compute_sharpe(last_30_values)
+
+        per_bot_metrics[label] = {
+            "realized_pnl": gross_pnl,
+            "net_pnl": net_pnl,
+            "fee_cents": fee_cents,
+            "win_rate": win_rate,
+            "wins": wins,
+            "losses": losses,
+            "trade_count": trade_count,
+            "sharpe_all_time": sharpe_all_time,
+            "sharpe_rolling_30d": sharpe_rolling_30d,
+            "daily_pnl": daily_pnl,
+        }
+
+        # Accumulate aggregate daily
+        for day, val in daily_pnl.items():
+            agg_daily_gross[day] += val
+        agg_total_gross += gross_pnl
+        agg_total_fees += fee_cents
+        agg_total_trades += trade_count
+        agg_wins += wins
+        agg_losses += losses
+
+    # Aggregate metrics
+    agg_daily_values = [agg_daily_gross[d] for d in sorted(agg_daily_gross)]
+    agg_sharpe_all_time = _compute_sharpe(agg_daily_values) if agg_daily_values else None
+
+    agg_sharpe_rolling_30d = None
+    if agg_daily_gross:
+        sorted_days = sorted(agg_daily_gross.keys())
+        if len(sorted_days) >= 2:
+            last_30 = sorted_days[-30:] if len(sorted_days) >= 30 else sorted_days
+            last_30_values = [agg_daily_gross[d] for d in last_30]
+            agg_sharpe_rolling_30d = _compute_sharpe(last_30_values)
+
+    # Weekly P&L
+    agg_weekly = defaultdict(int)
+    for day, val in agg_daily_gross.items():
+        week = _iso_week(day)
+        if week:
+            agg_weekly[week] += val
+
+    # Cumulative P&L
+    agg_cumulative = {}
+    running = 0
+    for day in sorted(agg_daily_gross):
+        running += agg_daily_gross[day]
+        agg_cumulative[day] = running
+
+    aggregate = {
+        "realized_pnl": agg_total_gross,
+        "net_pnl": agg_total_gross - agg_total_fees,
+        "fee_cents": agg_total_fees,
+        "win_rate": round(agg_wins / agg_total_trades, 4) if agg_total_trades > 0 else 0.0,
+        "wins": agg_wins,
+        "losses": agg_losses,
+        "trade_count": agg_total_trades,
+        "sharpe_all_time": agg_sharpe_all_time,
+        "sharpe_rolling_30d": agg_sharpe_rolling_30d,
+        "daily_pnl": dict(sorted(agg_daily_gross.items())),
+        "weekly_pnl": dict(sorted(agg_weekly.items())),
+        "cumulative_pnl": agg_cumulative,
+    }
+
+    return {
+        "per_bot": per_bot_metrics,
+        "aggregate": aggregate,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def _print_performance_metrics(metrics):
+    """Print performance metrics in a human-readable table."""
+    if not metrics:
+        return
+
+    print()
+    print("=" * 70)
+    print("P&L ANALYTICS")
+    print("=" * 70)
+
+    # Per-bot table
+    per_bot = metrics.get("per_bot", {})
+    if per_bot:
+        print(f"\n  {'Bot':<22} {'Gross':>8}  {'Net':>8}  {'Fees':>6}  {'WR':>6}  {'Sharpe':>7}  {'30d':>7}")
+        print("  " + "-" * 72)
+        for label, stats in per_bot.items():
+            gross = f"${stats['realized_pnl'] / 100:.2f}"
+            net = f"${stats['net_pnl'] / 100:.2f}"
+            fees = f"${stats['fee_cents'] / 100:.2f}"
+            wr = f"{stats['win_rate'] * 100:.1f}%" if stats['trade_count'] > 0 else "N/A"
+            sharpe = f"{stats['sharpe_all_time']:.2f}" if stats['sharpe_all_time'] is not None else "N/A"
+            s30d = f"{stats['sharpe_rolling_30d']:.2f}" if stats['sharpe_rolling_30d'] is not None else "N/A"
+            print(f"  {label:<22} {gross:>8}  {net:>8}  {fees:>6}  {wr:>6}  {sharpe:>7}  {s30d:>7}")
+
+    # Aggregate
+    agg = metrics.get("aggregate", {})
+    if agg:
+        print()
+        print("  --- Aggregate ---")
+        print(f"    Gross P&L:  ${agg.get('realized_pnl', 0) / 100:.2f}")
+        print(f"    Net P&L:    ${agg.get('net_pnl', 0) / 100:.2f}")
+        print(f"    Fees:       ${agg.get('fee_cents', 0) / 100:.2f}")
+        wr = agg.get('win_rate', 0)
+        print(f"    Win rate:   {wr * 100:.1f}% ({agg.get('wins', 0)}W/{agg.get('losses', 0)}L)")
+        sharpe = agg.get("sharpe_all_time")
+        s30d = agg.get("sharpe_rolling_30d")
+        print(f"    Sharpe (all-time):  {sharpe:.2f}" if sharpe is not None else "    Sharpe (all-time):  N/A")
+        print(f"    Sharpe (30-day):    {s30d:.2f}" if s30d is not None else "    Sharpe (30-day):    N/A")
+
+
 # ─── Main ───
 
 def main():
@@ -588,6 +738,11 @@ def main():
         "--reconcile",
         action="store_true",
         help="Query Kalshi API for settlements/fills and compute win rate, P&L, and Sharpe ratio.",
+    )
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Save performance metrics to data/performance-metrics.json (requires --reconcile).",
     )
     args = parser.parse_args()
 
@@ -611,6 +766,7 @@ def main():
 
     # Reconciliation (optional — requires API credentials)
     reconciliation = None
+    performance_metrics = None
     if args.reconcile:
         client = _get_client()
         settlements = fetch_settlements(client)
@@ -626,10 +782,92 @@ def main():
 
         reconciliation = reconcile_trades(local_trades_by_bot, settlements, fills)
 
+        # Enhance reconciliation with per-bot daily P&L and fee data from settlements
+        _enrich_reconciliation_with_daily_pnl(reconciliation, settlements)
+
+        # Compute performance metrics
+        performance_metrics = compute_performance_metrics(reconciliation)
+
+    if args.save:
+        if performance_metrics:
+            from kalshi_auth import _atomic_write_json
+            save_path = PROJECT_DIR / "data" / "performance-metrics.json"
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_json(save_path, performance_metrics)
+            print(f"Performance metrics saved to {save_path}", file=sys.stderr)
+        else:
+            print("Warning: --save requires --reconcile to generate performance data", file=sys.stderr)
+
     if args.json:
         print_json_report(results, reconciliation)
     else:
         print_text_report(results, reconciliation)
+        if performance_metrics:
+            _print_performance_metrics(performance_metrics)
+
+
+def _enrich_reconciliation_with_daily_pnl(reconciliation, settlements):
+    """Add per-bot daily_pnl and fee_cents to reconciliation data.
+
+    This enriches the reconciliation output so compute_performance_metrics()
+    can compute daily/rolling Sharpe per bot.
+    """
+    if not reconciliation or not settlements:
+        return
+
+    # Build ticker -> (bot_label, settled_day, revenue, fee) mapping
+    # First, build ticker -> bot_label from per_bot entries
+    bot_label_by_ticker = {}
+    for bot_entry in reconciliation.get("per_bot", []):
+        label = bot_entry["label"]
+        # We don't have direct ticker access here, so we track by the
+        # reconciliation loop's revenue attribution
+        pass
+
+    # Build daily P&L from settlements grouped by settled_time
+    # We need to match settlements to bots using the ticker -> bot mapping
+    from trade_files import TRADE_FILES as _canonical
+    ticker_to_label = {}
+    for tf in _canonical:
+        filepath = DATA_DIR / tf["filename"]
+        trades = load_trades_safe(filepath)
+        if trades:
+            for t in trades:
+                ticker = t.get("ticker", "")
+                if ticker:
+                    ticker_to_label[ticker] = tf["label"]
+
+    # Per-bot daily P&L accumulation
+    per_bot_daily = defaultdict(lambda: defaultdict(int))
+    per_bot_fees = defaultdict(int)
+
+    for s in settlements:
+        ticker = s.get("ticker", s.get("market_ticker", ""))
+        revenue = s.get("revenue", 0)
+        try:
+            revenue = int(revenue)
+        except (TypeError, ValueError):
+            revenue = 0
+
+        # Fee extraction
+        try:
+            fee_cents = round(float(s.get("fee_cost", "0")) * 100)
+        except (TypeError, ValueError):
+            fee_cents = 0
+
+        st = s.get("settled_time", "")
+        day = st[:10] if st and isinstance(st, str) else None
+
+        label = ticker_to_label.get(ticker, "Unknown")
+        if day:
+            per_bot_daily[label][day] += revenue
+        per_bot_fees[label] += fee_cents
+
+    # Merge into reconciliation per_bot entries
+    for bot_entry in reconciliation.get("per_bot", []):
+        label = bot_entry["label"]
+        bot_entry["daily_pnl"] = dict(sorted(per_bot_daily.get(label, {}).items()))
+        bot_entry["fee_cents"] = per_bot_fees.get(label, 0)
 
 
 if __name__ == "__main__":

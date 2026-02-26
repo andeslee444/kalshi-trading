@@ -735,6 +735,38 @@ async def api_health():
     return health_data
 
 
+BACKTEST_RESULTS_PATH = DATA_DIR / "backtest-results.json"
+PERFORMANCE_METRICS_PATH = DATA_DIR / "performance-metrics.json"
+
+
+@app.get("/api/backtest")
+async def api_backtest():
+    """Return full backtest results (Brier scores + calibration curves)."""
+    data = load_json_safe(BACKTEST_RESULTS_PATH)
+    if data is None:
+        return {"error": "No backtest results found. Run: python3 scripts/backtest.py --save"}
+    return data
+
+
+@app.get("/api/calibration-curve")
+async def api_calibration_curve():
+    """Return just the calibration curves section from backtest results."""
+    data = load_json_safe(BACKTEST_RESULTS_PATH)
+    if data is None:
+        return {"error": "No backtest results found. Run: python3 scripts/backtest.py --save"}
+    curves = data.get("calibration_curves", {})
+    return {"calibration_curves": curves, "timestamp": data.get("timestamp", data.get("generated_at"))}
+
+
+@app.get("/api/performance")
+async def api_performance():
+    """Return full P&L performance metrics."""
+    data = load_json_safe(PERFORMANCE_METRICS_PATH)
+    if data is None:
+        return {"error": "No performance metrics found. Run: python3 scripts/analyze-performance.py --reconcile --save"}
+    return data
+
+
 @app.get("/api/logs")
 async def api_logs(
     bot: str = Query("weather"),

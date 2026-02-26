@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Kalshi Trading Dashboard</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     body { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace; }
     .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
@@ -126,7 +127,28 @@
       </div>
     </div>
 
-    <!-- Row 5: Data Source Health + Log Viewer -->
+    <!-- Row 5: Model Quality -->
+    <div class="card">
+      <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Model Quality (Brier Scores)</h2>
+      <div id="brier-tables" class="mb-4">
+        <div class="text-gray-500 text-sm">Loading... (requires backtest data)</div>
+      </div>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4" id="calibration-charts-container">
+      </div>
+    </div>
+
+    <!-- Row 6: P&L Analytics -->
+    <div class="card">
+      <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">P&L Analytics</h2>
+      <div id="pnl-table" class="mb-4">
+        <div class="text-gray-500 text-sm">Loading... (requires performance data)</div>
+      </div>
+      <div style="height: 300px; max-width: 100%;">
+        <canvas id="cumulative-pnl-chart"></canvas>
+      </div>
+    </div>
+
+    <!-- Row 7: Data Source Health + Log Viewer -->
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
 
       <!-- Data Source Health -->
@@ -632,6 +654,265 @@ async function loadLogs() {
   el.scrollTop = el.scrollHeight;
 }
 
+// ─── Model Quality (Brier Scores + Calibration Curves) ───
+
+let calibrationCharts = {};
+
+async function loadBacktest() {
+  const data = await fetchJson('/api/backtest');
+  const el = document.getElementById('brier-tables');
+  const chartsContainer = document.getElementById('calibration-charts-container');
+
+  if (!data || data.error) {
+    el.innerHTML = `<div class="text-gray-500 text-sm">${data?.error || 'No backtest data available'}</div>`;
+    chartsContainer.innerHTML = '';
+    return;
+  }
+
+  // Per-bot Brier table
+  const perBot = data.per_bot || {};
+  const perMT = data.per_market_type_brier || {};
+  const perCity = data.per_city_brier || {};
+
+  let html = '';
+
+  // Per-bot table
+  if (Object.keys(perBot).length > 0) {
+    html += `<div class="mb-3"><span class="text-xs text-gray-500 uppercase">Per Bot</span>
+      <table class="w-full text-sm mt-1"><thead><tr class="text-gray-500 text-xs">
+        <th class="text-left py-1">Bot</th><th class="text-right py-1">N</th><th class="text-right py-1">Brier</th><th class="text-right py-1">Win Rate</th>
+      </tr></thead><tbody>`;
+    for (const [bot, stats] of Object.entries(perBot)) {
+      const bs = stats.brier_score != null ? stats.brier_score.toFixed(4) : 'N/A';
+      const wr = stats.win_rate != null ? (stats.win_rate * 100).toFixed(1) + '%' : 'N/A';
+      const flag = stats.n_evaluated < 30 ? ' <span class="text-yellow-500 text-xs">(low sample)</span>' : '';
+      html += `<tr class="border-t border-gray-800"><td class="py-1 text-gray-200">${escapeHtml(bot)}</td>
+        <td class="text-right text-gray-400">${stats.n_evaluated}${flag}</td>
+        <td class="text-right text-gray-200">${bs}</td>
+        <td class="text-right text-gray-200">${wr}</td></tr>`;
+    }
+    html += `</tbody></table></div>`;
+  }
+
+  // Per-market-type table
+  if (Object.keys(perMT).length > 0) {
+    html += `<div class="mb-3"><span class="text-xs text-gray-500 uppercase">Per Market Type</span>
+      <table class="w-full text-sm mt-1"><thead><tr class="text-gray-500 text-xs">
+        <th class="text-left py-1">Type</th><th class="text-right py-1">N</th><th class="text-right py-1">Brier</th>
+      </tr></thead><tbody>`;
+    for (const [mtype, stats] of Object.entries(perMT)) {
+      const bs = stats.brier != null ? stats.brier.toFixed(4) : 'N/A';
+      const flag = stats.n < 30 ? ' <span class="text-yellow-500 text-xs">(low)</span>' : '';
+      html += `<tr class="border-t border-gray-800"><td class="py-1 text-gray-200">${escapeHtml(mtype)}</td>
+        <td class="text-right text-gray-400">${stats.n}${flag}</td>
+        <td class="text-right text-gray-200">${bs}</td></tr>`;
+    }
+    html += `</tbody></table></div>`;
+  }
+
+  // Per-city table (compact)
+  if (Object.keys(perCity).length > 0) {
+    html += `<div class="mb-3"><span class="text-xs text-gray-500 uppercase">Per City (Weather)</span>
+      <div class="flex flex-wrap gap-3 mt-1 text-sm">`;
+    for (const [city, stats] of Object.entries(perCity)) {
+      const bs = stats.brier != null ? stats.brier.toFixed(4) : 'N/A';
+      const flag = stats.n < 30 ? ' *' : '';
+      html += `<span class="text-gray-300">${city}: <span class="text-gray-100">${bs}</span> <span class="text-gray-500">(n=${stats.n}${flag})</span></span>`;
+    }
+    html += `</div></div>`;
+  }
+
+  // Aggregate
+  const aggBrier = data.aggregate_brier || data.brier_score;
+  if (aggBrier != null) {
+    html += `<div class="text-sm text-gray-400 mt-2">Aggregate Brier: <span class="text-gray-100 font-semibold">${aggBrier.toFixed(4)}</span> <span class="text-xs">(0=perfect, 0.25=random)</span></div>`;
+  }
+
+  el.innerHTML = html;
+
+  // Calibration curve charts
+  const curves = data.calibration_curves || {};
+  const mtypes = Object.keys(curves).filter(k => curves[k] && curves[k].length > 0);
+
+  if (mtypes.length === 0) {
+    chartsContainer.innerHTML = '<div class="text-gray-500 text-sm">No calibration data available</div>';
+    return;
+  }
+
+  // Create canvas elements for each market type
+  chartsContainer.innerHTML = mtypes.map(mtype =>
+    `<div><div class="text-xs text-gray-500 uppercase mb-1">${escapeHtml(mtype)} Calibration</div>
+     <canvas id="cal-chart-${mtype}" height="200"></canvas></div>`
+  ).join('');
+
+  // Render charts
+  for (const mtype of mtypes) {
+    const curve = curves[mtype];
+    const ctx = document.getElementById(`cal-chart-${mtype}`);
+    if (!ctx) continue;
+
+    // Destroy previous chart if exists
+    if (calibrationCharts[mtype]) {
+      calibrationCharts[mtype].destroy();
+    }
+
+    const labels = curve.map(r => r.bin);
+    const predicted = curve.map(r => r.predicted_avg);
+    const actual = curve.map(r => r.actual_avg);
+
+    calibrationCharts[mtype] = new Chart(ctx, {
+      type: 'scatter',
+      data: {
+        datasets: [
+          {
+            label: 'Actual',
+            data: predicted.map((p, i) => ({ x: p, y: actual[i] })),
+            backgroundColor: '#22c55e',
+            borderColor: '#22c55e',
+            pointRadius: 5,
+            showLine: true,
+            borderWidth: 2,
+          },
+          {
+            label: 'Perfect',
+            data: [{ x: 0, y: 0 }, { x: 1, y: 1 }],
+            borderColor: '#4b5563',
+            borderDash: [5, 5],
+            pointRadius: 0,
+            showLine: true,
+            borderWidth: 1,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { labels: { color: '#9ca3af', font: { size: 10 } } },
+          tooltip: {
+            callbacks: {
+              label: function(ctx) {
+                const idx = ctx.dataIndex;
+                if (ctx.datasetIndex === 0) {
+                  const row = curve[idx];
+                  return `Pred: ${row.predicted_avg.toFixed(2)}, Actual: ${row.actual_avg.toFixed(2)} (n=${row.n})`;
+                }
+                return '';
+              }
+            }
+          }
+        },
+        scales: {
+          x: { title: { display: true, text: 'Predicted', color: '#6b7280' }, min: 0, max: 1, ticks: { color: '#6b7280' }, grid: { color: '#1f2937' } },
+          y: { title: { display: true, text: 'Actual', color: '#6b7280' }, min: 0, max: 1, ticks: { color: '#6b7280' }, grid: { color: '#1f2937' } },
+        },
+      },
+    });
+  }
+}
+
+// ─── P&L Analytics ───
+
+let cumulativePnlChart = null;
+
+async function loadPerformance() {
+  const data = await fetchJson('/api/performance');
+  const tableEl = document.getElementById('pnl-table');
+  const chartCanvas = document.getElementById('cumulative-pnl-chart');
+
+  if (!data || data.error) {
+    tableEl.innerHTML = `<div class="text-gray-500 text-sm">${data?.error || 'No performance data available'}</div>`;
+    return;
+  }
+
+  const perBot = data.per_bot || {};
+  const agg = data.aggregate || {};
+
+  // Per-bot P&L table
+  let html = `<table class="w-full text-sm"><thead><tr class="text-gray-500 text-xs">
+    <th class="text-left py-1">Bot</th><th class="text-right py-1">Gross</th><th class="text-right py-1">Net</th>
+    <th class="text-right py-1">Fees</th><th class="text-right py-1">WR</th><th class="text-right py-1">Sharpe</th><th class="text-right py-1">30d</th>
+  </tr></thead><tbody>`;
+
+  for (const [bot, stats] of Object.entries(perBot)) {
+    const gross = centsToUsd(stats.realized_pnl);
+    const net = centsToUsd(stats.net_pnl);
+    const fees = centsToUsd(stats.fee_cents);
+    const wr = stats.trade_count > 0 ? (stats.win_rate * 100).toFixed(1) + '%' : 'N/A';
+    const sharpe = stats.sharpe_all_time != null ? stats.sharpe_all_time.toFixed(2) : 'N/A';
+    const s30d = stats.sharpe_rolling_30d != null ? stats.sharpe_rolling_30d.toFixed(2) : 'N/A';
+    const grossColor = stats.realized_pnl > 0 ? 'text-green-400' : stats.realized_pnl < 0 ? 'text-red-400' : 'text-gray-400';
+    const netColor = stats.net_pnl > 0 ? 'text-green-400' : stats.net_pnl < 0 ? 'text-red-400' : 'text-gray-400';
+
+    html += `<tr class="border-t border-gray-800">
+      <td class="py-1 text-gray-200">${escapeHtml(bot)}</td>
+      <td class="text-right ${grossColor}">${gross}</td>
+      <td class="text-right ${netColor}">${net}</td>
+      <td class="text-right text-gray-400">${fees}</td>
+      <td class="text-right text-gray-200">${wr}</td>
+      <td class="text-right text-gray-200">${sharpe}</td>
+      <td class="text-right text-gray-200">${s30d}</td>
+    </tr>`;
+  }
+
+  // Aggregate row
+  if (agg.realized_pnl != null) {
+    const grossColor = agg.realized_pnl > 0 ? 'text-green-400' : agg.realized_pnl < 0 ? 'text-red-400' : 'text-gray-400';
+    const netColor = agg.net_pnl > 0 ? 'text-green-400' : agg.net_pnl < 0 ? 'text-red-400' : 'text-gray-400';
+    html += `<tr class="border-t-2 border-gray-600 font-semibold">
+      <td class="py-1 text-gray-100">TOTAL</td>
+      <td class="text-right ${grossColor}">${centsToUsd(agg.realized_pnl)}</td>
+      <td class="text-right ${netColor}">${centsToUsd(agg.net_pnl)}</td>
+      <td class="text-right text-gray-400">${centsToUsd(agg.fee_cents)}</td>
+      <td class="text-right text-gray-100">${agg.trade_count > 0 ? (agg.win_rate * 100).toFixed(1) + '%' : 'N/A'}</td>
+      <td class="text-right text-gray-100">${agg.sharpe_all_time != null ? agg.sharpe_all_time.toFixed(2) : 'N/A'}</td>
+      <td class="text-right text-gray-100">${agg.sharpe_rolling_30d != null ? agg.sharpe_rolling_30d.toFixed(2) : 'N/A'}</td>
+    </tr>`;
+  }
+
+  html += `</tbody></table>`;
+  tableEl.innerHTML = html;
+
+  // Cumulative P&L chart
+  const cumPnl = agg.cumulative_pnl || {};
+  const dates = Object.keys(cumPnl).sort();
+  if (dates.length > 0 && chartCanvas) {
+    const values = dates.map(d => cumPnl[d] / 100);  // Convert cents to dollars
+
+    if (cumulativePnlChart) {
+      cumulativePnlChart.destroy();
+    }
+
+    cumulativePnlChart = new Chart(chartCanvas, {
+      type: 'line',
+      data: {
+        labels: dates.map(d => d.substring(5)),  // MM-DD format
+        datasets: [{
+          label: 'Cumulative P&L ($)',
+          data: values,
+          borderColor: values[values.length - 1] >= 0 ? '#22c55e' : '#ef4444',
+          backgroundColor: 'rgba(34, 197, 94, 0.1)',
+          fill: true,
+          tension: 0.3,
+          pointRadius: dates.length > 30 ? 0 : 3,
+          borderWidth: 2,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { labels: { color: '#9ca3af', font: { size: 10 } } },
+        },
+        scales: {
+          x: { ticks: { color: '#6b7280', maxTicksLimit: 15 }, grid: { color: '#1f2937' } },
+          y: { ticks: { color: '#6b7280', callback: v => '$' + v.toFixed(0) }, grid: { color: '#1f2937' } },
+        },
+      },
+    });
+  }
+}
+
 // ─── Polling ───
 
 async function refreshAll() {
@@ -646,6 +927,8 @@ async function refreshAll() {
     loadDecisions(),
     loadHealth(),
     loadLogs(),
+    loadBacktest(),
+    loadPerformance(),
   ]);
   document.getElementById('last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
 }
