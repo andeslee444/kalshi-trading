@@ -108,47 +108,47 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| FEED-01 | — | Pending |
-| FEED-02 | — | Pending |
-| FEED-03 | — | Pending |
-| FEED-04 | — | Pending |
-| FEED-05 | — | Pending |
-| FEED-06 | — | Pending |
-| SIZE-01 | — | Pending |
-| SIZE-02 | — | Pending |
-| SIZE-03 | — | Pending |
-| EXIT-01 | — | Pending |
-| EXIT-02 | — | Pending |
-| EXIT-03 | — | Pending |
-| EXIT-04 | — | Pending |
-| EXIT-05 | — | Pending |
-| EXEC-01 | — | Pending |
-| EXEC-02 | — | Pending |
-| EXEC-03 | — | Pending |
-| EXEC-04 | — | Pending |
-| EXEC-05 | — | Pending |
-| EXEC-06 | — | Pending |
-| EXEC-07 | — | Pending |
-| CAL-01 | — | Pending |
-| CAL-02 | — | Pending |
-| CAL-03 | — | Pending |
-| CRYP-01 | — | Pending |
-| CRYP-02 | — | Pending |
-| CRYP-03 | — | Pending |
-| STRAT-01 | — | Pending |
-| STRAT-02 | — | Pending |
-| STRAT-03 | — | Pending |
-| OPS-01 | — | Pending |
-| OPS-02 | — | Pending |
-| OPS-03 | — | Pending |
-| OPS-04 | — | Pending |
-| OPS-05 | — | Pending |
+| FEED-01 | Phase 1 | Pending |
+| FEED-02 | Phase 1 | Pending |
+| FEED-03 | Phase 1 | Pending |
+| FEED-04 | Phase 1 | Pending |
+| FEED-05 | Phase 1 | Pending |
+| FEED-06 | Phase 1 | Pending |
+| SIZE-01 | Phase 2 | Pending |
+| SIZE-02 | Phase 2 | Pending |
+| SIZE-03 | Phase 2 | Pending |
+| EXIT-01 | Phase 3 | Pending |
+| EXIT-02 | Phase 3 | Pending |
+| EXIT-03 | Phase 3 | Pending |
+| EXIT-04 | Phase 3 | Pending |
+| EXIT-05 | Phase 3 | Pending |
+| EXEC-01 | Phase 4 | Pending |
+| EXEC-02 | Phase 4 | Pending |
+| EXEC-03 | Phase 4 | Pending |
+| EXEC-04 | Phase 4 | Pending |
+| EXEC-05 | Phase 4 | Pending |
+| EXEC-06 | Phase 4 | Pending |
+| EXEC-07 | Phase 4 | Pending |
+| CAL-01 | Phase 5 | Pending |
+| CAL-02 | Phase 5 | Pending |
+| CAL-03 | Phase 5 | Pending |
+| CRYP-01 | Phase 6 | Pending |
+| CRYP-02 | Phase 6 | Pending |
+| CRYP-03 | Phase 6 | Pending |
+| STRAT-01 | Phase 7 | Pending |
+| STRAT-02 | Phase 7 | Pending |
+| STRAT-03 | Phase 7 | Pending |
+| OPS-01 | Phase 8 | Pending |
+| OPS-02 | Phase 8 | Pending |
+| OPS-03 | Phase 8 | Pending |
+| OPS-04 | Phase 8 | Pending |
+| OPS-05 | Phase 8 | Pending |
 
 **Coverage:**
 - v1 requirements: 35 total
-- Mapped to phases: 0
-- Unmapped: 35
+- Mapped to phases: 35
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-02-26*
-*Last updated: 2026-02-26 after initial definition*
+*Last updated: 2026-02-26 after roadmap creation*
