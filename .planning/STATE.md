@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: phase-complete
-last_updated: "2026-02-26T08:18:04.769Z"
+status: unknown
+last_updated: "2026-02-26T08:19:03.335Z"
 progress:
-  total_phases: 8
+  total_phases: 1
   completed_phases: 1
   total_plans: 3
   completed_plans: 3
@@ -47,6 +47,7 @@ Progress: [██░░░░░░░░] 16%
 - Trend: stable
 
 *Updated after each plan completion*
+| Phase 01 P02 | 6min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -63,6 +64,9 @@ Recent decisions affecting current work:
 - [01-03]: Brier score as primary optimization target, P&L tiebreaker within 0.001 tolerance
 - [01-03]: Minimum 10 trades per city (up from 5) and 30 global for reliable calibration
 - [01-03]: Backup calibration.json before overwrite; skip save when no matched trades exist
+- [Phase 01-02]: Used 10-bin calibration default with fallback to 5 bins when sparse data
+- [Phase 01-02]: Chart.js via CDN for dashboard calibration curves and cumulative P&L chart
+
 ### Pending Todos
 
 None yet.
