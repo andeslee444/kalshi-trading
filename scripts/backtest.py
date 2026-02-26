@@ -31,14 +31,16 @@ from probability import (
     half_kelly_sell,
     quarter_kelly,
 )
-
+from kalshi_auth import _atomic_write_json
+from trade_files import TRADE_FILES as _CANONICAL_TRADE_FILES
+from ticker_utils import parse_weather_ticker as _parse_weather_ticker_shared
 
 # ─── Trade file definitions ───
+# Use canonical trade files from shared module, adapting to backtest's label/path format
+DATA_DIR = PROJECT_DIR / "data"
 TRADE_FILES = [
-    {"label": "weather", "path": PROJECT_DIR / "data" / "kalshi-trades.json"},
-    {"label": "strategy", "path": PROJECT_DIR / "data" / "kalshi-strategy-trades.json"},
-    {"label": "crypto", "path": PROJECT_DIR / "data" / "kalshi-crypto-trades.json"},
-    {"label": "beatrelease", "path": PROJECT_DIR / "data" / "beatrelease-trades.json"},
+    {"label": tf["bot"], "path": DATA_DIR / tf["filename"]}
+    for tf in _CANONICAL_TRADE_FILES
 ]
 
 MONTHS = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
@@ -59,6 +61,45 @@ def load_trades_safe(filepath):
         return data if isinstance(data, list) else []
     except (json.JSONDecodeError, ValueError, OSError):
         return []
+
+
+def classify_market_type(ticker):
+    """Classify a ticker into a market type category.
+
+    Returns one of: "weather", "crypto", "economics", "entertainment", "other".
+    """
+    t = ticker.upper()
+    if t.startswith("KXHIGH"):
+        return "weather"
+    if t.startswith(("KXBTC", "KXETH", "KXSOL")):
+        return "crypto"
+    if t.startswith(("KXCPI", "KXGDP", "KXJOBS")):
+        return "economics"
+    if t.startswith(("KXALBUM", "KX1ALBUM", "KXMOVIE", "KXBOX")):
+        return "entertainment"
+    # Beatrelease tickers are typically entertainment-related
+    # but may not have the KXALBUM prefix -- check bot label in caller
+    return "other"
+
+
+def classify_market_type_with_bot(ticker, bot_label):
+    """Classify market type, using bot label as fallback for ambiguous tickers."""
+    market_type = classify_market_type(ticker)
+    if market_type == "other" and bot_label in ("entertainment", "beatrelease"):
+        return "entertainment"
+    if market_type == "other" and bot_label == "monitor":
+        # Source monitor trades weather (NWS) and entertainment (HDD/BoxOffice)
+        # Use ticker prefix to disambiguate
+        return classify_market_type(ticker)
+    return market_type
+
+
+def extract_city_from_ticker(ticker):
+    """Extract city code from a weather ticker, or None if not a weather ticker."""
+    parsed = _parse_weather_ticker_shared(ticker)
+    if parsed:
+        return parsed["city"]
+    return None
 
 
 def fetch_settlements(client):
@@ -125,42 +166,49 @@ def brier_score(predictions):
     return sum((p - a) ** 2 for p, a in predictions) / len(predictions)
 
 
-def calibration_table(predictions, n_bins=5):
+def calibration_table(predictions, n_bins=10):
     """Bin predictions and compute calibration statistics.
 
     predictions: list of (predicted_prob, actual_outcome) tuples
+    n_bins: number of bins (default 10). Falls back to 5 if any bin has <5 observations.
     Returns list of dicts: {bin_label, n, predicted_avg, actual_avg, gap}
     """
     if not predictions:
         return []
 
-    bin_width = 1.0 / n_bins
-    bins = defaultdict(list)
+    def _compute_bins(preds, num_bins):
+        bin_width = 1.0 / num_bins
+        bins = defaultdict(list)
+        for pred, actual in preds:
+            bin_idx = min(int(pred / bin_width), num_bins - 1)
+            lo = bin_idx * bin_width
+            hi = lo + bin_width
+            label = f"{lo:.1f}-{hi:.1f}"
+            bins[label].append((pred, actual))
 
-    for pred, actual in predictions:
-        bin_idx = min(int(pred / bin_width), n_bins - 1)
-        lo = bin_idx * bin_width
-        hi = lo + bin_width
-        label = f"{lo:.1f}-{hi:.1f}"
-        bins[label].append((pred, actual))
+        table = []
+        for i in range(num_bins):
+            lo = i * bin_width
+            hi = lo + bin_width
+            label = f"{lo:.1f}-{hi:.1f}"
+            items = bins.get(label, [])
+            if not items:
+                continue
+            pred_avg = sum(p for p, _ in items) / len(items)
+            actual_avg = sum(a for _, a in items) / len(items)
+            table.append({
+                "bin": label,
+                "n": len(items),
+                "predicted_avg": round(pred_avg, 3),
+                "actual_avg": round(actual_avg, 3),
+                "gap": round(actual_avg - pred_avg, 3),
+            })
+        return table
 
-    table = []
-    for i in range(n_bins):
-        lo = i * bin_width
-        hi = lo + bin_width
-        label = f"{lo:.1f}-{hi:.1f}"
-        items = bins.get(label, [])
-        if not items:
-            continue
-        pred_avg = sum(p for p, _ in items) / len(items)
-        actual_avg = sum(a for _, a in items) / len(items)
-        table.append({
-            "bin": label,
-            "n": len(items),
-            "predicted_avg": round(pred_avg, 3),
-            "actual_avg": round(actual_avg, 3),
-            "gap": round(actual_avg - pred_avg, 3),
-        })
+    # Try requested bin count first, fall back to fewer bins if sparse
+    table = _compute_bins(predictions, n_bins)
+    if n_bins > 5 and any(row["n"] < 5 for row in table):
+        table = _compute_bins(predictions, 5)
 
     return table
 
@@ -461,10 +509,14 @@ def main():
                 result = reeval_strategy_trade(t, revenue)
             elif bot_label == "crypto":
                 result = reeval_crypto_trade(t, revenue)
-            elif bot_label in ("entertainment", "beatrelease"):
+            elif bot_label in ("entertainment", "beatrelease", "monitor"):
                 result = reeval_entertainment_trade(t, revenue)
+            elif bot_label == "economics":
+                # Economics trades: use stored model_prob if available
+                result = reeval_crypto_trade(t, revenue)  # same stored-prob pattern
             else:
-                continue
+                # For any other bot, attempt entertainment-style (stored confidence)
+                result = reeval_entertainment_trade(t, revenue)
 
             if result:
                 result["bot"] = bot_label
@@ -488,28 +540,78 @@ def main():
             "win_rate": round(sum(a for _, a in bot_preds) / len(bot_preds), 3) if bot_preds else None,
         }
 
+    # Per-market-type breakdown
+    market_type_groups = defaultdict(list)
+    for t in all_evaluated:
+        mtype = classify_market_type_with_bot(t["ticker"], t["bot"])
+        market_type_groups[mtype].append(t)
+
+    per_market_type_brier = {}
+    for mtype, group in sorted(market_type_groups.items()):
+        preds = [(t["predicted"], t["actual"]) for t in group]
+        bs_val = brier_score(preds)
+        per_market_type_brier[mtype] = {
+            "brier": round(bs_val, 6) if bs_val is not None else None,
+            "n": len(group),
+        }
+
+    # Per-city breakdown (weather trades only)
+    city_groups = defaultdict(list)
+    for t in all_evaluated:
+        city = extract_city_from_ticker(t["ticker"])
+        if city:
+            city_groups[city].append(t)
+
+    per_city_brier = {}
+    for city, group in sorted(city_groups.items()):
+        preds = [(t["predicted"], t["actual"]) for t in group]
+        bs_val = brier_score(preds)
+        per_city_brier[city] = {
+            "brier": round(bs_val, 6) if bs_val is not None else None,
+            "n": len(group),
+        }
+
+    # Per-market-type calibration curves
+    calibration_curves = {}
+    for mtype, group in sorted(market_type_groups.items()):
+        preds = [(t["predicted"], t["actual"]) for t in group]
+        if preds:
+            cal = calibration_table(preds)
+            calibration_curves[mtype] = cal
+
     report = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "n_trades_loaded": total_loaded,
         "n_settlements": n_settlements,
         "n_evaluated": len(all_evaluated),
-        "brier_score": round(bs, 6) if bs is not None else None,
+        "aggregate_brier": round(bs, 6) if bs is not None else None,
+        "brier_score": round(bs, 6) if bs is not None else None,  # backward compat
         "calibration_table": cal_table,
         "sizing_comparison": sizing,
         "threshold_sweep": sweep,
         "per_bot": per_bot,
+        "per_bot_brier": {k: {"brier": v["brier_score"], "n": v["n_evaluated"]} for k, v in per_bot.items()},
+        "per_market_type_brier": per_market_type_brier,
+        "per_city_brier": per_city_brier,
+        "calibration_curves": calibration_curves,
     }
 
     if args.save:
         save_path = PROJECT_DIR / "data" / "backtest-results.json"
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        save_path.write_text(json.dumps(report, indent=2))
+        _atomic_write_json(save_path, report)
         print(f"Results saved to {save_path}", file=sys.stderr)
 
     if args.json:
         print(json.dumps(report, indent=2))
     else:
         _print_report(report)
+
+
+def _low_sample_flag(n, threshold=30):
+    """Return '(low sample)' suffix if n < threshold, else empty string."""
+    return " (low sample)" if n < threshold else ""
 
 
 def _print_report(r):
@@ -520,21 +622,66 @@ def _print_report(r):
     print(f"Trades loaded: {r['n_trades_loaded']} | Settlements: {r['n_settlements']} | Evaluated: {r['n_evaluated']}")
     print("=" * 70)
 
-    # Brier score
-    bs = r["brier_score"]
+    # Aggregate Brier score
+    bs = r.get("aggregate_brier") or r.get("brier_score")
     if bs is not None:
-        print(f"\nBrier Score: {bs:.4f}  (0=perfect, 0.25=random, 1=worst)")
+        print(f"\nAggregate Brier Score: {bs:.4f}  (0=perfect, 0.25=random, 1=worst)")
     else:
         print("\nBrier Score: N/A (no evaluated trades)")
 
     # Calibration table
     cal = r.get("calibration_table", [])
     if cal:
-        print("\n--- Calibration Table ---")
+        print("\n--- Calibration Table (aggregate) ---")
         print(f"{'Bin':<12} {'N':>4}  {'Predicted':>9}  {'Actual':>7}  {'Gap':>6}")
         print("-" * 45)
         for row in cal:
             print(f"{row['bin']:<12} {row['n']:>4}  {row['predicted_avg']:>9.3f}  {row['actual_avg']:>7.3f}  {row['gap']:>+6.3f}")
+
+    # Per-bot breakdown
+    per_bot = r.get("per_bot", {})
+    if per_bot:
+        print("\n--- Per-Bot Breakdown ---")
+        print(f"  {'Bot':<20} {'N':>5}  {'Brier':>8}  {'Win Rate':>8}")
+        print("  " + "-" * 45)
+        for label, stats in per_bot.items():
+            bs_str = f"{stats['brier_score']:.4f}" if stats["brier_score"] is not None else "N/A"
+            wr_str = f"{stats['win_rate'] * 100:.1f}%" if stats["win_rate"] is not None else "N/A"
+            flag = _low_sample_flag(stats["n_evaluated"])
+            print(f"  {label:<20} {stats['n_evaluated']:>5}  {bs_str:>8}  {wr_str:>8}{flag}")
+
+    # Per-market-type breakdown
+    per_mt = r.get("per_market_type_brier", {})
+    if per_mt:
+        print("\n--- Per-Market-Type Breakdown ---")
+        print(f"  {'Market Type':<20} {'N':>5}  {'Brier':>8}")
+        print("  " + "-" * 35)
+        for mtype, stats in per_mt.items():
+            bs_str = f"{stats['brier']:.4f}" if stats["brier"] is not None else "N/A"
+            flag = _low_sample_flag(stats["n"])
+            print(f"  {mtype:<20} {stats['n']:>5}  {bs_str:>8}{flag}")
+
+    # Per-city breakdown
+    per_city = r.get("per_city_brier", {})
+    if per_city:
+        print("\n--- Per-City Breakdown (weather) ---")
+        print(f"  {'City':<10} {'N':>5}  {'Brier':>8}")
+        print("  " + "-" * 25)
+        for city, stats in per_city.items():
+            bs_str = f"{stats['brier']:.4f}" if stats["brier"] is not None else "N/A"
+            flag = _low_sample_flag(stats["n"])
+            print(f"  {city:<10} {stats['n']:>5}  {bs_str:>8}{flag}")
+
+    # Per-market-type calibration curves
+    cal_curves = r.get("calibration_curves", {})
+    if cal_curves:
+        for mtype, curve in cal_curves.items():
+            if curve:
+                print(f"\n--- Calibration Curve: {mtype} ---")
+                print(f"  {'Bin':<12} {'N':>4}  {'Predicted':>9}  {'Actual':>7}  {'Gap':>6}")
+                print("  " + "-" * 43)
+                for row in curve:
+                    print(f"  {row['bin']:<12} {row['n']:>4}  {row['predicted_avg']:>9.3f}  {row['actual_avg']:>7.3f}  {row['gap']:>+6.3f}")
 
     # Sizing comparison
     sz = r.get("sizing_comparison", {})
@@ -553,15 +700,6 @@ def _print_report(r):
         for row in sweep:
             wr = f"{row['win_rate'] * 100:.1f}%" if row["win_rate"] is not None else "N/A"
             print(f"   {row['threshold'] * 100:>5.0f}%    {row['trades']:>6}  {wr:>8}  ${row['pnl_cents'] / 100:>8.2f}")
-
-    # Per-bot
-    per_bot = r.get("per_bot", {})
-    if per_bot:
-        print("\n--- Per-Bot Breakdown ---")
-        for label, stats in per_bot.items():
-            bs_str = f"{stats['brier_score']:.4f}" if stats["brier_score"] is not None else "N/A"
-            wr_str = f"{stats['win_rate'] * 100:.1f}%" if stats["win_rate"] is not None else "N/A"
-            print(f"  {label}: n={stats['n_evaluated']}, Brier={bs_str}, WinRate={wr_str}")
 
     if r["n_evaluated"] == 0:
         print("\nNo trades could be matched to settlements.")
