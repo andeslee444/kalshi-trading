@@ -14,7 +14,7 @@ Requirements for this milestone. Each maps to roadmap phases.
 - [ ] **FEED-03**: Brier score computation produces non-null scores per bot and per market type
 - [ ] **FEED-04**: Calibration curve (reliability diagram) shows binned predicted-vs-actual for each probability model
 - [ ] **FEED-05**: Per-bot P&L tracking computes realized P&L, win rate, and Sharpe ratio from settled trades
-- [ ] **FEED-06**: Per-city sigma calibration populates `config/calibration.json` with optimized parameters
+- [x] **FEED-06**: Per-city sigma calibration populates `config/calibration.json` with optimized parameters
 
 ### Position Sizing
 
@@ -113,7 +113,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | FEED-03 | Phase 1 | Pending |
 | FEED-04 | Phase 1 | Pending |
 | FEED-05 | Phase 1 | Pending |
-| FEED-06 | Phase 1 | Pending |
+| FEED-06 | Phase 1 | Complete |
 | SIZE-01 | Phase 2 | Pending |
 | SIZE-02 | Phase 2 | Pending |
 | SIZE-03 | Phase 2 | Pending |
