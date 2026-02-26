@@ -33,12 +33,12 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. A calibration curve (reliability diagram) is viewable showing predicted-vs-actual probabilities binned by decile
   4. Per-bot P&L summary shows realized P&L, win rate, and Sharpe ratio computed from settled trades
   5. `config/calibration.json` contains per-city sigma parameters generated from actual settlement data
-**Plans**: TBD
+**Plans:** 3 plans
 
 Plans:
-- [ ] 01-01: Settlement reconciliation and backfill pipeline
-- [ ] 01-02: Brier scoring, calibration curves, and P&L metrics
-- [ ] 01-03: Per-city sigma calibration
+- [ ] 01-01-PLAN.md -- Settlement reconciliation pipeline: canonical trade files module, fix reconcile + backfill scripts
+- [ ] 01-02-PLAN.md -- Brier scores, calibration curves, P&L metrics: per-market-type breakdowns, Chart.js dashboard, daily/weekly P&L
+- [ ] 01-03-PLAN.md -- Per-city sigma calibration: multi-objective optimization (Brier + P&L), minimum sample thresholds
 
 ### Phase 2: Position Sizing
 **Goal**: All bots use correct position sizing math before being activated for live trading
