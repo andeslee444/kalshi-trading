@@ -9,8 +9,8 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### Feedback Loop
 
-- [ ] **FEED-01**: Settlement reconciliation pipeline annotates all trade logs with `settlement_result` field from Kalshi API
-- [ ] **FEED-02**: Backfill script queries individual market endpoints for trades missing settlement data
+- [x] **FEED-01**: Settlement reconciliation pipeline annotates all trade logs with `settlement_result` field from Kalshi API
+- [x] **FEED-02**: Backfill script queries individual market endpoints for trades missing settlement data
 - [ ] **FEED-03**: Brier score computation produces non-null scores per bot and per market type
 - [ ] **FEED-04**: Calibration curve (reliability diagram) shows binned predicted-vs-actual for each probability model
 - [ ] **FEED-05**: Per-bot P&L tracking computes realized P&L, win rate, and Sharpe ratio from settled trades
@@ -108,8 +108,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| FEED-01 | Phase 1 | Pending |
-| FEED-02 | Phase 1 | Pending |
+| FEED-01 | Phase 1 | Complete |
+| FEED-02 | Phase 1 | Complete |
 | FEED-03 | Phase 1 | Pending |
 | FEED-04 | Phase 1 | Pending |
 | FEED-05 | Phase 1 | Pending |
