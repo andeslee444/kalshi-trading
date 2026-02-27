@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: in-progress
-last_updated: "2026-02-27T22:05:00Z"
+last_updated: "2026-02-27T22:58:00Z"
 progress:
   total_phases: 8
   completed_phases: 1
-  total_plans: 4
-  completed_plans: 4
+  total_plans: 5
+  completed_plans: 5
 ---
 
 # Project State
@@ -18,36 +18,37 @@ progress:
 See: .planning/PROJECT.md (updated 2026-02-26)
 
 **Core value:** Every bot must produce consistent daily P&L -- bots trading regularly on validated edges, exits protecting capital, and measurable model calibration proving the math works.
-**Current focus:** Phase 1 complete (all 4 plans including gap closure). Ready for Phase 2 (Position Sizing) and Phase 3 (Position Management).
+**Current focus:** Phase 1 complete (all 5 plans including UAT gap closure). Ready for Phase 2 (Position Sizing) and Phase 3 (Position Management).
 
 ## Current Position
 
 Phase: 1 of 8 (Feedback Loop) -- COMPLETE
-Plan: 4 of 4 in current phase (all complete)
-Status: Phase 1 fully complete with pipeline executed and verified
-Last activity: 2026-02-27 -- Completed 01-04 (Gap Closure: pipeline execution + P&L bug fix)
+Plan: 5 of 5 in current phase (all complete)
+Status: Phase 1 fully complete with all UAT gaps closed
+Last activity: 2026-02-27 -- Completed 01-05 (UAT Gap Closure: API pagination + test suite green)
 
 Progress: [██░░░░░░░░] 16%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4
+- Total plans completed: 5
 - Average duration: 5 min
-- Total execution time: 0.4 hours
+- Total execution time: 0.5 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 01-feedback-loop | 4 | 26 min | 7 min |
+| 01-feedback-loop | 5 | 30 min | 6 min |
 
 **Recent Trend:**
-- Last 5 plans: 3min, 3min, 5min, 15min
+- Last 5 plans: 3min, 3min, 5min, 15min, 4min
 - Trend: stable
 
 *Updated after each plan completion*
 | Phase 01 P04 | 15min | 2 tasks | 9 files |
+| Phase 01 P05 | 4min | 2 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -69,6 +70,7 @@ Recent decisions affecting current work:
 - [01-04]: Kalshi revenue field is gross payout (cost + profit), not net profit -- must subtract cost for P&L
 - [01-04]: Kalshi API pagination limit is 100, not 1000
 - [01-04]: Chart.js canvas needs fixed-height container to prevent infinite growth on scroll
+- [01-05]: _reset_calibration() must set {} (not None) to prevent re-reading calibration.json during tests
 
 ### Pending Todos
 
@@ -81,5 +83,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-27
-Stopped at: Completed 01-04-PLAN.md (Gap Closure) -- Phase 1 fully complete
+Stopped at: Completed 01-05-PLAN.md (UAT Gap Closure) -- Phase 1 fully complete with all gaps closed
 Resume file: None
