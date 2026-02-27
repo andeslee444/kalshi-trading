@@ -533,18 +533,19 @@ def kalshi_fee_cents(price_cents):
     return KALSHI_FEE_RATE * p * (1 - p) * 100
 
 
-def edge_after_fees(raw_edge, price_cents):
-    """DEPRECATED: Do not use for new code. Fee should reduce the payout,
-    not the edge. Use raw edge + pass fee_cents to Kelly functions instead.
+def _edge_after_fees(raw_edge, price_cents):
+    """DEPRECATED internal helper. Use raw edge + fee_cents param instead.
 
     This function subtracts fee as a probability delta, but the mathematically
     correct treatment is to reduce the payout (100 -> 100-fee) in the Kelly
     formula. All bots now pass fee_cents directly to half_kelly/quarter_kelly.
-
-    Kept for backward compatibility with tests and any external callers.
     """
     fee = kalshi_fee_cents(price_cents)
     return raw_edge - fee / 100
+
+
+# Backward-compatible alias — underscore prefix signals deprecation to developers
+edge_after_fees = _edge_after_fees
 
 
 # ─── Crypto probability model ───
@@ -854,6 +855,36 @@ def quarter_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None,
     if contracts * price_cents > max_exposure_cents:
         contracts = max_exposure_cents // price_cents
     risk = contracts * price_cents
+    if return_details:
+        return (contracts, risk, details)
+    return (contracts, risk)
+
+
+def quarter_kelly_sell(edge, sell_price_cents, max_cost_cents, bankroll_cents=None,
+                       max_exposure_cents=None, fee_cents=0, return_details=False):
+    """Quarter-Kelly for sell-side trades (higher model uncertainty).
+
+    Mirrors quarter_kelly but for selling YES (buying NO).
+    Uses half_kelly_sell internally, then halves the result.
+
+    max_exposure_cents: hard cap on total position risk.
+                        Default scales with bankroll: max($5, 5% of bankroll).
+    fee_cents: per-contract fee in cents, passed through to half_kelly_sell.
+    If return_details=True, returns (contracts, risk_cents, details_dict).
+    """
+    if max_exposure_cents is None:
+        max_exposure_cents = max(500, int((bankroll_cents or 10000) * 0.05))
+    result = half_kelly_sell(edge, sell_price_cents, max_cost_cents, bankroll_cents,
+                             fee_cents=fee_cents, return_details=True)
+    contracts, _risk, details = result
+    # Halve the half-Kelly position (= quarter-Kelly)
+    contracts = contracts // 2
+    details["kelly_fraction"] = details["kelly_fraction"] / 2
+    # Hard-cap exposure (risk per contract = 100 - sell_price for sell side)
+    risk_per = 100 - sell_price_cents
+    if risk_per > 0 and contracts * risk_per > max_exposure_cents:
+        contracts = max_exposure_cents // risk_per
+    risk = contracts * risk_per if risk_per > 0 else 0
     if return_details:
         return (contracts, risk, details)
     return (contracts, risk)

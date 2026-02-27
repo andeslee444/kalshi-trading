@@ -564,7 +564,8 @@ class PortfolioAllocator:
         self._reset_daily_if_needed()
         total, available = self._get_balance()
         return {
-            "bankroll_cents": total,
+            "bankroll_cents": available,
+            "total_balance_cents": total,
             "available_cents": available,
             "total_risk_today_cents": self._total_risk_cents,
             "portfolio_risk_limit_cents": int(available * PORTFOLIO_DAILY_LOSS_FRACTION) if available else 0,
