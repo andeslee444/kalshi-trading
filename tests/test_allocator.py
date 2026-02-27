@@ -155,6 +155,32 @@ class TestBankrollUsesAvailable:
         assert budget.bankroll_cents != 50000
 
 
+class TestBankrollStatusReporting:
+    """Phase 2 Fix: get_status() should report available_balance as bankroll_cents."""
+
+    def _make_allocator(self, total=10000, available=2000):
+        mock_client = MagicMock()
+        mock_client.get_balance.return_value = (total, available)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            json.dump({}, f)
+            state_path = f.name
+        alloc = PortfolioAllocator(client=mock_client, state_path=state_path)
+        alloc._daily_date = datetime.date.today().isoformat()
+        return alloc
+
+    def test_status_bankroll_is_available(self):
+        """get_status() bankroll_cents should be available_balance, not total."""
+        alloc = self._make_allocator(total=10000, available=2000)
+        status = alloc.get_status()
+        assert status["bankroll_cents"] == 2000
+
+    def test_status_includes_total(self):
+        """get_status() should include total_balance_cents for reference."""
+        alloc = self._make_allocator(total=10000, available=2000)
+        status = alloc.get_status()
+        assert status["total_balance_cents"] == 10000
+
+
 class TestAbsoluteDailyLossCap:
     """Fix D: Absolute $100 daily risk cap."""
 

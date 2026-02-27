@@ -7,7 +7,7 @@ conftest.py adds src/kalshi/ to sys.path so direct import works.
 import math
 import pytest
 
-from probability import half_kelly, half_kelly_sell
+from probability import half_kelly, half_kelly_sell, quarter_kelly_sell
 
 
 # ---------------------------------------------------------------------------
@@ -183,3 +183,59 @@ class TestHalfKellySell:
         buy_contracts, buy_risk = half_kelly(0.10, 50, 5000, bankroll_cents=50000)
         sell_contracts, sell_risk = half_kelly_sell(0.10, 50, 5000, bankroll_cents=50000)
         assert buy_contracts == sell_contracts
+
+
+# ---------------------------------------------------------------------------
+# Sell-side quarter_kelly_sell tests (Phase 2, Plan 01)
+# ---------------------------------------------------------------------------
+
+class TestQuarterKellySell:
+    """Unit tests for ``quarter_kelly_sell`` — quarter-Kelly for sell-side trades."""
+
+    def test_zero_edge_returns_zero(self):
+        contracts, risk = quarter_kelly_sell(0, 50, 500)
+        assert contracts == 0
+        assert risk == 0
+
+    def test_negative_edge_returns_zero(self):
+        contracts, risk = quarter_kelly_sell(-0.10, 50, 500)
+        assert contracts == 0
+        assert risk == 0
+
+    def test_positive_edge_returns_positive(self):
+        contracts, risk = quarter_kelly_sell(0.20, 90, 500, bankroll_cents=50000)
+        assert contracts > 0
+
+    def test_halves_half_kelly_sell(self):
+        """quarter_kelly_sell should return <= half_kelly_sell // 2 contracts."""
+        hk_contracts, _ = half_kelly_sell(0.20, 90, 5000, bankroll_cents=50000)
+        qk_contracts, _ = quarter_kelly_sell(0.20, 90, 5000, bankroll_cents=50000)
+        assert qk_contracts <= hk_contracts // 2
+
+    def test_respects_max_exposure(self):
+        """With max_exposure_cents, total risk should not exceed it."""
+        contracts, risk = quarter_kelly_sell(
+            0.30, 90, 50000, bankroll_cents=500000, max_exposure_cents=100
+        )
+        # risk per contract = 100 - 90 = 10
+        assert contracts * (100 - 90) <= 100
+
+    def test_return_details(self):
+        """With return_details=True, returns 3-tuple with dict."""
+        result = quarter_kelly_sell(0.20, 90, 5000, bankroll_cents=50000, return_details=True)
+        assert len(result) == 3
+        contracts, risk, details = result
+        assert "kelly_fraction" in details
+        assert "bankroll_used" in details
+
+    def test_fee_reduces_contracts(self):
+        """fee_cents > 0 should reduce contracts or keep them the same."""
+        c_no_fee, _ = quarter_kelly_sell(0.15, 90, 5000, bankroll_cents=10000, fee_cents=0)
+        c_with_fee, _ = quarter_kelly_sell(0.15, 90, 5000, bankroll_cents=10000, fee_cents=2)
+        assert c_with_fee <= c_no_fee
+
+    def test_sell_price_boundary(self):
+        """At sell_price=100, should return (0, 0) — boundary case."""
+        contracts, risk = quarter_kelly_sell(0.10, 100, 500)
+        assert contracts == 0
+        assert risk == 0
