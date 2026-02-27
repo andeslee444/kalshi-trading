@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-last_updated: "2026-02-27T23:21:09.203Z"
+last_updated: "2026-02-27T23:26:38Z"
 progress:
   total_phases: 2
   completed_phases: 1
   total_plans: 7
-  completed_plans: 6
+  completed_plans: 7
 ---
 
 # Project State
@@ -18,23 +18,23 @@ progress:
 See: .planning/PROJECT.md (updated 2026-02-26)
 
 **Core value:** Every bot must produce consistent daily P&L -- bots trading regularly on validated edges, exits protecting capital, and measurable model calibration proving the math works.
-**Current focus:** Phase 2 in progress (Position Sizing). Plan 02-01 complete (quarter_kelly_sell, get_status fix). Plan 02-02 (bot migration) next.
+**Current focus:** Phase 2 complete (Position Sizing). All bots migrated to quarter-Kelly default. Phase 3 (Exit Management) next.
 
 ## Current Position
 
-Phase: 2 of 8 (Position Sizing)
-Plan: 1 of 2 in current phase (1 complete)
-Status: Plan 02-01 complete, Plan 02-02 pending
-Last activity: 2026-02-27 -- Completed 02-01 (Position Sizing Foundation: quarter_kelly_sell, get_status fix, edge_after_fees deprecation)
+Phase: 3 of 8 (Exit Management)
+Plan: 0 of ? in current phase (0 complete)
+Status: Phase 02 complete, Phase 03 pending
+Last activity: 2026-02-27 -- Completed 02-02 (Bot Migration to Quarter-Kelly Default Sizing)
 
-Progress: [███░░░░░░░] 24%
+Progress: [███░░░░░░░] 28%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 6
+- Total plans completed: 7
 - Average duration: 5 min
-- Total execution time: 0.5 hours
+- Total execution time: 0.6 hours
 
 **By Phase:**
 
@@ -43,13 +43,14 @@ Progress: [███░░░░░░░] 24%
 | 01-feedback-loop | 5 | 30 min | 6 min |
 
 **Recent Trend:**
-- Last 5 plans: 3min, 5min, 15min, 4min, 2min
+- Last 5 plans: 5min, 15min, 4min, 2min, 4min
 - Trend: stable
 
 *Updated after each plan completion*
 | Phase 01 P04 | 15min | 2 tasks | 9 files |
 | Phase 01 P05 | 4min | 2 tasks | 8 files |
 | Phase 02 P01 | 2min | 1 tasks | 4 files |
+| Phase 02 P02 | 4min | 2 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -74,6 +75,9 @@ Recent decisions affecting current work:
 - [01-05]: _reset_calibration() must set {} (not None) to prevent re-reading calibration.json during tests
 - [Phase 02]: Used simple alias for edge_after_fees deprecation (no warnings.warn) to avoid log clutter
 - [Phase 02]: quarter_kelly_sell delegates to half_kelly_sell then halves -- mirrors quarter_kelly pattern
+- [Phase 02-02]: Weather bot uses calibration gate: _load_calibration() per-city check to decide sizing tier
+- [Phase 02-02]: Bracket markets always use quarter-Kelly regardless of calibration status
+- [Phase 02-02]: Descriptive sizing labels include calibration status (e.g. "half-Kelly (calibrated)")
 
 ### Pending Todos
 
@@ -86,5 +90,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-27
-Stopped at: Completed 02-01-PLAN.md (Position Sizing Foundation: quarter_kelly_sell, get_status fix, edge_after_fees deprecation)
+Stopped at: Completed 02-02-PLAN.md (Bot Migration to Quarter-Kelly Default Sizing -- Phase 02 complete)
 Resume file: None
