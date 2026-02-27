@@ -40,7 +40,7 @@ def _fetch_all_settlements(client):
     settlements = {}
     cursor = None
     for _ in range(50):
-        path = "/portfolio/settlements?limit=1000"
+        path = "/portfolio/settlements?limit=100"
         if cursor:
             path += f"&cursor={cursor}"
         try:
@@ -70,7 +70,7 @@ def _fetch_all_fills(client):
     fills = {}
     cursor = None
     for _ in range(50):
-        path = "/portfolio/fills?limit=1000"
+        path = "/portfolio/fills?limit=100"
         if cursor:
             path += f"&cursor={cursor}"
         try:

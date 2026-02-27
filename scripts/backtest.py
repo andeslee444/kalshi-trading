@@ -107,7 +107,7 @@ def fetch_settlements(client):
     all_settlements = []
     cursor = None
     for _ in range(50):
-        path = "/portfolio/settlements?limit=1000"
+        path = "/portfolio/settlements?limit=100"
         if cursor:
             path += f"&cursor={cursor}"
         data = client.get(path)
@@ -124,7 +124,7 @@ def fetch_fills(client):
     all_fills = []
     cursor = None
     for _ in range(50):
-        path = "/portfolio/fills?limit=1000"
+        path = "/portfolio/fills?limit=100"
         if cursor:
             path += f"&cursor={cursor}"
         data = client.get(path)

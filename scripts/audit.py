@@ -159,7 +159,7 @@ class AuditEngine:
             self._settlements = []
             cursor = None
             for _ in range(50):
-                path = "/portfolio/settlements?limit=1000"
+                path = "/portfolio/settlements?limit=100"
                 if cursor:
                     path += f"&cursor={cursor}"
                 data = client.get(path)
@@ -176,7 +176,7 @@ class AuditEngine:
             self._fills = []
             cursor = None
             for _ in range(50):
-                path = "/portfolio/fills?limit=1000"
+                path = "/portfolio/fills?limit=100"
                 if cursor:
                     path += f"&cursor={cursor}"
                 data = client.get(path)
