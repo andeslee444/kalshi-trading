@@ -14,7 +14,7 @@ import requests
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary
-from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, half_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, nws_sigma_for_hour
+from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, quarter_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, nws_sigma_for_hour
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
 from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_threshold
 from capital_allocator import PortfolioAllocator
@@ -158,7 +158,7 @@ def match_hdd_to_markets(sales_data, prefetched_markets=None, ss=None):
                 title = m.get("title", "").lower()
                 subtitle = m.get("subtitle", "").lower()
                 if re.search(r'\b' + re.escape(artist) + r'\b', title) or re.search(r'\b' + re.escape(artist) + r'\b', subtitle):
-                    if not is_market_liquid(m):
+                    if not is_market_liquid(m, min_volume=5, max_spread=40):
                         if ss:
                             ss.skip("illiquid")
                         continue
@@ -259,7 +259,7 @@ def evaluate_album_trade(market, sale, ss=None):
             return
         price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
         fee = kalshi_fee_cents(price)
-        count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+        count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
             if ss:
                 ss.skip("kelly_zero")
@@ -276,7 +276,7 @@ def evaluate_album_trade(market, sale, ss=None):
         result = trade_manager.place_order(ticker, "yes", price, count, reasoning,
                                             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                             model_prob=round(confidence, 4), raw_edge=round(edge, 4),
-                                            fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                            fee_cents=round(fee, 2), sizing_method="quarter_kelly",
                                             market_close_time=market.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
@@ -318,7 +318,7 @@ def evaluate_album_trade(market, sale, ss=None):
             return
         price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
         fee = kalshi_fee_cents(price)
-        count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+        count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
             if ss:
                 ss.skip("kelly_zero")
@@ -335,7 +335,7 @@ def evaluate_album_trade(market, sale, ss=None):
         result = trade_manager.place_order(ticker, "no", price, count, reasoning,
                                             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                             model_prob=round(1.0 - confidence, 4), raw_edge=round(edge, 4),
-                                            fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                            fee_cents=round(fee, 2), sizing_method="quarter_kelly",
                                             market_close_time=market.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
@@ -528,7 +528,7 @@ def match_boxoffice_to_markets(box_data, prefetched_markets=None, ss=None):
                 market_title = m.get("title", "").lower()
                 title_words = [w for w in title_lower.split() if len(w) > 3]
                 if title_words and all(re.search(r'\b' + re.escape(w) + r'\b', market_title) for w in title_words):
-                    if not is_market_liquid(m):
+                    if not is_market_liquid(m, min_volume=5, max_spread=40):
                         continue
                     # Parse threshold for consistency
                     threshold_match = re.search(r'\$(\d+(?:\.\d+)?)\s*[MmBb](?:illion)?', m.get("title", ""))
@@ -621,7 +621,7 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
             return
         price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
         fee = kalshi_fee_cents(price)
-        count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+        count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
             if ss:
                 ss.skip("kelly_zero")
@@ -637,7 +637,7 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
         result = trade_manager.place_order(ticker, "yes", price, count, reasoning,
                                             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                             model_prob=round(confidence, 4), raw_edge=round(edge, 4),
-                                            fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                            fee_cents=round(fee, 2), sizing_method="quarter_kelly",
                                             market_close_time=market.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
@@ -679,7 +679,7 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
             return
         price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
         fee = kalshi_fee_cents(price)
-        count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+        count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
             if ss:
                 ss.skip("kelly_zero")
@@ -695,7 +695,7 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
         result = trade_manager.place_order(ticker, "no", price, count, reasoning,
                                             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                             model_prob=round(1.0 - confidence, 4), raw_edge=round(edge, 4),
-                                            fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                            fee_cents=round(fee, 2), sizing_method="quarter_kelly",
                                             market_close_time=market.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
@@ -862,6 +862,14 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
 
         now = datetime.datetime.now()
 
+        # Pre-dawn gate: running_high is meaningless before 8 AM
+        # The daily high hasn't started building yet
+        if now.hour < 8:
+            log.info(f"  NWS: skipping all cities — pre-dawn ({now.hour}:00), running_high unreliable")
+            if ss:
+                ss.skip("pre_dawn")
+            return
+
         # Group by city for consistency validation
         by_city = {}
         for m, parsed in today_markets:
@@ -959,7 +967,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                         continue
                     price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
                     fee = kalshi_fee_cents(price)
-                    count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+                    count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
                     if count <= 0:
                         if ss:
                             ss.skip("kelly_zero")
@@ -977,7 +985,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     result = trade_manager.place_order(ticker, "yes", price, count, reasoning,
                                                         market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                                         model_prob=round(prob, 4), raw_edge=round(edge, 4),
-                                                        fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                                        fee_cents=round(fee, 2), sizing_method="quarter_kelly",
                                                         market_close_time=m.get("close_time"),
                                                         kelly_fraction=kelly_details.get("kelly_fraction"),
                                                         bankroll_used=kelly_details.get("bankroll_used"),
@@ -1034,7 +1042,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                         continue
                     price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
                     fee = kalshi_fee_cents(price)
-                    count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+                    count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
                     if count <= 0:
                         if ss:
                             ss.skip("kelly_zero")
@@ -1052,7 +1060,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     result = trade_manager.place_order(ticker, "no", price, count, reasoning,
                                                         market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                                         model_prob=round(prob, 4), raw_edge=round(edge, 4),
-                                                        fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                                        fee_cents=round(fee, 2), sizing_method="quarter_kelly",
                                                         market_close_time=m.get("close_time"),
                                                         kelly_fraction=kelly_details.get("kelly_fraction"),
                                                         bankroll_used=kelly_details.get("bankroll_used"),
@@ -1110,7 +1118,6 @@ def main():
 
     while True:
         now = time.time()
-        health.record_bot_heartbeat("source-monitor")
         issues = health.check_health()
         if issues:
             log.warning("Health issues: %s", "; ".join(issues))
@@ -1157,6 +1164,9 @@ def main():
 
             if ss:
                 ss.finalize()
+
+            # Record heartbeat AFTER successful cycle (not before)
+            health.record_bot_heartbeat("source-monitor")
 
         except Exception as e:
             log.error(f"Main loop error: {e}")

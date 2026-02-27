@@ -21,7 +21,7 @@ from kalshi_auth import (
     HealthCheckMonitor, OrderMonitor, ScanSummary,
 )
 from probability import (
-    econ_nowcast_probability, cpi_nowcast_sigma, half_kelly, compute_limit_price,
+    econ_nowcast_probability, cpi_nowcast_sigma, quarter_kelly, compute_limit_price,
     kalshi_fee_cents, gas_price_probability,
 )
 from capital_allocator import PortfolioAllocator
@@ -795,7 +795,7 @@ def scan_and_trade():
             continue
 
         fee = kalshi_fee_cents(price)
-        count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+        count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
             ss.skip("kelly_zero")
             trade_manager.log_decision(ticker, side, "skipped", "kelly_zero: edge too small for price",
@@ -822,7 +822,7 @@ def scan_and_trade():
         result = trade_manager.place_order(ticker, side, price, count, reasoning,
                                             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                             model_prob=round(opp["prob"], 4), raw_edge=round(edge, 4),
-                                            fee_cents=round(kalshi_fee_cents(price), 2), sizing_method="half_kelly",
+                                            fee_cents=round(kalshi_fee_cents(price), 2), sizing_method="quarter_kelly",
                                             market_close_time=m.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),

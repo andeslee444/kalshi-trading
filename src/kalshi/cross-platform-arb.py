@@ -24,7 +24,7 @@ from kalshi_auth import (
 )
 from polymarket_client import PolymarketClient
 from capital_allocator import PortfolioAllocator
-from probability import half_kelly, compute_limit_price, kalshi_fee_cents
+from probability import quarter_kelly, compute_limit_price, kalshi_fee_cents
 
 setup_unbuffered()
 log = setup_logging("cross-platform-arb")
@@ -305,7 +305,7 @@ def scan_spreads():
                 yes_ask = spread["kalshi_yes_ask"]
                 price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
                 fee = kalshi_fee_cents(price)
-                count, risk = half_kelly(edge, price, budget.max_cost_cents,
+                count, risk = quarter_kelly(edge, price, budget.max_cost_cents,
                                           bankroll_cents=budget.bankroll_cents, fee_cents=fee)
                 if count > 0:
                     reasoning = (
@@ -316,7 +316,7 @@ def scan_spreads():
                     result = trade_manager.place_order(k_ticker, "yes", price, count, reasoning,
                                                         market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                                         model_prob=round(0.5 + edge, 4), raw_edge=round(edge, 4),
-                                                        fee_cents=round(kalshi_fee_cents(price), 2), sizing_method="half_kelly")
+                                                        fee_cents=round(kalshi_fee_cents(price), 2), sizing_method="quarter_kelly")
                     if result:
                         ss.trades_placed += 1
                         allocator.record_trade("cross-platform-arb", k_ticker, risk, edge=edge)

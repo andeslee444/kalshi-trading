@@ -8,7 +8,7 @@ import json, time, datetime, os, sys, re, traceback
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary
-from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, half_kelly, compute_limit_price, is_market_liquid, kalshi_fee_cents
+from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, quarter_kelly, compute_limit_price, is_market_liquid, kalshi_fee_cents
 from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_threshold
 from capital_allocator import PortfolioAllocator
 
@@ -232,7 +232,8 @@ def match_and_trade(markets, album_data, box_data, ss=None):
         last = m.get("last_price", 0)
 
         # Rec 7: Skip illiquid markets (prevents dead resting orders)
-        if not is_market_liquid(m):
+        # Relaxed thresholds for entertainment: lower volume, wider spreads typical
+        if not is_market_liquid(m, min_volume=5, max_spread=40):
             if ss:
                 ss.skip("illiquid")
             trade_manager.log_decision(ticker, "skip", "skipped", "illiquid",
@@ -354,7 +355,7 @@ def evaluate_album_opportunity(market, album, market_price, ss=None):
             return
         price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
         fee = kalshi_fee_cents(price)
-        count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+        count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
             if ss:
                 ss.skip("kelly_zero")
@@ -370,7 +371,7 @@ def evaluate_album_opportunity(market, album, market_price, ss=None):
         result = trade_manager.place_order(ticker, "yes", price, count, reasoning, confidence=confidence,
                                             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                             model_prob=round(confidence, 4), raw_edge=round(edge, 4),
-                                            fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                            fee_cents=round(fee, 2), sizing_method="quarter_kelly",
                                             market_close_time=market.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
@@ -413,7 +414,7 @@ def evaluate_album_opportunity(market, album, market_price, ss=None):
             return
         price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
         fee = kalshi_fee_cents(price)
-        count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+        count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
             if ss:
                 ss.skip("kelly_zero")
@@ -429,7 +430,7 @@ def evaluate_album_opportunity(market, album, market_price, ss=None):
         result = trade_manager.place_order(ticker, "no", price, count, reasoning, confidence=confidence,
                                             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                             model_prob=round(1.0 - confidence, 4), raw_edge=round(edge, 4),
-                                            fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                            fee_cents=round(fee, 2), sizing_method="quarter_kelly",
                                             market_close_time=market.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
@@ -521,7 +522,7 @@ def evaluate_boxoffice_opportunity(market, movie, market_price, ss=None):
             return
         price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
         fee = kalshi_fee_cents(price)
-        count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+        count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
             if ss:
                 ss.skip("kelly_zero")
@@ -536,7 +537,7 @@ def evaluate_boxoffice_opportunity(market, movie, market_price, ss=None):
         result = trade_manager.place_order(ticker, "yes", price, count, reasoning, confidence=confidence,
                                             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                             model_prob=round(confidence, 4), raw_edge=round(edge, 4),
-                                            fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                            fee_cents=round(fee, 2), sizing_method="quarter_kelly",
                                             market_close_time=market.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
@@ -579,7 +580,7 @@ def evaluate_boxoffice_opportunity(market, movie, market_price, ss=None):
             return
         price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
         fee = kalshi_fee_cents(price)
-        count, risk, kelly_details = half_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+        count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
             if ss:
                 ss.skip("kelly_zero")
@@ -594,7 +595,7 @@ def evaluate_boxoffice_opportunity(market, movie, market_price, ss=None):
         result = trade_manager.place_order(ticker, "no", price, count, reasoning, confidence=confidence,
                                             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                             model_prob=round(1.0 - confidence, 4), raw_edge=round(edge, 4),
-                                            fee_cents=round(fee, 2), sizing_method="half_kelly",
+                                            fee_cents=round(fee, 2), sizing_method="quarter_kelly",
                                             market_close_time=market.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),

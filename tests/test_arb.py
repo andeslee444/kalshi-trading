@@ -48,7 +48,7 @@ def _load_arb_module():
     sys.modules["kalshi_auth"] = fake_auth
 
     fake_prob = types.ModuleType("probability")
-    fake_prob.half_kelly = lambda *a, **kw: (0, 0)
+    fake_prob.quarter_kelly = lambda *a, **kw: (0, 0)
     fake_prob.compute_limit_price = lambda *a, **kw: 50
     fake_prob.kalshi_fee_cents = lambda p: 0.07 * (p / 100) * (1 - p / 100) * 100
     sys.modules["probability"] = fake_prob
