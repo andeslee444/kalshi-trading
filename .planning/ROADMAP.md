@@ -12,7 +12,7 @@ This system has extensive infrastructure but near-zero executed trades and zero 
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Feedback Loop** - Settlement reconciliation, Brier scores, calibration curves, and P&L tracking
+- [x] **Phase 1: Feedback Loop** - Settlement reconciliation, Brier scores, calibration curves, and P&L tracking
 - [ ] **Phase 2: Position Sizing** - Fix Kelly bankroll basis, standardize fees, default to quarter-Kelly
 - [ ] **Phase 3: Position Management** - Enable take-profit, stop-loss, model-shift exits, trailing stops, and order TTL
 - [ ] **Phase 4: Bot Activation** - Debug and activate entertainment, beatrelease, economics, strategy, and weather bots
@@ -39,7 +39,7 @@ Plans:
 - [x] 01-01-PLAN.md -- Settlement reconciliation pipeline: canonical trade files module, fix reconcile + backfill scripts
 - [x] 01-02-PLAN.md -- Brier scores, calibration curves, P&L metrics: per-market-type breakdowns, Chart.js dashboard, daily/weekly P&L
 - [x] 01-03-PLAN.md -- Per-city sigma calibration: multi-objective optimization (Brier + P&L), minimum sample thresholds
-- [ ] 01-04-PLAN.md -- Gap closure: execute pipeline end-to-end (reconcile + backfill + backtest + calibrate + performance) in write mode
+- [x] 01-04-PLAN.md -- Gap closure: execute pipeline end-to-end (reconcile + backfill + backtest + calibrate + performance) in write mode
 
 ### Phase 2: Position Sizing
 **Goal**: All bots use correct position sizing math before being activated for live trading
@@ -157,7 +157,7 @@ Note: Phase 2 and Phase 3 can execute in parallel (both depend only on Phase 1).
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Feedback Loop | 3/4 | Gap closure | - |
+| 1. Feedback Loop | 4/4 | Complete | 2026-02-27 |
 | 2. Position Sizing | 0/1 | Not started | - |
 | 3. Position Management | 0/2 | Not started | - |
 | 4. Bot Activation | 0/4 | Not started | - |
