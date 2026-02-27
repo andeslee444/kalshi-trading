@@ -89,6 +89,15 @@ def _load_beatrelease_scanner():
         "record_source_success": lambda self, *a, **kw: None,
         "record_source_error": lambda self, *a, **kw: None,
     })
+    fake_auth.ScanSummary = type("ScanSummary", (), {
+        "__init__": lambda self, *a, **kw: None,
+        "markets_fetched": 0,
+        "markets_evaluated": 0,
+        "trades_placed": 0,
+        "skips": {},
+        "log_summary": lambda self: None,
+    })
+    fake_auth.load_trades = lambda *a, **kw: []
     sys.modules["kalshi_auth"] = fake_auth
 
     fake_alloc = types.ModuleType("capital_allocator")
@@ -1898,6 +1907,14 @@ class TestSettlementAwareCleanup:
             "record_source_success": lambda self, *a, **kw: None,
             "record_source_error": lambda self, *a, **kw: None,
             "check_health": lambda self, *a, **kw: [],
+        })
+        fake_auth.ScanSummary = type("ScanSummary", (), {
+            "__init__": lambda self, *a, **kw: None,
+            "markets_fetched": 0,
+            "markets_evaluated": 0,
+            "trades_placed": 0,
+            "skips": {},
+            "log_summary": lambda self: None,
         })
         sys.modules["kalshi_auth"] = fake_auth
 

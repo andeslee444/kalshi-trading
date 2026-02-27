@@ -106,6 +106,12 @@ class TestStudentTCdf:
 
 class TestWeatherProbability:
 
+    def setup_method(self):
+        _reset_calibration()
+
+    def teardown_method(self):
+        _reset_calibration()
+
     # T-direction
 
     def test_t_forecast_well_above(self):

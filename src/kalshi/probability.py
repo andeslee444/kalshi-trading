@@ -145,9 +145,14 @@ def _load_calibration():
 
 
 def _reset_calibration():
-    """Reset cached calibration (for testing)."""
+    """Reset cached calibration to defaults (for testing).
+
+    Sets _calibration to empty dict so _load_calibration() returns {}
+    without re-reading calibration.json from disk. This ensures tests
+    use hardcoded default sigma values regardless of what's on disk.
+    """
     global _calibration
-    _calibration = None
+    _calibration = {}
 
 
 # ─── Probability models ───
@@ -165,6 +170,9 @@ def weather_probability(forecast_temp, threshold, direction, days_out=0, city=No
     direction="T": P(actual > threshold) = 1 - Phi((threshold - forecast) / sigma)
     direction="B": P(threshold <= actual < threshold+1) = Phi((threshold+1 - forecast)/sigma) - Phi((threshold - forecast)/sigma)
     """
+    if forecast_temp is None:
+        return None
+
     cal = _load_calibration()
     intercept = 2.0  # NWS MAE data shows day-0 error ~2.0°F (was 2.5)
     slope = 0.5
@@ -907,21 +915,29 @@ MIN_LIQUIDITY_VOLUME = 50
 MAX_SPREAD_FOR_ENTRY = 20  # cents
 
 
-def is_market_liquid(market):
+def is_market_liquid(market, min_volume=None, max_spread=None):
     """Check if a market has sufficient liquidity for entry.
 
-    Requires both a bid and ask, spread <= 20c, and volume >= 50.
+    Requires both a bid and ask, spread <= max_spread, and volume >= min_volume.
     Prevents placing orders in dead markets with no counterparties.
+
+    Args:
+        market: Market dict with yes_bid, yes_ask, volume fields.
+        min_volume: Override minimum volume (default: MIN_LIQUIDITY_VOLUME=50).
+        max_spread: Override max spread in cents (default: MAX_SPREAD_FOR_ENTRY=20).
     """
+    vol_threshold = min_volume if min_volume is not None else MIN_LIQUIDITY_VOLUME
+    spread_threshold = max_spread if max_spread is not None else MAX_SPREAD_FOR_ENTRY
+
     yes_bid = market.get("yes_bid", 0)
     yes_ask = market.get("yes_ask", 0)
     volume = market.get("volume", 0) or 0
 
     if not yes_bid or not yes_ask:
         return False
-    if yes_ask - yes_bid > MAX_SPREAD_FOR_ENTRY:
+    if yes_ask - yes_bid > spread_threshold:
         return False
-    if volume < MIN_LIQUIDITY_VOLUME:
+    if volume < vol_threshold:
         return False
     return True
 

@@ -6,6 +6,8 @@ import sys
 import pytest
 from pathlib import Path
 
+from probability import _reset_calibration
+
 
 # ---------------------------------------------------------------------------
 # Import helper -- weather-bot.py has a hyphen in its name and performs
@@ -160,6 +162,12 @@ class TestParseTicker:
 # ===================================================================
 
 class TestComputeProbability:
+
+    def setup_method(self):
+        _reset_calibration()
+
+    def teardown_method(self):
+        _reset_calibration()
 
     # --- direction = "T" (above threshold) ---
 
