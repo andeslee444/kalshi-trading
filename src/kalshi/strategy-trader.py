@@ -7,7 +7,7 @@ import json, time, datetime, os, sys, math, argparse, traceback
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log, _atomic_write_json, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary
-from probability import half_kelly_sell, longshot_edge, compute_limit_price, kalshi_fee_cents, classify_ticker_category
+from probability import quarter_kelly_sell, longshot_edge, compute_limit_price, kalshi_fee_cents, classify_ticker_category
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -70,7 +70,7 @@ def find_longshot_sells(markets, bankroll):
         # bias strength and time decay
         est_edge_prelim = longshot_edge(yes_ask, ticker=ticker, hours_to_close=hours)
 
-        # Minimum edge filter — half_kelly_sell already deducts fees from
+        # Minimum edge filter — quarter_kelly_sell already deducts fees from
         # win_amount, so no need to subtract fees here (avoids double-counting)
         fee_per_contract = kalshi_fee_cents(yes_ask)
         min_edge = 0.005  # 0.5% minimum edge (fees handled in Kelly sizing)
@@ -102,7 +102,7 @@ def find_longshot_sells(markets, bankroll):
                                        edge=est_edge, price_cents=sell_price)
             continue
 
-        contracts, risk, kelly_details = half_kelly_sell(
+        contracts, risk, kelly_details = quarter_kelly_sell(
             est_edge, sell_price, budget.max_cost_cents,
             bankroll_cents=budget.bankroll_cents, fee_cents=fee_per_contract,
             return_details=True,
@@ -296,7 +296,7 @@ def run_scan():
             model_prob=round(c["yes_price"] / 100.0 - c["est_edge"], 4),
             raw_edge=round(c["est_edge"], 4),
             fee_cents=round(kalshi_fee_cents(c["yes_price"]), 2),
-            sizing_method="half_kelly_sell",
+            sizing_method="quarter_kelly_sell",
             market_close_time=c.get("close_time"),
             kelly_fraction=c.get("kelly_fraction"),
             bankroll_used=c.get("bankroll_used"),

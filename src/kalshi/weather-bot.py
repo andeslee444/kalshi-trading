@@ -7,7 +7,7 @@ import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary
-from probability import weather_probability, weather_sigma, ensemble_weather_probability, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid
+from probability import weather_probability, weather_sigma, ensemble_weather_probability, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, _load_calibration
 from ticker_utils import parse_weather_ticker as parse_ticker
 from capital_allocator import PortfolioAllocator
 
@@ -31,7 +31,7 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": config["maxTradeAmount"],
     "maxDailyTrades": config.get("maxDailyTrades", 10),
     "maxDailyLoss": config.get("maxDailyLoss", 10),
-}, logger=log, order_monitor=order_monitor)
+}, logger=log, order_monitor=order_monitor, cooldown_hours=12)
 trim_trade_log(TRADES_PATH)
 
 # === Weather Forecast ===
@@ -99,10 +99,12 @@ def get_ensemble_forecast(lat, lon):
 
     combined = {}
     for date in sorted(all_dates):
-        combined[date] = {}
+        day_data = {}
         for model_key, forecasts in model_forecasts.items():
             if date in forecasts:
-                combined[date][model_key] = forecasts[date]
+                day_data[model_key] = forecasts[date]
+        if day_data:  # Only include dates with at least one model's data
+            combined[date] = day_data
 
     return combined
 
@@ -187,6 +189,9 @@ def scan_and_trade():
 
         # Compute probability — ensemble or single-model
         if ENSEMBLE_ENABLED and isinstance(forecast_data, dict):
+            if not forecast_data:
+                ss.skip("empty_forecast")
+                continue
             our_prob = ensemble_weather_probability(forecast_data, parsed["threshold"], parsed["direction"], days_out, city=city)
             forecast_temp = sum(forecast_data.values()) / len(forecast_data)  # mean for logging
             if our_prob is None:
@@ -194,8 +199,27 @@ def scan_and_trade():
                 log.warning("Ensemble returned None for %s, falling back to single-model", ticker)
                 our_prob = compute_probability(forecast_temp, parsed["threshold"], parsed["direction"], days_out, city=city)
         else:
-            forecast_temp = forecast_data if not isinstance(forecast_data, dict) else list(forecast_data.values())[0]
+            if isinstance(forecast_data, dict):
+                if not forecast_data:
+                    ss.skip("empty_forecast")
+                    continue
+                forecast_temp = list(forecast_data.values())[0]
+            else:
+                forecast_temp = forecast_data
+            if forecast_temp is None:
+                ss.skip("null_forecast")
+                continue
             our_prob = compute_probability(forecast_temp, parsed["threshold"], parsed["direction"], days_out, city=city)
+
+        # Skip near-threshold coinflips (|forecast - threshold| < 2°F)
+        MIN_FORECAST_DISTANCE_F = 2.0
+        distance = abs(forecast_temp - parsed["threshold"])
+        if distance < MIN_FORECAST_DISTANCE_F:
+            ss.skip("near_threshold")
+            trade_manager.log_decision(ticker, "skip", "skipped", "near_threshold",
+                                       forecast=forecast_temp, threshold=parsed["threshold"],
+                                       distance=round(distance, 1))
+            continue
 
         yes_ask = m.get("yes_ask", 0)
         yes_bid = m.get("yes_bid", 0)
@@ -297,29 +321,40 @@ def scan_and_trade():
                                        edge=edge, price_cents=price)
             continue
 
-        # Position sizing based on market type and conviction
+        # Position sizing based on market type, conviction, and calibration status
         fee = kalshi_fee_cents(price)
+        cal = _load_calibration()
+        city_code = opp["parsed"]["city"]
+        is_calibrated = bool(cal.get("weather", {}).get("per_city", {}).get(city_code))
+
         if is_bracket:
-            # Rec 3+10: Quarter-Kelly for brackets (cap scales with bankroll)
+            # Rec 3+10: Quarter-Kelly for brackets (always, regardless of calibration)
             count, risk, kelly_details = quarter_kelly(
                 edge, price, budget.max_cost_cents,
                 bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True,
             )
             sizing_label = "quarter-Kelly"
-        elif side == "no" and (1 - opp["our_prob"]) > 0.80:
-            # Rec 4: High-conviction threshold-NO → 60% Kelly
+        elif is_calibrated and side == "no" and (1 - opp["our_prob"]) > 0.80:
+            # Calibration-validated: high-conviction threshold-NO -> 60% Kelly
             count, risk, kelly_details = high_conviction_kelly(
                 edge, price, budget.max_cost_cents,
                 bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True,
             )
-            sizing_label = "60%-Kelly (high-conviction)"
-        else:
-            # Standard half-Kelly
+            sizing_label = "60%-Kelly (high-conviction, calibrated)"
+        elif is_calibrated:
+            # Calibration-validated: standard threshold -> half-Kelly
             count, risk, kelly_details = half_kelly(
                 edge, price, budget.max_cost_cents,
                 bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True,
             )
-            sizing_label = "half-Kelly"
+            sizing_label = "half-Kelly (calibrated)"
+        else:
+            # Not calibrated: default to quarter-Kelly (SIZE-03)
+            count, risk, kelly_details = quarter_kelly(
+                edge, price, budget.max_cost_cents,
+                bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True,
+            )
+            sizing_label = "quarter-Kelly (uncalibrated)"
 
         if count <= 0:
             log.info(f"  Kelly says 0 contracts for {ticker} (edge too small for price), skipping")
