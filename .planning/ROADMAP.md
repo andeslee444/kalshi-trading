@@ -50,10 +50,11 @@ Plans:
   1. Kelly sizing functions compute bankroll from available balance (after subtracting open position exposure), not total balance
   2. Fee calculation follows a single standardized pattern across all bots via the `fee_cents` parameter
   3. All bots default to quarter-Kelly sizing until their Brier score validates model accuracy
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 02-01: Fix Kelly bankroll basis and standardize fee treatment across all bots
+- [ ] 02-01-PLAN.md -- Core sizing: Add quarter_kelly_sell, fix get_status bankroll, deprecate edge_after_fees, TDD tests
+- [ ] 02-02-PLAN.md -- Bot migration: Switch 6 bots to quarter_kelly default, calibration-gated weather sizing
 
 ### Phase 3: Position Management
 **Goal**: The position monitor actively manages open positions with exits instead of holding everything to settlement
@@ -159,7 +160,7 @@ Note: Phase 2 and Phase 3 can execute in parallel (both depend only on Phase 1).
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Feedback Loop | 4/5 | UAT gap closure | - |
-| 2. Position Sizing | 0/1 | Not started | - |
+| 2. Position Sizing | 0/2 | Not started | - |
 | 3. Position Management | 0/2 | Not started | - |
 | 4. Bot Activation | 0/4 | Not started | - |
 | 5. Automated Calibration | 0/2 | Not started | - |

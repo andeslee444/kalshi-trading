@@ -18,9 +18,9 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### Position Sizing
 
-- [ ] **SIZE-01**: All Kelly sizing functions use available balance (not total balance) as bankroll basis
-- [ ] **SIZE-02**: Fee treatment is standardized across all bots (single pattern via `fee_cents` parameter)
-- [ ] **SIZE-03**: Quarter-Kelly is the default sizing until models are calibration-validated
+- [x] **SIZE-01**: All Kelly sizing functions use available balance (not total balance) as bankroll basis
+- [x] **SIZE-02**: Fee treatment is standardized across all bots (single pattern via `fee_cents` parameter)
+- [x] **SIZE-03**: Quarter-Kelly is the default sizing until models are calibration-validated
 
 ### Position Management
 
@@ -114,9 +114,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | FEED-04 | Phase 1 | Complete |
 | FEED-05 | Phase 1 | Complete |
 | FEED-06 | Phase 1 | Complete |
-| SIZE-01 | Phase 2 | Pending |
-| SIZE-02 | Phase 2 | Pending |
-| SIZE-03 | Phase 2 | Pending |
+| SIZE-01 | Phase 2 | Complete |
+| SIZE-02 | Phase 2 | Complete |
+| SIZE-03 | Phase 2 | Complete |
 | EXIT-01 | Phase 3 | Pending |
 | EXIT-02 | Phase 3 | Pending |
 | EXIT-03 | Phase 3 | Pending |
