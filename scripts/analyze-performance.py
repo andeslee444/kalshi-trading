@@ -328,7 +328,7 @@ def fetch_settlements(client) -> list[dict]:
     all_settlements: list[dict] = []
     cursor = None
     for _ in range(50):
-        path = "/portfolio/settlements?limit=1000"
+        path = "/portfolio/settlements?limit=100"
         if cursor:
             path += f"&cursor={cursor}"
         data = client.get(path)
@@ -345,7 +345,7 @@ def fetch_fills(client) -> list[dict]:
     all_fills: list[dict] = []
     cursor = None
     for _ in range(50):
-        path = "/portfolio/fills?limit=1000"
+        path = "/portfolio/fills?limit=100"
         if cursor:
             path += f"&cursor={cursor}"
         data = client.get(path)
@@ -377,8 +377,10 @@ def reconcile_trades(
         dict with "per_bot" (list) and "aggregate" keys.
     """
     # Build ticker → settlement map.  If a ticker appears multiple times
-    # (e.g. multiple contracts), sum the revenues.
-    ticker_revenue: dict[str, int] = defaultdict(int)
+    # (e.g. multiple contracts), sum the profit (revenue - cost).
+    # NOTE: Kalshi's "revenue" field is gross payout (cost back + profit),
+    # NOT net profit. We must subtract total cost to get actual P&L.
+    ticker_profit: dict[str, int] = defaultdict(int)
     ticker_settled: dict[str, str] = {}  # ticker → earliest settled_time date
     for s in settlements:
         ticker = s.get("ticker", "")
@@ -387,7 +389,8 @@ def reconcile_trades(
             revenue = int(revenue)
         except (TypeError, ValueError):
             revenue = 0
-        ticker_revenue[ticker] += revenue
+        cost = int(s.get("yes_total_cost", 0)) + int(s.get("no_total_cost", 0))
+        ticker_profit[ticker] += revenue - cost
 
         st = s.get("settled_time", "")
         if st and isinstance(st, str):
@@ -396,7 +399,7 @@ def reconcile_trades(
             if existing is None or day < existing:
                 ticker_settled[ticker] = day
 
-    # Daily P&L from settlements (for Sharpe)
+    # Daily P&L from settlements (for Sharpe) — uses profit, not raw revenue
     daily_pnl: dict[str, int] = defaultdict(int)
     for s in settlements:
         ticker = s.get("ticker", "")
@@ -405,10 +408,11 @@ def reconcile_trades(
             revenue = int(revenue)
         except (TypeError, ValueError):
             revenue = 0
+        cost = int(s.get("yes_total_cost", 0)) + int(s.get("no_total_cost", 0))
         st = s.get("settled_time", "")
         if st and isinstance(st, str):
             day = st[:10]
-            daily_pnl[day] += revenue
+            daily_pnl[day] += revenue - cost
 
     # Per-bot reconciliation with dedup by order_id
     # Track counted order_ids to prevent double-counting when the same ticker
@@ -449,10 +453,10 @@ def reconcile_trades(
             if ticker in counted_tickers:
                 continue
 
-            if ticker in ticker_revenue:
-                rev = ticker_revenue[ticker]
-                pnl_cents += rev
-                if rev > 0:
+            if ticker in ticker_profit:
+                prof = ticker_profit[ticker]
+                pnl_cents += prof
+                if prof > 0:
                     wins += 1
                     if side == "yes":
                         yes_wins += 1
@@ -815,7 +819,7 @@ def _enrich_reconciliation_with_daily_pnl(reconciliation, settlements):
     if not reconciliation or not settlements:
         return
 
-    # Build ticker -> (bot_label, settled_day, revenue, fee) mapping
+    # Build ticker -> (bot_label, settled_day, profit, fee) mapping
     # First, build ticker -> bot_label from per_bot entries
     bot_label_by_ticker = {}
     for bot_entry in reconciliation.get("per_bot", []):
@@ -848,6 +852,9 @@ def _enrich_reconciliation_with_daily_pnl(reconciliation, settlements):
             revenue = int(revenue)
         except (TypeError, ValueError):
             revenue = 0
+        # Kalshi "revenue" is gross payout; subtract cost to get profit
+        cost = int(s.get("yes_total_cost", 0)) + int(s.get("no_total_cost", 0))
+        profit = revenue - cost
 
         # Fee extraction
         try:
@@ -860,7 +867,7 @@ def _enrich_reconciliation_with_daily_pnl(reconciliation, settlements):
 
         label = ticker_to_label.get(ticker, "Unknown")
         if day:
-            per_bot_daily[label][day] += revenue
+            per_bot_daily[label][day] += profit
         per_bot_fees[label] += fee_cents
 
     # Merge into reconciliation per_bot entries

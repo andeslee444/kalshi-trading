@@ -742,7 +742,7 @@ async function loadBacktest() {
   // Create canvas elements for each market type
   chartsContainer.innerHTML = mtypes.map(mtype =>
     `<div><div class="text-xs text-gray-500 uppercase mb-1">${escapeHtml(mtype)} Calibration</div>
-     <canvas id="cal-chart-${mtype}" height="200"></canvas></div>`
+     <div style="position:relative;height:250px"><canvas id="cal-chart-${mtype}"></canvas></div></div>`
   ).join('');
 
   // Render charts
