@@ -576,6 +576,8 @@ def scan_cycle():
         if "kalshi" not in text_lower and "prediction market" not in text_lower:
             log.info("  Not Kalshi-related, skipping trade extraction")
             ss.skip("not_kalshi_related")
+            trade_manager.log_decision("N/A", "skip", "skipped", "not_kalshi_related",
+                                       post_title=title[:80], url=url)
             seen_posts[url] = {"hash": new_hash, "last_processed": datetime.datetime.now().isoformat()}
             continue
 
@@ -585,6 +587,8 @@ def scan_cycle():
         if not trades:
             log.info("  No trades extracted")
             ss.skip("no_trades_extracted")
+            trade_manager.log_decision("N/A", "skip", "skipped", "no_trades_extracted",
+                                       post_title=title[:80], url=url)
             notification_lines.append(f"* {title} [{change_type}] — no trades extracted")
             seen_posts[url] = {"hash": new_hash, "last_processed": datetime.datetime.now().isoformat()}
             continue
@@ -651,6 +655,21 @@ def scan_cycle():
                     continue
                 blog_confidence = min(0.95, limit_price / 100.0 + 0.15)
                 edge = blog_confidence - actual_price / 100.0
+
+            # Discount LLM-stated confidence — blog posts are systematically overconfident
+            LLM_CALIBRATION_DISCOUNT = 0.15
+            calibrated_confidence = max(0.50, blog_confidence - LLM_CALIBRATION_DISCOUNT)
+            edge = calibrated_confidence - actual_price / 100.0
+
+            # Require calibrated confidence > 60% before trading
+            if calibrated_confidence < 0.60:
+                log.info(f"  Skipping {ticker}: calibrated confidence {calibrated_confidence*100:.0f}% < 60%")
+                ss.skip("low_calibrated_confidence")
+                trade_manager.log_decision(ticker, side, "skipped", "low_calibrated_confidence",
+                                           raw_confidence=round(blog_confidence, 4),
+                                           calibrated_confidence=round(calibrated_confidence, 4),
+                                           price_cents=actual_price)
+                continue
 
             if edge <= 0.02:
                 log.info(f"  Skipping {ticker}: computed edge {edge*100:.1f}% too small")
