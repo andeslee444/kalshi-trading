@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: unknown
-last_updated: "2026-02-28T04:00:35.938Z"
+status: in-progress
+last_updated: "2026-02-28T07:11:21Z"
 progress:
-  total_phases: 4
+  total_phases: 5
   completed_phases: 4
-  total_plans: 13
-  completed_plans: 13
+  total_plans: 15
+  completed_plans: 14
 ---
 
 # Project State
@@ -18,23 +18,23 @@ progress:
 See: .planning/PROJECT.md (updated 2026-02-26)
 
 **Core value:** Every bot must produce consistent daily P&L -- bots trading regularly on validated edges, exits protecting capital, and measurable model calibration proving the math works.
-**Current focus:** Phase 4 complete (Bot Activation). All bots activated with adaptive polling, calibration logging, and decision observability.
+**Current focus:** Phase 5 in progress (Automated Calibration). Daily pipeline operational, drift detection active.
 
 ## Current Position
 
-Phase: 4 of 8 (Bot Activation) -- COMPLETE
-Plan: 4 of 4 in current phase (4 complete)
-Status: Phase 04 complete, ready for Phase 05
-Last activity: 2026-02-28 -- Completed 04-04 (NWS Adaptive Polling & Weather Calibration Logging)
+Phase: 5 of 8 (Automated Calibration) -- IN PROGRESS
+Plan: 1 of 2 in current phase (1 complete)
+Status: Plan 05-01 complete (Calibration Pipeline), ready for Plan 05-02
+Last activity: 2026-02-28 -- Completed 05-01 (Calibration Pipeline)
 
-Progress: [██████░░░░] 50%
+Progress: [███████░░░] 56%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 12
+- Total plans completed: 13
 - Average duration: 4 min
-- Total execution time: 0.8 hours
+- Total execution time: 0.9 hours
 
 **By Phase:**
 
@@ -43,7 +43,7 @@ Progress: [██████░░░░] 50%
 | 01-feedback-loop | 5 | 30 min | 6 min |
 
 **Recent Trend:**
-- Last 5 plans: 7min, 4min, 2min, 2min, 2min
+- Last 5 plans: 4min, 2min, 2min, 2min, 4min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -57,6 +57,7 @@ Progress: [██████░░░░] 50%
 | Phase 04 P03 | 2min | 2 tasks | 1 files |
 | Phase 04 P04 | 2min | 2 tasks | 2 files |
 | Phase 04 P02 | 2min | 2 tasks | 2 files |
+| Phase 05 P01 | 4min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -101,6 +102,9 @@ Recent decisions affecting current work:
 - [Phase 04-04]: is_calibrated added to trade records for downstream analysis
 - [Phase 04-02]: market_type classification moved before threshold parsing for richer decision logs in economics bot
 - [Phase 04-02]: Cleveland Fed parser logs page length and table count when both parsers fail
+- [Phase 05-01]: Continue on stage failure -- failed reconcile should not prevent backtest from running
+- [Phase 05-01]: Baselines only update on explicit --update-baseline flag, never auto-update on detection runs
+- [Phase 05-01]: Calibrate stage runs with --json only (no --save) to prevent auto-applying calibration in pipeline
 
 ### Pending Todos
 
@@ -113,5 +117,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-28
-Stopped at: Completed 04-02-PLAN.md (Bot Decision Logging -- Phase 04 complete)
+Stopped at: Completed 05-01-PLAN.md (Calibration Pipeline)
 Resume file: None
