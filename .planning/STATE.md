@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: in-progress
-last_updated: "2026-02-28T03:52:37Z"
+last_updated: "2026-02-28T03:53:43Z"
 progress:
   total_phases: 4
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 13
-  completed_plans: 10
+  completed_plans: 12
 ---
 
 # Project State
@@ -18,23 +18,23 @@ progress:
 See: .planning/PROJECT.md (updated 2026-02-26)
 
 **Core value:** Every bot must produce consistent daily P&L -- bots trading regularly on validated edges, exits protecting capital, and measurable model calibration proving the math works.
-**Current focus:** Phase 4 in progress (Bot Activation). Entertainment bot enabled with tuned thresholds. Activating remaining bots.
+**Current focus:** Phase 4 complete (Bot Activation). All bots activated with adaptive polling, calibration logging, and decision observability.
 
 ## Current Position
 
-Phase: 4 of 8 (Bot Activation)
-Plan: 1 of 4 in current phase (1 complete)
-Status: Phase 04 in progress -- 04-01 complete
-Last activity: 2026-02-28 -- Completed 04-01 (Entertainment Bot Activation)
+Phase: 4 of 8 (Bot Activation) -- COMPLETE
+Plan: 4 of 4 in current phase (4 complete)
+Status: Phase 04 complete, ready for Phase 05
+Last activity: 2026-02-28 -- Completed 04-04 (NWS Adaptive Polling & Weather Calibration Logging)
 
-Progress: [█████░░░░░] 40%
+Progress: [██████░░░░] 50%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 9
-- Average duration: 5 min
-- Total execution time: 0.7 hours
+- Total plans completed: 12
+- Average duration: 4 min
+- Total execution time: 0.8 hours
 
 **By Phase:**
 
@@ -43,7 +43,7 @@ Progress: [█████░░░░░] 40%
 | 01-feedback-loop | 5 | 30 min | 6 min |
 
 **Recent Trend:**
-- Last 5 plans: 2min, 4min, 7min, 4min, 2min
+- Last 5 plans: 7min, 4min, 2min, 2min, 2min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -54,6 +54,8 @@ Progress: [█████░░░░░] 40%
 | Phase 03 P01 | 7min | 2 tasks | 5 files |
 | Phase 03 P02 | 4min | 2 tasks | 4 files |
 | Phase 04 P01 | 2min | 2 tasks | 2 files |
+| Phase 04 P03 | 2min | 2 tasks | 1 files |
+| Phase 04 P04 | 2min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -91,6 +93,11 @@ Recent decisions affecting current work:
 - [Phase 03-02]: Grace period prevents stale peak data from triggering exits on restart
 - [Phase 03-02]: Trailing state renamed to trailing-state.json with auto-migration
 - [Phase 04-01]: Confidence threshold 0.70 captures realistic 5-10% data exceedances from HDD while still requiring meaningful signal
+- [Phase 04-03]: Updated log header to say Top 10 to match the new longshot cap
+- [Phase 04-03]: Did not instrument find_near_settlement() -- display-only function, no trades placed
+- [Phase 04-04]: Peak hours 10am-4pm ET for NWS adaptive polling (running highs still developing)
+- [Phase 04-04]: Debug-level sigma logging for all evaluated markets, not just placed trades
+- [Phase 04-04]: is_calibrated added to trade records for downstream analysis
 
 ### Pending Todos
 
@@ -103,5 +110,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-28
-Stopped at: Completed 04-01-PLAN.md (Entertainment Bot Activation)
+Stopped at: Completed 04-04-PLAN.md (NWS Adaptive Polling & Weather Calibration Logging -- Phase 04 complete)
 Resume file: None
