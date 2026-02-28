@@ -656,7 +656,7 @@ def classify_ticker_category(ticker):
     if any(x in t for x in ["KXCPI", "KXGDP", "KXFED", "KXJOBS", "KXRATE",
                              "KXECON", "KXINFLATION"]):
         return "economics"
-    if any(x in t for x in ["KXBTC", "KXETH", "KXCRYPTO", "KXSOL"]):
+    if any(x in t for x in ["KXBTC", "KXETH", "KXCRYPTO", "KXSOL", "KXDOGE", "KXXRP"]):
         return "crypto"
     return "default"
 

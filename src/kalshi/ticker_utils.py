@@ -46,22 +46,26 @@ def parse_weather_ticker(ticker):
 
 
 def parse_crypto_ticker(ticker):
-    """Parse crypto market tickers (BTC, ETH, SOL).
+    """Parse crypto market tickers (BTC, ETH, SOL, DOGE, XRP).
 
-    Handles both old and new Kalshi date formats:
-        Old: KX<ASSET>-<DD><MON><YY>  (pre-2026-02-22)
-        New: KX<ASSET>-<YY><MON><DD>  (current)
+    Handles both old and new Kalshi date formats, including hourly settlement:
+        Old: KX<ASSET>-<DD><MON><YY>-<TB><threshold>
+        New: KX<ASSET>-<YY><MON><DD>-<TB><threshold>
+        Hourly: KX<ASSET>-<YY><MON><DDHR>-<TB><threshold>
+
+    Asset suffixes (D=daily, E=expiry) are stripped.
 
     Examples:
-        KXBTC-26FEB28-T70000  -> {"asset": "BTC", "date": "2026-02-28", "direction": "T", "threshold": 70000.0}
-        KXETH-26MAR01-B3500   -> {"asset": "ETH", "date": "2026-03-01", "direction": "B", "threshold": 3500.0}
+        KXBTC-26MAR0117-T72999.99 -> {"asset": "BTC", "date": "2026-03-01", ..., "settlement_hour": 17}
+        KXDOGE-26MAR0117-T0.175   -> {"asset": "DOGE", "date": "2026-03-01", ..., "settlement_hour": 17}
+        KXETH-26MAR01-B3500       -> {"asset": "ETH", "date": "2026-03-01", ...}
 
     Falls back to a simpler pattern if the full date format doesn't match.
     """
-    m = re.match(r"KX(BTC|ETH|SOL|CRYPTO)(\w*)-(\d{2})([A-Z]{3})(\d{2})-([TB])([\d.]+)", ticker)
+    m = re.match(r"KX(BTC|ETH|SOL|DOGE|XRP|CRYPTO)(\w*)-(\d{2})([A-Z]{3})(\d{2,4})-([TB])([\d.]+)", ticker)
     if not m:
         # Try simpler format without date
-        m2 = re.match(r"KX(BTC|ETH|SOL).*-([TB])([\d.]+)$", ticker)
+        m2 = re.match(r"KX(BTC|ETH|SOL|DOGE|XRP).*-([TB])([\d.]+)$", ticker)
         if m2:
             return {
                 "asset": m2.group(1),
@@ -71,21 +75,34 @@ def parse_crypto_ticker(ticker):
         return None
 
     asset = m.group(1)
-    g2, mon, g4 = int(m.group(3)), m.group(4), int(m.group(5))
+    g2 = int(m.group(3))
+    mon = m.group(4)
+    g4_str = m.group(5)
     direction = m.group(6)
     threshold = float(m.group(7))
     month = MONTHS.get(mon)
     if not month:
         return None
-    # Detect format: if first number >= 25 it's a year (YYMONDD), otherwise a day (DDMONYY)
-    if g2 >= 25:
-        yr, day = g2, g4
-    else:
-        day, yr = g2, g4
 
-    return {
+    # Detect format: if first number >= 25 it's a year (YYMONDD[HR]), otherwise a day (DDMONYY)
+    settlement_hour = None
+    if g2 >= 25:
+        yr = g2
+        if len(g4_str) == 4:
+            day = int(g4_str[:2])
+            settlement_hour = int(g4_str[2:])
+        else:
+            day = int(g4_str)
+    else:
+        day = g2
+        yr = int(g4_str)
+
+    result = {
         "asset": asset,
         "date": f"{2000+yr}-{month:02d}-{day:02d}",
         "direction": direction,
         "threshold": threshold,
     }
+    if settlement_hour is not None:
+        result["settlement_hour"] = settlement_hour
+    return result

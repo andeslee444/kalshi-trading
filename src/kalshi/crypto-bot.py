@@ -71,13 +71,15 @@ trade_manager = TradeManager(client, TRADES_PATH, {
 trim_trade_log(TRADES_PATH)
 
 # === Market ticker prefixes ===
-CRYPTO_PREFIXES = ["KXBTC", "KXETH", "KXCRYPTO", "KXSOL"]
+CRYPTO_PREFIXES = ["KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXXRP", "KXCRYPTO"]
 
 # Default annualized volatilities (post-ETF era, updated 2026)
 DEFAULT_VOLS = {
     "BTC": 0.50,  # post-ETF BTC vol is 40-55%
     "ETH": 0.65,  # ETH vol tracks BTC more closely now
     "SOL": 0.80,
+    "DOGE": 0.90,  # meme coin, high vol
+    "XRP": 0.75,   # mid-cap alt, moderate-high vol
 }
 
 # Recent price cache for realized vol computation
@@ -302,7 +304,7 @@ def scan_and_trade():
     # Fetch spot prices
     log.info("\nFetching crypto prices...")
     spot_prices = {}
-    for asset in ["BTC", "ETH", "SOL"]:
+    for asset in ["BTC", "ETH", "SOL", "DOGE", "XRP"]:
         price = fetch_coinbase_spot(asset)
         if price:
             spot_prices[asset] = price
@@ -577,7 +579,7 @@ def main():
     args = parser.parse_args()
 
     log.info("=" * 60)
-    log.info("Kalshi Crypto Bot (BTC/ETH/SOL)")
+    log.info("Kalshi Crypto Bot (BTC/ETH/SOL/DOGE/XRP)")
     log.info(f"  Max: ${MAX_TRADE}/trade | Edge: {EDGE_THRESHOLD*100:.0f}%")
     log.info(f"  Scan interval: {SCAN_INTERVAL} minutes")
     log.info("=" * 60)
