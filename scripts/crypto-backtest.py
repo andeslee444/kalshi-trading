@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Crypto model validation: data fetching, settlement audit, and backtest harness.
+"""Crypto model validation: data fetching, settlement audit, backtest, and vol sweep.
 
 Fetches and caches historical data from three sources:
   1. Coinbase Exchange API — BTC/ETH/SOL 15-minute candles (90 days)
@@ -10,19 +10,22 @@ Usage:
     python3 scripts/crypto-backtest.py --fetch               # Download and cache all data sources
     python3 scripts/crypto-backtest.py --fetch --force        # Re-download even if cache exists
     python3 scripts/crypto-backtest.py --settlement-audit     # Time-to-settlement analysis
-    python3 scripts/crypto-backtest.py --backtest             # Model replay (Plan 02)
-    python3 scripts/crypto-backtest.py --vol-sweep            # Parameter optimization (Plan 02)
+    python3 scripts/crypto-backtest.py --backtest             # Model replay backtest
+    python3 scripts/crypto-backtest.py --backtest --save      # Backtest + save to backtest-results.json
+    python3 scripts/crypto-backtest.py --vol-sweep            # IV/RV parameter optimization
 """
 
 import argparse
+import bisect
 import json
 import math
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from statistics import mean, median
+from statistics import mean, median, stdev
 
 # --- Path setup (same pattern as scripts/backtest.py) ---
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"))
@@ -31,7 +34,12 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 from kalshi_auth import (
     KalshiClient, retry_request, _atomic_write_json, setup_logging,
 )
+from probability import crypto_price_probability
 from ticker_utils import parse_crypto_ticker
+
+# Import brier_score and calibration_table from existing backtest infrastructure
+sys.path.insert(0, str(PROJECT_DIR / "scripts"))
+from backtest import brier_score, calibration_table
 
 log = setup_logging("crypto-backtest")
 
@@ -544,19 +552,652 @@ def run_settlement_audit():
 
 
 # ============================================================
-# Stub subcommands for Plan 02
+# Backtest Helper Functions
 # ============================================================
 
-def run_backtest():
-    """Model replay backtest (implemented in Plan 02)."""
-    print("Backtest subcommand not yet implemented. Coming in 06-02-PLAN.")
-    sys.exit(0)
+def find_nearest_candle_close(candles, target_ts):
+    """Binary search for the candle closest to target_ts.
 
+    candles: sorted ascending by timestamp (index 0).
+    Returns close price (index 4), or None if no candle within 30 minutes.
+    """
+    if not candles:
+        return None
+
+    # Binary search for insertion point
+    timestamps = [c[0] for c in candles]
+    idx = bisect.bisect_left(timestamps, target_ts)
+
+    best = None
+    best_dist = float("inf")
+
+    for i in [idx - 1, idx]:
+        if 0 <= i < len(candles):
+            dist = abs(candles[i][0] - target_ts)
+            if dist < best_dist:
+                best_dist = dist
+                best = candles[i]
+
+    if best is None or best_dist > 1800:  # 30 minutes
+        return None
+    return best[4]  # close price
+
+
+def compute_rv_at_time(candles, target_ts, lookback_hours=24):
+    """Compute realized volatility from candles preceding target_ts.
+
+    Uses log returns from consecutive 15-min close prices.
+    Annualizes using intervals_per_year = 365.25 * 24 * 4 (15-min intervals).
+    Clamps result to [0.10, 3.0]. Returns None if insufficient data.
+    """
+    cutoff = target_ts - lookback_hours * 3600
+    timestamps = [c[0] for c in candles]
+
+    # Find candles in [cutoff, target_ts]
+    lo = bisect.bisect_left(timestamps, cutoff)
+    hi = bisect.bisect_right(timestamps, target_ts)
+    window = candles[lo:hi]
+
+    if len(window) < 5:
+        return None
+
+    # Compute log returns from consecutive close prices
+    log_returns = []
+    for i in range(1, len(window)):
+        prev_close = window[i - 1][4]
+        curr_close = window[i][4]
+        if prev_close > 0 and curr_close > 0:
+            log_returns.append(math.log(curr_close / prev_close))
+
+    if len(log_returns) < 3:
+        return None
+
+    # Annualize: std(returns) * sqrt(intervals_per_year)
+    intervals_per_year = 365.25 * 24 * 4  # 15-min intervals
+    avg = sum(log_returns) / len(log_returns)
+    variance = sum((r - avg) ** 2 for r in log_returns) / (len(log_returns) - 1)
+    vol = math.sqrt(variance * intervals_per_year)
+
+    return max(0.10, min(3.0, vol))
+
+
+def find_dvol_at_time(dvol_data, target_ts):
+    """Find DVOL value closest to target_ts.
+
+    dvol_data: [[timestamp_ms, open, high, low, close], ...] sorted ascending.
+    target_ts: Unix timestamp in seconds.
+    Returns close value / 100 (DVOL percentage -> decimal), or None if >2h away.
+    """
+    if not dvol_data:
+        return None
+
+    target_ms = target_ts * 1000
+    timestamps_ms = [p[0] for p in dvol_data]
+    idx = bisect.bisect_left(timestamps_ms, target_ms)
+
+    best = None
+    best_dist = float("inf")
+
+    for i in [idx - 1, idx]:
+        if 0 <= i < len(dvol_data):
+            dist = abs(dvol_data[i][0] - target_ms)
+            if dist < best_dist:
+                best_dist = dist
+                best = dvol_data[i]
+
+    if best is None or best_dist > 7200000:  # 2 hours in ms
+        return None
+    return best[4] / 100.0  # DVOL is in percentage, convert to decimal
+
+
+def _extract_bracket_range_from_market(market):
+    """Extract bracket range [low, high) from market data.
+
+    Uses floor_strike and rules_primary to determine the range.
+    Returns (low, high) or None if not a bracket market.
+    """
+    floor_strike = market.get("floor_strike")
+    if floor_strike is None or floor_strike <= 0:
+        return None
+
+    # Try to extract upper bound from rules_primary
+    rules = market.get("rules_primary", "")
+    match = re.search(r"between\s+([\d,]+(?:\.\d+)?)\s*-\s*([\d,]+(?:\.\d+)?)", rules)
+    if match:
+        try:
+            low = float(match.group(1).replace(",", ""))
+            high = float(match.group(2).replace(",", ""))
+            if high > low > 0:
+                return (low, high)
+        except ValueError:
+            pass
+
+    # Fallback: guess from floor_strike
+    return None
+
+
+def replay_market(market, candles_by_asset, dvol_by_asset, vol_config):
+    """Replay a single market through the crypto model.
+
+    Returns prediction dict or None if market cannot be replayed.
+    """
+    ticker = market.get("ticker", "")
+    result_field = market.get("result", "")
+
+    # Skip voided/empty results
+    if result_field not in ("yes", "no", "all_yes", "all_no"):
+        return None
+
+    actual = 1 if result_field in ("yes", "all_yes") else 0
+
+    # Parse ticker
+    parsed = parse_crypto_ticker(ticker)
+    if not parsed:
+        return None
+
+    asset = parsed.get("asset", "")
+    direction = parsed.get("direction", "")
+    threshold = parsed.get("threshold")
+
+    if not asset or threshold is None:
+        return None
+
+    # Map CRYPTO asset to candle asset (KXCRYPTO tickers map to BTC)
+    candle_asset = "BTC" if asset == "CRYPTO" else asset
+
+    # Get candles for this asset
+    candles = candles_by_asset.get(candle_asset)
+    if not candles:
+        return None
+
+    # Parse open_time
+    open_ts = parse_iso_ts(market.get("open_time"))
+    close_ts = parse_iso_ts(market.get("close_time"))
+    if open_ts is None or close_ts is None:
+        return None
+
+    # Find spot price at open time
+    spot_price = find_nearest_candle_close(candles, open_ts)
+    if spot_price is None or spot_price <= 0:
+        return None
+
+    # Compute settlement duration in minutes
+    minutes_to_settle = max(1, (close_ts - open_ts) / 60)
+
+    # Get volatility
+    iv_weight = vol_config.get("iv_weight", 0.6)
+    rv_lookback = vol_config.get("rv_lookback_hours", 24)
+
+    rv = compute_rv_at_time(candles, open_ts, lookback_hours=rv_lookback)
+    dvol_data = dvol_by_asset.get(candle_asset)
+    iv = find_dvol_at_time(dvol_data, open_ts) if dvol_data else None
+
+    # Blend vol per vol_config (same logic as crypto-bot.py)
+    default_vol = {"BTC": 0.50, "ETH": 0.65, "SOL": 0.80}.get(candle_asset, 0.50)
+    if iv is not None and rv is not None:
+        vol_to_use = iv_weight * iv + (1 - iv_weight) * rv
+    elif iv is not None:
+        vol_to_use = iv
+    elif rv is not None:
+        vol_to_use = (1 - 0.7) * default_vol + 0.7 * rv
+    else:
+        return None  # No vol data available
+
+    # Compute model probability
+    if direction == "T":
+        model_prob = crypto_price_probability(
+            spot_price, threshold, "above",
+            time_horizon_minutes=minutes_to_settle,
+            realized_vol_pct=vol_to_use, iv_pct=None,
+        )
+    elif direction == "B":
+        # Bracket market: P(low <= price < high)
+        bracket = _extract_bracket_range_from_market(market)
+        if bracket:
+            low, high = bracket
+        else:
+            # Fallback bracket widths by asset
+            bw = {"BTC": 500, "ETH": 40, "SOL": 1}.get(candle_asset, 100)
+            floor_strike = market.get("floor_strike", threshold)
+            low = floor_strike
+            high = floor_strike + bw
+
+        prob_above_low = crypto_price_probability(
+            spot_price, low, "above",
+            time_horizon_minutes=minutes_to_settle,
+            realized_vol_pct=vol_to_use, iv_pct=None,
+        )
+        prob_above_high = crypto_price_probability(
+            spot_price, high, "above",
+            time_horizon_minutes=minutes_to_settle,
+            realized_vol_pct=vol_to_use, iv_pct=None,
+        )
+        model_prob = max(0.0, prob_above_low - prob_above_high)
+    else:
+        return None  # Unknown direction
+
+    return {
+        "ticker": ticker,
+        "asset": candle_asset,
+        "model_prob": round(model_prob, 6),
+        "actual": actual,
+        "vol_used": round(vol_to_use, 6),
+        "iv": round(iv, 6) if iv is not None else None,
+        "rv": round(rv, 6) if rv is not None else None,
+        "minutes_to_settle": round(minutes_to_settle, 1),
+        "spot_at_open": round(spot_price, 2),
+        "threshold": threshold,
+        "direction": direction,
+    }
+
+
+# ============================================================
+# Backtest Runner
+# ============================================================
+
+def run_backtest(save=False):
+    """Replay all cached crypto markets through the model and compute Brier scores."""
+    # Load caches
+    markets_path = CACHE_DIR / "kalshi-crypto-markets.json"
+    if not markets_path.exists():
+        print("ERROR: No cached markets. Run --fetch first.")
+        sys.exit(1)
+
+    markets = json.loads(markets_path.read_text())
+
+    candles_by_asset = {}
+    for asset in COINBASE_ASSETS:
+        path = CACHE_DIR / f"coinbase-candles-{asset}.json"
+        if not path.exists():
+            print(f"ERROR: Missing candle cache for {asset}. Run --fetch first.")
+            sys.exit(1)
+        candles_by_asset[asset] = json.loads(path.read_text())
+
+    dvol_by_asset = {}
+    for asset in DERIBIT_ASSETS:
+        path = CACHE_DIR / f"deribit-dvol-{asset}.json"
+        if path.exists():
+            dvol_by_asset[asset] = json.loads(path.read_text())
+
+    # Default vol config (matches production)
+    vol_config = {"iv_weight": 0.6, "rv_lookback_hours": 24}
+
+    # Replay all markets
+    predictions = []
+    skip_counts = {"no_spot": 0, "no_vol": 0, "voided": 0, "unparsed": 0}
+
+    for m in markets:
+        result_field = m.get("result", "")
+        if result_field not in ("yes", "no", "all_yes", "all_no"):
+            skip_counts["voided"] += 1
+            continue
+
+        pred = replay_market(m, candles_by_asset, dvol_by_asset, vol_config)
+        if pred is None:
+            # Determine skip reason
+            parsed = parse_crypto_ticker(m.get("ticker", ""))
+            if not parsed:
+                skip_counts["unparsed"] += 1
+            else:
+                candle_asset = "BTC" if parsed.get("asset") == "CRYPTO" else parsed.get("asset", "")
+                open_ts = parse_iso_ts(m.get("open_time"))
+                if open_ts and candle_asset in candles_by_asset:
+                    spot = find_nearest_candle_close(candles_by_asset.get(candle_asset, []), open_ts)
+                    if spot is None:
+                        skip_counts["no_spot"] += 1
+                    else:
+                        skip_counts["no_vol"] += 1
+                else:
+                    skip_counts["no_spot"] += 1
+            continue
+
+        predictions.append(pred)
+
+    # Compute aggregate Brier score
+    brier_pairs = [(p["model_prob"], p["actual"]) for p in predictions]
+    aggregate_brier = brier_score(brier_pairs)
+
+    # Per-asset Brier scores
+    per_asset_brier = {}
+    assets_in_data = sorted(set(p["asset"] for p in predictions))
+    for asset in assets_in_data:
+        asset_preds = [(p["model_prob"], p["actual"]) for p in predictions if p["asset"] == asset]
+        bs = brier_score(asset_preds)
+        per_asset_brier[asset] = {"brier": round(bs, 6) if bs is not None else None, "n": len(asset_preds)}
+
+    # Calibration table
+    cal_table = calibration_table(brier_pairs)
+
+    # Vol benchmark: compare our RV to Deribit DVOL
+    vol_benchmark = _compute_vol_benchmark(predictions)
+
+    # Save raw predictions
+    raw_path = CACHE_DIR / "crypto-backtest-raw.json"
+    _atomic_write_json(raw_path, predictions)
+
+    # Load settlement audit for report
+    audit_path = CACHE_DIR / "settlement-audit.json"
+    settlement_audit = {}
+    if audit_path.exists():
+        try:
+            settlement_audit = json.loads(audit_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Print report
+    print("\n" + "=" * 60)
+    print("CRYPTO BACKTEST RESULTS")
+    print("=" * 60)
+    print(f"Markets replayed: {len(predictions)} (", end="")
+    print(", ".join(f"{a}: {per_asset_brier[a]['n']}" for a in assets_in_data), end=")\n")
+    print(f"Markets skipped: {sum(skip_counts.values())} (", end="")
+    print(", ".join(f"{k}: {v}" for k, v in skip_counts.items() if v > 0), end=")\n")
+
+    print(f"\nAggregate Brier Score: {aggregate_brier:.4f}  (target: <= 0.20)")
+    for asset in assets_in_data:
+        info = per_asset_brier[asset]
+        bs_str = f"{info['brier']:.4f}" if info['brier'] is not None else "N/A"
+        print(f"  {asset}: {bs_str} (n={info['n']})")
+
+    # Calibration table
+    if cal_table:
+        print(f"\nCalibration Table:")
+        print(f"  {'Bin':<12} {'N':>5}  {'Predicted':>9}  {'Actual':>7}  {'Gap':>7}")
+        print("  " + "-" * 45)
+        for row in cal_table:
+            print(f"  {row['bin']:<12} {row['n']:>5}  {row['predicted_avg']:>9.3f}  {row['actual_avg']:>7.3f}  {row['gap']:>+7.3f}")
+
+    # Vol benchmark
+    if vol_benchmark:
+        print(f"\nVol Benchmark (vs Deribit DVOL):")
+        for asset, stats in sorted(vol_benchmark.items()):
+            corr_str = f"{stats['correlation']:.3f}" if stats["correlation"] is not None else "N/A"
+            print(f"  {asset}: RV mean={stats['mean_rv']*100:.1f}%, "
+                  f"DVOL mean={stats['mean_dvol']*100:.1f}%, "
+                  f"MAE={stats['mae']*100:.1f}%, corr={corr_str}")
+
+    print(f"\nVol Config Used: IV weight={vol_config['iv_weight']:.2f}, "
+          f"RV lookback={vol_config['rv_lookback_hours']}h")
+
+    # Brier warning with suggestions
+    if aggregate_brier is not None and aggregate_brier > 0.20:
+        print(f"\nWARNING: Brier score {aggregate_brier:.4f} exceeds 0.20 target. Suggested fixes:")
+        _print_fix_suggestions(cal_table, per_asset_brier, vol_benchmark)
+    elif aggregate_brier is not None:
+        print(f"\nPASS: Brier score {aggregate_brier:.4f} meets the <= 0.20 target.")
+
+    print(f"\nRaw predictions saved to: {raw_path}")
+
+    # Save to backtest-results.json if requested
+    if save:
+        save_crypto_results(
+            aggregate_brier, per_asset_brier, cal_table, vol_config,
+            vol_benchmark, settlement_audit, len(predictions),
+        )
+
+    return {
+        "aggregate_brier": aggregate_brier,
+        "per_asset_brier": per_asset_brier,
+        "calibration_table": cal_table,
+        "vol_benchmark": vol_benchmark,
+        "n_markets": len(predictions),
+        "predictions": predictions,
+    }
+
+
+def _compute_vol_benchmark(predictions):
+    """Compare our computed RV to Deribit DVOL across markets.
+
+    Returns dict by asset: {mean_rv, mean_dvol, mae, correlation}.
+    """
+    by_asset = {}
+    for p in predictions:
+        if p["iv"] is not None and p["rv"] is not None:
+            asset = p["asset"]
+            if asset not in by_asset:
+                by_asset[asset] = []
+            by_asset[asset].append((p["rv"], p["iv"]))
+
+    benchmark = {}
+    for asset, pairs in sorted(by_asset.items()):
+        if not pairs:
+            continue
+        rvs = [r for r, _ in pairs]
+        dvols = [d for _, d in pairs]
+        mae = mean(abs(r - d) for r, d in pairs)
+
+        # Correlation (Pearson)
+        correlation = None
+        if len(pairs) >= 50:
+            mean_rv = mean(rvs)
+            mean_dv = mean(dvols)
+            num = sum((r - mean_rv) * (d - mean_dv) for r, d in pairs)
+            den_r = math.sqrt(sum((r - mean_rv) ** 2 for r in rvs))
+            den_d = math.sqrt(sum((d - mean_dv) ** 2 for d in dvols))
+            if den_r > 0 and den_d > 0:
+                correlation = round(num / (den_r * den_d), 4)
+
+        benchmark[asset] = {
+            "mean_rv": round(mean(rvs), 6),
+            "mean_dvol": round(mean(dvols), 6),
+            "mae": round(mae, 6),
+            "correlation": correlation,
+            "n_pairs": len(pairs),
+        }
+
+    return benchmark
+
+
+def _print_fix_suggestions(cal_table, per_asset_brier, vol_benchmark):
+    """Print specific parameter fix suggestions when Brier > 0.20."""
+    suggestions = []
+
+    # Check calibration gaps
+    if cal_table:
+        overconfident = [r for r in cal_table if r["gap"] < -0.10 and r["n"] >= 10]
+        underconfident = [r for r in cal_table if r["gap"] > 0.10 and r["n"] >= 10]
+        if overconfident:
+            bins = ", ".join(r["bin"] for r in overconfident)
+            suggestions.append(f"  - Model overconfident in bins [{bins}]: "
+                             f"increase vol or reduce certainty for these probability ranges")
+        if underconfident:
+            bins = ", ".join(r["bin"] for r in underconfident)
+            suggestions.append(f"  - Model underconfident in bins [{bins}]: "
+                             f"decrease vol or tighten probability estimates")
+
+    # Check per-asset issues
+    for asset, info in per_asset_brier.items():
+        if info["brier"] is not None and info["brier"] > 0.25 and info["n"] >= 20:
+            suggestions.append(f"  - {asset} Brier={info['brier']:.4f} is poor: "
+                             f"consider asset-specific vol calibration")
+
+    # Check vol benchmark
+    if vol_benchmark:
+        for asset, stats in vol_benchmark.items():
+            if stats["mae"] > 0.15:
+                suggestions.append(f"  - {asset} RV-DVOL MAE={stats['mae']*100:.1f}%: "
+                                 f"volatility estimation diverges significantly from market IV")
+
+    if not suggestions:
+        suggestions.append("  - Review time-to-settlement accuracy for short-duration markets")
+        suggestions.append("  - Consider increasing IV weight in vol blend")
+
+    for s in suggestions:
+        print(s)
+
+
+# ============================================================
+# Vol Parameter Sweep
+# ============================================================
 
 def run_vol_sweep():
-    """Parameter optimization sweep (implemented in Plan 02)."""
-    print("Vol sweep subcommand not yet implemented. Coming in 06-02-PLAN.")
-    sys.exit(0)
+    """Test multiple IV/RV blend configurations and rank by Brier score."""
+    # Load caches (same as backtest)
+    markets_path = CACHE_DIR / "kalshi-crypto-markets.json"
+    if not markets_path.exists():
+        print("ERROR: No cached markets. Run --fetch first.")
+        sys.exit(1)
+
+    markets = json.loads(markets_path.read_text())
+
+    candles_by_asset = {}
+    for asset in COINBASE_ASSETS:
+        path = CACHE_DIR / f"coinbase-candles-{asset}.json"
+        if not path.exists():
+            print(f"ERROR: Missing candle cache for {asset}. Run --fetch first.")
+            sys.exit(1)
+        candles_by_asset[asset] = json.loads(path.read_text())
+
+    dvol_by_asset = {}
+    for asset in DERIBIT_ASSETS:
+        path = CACHE_DIR / f"deribit-dvol-{asset}.json"
+        if path.exists():
+            dvol_by_asset[asset] = json.loads(path.read_text())
+
+    # Pre-filter to settled markets only (avoid re-filtering in each iteration)
+    settled_markets = [m for m in markets
+                       if m.get("result") in ("yes", "no", "all_yes", "all_no")]
+
+    # Sweep grid
+    iv_weights = [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 1.0]
+    rv_lookbacks = [6, 12, 24, 48]
+    total_configs = len(iv_weights) * len(rv_lookbacks)
+
+    results = []
+    prod_result = None
+
+    print(f"\n{'='*60}")
+    print(f"VOL PARAMETER SWEEP")
+    print(f"{'='*60}")
+    print(f"Configs to test: {total_configs}")
+    print(f"Markets available: {len(settled_markets)}\n")
+
+    for i, iv_w in enumerate(iv_weights):
+        for rv_h in rv_lookbacks:
+            vol_config = {"iv_weight": iv_w, "rv_lookback_hours": rv_h}
+            predictions = []
+
+            for m in settled_markets:
+                pred = replay_market(m, candles_by_asset, dvol_by_asset, vol_config)
+                if pred is not None:
+                    predictions.append(pred)
+
+            if not predictions:
+                continue
+
+            brier_pairs = [(p["model_prob"], p["actual"]) for p in predictions]
+            bs = brier_score(brier_pairs)
+
+            entry = {
+                "iv_weight": iv_w,
+                "rv_hours": rv_h,
+                "brier": round(bs, 6) if bs is not None else None,
+                "n_markets": len(predictions),
+            }
+            results.append(entry)
+
+            # Track production config
+            if iv_w == 0.6 and rv_h == 24:
+                prod_result = entry
+
+            # Progress indicator
+            config_num = i * len(rv_lookbacks) + rv_lookbacks.index(rv_h) + 1
+            if config_num % 7 == 0 or config_num == 1 or config_num == total_configs:
+                bs_str = f"{bs:.4f}" if bs is not None else "N/A"
+                print(f"  Config {config_num}/{total_configs}: IV={iv_w:.1f}, "
+                      f"RV={rv_h}h -> Brier={bs_str} (n={len(predictions)})")
+
+    # Sort by Brier score ascending (best first)
+    results.sort(key=lambda r: r["brier"] if r["brier"] is not None else 999)
+
+    # Print results table
+    print(f"\n{'='*60}")
+    print(f"VOL PARAMETER SWEEP RESULTS")
+    print(f"{'='*60}")
+    best = results[0] if results else None
+    if best:
+        print(f"Best: IV={best['iv_weight']:.2f}, "
+              f"RV_lookback={best['rv_hours']}h, "
+              f"Brier={best['brier']:.4f} (n={best['n_markets']})")
+    if prod_result:
+        print(f"Current production: IV=0.60, RV_lookback=24h, "
+              f"Brier={prod_result['brier']:.4f}")
+
+    print(f"\n{'Rank':>4} | {'IV Weight':>9} | {'RV Lookback':>11} | {'Brier':>8} | {'N':>5}")
+    print("-" * 50)
+    for rank, r in enumerate(results, 1):
+        bs_str = f"{r['brier']:.4f}" if r["brier"] is not None else "N/A"
+        marker = " *" if r is prod_result else ""
+        print(f"{rank:>4} | {r['iv_weight']:>9.2f} | {r['rv_hours']:>9}h | {bs_str:>8} | {r['n_markets']:>5}{marker}")
+
+    # Recommendation
+    if best and prod_result and best["brier"] is not None and prod_result["brier"] is not None:
+        if best is not prod_result:
+            improvement = prod_result["brier"] - best["brier"]
+            print(f"\nRECOMMENDATION: Switch to IV={best['iv_weight']:.2f}, "
+                  f"RV_lookback={best['rv_hours']}h")
+            print(f"  Brier improvement: {improvement:.4f} "
+                  f"({improvement/prod_result['brier']*100:.1f}%)")
+        else:
+            print(f"\nCurrent production config is already optimal.")
+
+    # Save sweep results
+    sweep_path = CACHE_DIR / "vol-sweep-results.json"
+    _atomic_write_json(sweep_path, {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "configs_tested": total_configs,
+        "results": results,
+        "best": best,
+        "production": prod_result,
+    })
+    print(f"\nSweep results saved to: {sweep_path}")
+
+
+# ============================================================
+# Save results to backtest-results.json
+# ============================================================
+
+def save_crypto_results(aggregate_brier, per_asset_brier, cal_table, vol_config,
+                        vol_benchmark, settlement_audit, n_markets, vol_sweep_best=None):
+    """Extend data/backtest-results.json with crypto_validation section."""
+    results_path = PROJECT_DIR / "data" / "backtest-results.json"
+
+    # Load existing results if present
+    existing = {}
+    if results_path.exists():
+        try:
+            existing = json.loads(results_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Build crypto validation section
+    crypto_section = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "aggregate_brier": round(aggregate_brier, 6) if aggregate_brier is not None else None,
+        "per_asset_brier": per_asset_brier,
+        "calibration_table": cal_table,
+        "vol_config_used": vol_config,
+        "vol_benchmark": vol_benchmark,
+        "settlement_audit": {
+            "verdict": settlement_audit.get("verdict", ""),
+            "typical_durations": settlement_audit.get("typical_durations", {}),
+        },
+        "n_markets_replayed": n_markets,
+        "brier_target": 0.20,
+        "passes_target": aggregate_brier is not None and aggregate_brier <= 0.20,
+    }
+    if vol_sweep_best:
+        crypto_section["vol_sweep_best"] = vol_sweep_best
+
+    existing["crypto_validation"] = crypto_section
+
+    # Also add crypto calibration curve to calibration_curves section
+    if "calibration_curves" not in existing:
+        existing["calibration_curves"] = {}
+    existing["calibration_curves"]["crypto"] = cal_table
+
+    _atomic_write_json(results_path, existing)
+    print(f"\nCrypto validation results saved to: {results_path}")
 
 
 # ============================================================
@@ -572,9 +1213,11 @@ def main():
     parser.add_argument("--settlement-audit", action="store_true",
                         help="Time-to-settlement exhaustive audit")
     parser.add_argument("--backtest", action="store_true",
-                        help="Model replay backtest (Plan 02)")
+                        help="Model replay backtest")
     parser.add_argument("--vol-sweep", action="store_true",
-                        help="Vol parameter optimization (Plan 02)")
+                        help="Vol parameter optimization")
+    parser.add_argument("--save", action="store_true",
+                        help="Save backtest results to data/backtest-results.json")
     parser.add_argument("--force", action="store_true",
                         help="Re-download even if cache exists")
     args = parser.parse_args()
@@ -590,7 +1233,7 @@ def main():
         run_settlement_audit()
 
     if args.backtest:
-        run_backtest()
+        run_backtest(save=args.save)
 
     if args.vol_sweep:
         run_vol_sweep()
