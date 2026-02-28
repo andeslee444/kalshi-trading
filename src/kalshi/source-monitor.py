@@ -1085,6 +1085,22 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
 
 
 # ============================================================
+# ADAPTIVE POLLING
+# ============================================================
+
+def _nws_interval_seconds(config):
+    """Adaptive NWS polling: 5 min during peak hours (10am-4pm ET), config interval otherwise.
+
+    Peak hours are when temperature observations are most likely to create
+    info-arb opportunities (running highs still developing).
+    """
+    et_now = datetime.datetime.now(ZoneInfo("America/New_York"))
+    if 10 <= et_now.hour < 16:
+        return 5 * 60  # 5 minutes during peak
+    return config["sources"]["nws"]["intervalMinutes"] * 60  # config default off-peak
+
+
+# ============================================================
 # MAIN LOOP
 # ============================================================
 
@@ -1109,12 +1125,11 @@ def main():
 
     hdd_interval = config["sources"]["hdd"]["intervalMinutes"] * 60
     box_interval = config["sources"]["boxoffice"]["intervalMinutes"] * 60
-    nws_interval = config["sources"]["nws"]["intervalMinutes"] * 60
 
     log.info(f"\nStarting monitoring loop...")
     log.info(f"   HDD: every {config['sources']['hdd']['intervalMinutes']}min")
     log.info(f"   Box Office: every {config['sources']['boxoffice']['intervalMinutes']}min (Fri-Mon)")
-    log.info(f"   NWS: every {config['sources']['nws']['intervalMinutes']}min\n")
+    log.info(f"   NWS: adaptive (5min peak / {config['sources']['nws']['intervalMinutes']}min off-peak)\n")
 
     while True:
         now = time.time()
@@ -1127,7 +1142,7 @@ def main():
             # Determine which sources need checking this cycle
             need_hdd = config["sources"]["hdd"]["enabled"] and (now - last_hdd) >= hdd_interval
             need_box = config["sources"]["boxoffice"]["enabled"] and (now - last_boxoffice) >= box_interval
-            need_nws = config["sources"]["nws"]["enabled"] and (now - last_nws) >= nws_interval
+            need_nws = config["sources"]["nws"]["enabled"] and (now - last_nws) >= _nws_interval_seconds(config)
 
             # Create scan summary for this iteration
             ss = ScanSummary("source-monitor", log) if (need_hdd or need_box or need_nws) else None
