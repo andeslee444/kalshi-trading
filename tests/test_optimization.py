@@ -1916,6 +1916,7 @@ class TestSettlementAwareCleanup:
             "skips": {},
             "log_summary": lambda self: None,
         })
+        fake_auth.notify_whatsapp = lambda *a, **kw: None
         sys.modules["kalshi_auth"] = fake_auth
 
         fake_prob = types.ModuleType("probability")

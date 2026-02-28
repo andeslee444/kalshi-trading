@@ -20,6 +20,7 @@ from kalshi_auth import (
     PROJECT_DIR, TradeManager, trim_trade_log, CITY_TIMEZONES, _local_today,
     round_half_up, retry_request, fetch_parallel, HealthCheckMonitor,
     load_trades, _atomic_write_json, ScanSummary,
+    notify_whatsapp,
 )
 from probability import weather_probability, nws_probability, half_kelly, kalshi_fee_cents
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
@@ -45,6 +46,36 @@ MODEL_SHIFT_THRESHOLD = pm_config.get("modelShiftThreshold", 0.25)
 MAX_DAILY_EXITS = pm_config.get("maxDailyExits", 20)
 SCAN_INTERVAL = pm_config.get("scanIntervalMinutes", 15)
 ORDER_TTL_MINUTES = pm_config.get("orderTtlMinutes", 120)
+
+# Source bot name -> bots-config.json key mapping
+BOT_CONFIG_MAP = {
+    "weather": "weather",
+    "source-monitor": "weather",  # NWS trades use weather config
+    "entertainment": "entertainment",
+    "crypto": "crypto",
+    "economics": "economics",
+    "strategy": "strategy",
+    "beatrelease": "beatrelease",
+}
+
+
+def _get_exit_config(source_bot):
+    """Look up per-bot exit thresholds from bots-config.json.
+
+    Falls back to position_monitor defaults if bot has no exit config.
+    """
+    config_key = BOT_CONFIG_MAP.get(source_bot, "position_monitor")
+    bot_cfg = bots_config.get(config_key, {})
+    exit_cfg = bot_cfg.get("exit", {})
+    return {
+        "take_profit_cents": exit_cfg.get("takeProfitCents", int(TAKE_PROFIT_THRESHOLD * 100)),
+        "stop_loss_cents": exit_cfg.get("stopLossCents", int(STOP_LOSS_THRESHOLD * 100)),
+        "model_shift_pp": exit_cfg.get("modelShiftPp", int(MODEL_SHIFT_THRESHOLD * 100)),
+        "trailing_drop_cents": exit_cfg.get("trailingDropCents", pm_config.get("trailingDropCents", 10)),
+        "trailing_min_profit_cents": exit_cfg.get("trailingMinProfitCents", pm_config.get("trailingMinProfitCents", 10)),
+        "take_profit_fraction": exit_cfg.get("takeProfitFraction", 0.50),
+    }
+
 
 # === Entry Record Lookup (for 4.1 entry-price stop, 4.3 info-arb gate) ===
 
@@ -136,32 +167,36 @@ def get_market_data(ticker):
 
 # === Exit Evaluation ===
 
-def evaluate_take_profit(position, market):
-    """Check if position should be exited for profit.
+def evaluate_take_profit(position, market, exit_config):
+    """Check if position should be partially exited for profit.
 
-    If we bought YES and the bid is now >= take-profit threshold,
-    sell to lock in gains rather than waiting for settlement.
+    Sells a fraction (exit_config['take_profit_fraction']) at current bid
+    using limit order. The remainder rides to settlement or trailing stop.
     """
     ticker = position.get("ticker", "")
     yes_count = position.get("yes", 0)
     no_count = position.get("no", 0)
+    take_profit_cents = exit_config["take_profit_cents"]
+    take_profit_fraction = exit_config["take_profit_fraction"]
 
     yes_bid = market.get("yes_bid", 0)
     no_bid = market.get("no_bid", 0) if market.get("no_bid") else (100 - market.get("yes_ask", 100))
 
-    take_profit_cents = int(TAKE_PROFIT_THRESHOLD * 100)
-
-    # Check YES position take-profit (fee-aware: net proceeds must exceed threshold)
+    # Check YES position take-profit (fee-aware)
     if yes_count > 0 and yes_bid > 0:
         fee = kalshi_fee_cents(yes_bid)
         net_proceeds = yes_bid - fee
         if net_proceeds >= take_profit_cents:
+            exit_count = max(1, int(yes_count * take_profit_fraction))
             return {
                 "action": "take_profit",
                 "side": "yes",
-                "count": yes_count,
+                "count": exit_count,
                 "price": yes_bid,
-                "reasoning": f"Take profit: YES bid {yes_bid}c - fee {fee:.1f}c = net {net_proceeds:.0f}c >= {take_profit_cents}c threshold",
+                "order_type": "limit",
+                "reasoning": (f"Take profit: YES bid {yes_bid}c - fee {fee:.1f}c = "
+                              f"net {net_proceeds:.0f}c >= {take_profit_cents}c threshold "
+                              f"(selling {exit_count}/{yes_count} contracts)"),
             }
 
     # Check NO position take-profit (fee-aware)
@@ -169,61 +204,58 @@ def evaluate_take_profit(position, market):
         fee = kalshi_fee_cents(no_bid)
         net_proceeds = no_bid - fee
         if net_proceeds >= take_profit_cents:
+            exit_count = max(1, int(no_count * take_profit_fraction))
             return {
                 "action": "take_profit",
                 "side": "no",
-                "count": no_count,
+                "count": exit_count,
                 "price": no_bid,
-                "reasoning": f"Take profit: NO bid {no_bid}c - fee {fee:.1f}c = net {net_proceeds:.0f}c >= {take_profit_cents}c threshold",
+                "order_type": "limit",
+                "reasoning": (f"Take profit: NO bid {no_bid}c - fee {fee:.1f}c = "
+                              f"net {net_proceeds:.0f}c >= {take_profit_cents}c threshold "
+                              f"(selling {exit_count}/{no_count} contracts)"),
             }
 
     return None
 
 
-def evaluate_stop_loss(position, market, entry_price_cents=None):
+def evaluate_stop_loss(position, market, exit_config, entry_price_cents=None):
     """Check if position should be cut to limit losses.
 
-    Uses entry-price-relative stop when entry price is known (e.g., exit
-    at 40% loss from entry). Falls back to absolute threshold otherwise.
+    Uses absolute threshold from exit_config. Sends market order (urgent exit).
+    Closes full position.
     """
-    ticker = position.get("ticker", "")
     yes_count = position.get("yes", 0)
     no_count = position.get("no", 0)
+    stop_loss_cents = exit_config["stop_loss_cents"]
 
     yes_bid = market.get("yes_bid", 0)
     no_bid = market.get("no_bid", 0) if market.get("no_bid") else (100 - market.get("yes_ask", 100))
 
-    stop_loss_pct = pm_config.get("stopLossPct", 0.40)
-    absolute_stop = int(STOP_LOSS_THRESHOLD * 100)
-
     # Check YES position stop-loss
     if yes_count > 0 and yes_bid > 0:
-        if entry_price_cents:
-            stop_price = int(entry_price_cents * (1 - stop_loss_pct))
-        else:
-            stop_price = absolute_stop
-        if yes_bid <= stop_price:
+        if yes_bid <= stop_loss_cents:
             return {
                 "action": "stop_loss",
                 "side": "yes",
                 "count": yes_count,
                 "price": yes_bid,
-                "reasoning": f"Stop loss: YES bid {yes_bid}c <= {stop_price}c (entry={entry_price_cents or '?'}c, {stop_loss_pct*100:.0f}% loss threshold)",
+                "order_type": "market",
+                "reasoning": (f"Stop loss: YES bid {yes_bid}c <= {stop_loss_cents}c threshold "
+                              f"(entry={entry_price_cents or '?'}c) — MARKET ORDER"),
             }
 
     # Check NO position stop-loss
     if no_count > 0 and no_bid > 0:
-        if entry_price_cents:
-            stop_price = int(entry_price_cents * (1 - stop_loss_pct))
-        else:
-            stop_price = absolute_stop
-        if no_bid <= stop_price:
+        if no_bid <= stop_loss_cents:
             return {
                 "action": "stop_loss",
                 "side": "no",
                 "count": no_count,
                 "price": no_bid,
-                "reasoning": f"Stop loss: NO bid {no_bid}c <= {stop_price}c (entry={entry_price_cents or '?'}c, {stop_loss_pct*100:.0f}% loss threshold)",
+                "order_type": "market",
+                "reasoning": (f"Stop loss: NO bid {no_bid}c <= {stop_loss_cents}c threshold "
+                              f"(entry={entry_price_cents or '?'}c) — MARKET ORDER"),
             }
 
     return None
@@ -317,74 +349,101 @@ def _fetch_nws_running_high(city_code):
     return None
 
 
-def evaluate_model_shift(position, market):
+def _compute_current_probability(ticker, source_bot, entry_side):
+    """Recompute probability using the model that opened this position.
+
+    Routes to the correct probability model by source_bot name.
+    Returns (probability_for_our_side, reasoning_str) or (None, None) on failure.
+    """
+    # Weather: parse ticker, fetch NWS running high
+    if source_bot in ("weather", "source-monitor"):
+        parsed = parse_temp_ticker(ticker)
+        if not parsed:
+            return None, None
+        city = parsed["city"]
+        city_today = _local_today(city)
+        if parsed["date"] != city_today:
+            return None, None  # only model-shift for today's markets
+        running_high = _fetch_nws_running_high(city)
+        if running_high is None:
+            return None, None
+        prob = nws_probability(running_high, parsed["threshold"], parsed["direction"],
+                               datetime.datetime.now().hour)
+        return (prob if entry_side == "yes" else 1.0 - prob,
+                f"NWS {city} high {running_high}F, model prob={prob*100:.0f}%")
+
+    # Crypto: would need current price + vol + settlement time
+    # Complex data fetching -- defer to Phase 4 when crypto bot is active
+    if source_bot == "crypto":
+        return None, None  # Skip for now
+
+    # Entertainment/beatrelease: no live data source to recompute
+    if source_bot in ("entertainment", "beatrelease"):
+        return None, None  # Hold to settlement
+
+    # Economics: would need current nowcast value
+    if source_bot == "economics":
+        return None, None  # Skip for now
+
+    return None, None  # Unknown bot
+
+
+def evaluate_model_shift(position, market, exit_config, entry_rec=None):
     """Check if our probability model now disagrees with our position.
 
-    For weather positions, fetches NWS running high and recomputes probability.
-    Exits when:
-      1. Fair value (model prob * 100) < bid - FEE_BUFFER_CENTS, AND
-      2. Model probability on our side < 0.35
+    Uses _compute_current_probability to route to the correct model.
+    Exits when current model probability on our side diverges from entry
+    probability by more than model_shift_pp percentage points.
+    Uses limit order at current bid (patient exit).
     """
     ticker = position.get("ticker", "")
     yes_count = position.get("yes", 0)
     no_count = position.get("no", 0)
+    model_shift_pp = exit_config["model_shift_pp"]
 
-    parsed = parse_temp_ticker(ticker)
-    if not parsed:
-        return None  # Can only model-shift weather markets for now
-
-    city = parsed["city"]
-    city_today = _local_today(city)
-
-    # Only evaluate model shift for today's markets
-    if parsed["date"] != city_today:
+    if not entry_rec:
         return None
 
-    # Fetch NWS running high
-    running_high = _fetch_nws_running_high(city)
-    if running_high is None:
+    source_bot = entry_rec.get("source_bot", "")
+    entry_prob = entry_rec.get("model_prob")
+    if entry_prob is None:
         return None
 
-    threshold = parsed["threshold"]
-    direction = parsed["direction"]
-    now = datetime.datetime.now()
+    # Determine our side and bid
+    if yes_count > 0:
+        side = "yes"
+        count = yes_count
+        bid = market.get("yes_bid", 0)
+        entry_side = "yes"
+    elif no_count > 0:
+        side = "no"
+        count = no_count
+        bid = market.get("no_bid", 0) or (100 - market.get("yes_ask", 100))
+        entry_side = "no"
+    else:
+        return None
 
-    prob = nws_probability(running_high, threshold, direction, now.hour)
-    yes_bid = market.get("yes_bid", 0)
-    no_bid = market.get("no_bid", 0) if market.get("no_bid") else (100 - market.get("yes_ask", 100))
+    if bid <= 0:
+        return None
 
-    # Check YES position: model now says prob < 0.35 (against us)
-    if yes_count > 0 and prob < 0.35:
-        fair_value_cents = int(prob * 100)
-        fee = kalshi_fee_cents(yes_bid)
-        if fair_value_cents < yes_bid - fee:
-            return {
-                "action": "model_shift",
-                "side": "yes",
-                "count": yes_count,
-                "price": yes_bid,
-                "reasoning": (
-                    f"Model shift: NWS {city} high {running_high}F, "
-                    f"prob={prob*100:.0f}% < 35%, fair={fair_value_cents}c < bid={yes_bid}c - fee {fee:.1f}c"
-                ),
-            }
+    # Compute current probability using the correct model
+    current_prob, reasoning = _compute_current_probability(ticker, source_bot, entry_side)
+    if current_prob is None:
+        return None  # Can't evaluate model-shift, skip
 
-    # Check NO position: model now says prob > 0.65 (YES prob > 65%, against our NO)
-    if no_count > 0 and prob > 0.65:
-        no_prob = 1.0 - prob
-        fair_no_cents = int(no_prob * 100)
-        fee = kalshi_fee_cents(no_bid)
-        if fair_no_cents < no_bid - fee:
-            return {
-                "action": "model_shift",
-                "side": "no",
-                "count": no_count,
-                "price": no_bid,
-                "reasoning": (
-                    f"Model shift: NWS {city} high {running_high}F, "
-                    f"NO prob={no_prob*100:.0f}% < 35%, fair={fair_no_cents}c < bid={no_bid}c - fee {fee:.1f}c"
-                ),
-            }
+    # Check if divergence exceeds threshold
+    divergence_pp = abs(current_prob * 100 - entry_prob * 100)
+    if divergence_pp >= model_shift_pp and current_prob < 0.50:
+        return {
+            "action": "model_shift",
+            "side": side,
+            "count": count,  # full position exit
+            "price": bid,
+            "order_type": "limit",
+            "reasoning": (f"Model shift: {reasoning}, current={current_prob*100:.0f}% "
+                          f"vs entry={entry_prob*100:.0f}% "
+                          f"(divergence {divergence_pp:.0f}pp >= {model_shift_pp}pp) — limit at {bid}c"),
+        }
 
     return None
 
@@ -530,25 +589,20 @@ def scan_positions():
         # Look up entry record for this position
         entry_rec = entry_records.get(ticker, {})
         entry_price = entry_rec.get("price_cents")
+        source_bot = entry_rec.get("source_bot", "")
+        exit_config = _get_exit_config(source_bot)
 
         # Evaluate exit conditions in priority order
         exit_signal = None
 
-        # 1. Take profit (skip for confirmed info-arb — hold to settlement)
-        skip_take_profit = (
-            entry_rec.get("source_bot") == "source-monitor"
-            and entry_rec.get("model_prob", 0) > 0.95
-        )
-        if skip_take_profit:
-            log.info(f"  Skipping take-profit for {ticker} (confirmed info-arb, hold to settlement)")
-        else:
-            exit_signal = evaluate_take_profit(pos, market)
+        # 1. Take profit (per-bot thresholds handle info-arb naturally)
+        exit_signal = evaluate_take_profit(pos, market, exit_config)
 
-        # 2. Stop loss (entry-price-relative when available)
+        # 2. Stop loss (per-bot threshold, market order)
         if not exit_signal:
-            exit_signal = evaluate_stop_loss(pos, market, entry_price_cents=entry_price)
+            exit_signal = evaluate_stop_loss(pos, market, exit_config, entry_price_cents=entry_price)
 
-        # 3. Trailing stop
+        # 3. Trailing stop (unchanged for this plan -- will be updated in 03-02)
         if not exit_signal:
             if ticker not in peaks:
                 peaks[ticker] = {
@@ -561,9 +615,9 @@ def scan_positions():
                 peaks[ticker]["entry_price"] = entry_price
             exit_signal, peaks[ticker] = evaluate_trailing_stop(pos, market, peaks[ticker])
 
-        # 4. Model shift
+        # 4. Model shift (per-bot threshold, multi-model routing)
         if not exit_signal:
-            exit_signal = evaluate_model_shift(pos, market)
+            exit_signal = evaluate_model_shift(pos, market, exit_config, entry_rec=entry_rec)
 
         if exit_signal and exits_today < MAX_DAILY_EXITS:
             log.info(f"  -> EXIT SIGNAL: {exit_signal['action']} on {ticker}")
@@ -575,6 +629,7 @@ def scan_positions():
                 exit_signal["price"],
                 exit_signal["count"],
                 exit_signal["reasoning"],
+                order_type=exit_signal.get("order_type", "limit"),
                 exit_type=exit_signal["action"],
                 sizing_method="position_exit",
                 entry_price_cents=entry_price,
@@ -586,6 +641,17 @@ def scan_positions():
                 allocator.record_trade("position-monitor", ticker, risk=0, edge=0)
                 trade_manager.log_decision(ticker, exit_signal["side"], "placed", exit_signal["action"],
                                            price_cents=exit_signal["price"])
+
+                # WhatsApp notification on successful exit
+                entry_cost_cents = (entry_price or 0) * exit_signal["count"]
+                exit_proceeds_cents = exit_signal["price"] * exit_signal["count"]
+                pnl_cents = exit_proceeds_cents - entry_cost_cents
+                pnl_str = f"+${pnl_cents/100:.2f}" if pnl_cents >= 0 else f"-${abs(pnl_cents)/100:.2f}"
+                notify_whatsapp(
+                    f"EXIT [{exit_signal['action']}] {ticker}: "
+                    f"bought {entry_price or '?'}c, sold {exit_signal['price']}c, {pnl_str}",
+                    logger=log,
+                )
             else:
                 trade_manager.log_decision(ticker, exit_signal["side"], "rejected", "sell_failed",
                                            price_cents=exit_signal["price"])
@@ -653,9 +719,11 @@ def main():
 
     log.info("=" * 60)
     log.info("Kalshi Position Monitor")
-    log.info(f"  Take-profit: {TAKE_PROFIT_THRESHOLD*100:.0f}%  Stop-loss: {STOP_LOSS_THRESHOLD*100:.0f}%")
-    log.info(f"  Model-shift: {MODEL_SHIFT_THRESHOLD*100:.0f}%  Max exits/day: {MAX_DAILY_EXITS}")
+    log.info(f"  Default take-profit: {pm_config.get('takeProfitThreshold', 0.80)*100:.0f}c")
+    log.info(f"  Default stop-loss: {pm_config.get('stopLossThreshold', 0.30)*100:.0f}c")
+    log.info(f"  Default model-shift: {MODEL_SHIFT_THRESHOLD*100:.0f}pp  Max exits/day: {MAX_DAILY_EXITS}")
     log.info(f"  Scan interval: {SCAN_INTERVAL} minutes")
+    log.info(f"  Per-bot exit config enabled ({len([k for k in bots_config if 'exit' in bots_config.get(k, {})])} bots configured)")
     log.info("=" * 60)
 
     # Verify auth
