@@ -10,11 +10,11 @@
     }
   },
   "entertainment": {
-    "enabled": false,
+    "enabled": true,
     "maxTradeAmount": 5,
     "maxDailyTrades": 10,
     "maxDailyLoss": 25,
-    "confidenceThreshold": 0.85,
+    "confidenceThreshold": 0.70,
     "scanIntervalMinutes": 15,
     "tickers": ["ALBUM", "BOX", "MOVIE", "STREAM", "MUSIC", "BILLBOARD", "OSCAR", "GRAMMY", "SPOTIFY", "FILM", "ENTERTAIN"],
     "exit": {
