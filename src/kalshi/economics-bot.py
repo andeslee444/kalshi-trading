@@ -298,10 +298,14 @@ def fetch_cleveland_fed_nowcast():
 
         # Fallback: regex parsing
         if not nowcast:
+            log.warning("  Cleveland Fed: BS4 parser found no data, falling back to regex")
             nowcast, strategy = _parse_nowcast_regex(html)
 
         if nowcast and strategy:
             log.info(f"  Cleveland Fed parsed via: {strategy}")
+        elif not nowcast:
+            log.warning("  Cleveland Fed: regex parser also found no data (page structure may have changed)")
+            log.info(f"  Cleveland Fed page length: {len(html)} chars, tables found: {html.count('<table')}")
 
         if nowcast:
             for key, val in nowcast.items():
@@ -604,9 +608,12 @@ def scan_and_trade():
         ticker = m.get("ticker", "")
         title = m.get("title", "")
 
+        market_type = _classify_econ_market(ticker)
         threshold, direction_type = parse_econ_threshold(m)
         if threshold is None:
             ss.skip("no_threshold")
+            trade_manager.log_decision(ticker, "skip", "skipped", "no_threshold",
+                                       market_type=market_type, title=title[:80])
             continue
 
         # Determine which nowcast value to use
@@ -620,11 +627,15 @@ def scan_and_trade():
 
         if nowcast_value is None:
             ss.skip("no_nowcast")
+            trade_manager.log_decision(ticker, "skip", "skipped", "no_nowcast",
+                                       market_type=market_type, title=title[:80])
             continue
 
         # Skip nowcast-based trades when data is stale
         if nowcast_stale:
             ss.skip("stale_nowcast")
+            trade_manager.log_decision(ticker, "skip", "skipped", "stale_nowcast",
+                                       market_type=market_type, cache_age_hours=round(_nowcast_cache_age_hours(), 1))
             continue
 
         ss.markets_evaluated += 1
