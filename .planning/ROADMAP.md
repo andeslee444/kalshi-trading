@@ -164,6 +164,6 @@ Note: Phase 2 and Phase 3 can execute in parallel (both depend only on Phase 1).
 | 3. Position Management | 1/2 | In progress | - |
 | 4. Bot Activation | 0/4 | Not started | - |
 | 5. Automated Calibration | 0/2 | Not started | - |
-| 6. Crypto Validation | 0/2 | Not started | - |
+| 6. Crypto Validation | 1/2 | In progress | - |
 | 7. New Strategies | 0/2 | Not started | - |
 | 8. Operational Hardening | 0/2 | Not started | - |

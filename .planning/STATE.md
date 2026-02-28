@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: unknown
-last_updated: "2026-02-28T07:23:50.212Z"
+status: in-progress
+last_updated: "2026-02-28T09:43:30Z"
 progress:
-  total_phases: 5
+  total_phases: 8
   completed_phases: 5
-  total_plans: 15
-  completed_plans: 15
+  total_plans: 21
+  completed_plans: 16
 ---
 
 # Project State
@@ -18,23 +18,23 @@ progress:
 See: .planning/PROJECT.md (updated 2026-02-26)
 
 **Core value:** Every bot must produce consistent daily P&L -- bots trading regularly on validated edges, exits protecting capital, and measurable model calibration proving the math works.
-**Current focus:** Phase 5 complete (Automated Calibration). Daily pipeline with drift detection and suggestion generation operational.
+**Current focus:** Phase 6 in progress (Crypto Validation). Data pipeline and settlement audit complete, model backtest next.
 
 ## Current Position
 
-Phase: 5 of 8 (Automated Calibration) -- COMPLETE
-Plan: 2 of 2 in current phase (2 complete)
-Status: Phase 05 complete, ready for Phase 06 (Crypto Validation)
-Last activity: 2026-02-28 -- Completed 05-02 (Calibration Suggestion Generation)
+Phase: 6 of 8 (Crypto Validation) -- IN PROGRESS
+Plan: 1 of 2 in current phase (1 complete)
+Status: 06-01 complete (data fetching + settlement audit), ready for 06-02 (model backtest)
+Last activity: 2026-02-28 -- Completed 06-01 (Data Fetching and Settlement Audit)
 
-Progress: [██████████] 60%
+Progress: [████████████████] 76%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 13
+- Total plans completed: 14
 - Average duration: 4 min
-- Total execution time: 0.9 hours
+- Total execution time: 1.0 hours
 
 **By Phase:**
 
@@ -43,7 +43,7 @@ Progress: [██████████] 60%
 | 01-feedback-loop | 5 | 30 min | 6 min |
 
 **Recent Trend:**
-- Last 5 plans: 4min, 2min, 2min, 2min, 4min
+- Last 5 plans: 2min, 2min, 2min, 4min, 6min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -59,6 +59,7 @@ Progress: [██████████] 60%
 | Phase 04 P02 | 2min | 2 tasks | 2 files |
 | Phase 05 P01 | 4min | 2 tasks | 3 files |
 | Phase 05 P02 | 5min | 2 tasks | 2 files |
+| Phase 06 P01 | 6min | 2 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -110,6 +111,9 @@ Recent decisions affecting current work:
 - [Phase 05-02]: Suggestion files use date-stamped names with -N suffix for same-day duplicates
 - [Phase 05-02]: apply_suggestion re-snapshots baselines after applying -- ensures drift detection reflects new calibration
 - [Phase 05-02]: Calibration sections use global_brier field matching calibrate-sigma.py output structure
+- [Phase 06-01]: estimate_time_to_settlement() validated as correct -- uses close_time - now dynamically, no hardcoded T=2456min
+- [Phase 06-01]: 15-minute markets (KXBTC15M) have different ticker format not handled by parse_crypto_ticker -- documented, not blocking
+- [Phase 06-01]: SOL DVOL unavailable on Deribit -- SOL backtest will use realized vol only
 
 ### Pending Todos
 
@@ -122,5 +126,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-28
-Stopped at: Completed 05-02-PLAN.md (Calibration Suggestion Generation)
+Stopped at: Completed 06-01-PLAN.md (Data Fetching and Settlement Audit)
 Resume file: None
