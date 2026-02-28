@@ -51,6 +51,11 @@ SETTLEMENT_BUFFER_MINUTES = crypto_config.get("settlementBufferMinutes", 1)
 USE_OU = crypto_config.get("useOrnsteinUhlenbeck", False)
 OU_HALF_LIFE = crypto_config.get("ouHalfLifeMinutes", 120)
 DRIFT_PCT = crypto_config.get("driftPct", 0.0)
+MID_RANGE_EDGE_THRESHOLD = crypto_config.get("midRangeEdgeThreshold", 0.15)
+MID_RANGE_BAND = (
+    crypto_config.get("midRangeLow", 0.25),
+    crypto_config.get("midRangeHigh", 0.75),
+)
 
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
@@ -100,6 +105,32 @@ def _save_price_history():
 
 
 _load_price_history()
+
+
+def _effective_edge_threshold(model_prob):
+    """Higher edge required when model probability is in the uncertain mid-range."""
+    if MID_RANGE_BAND[0] < model_prob < MID_RANGE_BAND[1]:
+        return MID_RANGE_EDGE_THRESHOLD
+    return EDGE_THRESHOLD
+
+
+def compute_trailing_drift(asset):
+    """Compute annualized drift from trailing 24h price change.
+
+    Returns drift as decimal (e.g., -1.2 = -120% annualized), or 0.0 if insufficient data.
+    Clamped to [-2.0, 2.0] to prevent extreme values.
+    """
+    history = _price_history.get(asset, [])
+    if len(history) < 2:
+        return 0.0
+    oldest_price = history[0][1]
+    newest_price = history[-1][1]
+    dt_seconds = history[-1][0] - history[0][0]
+    if dt_seconds < 3600 or oldest_price <= 0:  # need at least 1h of data
+        return 0.0
+    log_return = math.log(newest_price / oldest_price)
+    annualized = log_return * (365.25 * 86400 / dt_seconds)
+    return max(-2.0, min(2.0, annualized))
 
 
 # === Data Sources ===
@@ -162,24 +193,31 @@ def fetch_deribit_iv(asset="BTC"):
         return None
 
 
-def compute_realized_vol(asset, current_price):
+def compute_realized_vol(asset, current_price=None, lookback_seconds=86400):
     """Compute realized volatility from recent price observations.
+
+    Args:
+        asset: Asset symbol (e.g., "BTC", "ETH").
+        current_price: If provided, records a new observation before computing.
+        lookback_seconds: Window for vol computation (default 24h).
 
     Returns annualized vol as decimal, or None if insufficient data.
     """
     now = time.time()
 
-    # Record current observation
-    if asset not in _price_history:
-        _price_history[asset] = []
-    _price_history[asset].append((now, current_price))
+    # Record current observation (only if price provided)
+    if current_price is not None:
+        if asset not in _price_history:
+            _price_history[asset] = []
+        _price_history[asset].append((now, current_price))
+        # Prune to 24h regardless of lookback (keep full history for flexibility)
+        cutoff_24h = now - 86400
+        _price_history[asset] = [(t, p) for t, p in _price_history[asset] if t > cutoff_24h]
+        _save_price_history()
 
-    # Keep only last 24h of observations
-    cutoff = now - 86400
-    _price_history[asset] = [(t, p) for t, p in _price_history[asset] if t > cutoff]
-    _save_price_history()
-
-    history = _price_history[asset]
+    # Compute vol with requested lookback
+    cutoff = now - lookback_seconds
+    history = [(t, p) for t, p in _price_history.get(asset, []) if t > cutoff]
     if len(history) < 5:
         return None
 
@@ -284,13 +322,20 @@ def scan_and_trade():
             iv_data[asset] = iv
             health.record_source_success("deribit")
 
-    # Compute realized vol
+    # Compute realized vol (records observation + 24h vol)
     realized_vols = {}
     for asset, price in spot_prices.items():
         rv = compute_realized_vol(asset, price)
         if rv:
             realized_vols[asset] = rv
             log.info(f"  {asset} realized vol: {rv*100:.1f}%")
+
+    # Compute trailing drift per asset
+    drift_by_asset = {}
+    for asset in spot_prices:
+        drift_by_asset[asset] = compute_trailing_drift(asset)
+        if drift_by_asset[asset] != 0.0:
+            log.info(f"  {asset} trailing drift: {drift_by_asset[asset]*100:.0f}% ann")
 
     # Fetch crypto markets
     all_markets = []
@@ -327,6 +372,11 @@ def scan_and_trade():
         threshold = parsed["threshold"]
         direction = parsed.get("direction", "T")
 
+        # Skip bracket markets if disabled (87% non-fill rate)
+        if direction == "B" and not crypto_config.get("enableBrackets", True):
+            ss.skip("brackets_disabled")
+            continue
+
         # Estimate time to settlement
         minutes_to_settle = estimate_time_to_settlement(m)
 
@@ -335,9 +385,21 @@ def scan_and_trade():
             ss.skip("settlement_buffer")
             continue
 
+        # Horizon-matched vol lookback
+        if minutes_to_settle <= 30:
+            rv_lookback = 3600       # 1h for <=30-min markets
+        elif minutes_to_settle <= 120:
+            rv_lookback = 6 * 3600   # 6h for hourly markets
+        else:
+            rv_lookback = 86400      # 24h for daily/weekly
+
         # Get volatility — IV is forward-looking so gets more weight
         iv = iv_data.get(asset)
-        rv = realized_vols.get(asset)
+        # Use horizon-matched RV if shorter lookback needed, else use pre-computed 24h RV
+        if rv_lookback < 86400:
+            rv = compute_realized_vol(asset, lookback_seconds=rv_lookback)
+        else:
+            rv = realized_vols.get(asset)
         default_vol = DEFAULT_VOLS.get(asset, 0.50)
         if iv is not None and rv is not None:
             vol_to_use = 0.6 * iv + 0.4 * rv  # IV more predictive for short-term crypto
@@ -347,13 +409,15 @@ def scan_and_trade():
             vol_to_use = 0.3 * default_vol + 0.7 * rv
         else:
             vol_to_use = default_vol
+
+        drift = drift_by_asset.get(asset, DRIFT_PCT)
         if direction == "T":
             prob = crypto_price_probability(
                 current_price, threshold, "above",
                 time_horizon_minutes=minutes_to_settle,
                 realized_vol_pct=vol_to_use, iv_pct=None,
                 use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
-                drift_pct=DRIFT_PCT,
+                drift_pct=drift,
             )
         else:
             # Bracket: probability price lands in [threshold, threshold+range)
@@ -363,14 +427,14 @@ def scan_and_trade():
                 time_horizon_minutes=minutes_to_settle,
                 realized_vol_pct=vol_to_use, iv_pct=None,
                 use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
-                drift_pct=DRIFT_PCT,
+                drift_pct=drift,
             )
             prob_above_high = crypto_price_probability(
                 current_price, threshold + range_size, "above",
                 time_horizon_minutes=minutes_to_settle,
                 realized_vol_pct=vol_to_use, iv_pct=None,
                 use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
-                drift_pct=DRIFT_PCT,
+                drift_pct=drift,
             )
             prob = prob_above_low - prob_above_high
 
@@ -389,9 +453,10 @@ def scan_and_trade():
         ss.markets_evaluated += 1
 
         # Determine trade direction and edge (raw edge, fees handled in Kelly)
+        eff_threshold = _effective_edge_threshold(prob)
         if prob > 0.5 and yes_ask:
             edge = prob - yes_ask / 100
-            if edge > EDGE_THRESHOLD:
+            if edge > eff_threshold:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "yes",
                     "prob": prob, "edge": edge, "asset": asset,
@@ -400,14 +465,15 @@ def scan_and_trade():
                     "vol_used": vol_to_use,
                 })
             else:
+                reason = "edge below mid-range threshold" if eff_threshold > EDGE_THRESHOLD else "edge below threshold"
                 trade_manager.log_decision(
-                    ticker, "yes", "skipped", "edge below threshold",
+                    ticker, "yes", "skipped", reason,
                     edge=edge, price_cents=yes_ask,
                 )
         elif prob <= 0.5 and no_ask:
             no_prob = 1.0 - prob
             edge = no_prob - no_ask / 100
-            if edge > EDGE_THRESHOLD:
+            if edge > eff_threshold:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "no",
                     "prob": prob, "edge": edge, "asset": asset,
@@ -416,8 +482,9 @@ def scan_and_trade():
                     "vol_used": vol_to_use,
                 })
             else:
+                reason = "edge below mid-range threshold" if eff_threshold > EDGE_THRESHOLD else "edge below threshold"
                 trade_manager.log_decision(
-                    ticker, "no", "skipped", "edge below threshold",
+                    ticker, "no", "skipped", reason,
                     edge=edge, price_cents=no_ask,
                 )
 
