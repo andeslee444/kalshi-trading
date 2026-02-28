@@ -100,11 +100,11 @@ Plans:
   1. A daily cron job runs reconcile, then backtest, then compares Brier scores to baseline, completing without manual intervention
   2. When calibration analysis finds sigma parameters that improve Brier score, a suggestion is surfaced for human review (not auto-applied)
   3. WhatsApp alert fires within one pipeline cycle when any model's Brier score degrades more than 10% from established baseline
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 05-01: Daily reconcile-backtest-alert pipeline
-- [ ] 05-02: Auto-suggest calibration parameters with drift detection
+- [ ] 05-01-PLAN.md -- Daily reconcile-backtest-alert pipeline: subprocess orchestration, baseline management, drift detection, WhatsApp summary, cron scheduling
+- [ ] 05-02-PLAN.md -- Calibration suggestion generation: auto-suggest improved sigma params for human review, apply mechanism, unit tests
 
 ### Phase 6: Crypto Validation
 **Goal**: The crypto trading model is validated against historical data with documented accuracy metrics
