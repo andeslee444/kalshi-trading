@@ -34,14 +34,16 @@
         "HOU": "KHOU",
         "ATL": "KATL",
         "BOS": "KBOS",
-        "SF": "KSFO",
+        "SFO": "KSFO",
         "SEA": "KSEA",
-        "LAS": "KLAS",
+        "LV": "KLAS",
         "DAL": "KDFW",
-        "DET": "KDTW",
-        "MSP": "KMSP",
+        "MIN": "KMSP",
         "PHX": "KPHX",
-        "DC": "KDCA"
+        "DC": "KDCA",
+        "NOLA": "KMSY",
+        "OKC": "KOKC",
+        "SATX": "KSAT"
       },
       "intervalMinutes": 10
     }

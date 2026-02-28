@@ -18,14 +18,16 @@
     "HOU": { "lat": 29.76, "lon": -95.37, "name": "Houston" },
     "ATL": { "lat": 33.75, "lon": -84.39, "name": "Atlanta" },
     "BOS": { "lat": 42.36, "lon": -71.06, "name": "Boston" },
-    "SF": { "lat": 37.77, "lon": -122.42, "name": "San Francisco" },
+    "SFO": { "lat": 37.77, "lon": -122.42, "name": "San Francisco" },
     "SEA": { "lat": 47.61, "lon": -122.33, "name": "Seattle" },
-    "LAS": { "lat": 36.17, "lon": -115.14, "name": "Las Vegas" },
+    "LV": { "lat": 36.17, "lon": -115.14, "name": "Las Vegas" },
     "DAL": { "lat": 32.78, "lon": -96.80, "name": "Dallas" },
-    "DET": { "lat": 42.33, "lon": -83.05, "name": "Detroit" },
-    "MSP": { "lat": 44.98, "lon": -93.27, "name": "Minneapolis" },
+    "MIN": { "lat": 44.98, "lon": -93.27, "name": "Minneapolis" },
     "PHX": { "lat": 33.45, "lon": -112.07, "name": "Phoenix" },
-    "DC": { "lat": 38.91, "lon": -77.04, "name": "Washington DC" }
+    "DC": { "lat": 38.91, "lon": -77.04, "name": "Washington DC" },
+    "NOLA": { "lat": 29.95, "lon": -90.07, "name": "New Orleans" },
+    "OKC": { "lat": 35.47, "lon": -97.52, "name": "Oklahoma City" },
+    "SATX": { "lat": 29.42, "lon": -98.49, "name": "San Antonio" }
   },
   "disableWeatherYes": false,
   "ensemble": {

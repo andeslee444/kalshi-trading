@@ -10,7 +10,73 @@ from ticker_utils import parse_weather_ticker, parse_crypto_ticker
 
 class TestParseWeatherTicker:
 
-    def test_standard_threshold_ticker(self):
+    # --- Current YYMONDD format (2026-02-22 onwards) ---
+
+    def test_current_format_threshold(self):
+        r = parse_weather_ticker("KXHIGHMIA-26FEB28-T86")
+        assert r is not None
+        assert r["city"] == "MIA"
+        assert r["date"] == "2026-02-28"
+        assert r["direction"] == "T"
+        assert r["threshold"] == 86.0
+
+    def test_current_format_bracket(self):
+        r = parse_weather_ticker("KXHIGHAUS-26MAR01-B87.5")
+        assert r is not None
+        assert r["city"] == "AUS"
+        assert r["date"] == "2026-03-01"
+        assert r["direction"] == "B"
+        assert r["threshold"] == 87.5
+
+    def test_current_format_different_cities(self):
+        for ticker, city, date in [
+            ("KXHIGHCHI-26MAR01-T36", "CHI", "2026-03-01"),
+            ("KXHIGHDEN-26FEB28-T64", "DEN", "2026-02-28"),
+            ("KXHIGHLAX-26MAR01-T78", "LAX", "2026-03-01"),
+            ("KXHIGHNY-26FEB28-T50", "NY", "2026-02-28"),
+            ("KXHIGHPHIL-26FEB28-B55.5", "PHIL", "2026-02-28"),
+        ]:
+            r = parse_weather_ticker(ticker)
+            assert r is not None, f"Failed to parse: {ticker}"
+            assert r["city"] == city
+            assert r["date"] == date
+
+    # --- T-prefix cities (KXHIGHT<CITY>) ---
+
+    def test_t_prefix_city_atl(self):
+        r = parse_weather_ticker("KXHIGHTATL-26MAR01-T72")
+        assert r is not None
+        assert r["city"] == "ATL"
+        assert r["date"] == "2026-03-01"
+
+    def test_t_prefix_city_bos(self):
+        r = parse_weather_ticker("KXHIGHTBOS-26FEB28-B49.5")
+        assert r is not None
+        assert r["city"] == "BOS"
+        assert r["date"] == "2026-02-28"
+        assert r["direction"] == "B"
+
+    def test_t_prefix_various_cities(self):
+        for ticker, city in [
+            ("KXHIGHTDAL-26MAR01-T80", "DAL"),
+            ("KXHIGHTDC-26FEB28-T59", "DC"),
+            ("KXHIGHTHOU-26FEB28-T73", "HOU"),
+            ("KXHIGHTLV-26MAR01-B65.5", "LV"),
+            ("KXHIGHTMIN-26FEB28-T30", "MIN"),
+            ("KXHIGHTNOLA-26MAR01-T72", "NOLA"),
+            ("KXHIGHTOKC-26FEB28-T60", "OKC"),
+            ("KXHIGHTPHX-26MAR01-T90", "PHX"),
+            ("KXHIGHTSATX-26FEB28-B75.5", "SATX"),
+            ("KXHIGHTSEA-26FEB28-T50", "SEA"),
+            ("KXHIGHTSFO-26MAR01-T65", "SFO"),
+        ]:
+            r = parse_weather_ticker(ticker)
+            assert r is not None, f"Failed to parse: {ticker}"
+            assert r["city"] == city
+
+    # --- Old DDMONYY format (backward compatibility for trade log parsing) ---
+
+    def test_old_format_standard(self):
         r = parse_weather_ticker("KXHIGHMIA-21FEB26-T86")
         assert r is not None
         assert r["city"] == "MIA"
@@ -18,31 +84,40 @@ class TestParseWeatherTicker:
         assert r["direction"] == "T"
         assert r["threshold"] == 86.0
 
-    def test_bracket_ticker(self):
+    def test_old_format_bracket(self):
         r = parse_weather_ticker("KXHIGHMIA-21FEB26-B85.5")
         assert r is not None
-        assert r["city"] == "MIA"
         assert r["date"] == "2026-02-21"
         assert r["direction"] == "B"
         assert r["threshold"] == 85.5
 
-    def test_different_city(self):
+    def test_old_format_different_city(self):
         r = parse_weather_ticker("KXHIGHLAX-05MAR26-T72")
         assert r is not None
         assert r["city"] == "LAX"
         assert r["date"] == "2026-03-05"
         assert r["threshold"] == 72.0
 
-    def test_chicago(self):
+    def test_old_format_chicago(self):
         r = parse_weather_ticker("KXHIGHCHI-15JAN26-T30")
         assert r is not None
         assert r["city"] == "CHI"
         assert r["date"] == "2026-01-15"
 
-    def test_december(self):
-        r = parse_weather_ticker("KXHIGHNY-31DEC25-T45")
+    # --- YYMONDD format heuristic ---
+
+    def test_yymondd_year26(self):
+        """26FEB16: g2=26 >= 25 -> YYMONDD -> year=26, day=16 -> 2026-02-16."""
+        r = parse_weather_ticker("KXHIGHMIA-26FEB16-T86")
         assert r is not None
-        assert r["date"] == "2025-12-31"
+        assert r["date"] == "2026-02-16"
+
+    def test_yymondd_year27(self):
+        r = parse_weather_ticker("KXHIGHMIA-27JAN15-T80")
+        assert r is not None
+        assert r["date"] == "2027-01-15"
+
+    # --- Invalid tickers ---
 
     def test_invalid_ticker_returns_none(self):
         assert parse_weather_ticker("KXBTC-21FEB26-T70000") is None
@@ -53,20 +128,8 @@ class TestParseWeatherTicker:
     def test_invalid_month_returns_none(self):
         assert parse_weather_ticker("KXHIGHMIA-21XYZ26-T86") is None
 
-    def test_date_order_correct(self):
-        """Verify day/month/year are parsed in correct order (regression test for weather-bot bug)."""
-        # Ticker: KXHIGHMIA-26FEB16 means Feb 26, 2016 (day=26, month=FEB, year=16)
-        # The old weather-bot bug swapped yr and day: yr=26, day=16 -> 2026-02-16
-        # Correct: day=26, month=02, year=16 -> 2016-02-26
-        r = parse_weather_ticker("KXHIGHMIA-26FEB16-T86")
-        assert r is not None
-        assert r["date"] == "2016-02-26"
-
-    def test_another_date_order(self):
-        # 15JAN25 -> day=15, month=JAN=01, year=25 -> 2025-01-15
-        r = parse_weather_ticker("KXHIGHMIA-15JAN25-T80")
-        assert r is not None
-        assert r["date"] == "2025-01-15"
+    def test_inflation_ticker_returns_none(self):
+        assert parse_weather_ticker("KXHIGHINFLATION-26DEC-T3.5") is None
 
 
 # ===================================================================

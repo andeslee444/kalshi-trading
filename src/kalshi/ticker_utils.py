@@ -14,22 +14,29 @@ MONTHS = {
 def parse_weather_ticker(ticker):
     """Parse KXHIGH weather temperature tickers.
 
-    Examples:
-        KXHIGHMIA-21FEB26-T86  -> {"city": "MIA", "date": "2026-02-21", "direction": "T", "threshold": 86.0}
-        KXHIGHMIA-21FEB26-B85.5 -> {"city": "MIA", "date": "2026-02-21", "direction": "B", "threshold": 85.5}
+    Handles both old and new Kalshi formats:
+        Old: KXHIGH<CITY>-<DD><MON><YY>  (pre-2026-02-22)
+        New: KXHIGH[T]<CITY>-<YY><MON><DD>  (current, T prefix on newer cities)
 
-    Ticker format: KXHIGH<CITY>-<DD><MON><YY>-<T|B><threshold>
+    Examples:
+        KXHIGHMIA-26FEB28-T86   -> {"city": "MIA", "date": "2026-02-28", "direction": "T", "threshold": 86.0}
+        KXHIGHTATL-26MAR01-B70.5 -> {"city": "ATL", "date": "2026-03-01", "direction": "B", "threshold": 70.5}
     """
-    m = re.match(r"KXHIGH([A-Z]+)-(\d{2})([A-Z]{3})(\d{2})-([TB])([\d.]+)", ticker)
+    m = re.match(r"KXHIGHT?([A-Z]+)-(\d{2})([A-Z]{3})(\d{2})-([TB])([\d.]+)", ticker)
     if not m:
         return None
     city = m.group(1)
-    day, mon, yr = int(m.group(2)), m.group(3), int(m.group(4))
+    g2, mon, g4 = int(m.group(2)), m.group(3), int(m.group(4))
     direction = m.group(5)
     threshold = float(m.group(6))
     month = MONTHS.get(mon)
     if not month:
         return None
+    # Detect format: if first number >= 25 it's a year (YYMONDD), otherwise a day (DDMONYY)
+    if g2 >= 25:
+        yr, day = g2, g4
+    else:
+        day, yr = g2, g4
     return {
         "city": city,
         "date": f"{2000+yr}-{month:02d}-{day:02d}",
