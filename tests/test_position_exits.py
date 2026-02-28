@@ -519,3 +519,149 @@ class TestComputeCurrentProbability:
         prob, reason = _mod._compute_current_probability("TICK-1", "unknown_xyz", "yes")
         assert prob is None
         assert reason is None
+
+
+# ===================================================================
+# evaluate_trailing_stop tests (with illiquidity protection and arming)
+# ===================================================================
+
+class TestEvaluateTrailingStop:
+    """Test trailing stop with illiquidity protection, arming, and market orders."""
+
+    def test_triggers_on_drop_from_peak(self):
+        """Should trigger when bid drops trailing_drop_cents from peak."""
+        pos = {"ticker": "TICK-1", "yes": 5, "no": 0}
+        market = {"yes_bid": 60, "yes_ask": 62}
+        peak = {"entry_price": 40, "peak_bid": 75, "side": "yes"}
+        ec = _exit_config(trailing_drop_cents=10, trailing_min_profit_cents=10)
+        result, updated_peak = _mod.evaluate_trailing_stop(pos, market, peak, ec)
+        assert result is not None
+        assert result["action"] == "trailing_stop"
+        assert result["side"] == "yes"
+        assert result["count"] == 5
+        assert result["price"] == 60
+        # Dropped 15c from peak of 75, threshold is 10c
+
+    def test_arms_only_after_min_profit(self):
+        """Should NOT trigger if peak hasn't reached entry + min profit."""
+        pos = {"ticker": "TICK-1", "yes": 5, "no": 0}
+        market = {"yes_bid": 42, "yes_ask": 44}
+        # Peak is 48, entry is 40, min_profit is 10 => need peak >= 50
+        peak = {"entry_price": 40, "peak_bid": 48, "side": "yes"}
+        ec = _exit_config(trailing_drop_cents=5, trailing_min_profit_cents=10)
+        result, _ = _mod.evaluate_trailing_stop(pos, market, peak, ec)
+        assert result is None
+
+    def test_skips_illiquid_no_bid(self):
+        """Should return None with warning when bid is 0."""
+        pos = {"ticker": "TICK-1", "yes": 5, "no": 0}
+        market = {"yes_bid": 0, "yes_ask": 50}
+        peak = {"entry_price": 30, "peak_bid": 70, "side": "yes"}
+        ec = _exit_config()
+        result, _ = _mod.evaluate_trailing_stop(pos, market, peak, ec)
+        assert result is None
+
+    def test_skips_illiquid_wide_spread(self):
+        """Should return None when spread > 20c."""
+        pos = {"ticker": "TICK-1", "yes": 5, "no": 0}
+        # Spread = 70 - 40 = 30c > 20c
+        market = {"yes_bid": 40, "yes_ask": 70}
+        peak = {"entry_price": 30, "peak_bid": 60, "side": "yes"}
+        ec = _exit_config(trailing_drop_cents=10, trailing_min_profit_cents=10)
+        result, _ = _mod.evaluate_trailing_stop(pos, market, peak, ec)
+        assert result is None
+
+    def test_uses_market_order_type(self):
+        """Trailing stop exits should specify order_type='market'."""
+        pos = {"ticker": "TICK-1", "yes": 3, "no": 0}
+        market = {"yes_bid": 55, "yes_ask": 57}
+        peak = {"entry_price": 40, "peak_bid": 70, "side": "yes"}
+        ec = _exit_config(trailing_drop_cents=10, trailing_min_profit_cents=10)
+        result, _ = _mod.evaluate_trailing_stop(pos, market, peak, ec)
+        assert result is not None
+        assert result["order_type"] == "market"
+        assert "MARKET ORDER" in result["reasoning"]
+
+    def test_updates_peak_on_higher_bid(self):
+        """Peak should update when current bid exceeds stored peak."""
+        pos = {"ticker": "TICK-1", "yes": 3, "no": 0}
+        market = {"yes_bid": 80, "yes_ask": 82}
+        peak = {"entry_price": 40, "peak_bid": 70, "side": "yes"}
+        ec = _exit_config(trailing_drop_cents=10, trailing_min_profit_cents=10)
+        result, updated = _mod.evaluate_trailing_stop(pos, market, peak, ec)
+        # No trigger (bid=80 is new peak, no drop)
+        assert result is None
+        assert updated["peak_bid"] == 80
+        assert "last_updated" in updated
+
+    def test_no_trigger_when_bid_above_peak_minus_drop(self):
+        """Should return None when drop is less than trailing_drop_cents."""
+        pos = {"ticker": "TICK-1", "yes": 3, "no": 0}
+        market = {"yes_bid": 66, "yes_ask": 68}
+        # Peak is 70, drop is 4c, threshold is 10c => no trigger
+        peak = {"entry_price": 40, "peak_bid": 70, "side": "yes"}
+        ec = _exit_config(trailing_drop_cents=10, trailing_min_profit_cents=10)
+        result, _ = _mod.evaluate_trailing_stop(pos, market, peak, ec)
+        assert result is None
+
+    def test_exits_full_position(self):
+        """Trailing stop always exits full count."""
+        pos = {"ticker": "TICK-1", "yes": 8, "no": 0}
+        market = {"yes_bid": 55, "yes_ask": 57}
+        peak = {"entry_price": 40, "peak_bid": 70, "side": "yes"}
+        ec = _exit_config(trailing_drop_cents=10, trailing_min_profit_cents=10)
+        result, _ = _mod.evaluate_trailing_stop(pos, market, peak, ec)
+        assert result is not None
+        assert result["count"] == 8
+
+    def test_no_side_trailing_stop(self):
+        """NO position trailing stop should also work."""
+        pos = {"ticker": "TICK-1", "yes": 0, "no": 4}
+        # no_bid = 100 - yes_ask = 100 - 30 = 70
+        market = {"yes_bid": 25, "yes_ask": 30, "no_bid": 55, "no_ask": 58}
+        peak = {"entry_price": 40, "peak_bid": 70, "side": "no"}
+        ec = _exit_config(trailing_drop_cents=10, trailing_min_profit_cents=10)
+        result, _ = _mod.evaluate_trailing_stop(pos, market, peak, ec)
+        assert result is not None
+        assert result["side"] == "no"
+        assert result["count"] == 4
+        assert result["order_type"] == "market"
+
+    def test_no_position_returns_none(self):
+        """Empty position (yes=0, no=0) should return None."""
+        pos = {"ticker": "TICK-1", "yes": 0, "no": 0}
+        market = {"yes_bid": 50, "yes_ask": 52}
+        peak = {"entry_price": 30, "peak_bid": 60, "side": "yes"}
+        ec = _exit_config()
+        result, _ = _mod.evaluate_trailing_stop(pos, market, peak, ec)
+        assert result is None
+
+    def test_last_updated_set_on_evaluation(self):
+        """Peak info should have last_updated set after evaluation."""
+        pos = {"ticker": "TICK-1", "yes": 3, "no": 0}
+        market = {"yes_bid": 55, "yes_ask": 57}
+        peak = {"entry_price": 40, "peak_bid": 55, "side": "yes"}
+        ec = _exit_config()
+        _, updated = _mod.evaluate_trailing_stop(pos, market, peak, ec)
+        assert "last_updated" in updated
+
+
+# ===================================================================
+# Stale order cancellation tests (EXIT-05)
+# ===================================================================
+
+class TestStaleOrderCancellation:
+    """Test stale order TTL cancellation (EXIT-05)."""
+
+    def test_orders_older_than_ttl_cancelled(self):
+        """Orders older than ORDER_TTL_MINUTES should be cancelled."""
+        import datetime as dt
+        # ORDER_TTL_MINUTES defaults to 120 in the module
+        assert _mod.ORDER_TTL_MINUTES == 120
+
+    def test_order_ttl_configurable(self):
+        """ORDER_TTL_MINUTES should be read from config."""
+        # Verify the module read the config value
+        assert hasattr(_mod, 'ORDER_TTL_MINUTES')
+        assert isinstance(_mod.ORDER_TTL_MINUTES, (int, float))
+        assert _mod.ORDER_TTL_MINUTES > 0

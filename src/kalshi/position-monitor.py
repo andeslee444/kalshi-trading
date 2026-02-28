@@ -106,14 +106,29 @@ def _load_entry_records():
 
 # === Trailing Stop Peak State ===
 
-PEAKS_PATH = PROJECT_DIR / "data" / "position-peaks.json"
+TRAILING_STATE_PATH = PROJECT_DIR / "data" / "trailing-state.json"
+_OLD_PEAKS_PATH = PROJECT_DIR / "data" / "position-peaks.json"
 
 
 def _load_peaks():
-    """Load trailing stop peak state from disk."""
-    if PEAKS_PATH.exists():
+    """Load trailing stop peak state from disk.
+
+    Handles migration from old position-peaks.json to trailing-state.json.
+    """
+    if TRAILING_STATE_PATH.exists():
         try:
-            return json.loads(PEAKS_PATH.read_text())
+            return json.loads(TRAILING_STATE_PATH.read_text())
+        except (json.JSONDecodeError, ValueError):
+            return {}
+    # Migration: read from old path if new doesn't exist
+    if _OLD_PEAKS_PATH.exists():
+        try:
+            data = json.loads(_OLD_PEAKS_PATH.read_text())
+            # Write to new path and remove old
+            _atomic_write_json(TRAILING_STATE_PATH, data)
+            _OLD_PEAKS_PATH.unlink(missing_ok=True)
+            log.info("Migrated trailing state from position-peaks.json to trailing-state.json")
+            return data
         except (json.JSONDecodeError, ValueError):
             return {}
     return {}
@@ -121,7 +136,7 @@ def _load_peaks():
 
 def _save_peaks(peaks):
     """Save trailing stop peak state to disk atomically."""
-    _atomic_write_json(PEAKS_PATH, peaks)
+    _atomic_write_json(TRAILING_STATE_PATH, peaks)
 
 
 # Load NWS station config for model-shift evaluation
@@ -261,13 +276,15 @@ def evaluate_stop_loss(position, market, exit_config, entry_price_cents=None):
     return None
 
 
-def evaluate_trailing_stop(position, market, peak_info):
+def evaluate_trailing_stop(position, market, peak_info, exit_config):
     """Exit if bid dropped significantly from observed peak, locking in gains.
 
     Only triggers when:
-      1. Peak bid was profitable (peak >= entry + trailingMinProfitCents)
-      2. Current bid dropped >= trailingDropCents from peak
+      1. Peak bid was profitable (peak >= entry + trailing_min_profit_cents)
+      2. Current bid dropped >= trailing_drop_cents from peak
+      3. Market is liquid (bid > 0 and spread <= 20c)
 
+    Uses market order for urgent exit.
     Returns (exit_signal_or_None, updated_peak_info).
     """
     yes_count = position.get("yes", 0)
@@ -275,13 +292,25 @@ def evaluate_trailing_stop(position, market, peak_info):
 
     if yes_count > 0:
         current_bid = market.get("yes_bid", 0)
+        current_ask = market.get("yes_ask", 0)
         side = "yes"
         count = yes_count
     elif no_count > 0:
         current_bid = market.get("no_bid", 0) or (100 - market.get("yes_ask", 100))
+        current_ask = market.get("no_ask", 0) if market.get("no_ask") else (100 - market.get("yes_bid", 0))
         side = "no"
         count = no_count
     else:
+        return None, peak_info
+
+    # Illiquidity check: skip if no bids or spread > 20c
+    if current_bid <= 0:
+        log.warning(f"  Trailing stop: skipping {position.get('ticker', '')} — no bids (illiquid)")
+        return None, peak_info
+
+    spread = abs(current_ask - current_bid) if current_ask > 0 else 0
+    if spread > 20:
+        log.warning(f"  Trailing stop: skipping {position.get('ticker', '')} — wide spread {spread}c (illiquid)")
         return None, peak_info
 
     entry_price = peak_info.get("entry_price", 0)
@@ -291,21 +320,26 @@ def evaluate_trailing_stop(position, market, peak_info):
     if current_bid > peak_bid:
         peak_info["peak_bid"] = current_bid
         peak_bid = current_bid
+    peak_info["last_updated"] = datetime.datetime.now().isoformat()
 
-    trailing_drop = pm_config.get("trailingDropCents", 10)
-    trailing_min_profit = pm_config.get("trailingMinProfitCents", 10)
+    trailing_drop = exit_config["trailing_drop_cents"]
+    trailing_min_profit = exit_config["trailing_min_profit_cents"]
 
-    # Trigger: dropped trailing_drop from peak AND peak was profitable
-    if (peak_bid - current_bid >= trailing_drop
-            and peak_bid >= entry_price + trailing_min_profit):
+    # Arming condition: peak must be >= entry + min profit
+    if peak_bid < entry_price + trailing_min_profit:
+        return None, peak_info
+
+    # Trigger: dropped trailing_drop from peak
+    if peak_bid - current_bid >= trailing_drop:
         return {
             "action": "trailing_stop",
             "side": side,
             "count": count,
             "price": current_bid,
+            "order_type": "market",
             "reasoning": (
                 f"Trailing stop: {side} bid {current_bid}c, peak was {peak_bid}c "
-                f"(entry {entry_price}c), dropped {peak_bid - current_bid}c"
+                f"(entry {entry_price}c), dropped {peak_bid - current_bid}c >= {trailing_drop}c — MARKET ORDER"
             ),
         }, peak_info
 
@@ -567,6 +601,12 @@ def scan_positions():
     entry_records = _load_entry_records()
     log.info(f"Loaded {len(entry_records)} entry records from {len(ALL_TRADE_LOGS)} trade logs")
     peaks = _load_peaks()
+    # Grace period: skip trailing stop evaluation for first scan after restart
+    # to prevent stale peak data from triggering immediate exits
+    _first_scan = not hasattr(scan_positions, '_has_run')
+    scan_positions._has_run = True
+    if _first_scan:
+        log.info("  First scan after restart — trailing stop grace period active")
     open_tickers = set()
 
     for pos in positions:
@@ -602,18 +642,29 @@ def scan_positions():
         if not exit_signal:
             exit_signal = evaluate_stop_loss(pos, market, exit_config, entry_price_cents=entry_price)
 
-        # 3. Trailing stop (unchanged for this plan -- will be updated in 03-02)
+        # 3. Trailing stop (per-bot config, illiquidity protection, market orders)
         if not exit_signal:
             if ticker not in peaks:
                 peaks[ticker] = {
                     "entry_price": entry_price or 0,
                     "peak_bid": 0,
                     "side": "yes" if yes_count > 0 else "no",
+                    "source_bot": source_bot,
+                    "first_seen": datetime.datetime.now().isoformat(),
+                    "last_updated": datetime.datetime.now().isoformat(),
                 }
             elif entry_price:
                 # Refresh entry price in case position was averaged up/down
                 peaks[ticker]["entry_price"] = entry_price
-            exit_signal, peaks[ticker] = evaluate_trailing_stop(pos, market, peaks[ticker])
+
+            if not _first_scan:
+                exit_signal, peaks[ticker] = evaluate_trailing_stop(pos, market, peaks[ticker], exit_config)
+            else:
+                # Grace period: still update peaks, just don't trigger exits
+                current_bid = market.get("yes_bid", 0) if yes_count > 0 else (market.get("no_bid", 0) or (100 - market.get("yes_ask", 100)))
+                if current_bid > peaks[ticker].get("peak_bid", 0):
+                    peaks[ticker]["peak_bid"] = current_bid
+                peaks[ticker]["last_updated"] = datetime.datetime.now().isoformat()
 
         # 4. Model shift (per-bot threshold, multi-model routing)
         if not exit_signal:
@@ -663,9 +714,11 @@ def scan_positions():
             ss.skip("no_exit_signal")
 
     # Clean up peaks for closed positions and save
-    for stale_ticker in list(peaks.keys()):
-        if stale_ticker not in open_tickers:
-            del peaks[stale_ticker]
+    stale_tickers = [t for t in peaks.keys() if t not in open_tickers]
+    for stale_ticker in stale_tickers:
+        del peaks[stale_ticker]
+    if stale_tickers:
+        log.info(f"  Cleaned up trailing state for {len(stale_tickers)} closed positions")
     _save_peaks(peaks)
 
     # Process allocator pending exits (superseded by better signals)
