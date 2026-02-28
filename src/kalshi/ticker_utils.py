@@ -48,9 +48,13 @@ def parse_weather_ticker(ticker):
 def parse_crypto_ticker(ticker):
     """Parse crypto market tickers (BTC, ETH, SOL).
 
+    Handles both old and new Kalshi date formats:
+        Old: KX<ASSET>-<DD><MON><YY>  (pre-2026-02-22)
+        New: KX<ASSET>-<YY><MON><DD>  (current)
+
     Examples:
-        KXBTC-21FEB26-T70000  -> {"asset": "BTC", "date": "2026-02-21", "direction": "T", "threshold": 70000.0}
-        KXETH-21FEB26-B3500   -> {"asset": "ETH", "date": "2026-02-21", "direction": "B", "threshold": 3500.0}
+        KXBTC-26FEB28-T70000  -> {"asset": "BTC", "date": "2026-02-28", "direction": "T", "threshold": 70000.0}
+        KXETH-26MAR01-B3500   -> {"asset": "ETH", "date": "2026-03-01", "direction": "B", "threshold": 3500.0}
 
     Falls back to a simpler pattern if the full date format doesn't match.
     """
@@ -67,12 +71,17 @@ def parse_crypto_ticker(ticker):
         return None
 
     asset = m.group(1)
-    day, mon, yr = int(m.group(3)), m.group(4), int(m.group(5))
+    g2, mon, g4 = int(m.group(3)), m.group(4), int(m.group(5))
     direction = m.group(6)
     threshold = float(m.group(7))
     month = MONTHS.get(mon)
     if not month:
         return None
+    # Detect format: if first number >= 25 it's a year (YYMONDD), otherwise a day (DDMONYY)
+    if g2 >= 25:
+        yr, day = g2, g4
+    else:
+        day, yr = g2, g4
 
     return {
         "asset": asset,

@@ -80,7 +80,7 @@
     "settlementBufferMinutes": 1,
     "useOrnsteinUhlenbeck": true,
     "ouHalfLifeMinutes": 120,
-    "enableBrackets": false,
+    "enableBrackets": true,
     "exit": {
       "takeProfitCents": 85,
       "stopLossCents": 25,
@@ -91,10 +91,10 @@
     }
   },
   "economics": {
-    "maxTradeAmount": 15,
-    "maxTradeAmountPct": 0.03,
-    "maxDailyTrades": 5,
-    "maxDailyLoss": 75,
+    "maxTradeAmount": 25,
+    "maxTradeAmountPct": 0.05,
+    "maxDailyTrades": 15,
+    "maxDailyLoss": 200,
     "maxDailyLossPct": 0.15,
     "scanIntervalMinutes": 360,
     "edgeThreshold": 0.08,
