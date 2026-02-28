@@ -278,6 +278,8 @@ def match_and_trade(markets, album_data, box_data, ss=None):
         if not matched:
             if ss:
                 ss.skip("no_match")
+            trade_manager.log_decision(ticker, "skip", "skipped", "no_match",
+                                       title=title[:80])
 
 def evaluate_album_opportunity(market, album, market_price, ss=None):
     """Evaluate album sales trade opportunity."""
