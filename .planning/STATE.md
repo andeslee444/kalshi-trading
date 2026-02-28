@@ -56,6 +56,7 @@ Progress: [██████░░░░] 50%
 | Phase 04 P01 | 2min | 2 tasks | 2 files |
 | Phase 04 P03 | 2min | 2 tasks | 1 files |
 | Phase 04 P04 | 2min | 2 tasks | 2 files |
+| Phase 04 P02 | 2min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -98,6 +99,8 @@ Recent decisions affecting current work:
 - [Phase 04-04]: Peak hours 10am-4pm ET for NWS adaptive polling (running highs still developing)
 - [Phase 04-04]: Debug-level sigma logging for all evaluated markets, not just placed trades
 - [Phase 04-04]: is_calibrated added to trade records for downstream analysis
+- [Phase 04-02]: market_type classification moved before threshold parsing for richer decision logs in economics bot
+- [Phase 04-02]: Cleveland Fed parser logs page length and table count when both parsers fail
 
 ### Pending Todos
 
