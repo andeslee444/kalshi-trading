@@ -56,8 +56,10 @@ allocator = PortfolioAllocator(client, logger=log)
 health = HealthCheckMonitor(logger=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": MAX_TRADE,
+    "maxTradeAmountPct": arb_config.get("maxTradeAmountPct"),
     "maxDailyTrades": MAX_DAILY_TRADES,
     "maxDailyLoss": MAX_DAILY_LOSS,
+    "maxDailyLossPct": arb_config.get("maxDailyLossPct"),
 }, logger=log)
 trim_trade_log(TRADES_PATH)
 

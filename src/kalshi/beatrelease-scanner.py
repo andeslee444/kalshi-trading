@@ -43,8 +43,10 @@ STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 client = KalshiClient()
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": MAX_TRADE_CENTS / 100,
+    "maxTradeAmountPct": _bots_cfg.get("maxTradeAmountPct"),
     "maxDailyTrades": _bots_cfg.get("maxDailyTrades", 10),
     "maxDailyLoss": _bots_cfg.get("maxDailyLoss", 25),
+    "maxDailyLossPct": _bots_cfg.get("maxDailyLossPct"),
 }, logger=log)
 allocator = PortfolioAllocator(client, logger=log)
 health = HealthCheckMonitor(logger=log)

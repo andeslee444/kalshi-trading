@@ -665,7 +665,12 @@ class CircuitBreaker:
 # === Config validation ===
 
 def validate_trade_config(config, bot_name=""):
-    """Validate trade-related config values. Raises ValueError on bad config."""
+    """Validate trade-related config values. Raises ValueError on bad config.
+
+    Static dollar values (maxTradeAmount, maxDailyLoss) serve as floors.
+    Optional percentage keys (maxTradeAmountPct, maxDailyLossPct) enable
+    bankroll-proportional scaling — effective limit = max(static, bankroll * pct).
+    """
     prefix = f"[{bot_name}] " if bot_name else ""
 
     amt = config.get("maxTradeAmount")
@@ -685,6 +690,16 @@ def validate_trade_config(config, bot_name=""):
         raise ValueError(f"{prefix}maxDailyLoss must be positive, got {loss}")
     if loss > 500:
         raise ValueError(f"{prefix}maxDailyLoss={loss} exceeds $500 safety cap")
+
+    # Validate optional percentage-based scaling keys
+    for pct_key, label in [("maxTradeAmountPct", "maxTradeAmountPct"),
+                           ("maxDailyLossPct", "maxDailyLossPct")]:
+        pct = config.get(pct_key)
+        if pct is not None:
+            if not isinstance(pct, (int, float)) or pct < 0:
+                raise ValueError(f"{prefix}{label} must be non-negative, got {pct}")
+            if pct > 0.25:
+                raise ValueError(f"{prefix}{label}={pct} exceeds 25% safety cap")
 
 
 # === Trade log trimming ===
@@ -948,6 +963,16 @@ class TradeManager:
         self._daily_date = None
         self._daily_loss_alerted = False
 
+        # Balance cache for bankroll-proportional limits (30s TTL)
+        self._cached_balance_cents = None
+        self._balance_fetched_at = 0
+
+        # Log if percentage-based scaling is active
+        if config.get("maxTradeAmountPct") or config.get("maxDailyLossPct"):
+            self.log.info("Bankroll-proportional limits active: trade=%.1f%%, daily=%.1f%%",
+                          config.get("maxTradeAmountPct", 0) * 100,
+                          config.get("maxDailyLossPct", 0) * 100)
+
     def _reset_daily_if_needed(self):
         today = datetime.date.today().isoformat()
         if self._daily_date != today:
@@ -968,6 +993,49 @@ class TradeManager:
         if self._daily_trades > 0:
             self.log.info("Daily counters rebuilt from log: %d trades, $%.2f risk",
                           self._daily_trades, self._daily_spend_cents / 100)
+
+    def _get_available_balance(self):
+        """Get available balance in cents, cached for 30 seconds."""
+        now = time.time()
+        if self._cached_balance_cents is not None and (now - self._balance_fetched_at) < 30:
+            return self._cached_balance_cents
+        if self.client:
+            try:
+                _, available = self.client.get_balance()
+                self._cached_balance_cents = available
+                self._balance_fetched_at = now
+                return available
+            except Exception:
+                pass
+        return self._cached_balance_cents or 0
+
+    def _effective_max_trade_cents(self):
+        """Resolve max trade amount: max(static config, bankroll * pct).
+
+        Static config is the floor — percentage scales with bankroll.
+        """
+        static_cents = int(self.config["maxTradeAmount"] * 100)
+        pct = self.config.get("maxTradeAmountPct")
+        if pct and pct > 0:
+            balance = self._get_available_balance()
+            if balance > 0:
+                dynamic_cents = int(balance * pct)
+                return max(static_cents, dynamic_cents)
+        return static_cents
+
+    def _effective_max_daily_loss_cents(self):
+        """Resolve max daily loss: max(static config, bankroll * pct).
+
+        Static config is the floor — percentage scales with bankroll.
+        """
+        static_cents = int(self.config["maxDailyLoss"] * 100)
+        pct = self.config.get("maxDailyLossPct")
+        if pct and pct > 0:
+            balance = self._get_available_balance()
+            if balance > 0:
+                dynamic_cents = int(balance * pct)
+                return max(static_cents, dynamic_cents)
+        return static_cents
 
     @staticmethod
     def _classify_limit_tier(edge):
@@ -1090,7 +1158,7 @@ class TradeManager:
             return None
 
         # 4. Daily loss/spend limit (risk = purchase price per contract for both YES and NO)
-        max_loss_cents = int(self.config["maxDailyLoss"] * 100)
+        max_loss_cents = self._effective_max_daily_loss_cents()
         if side == "no":
             # Buying NO: max loss per contract is the purchase price
             risk_per_contract = price_cents
@@ -1101,13 +1169,13 @@ class TradeManager:
         if self._daily_spend_cents + risk_cents > max_loss_cents:
             self.log.warning(
                 "Daily loss limit ($%.2f) would be exceeded — risked $%.2f + $%.2f > $%.2f. Skipping %s",
-                self.config["maxDailyLoss"],
+                max_loss_cents / 100,
                 self._daily_spend_cents / 100, risk_cents / 100,
                 max_loss_cents / 100, ticker
             )
             if not self._daily_loss_alerted:
                 notify_webhook(
-                    f"Daily loss limit (${self.config['maxDailyLoss']}) reached — trades blocked",
+                    f"Daily loss limit (${max_loss_cents/100:.0f}) reached — trades blocked",
                     level="warning",
                 )
                 self._daily_loss_alerted = True
@@ -1119,7 +1187,7 @@ class TradeManager:
             return None
 
         # 6. Cost cap (adjust count down if needed, using risk-adjusted cost)
-        max_cost_cents = int(self.config["maxTradeAmount"] * 100)
+        max_cost_cents = self._effective_max_trade_cents()
         cost_per_contract = price_cents
         if cost_per_contract * count > max_cost_cents:
             original_count = count

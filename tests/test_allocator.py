@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 from capital_allocator import (
     PortfolioAllocator, compute_signal_quality, MODEL_QUALITY_FACTOR, BudgetResponse,
     CITY_REGIONS, _CITY_TO_REGION, MAX_REGION_FRACTION, _load_absolute_cap,
+    _load_absolute_cap_pct, ABSOLUTE_DAILY_LOSS_CAP_PCT,
 )
 
 
@@ -195,20 +196,24 @@ class TestAbsoluteDailyLossCap:
         return alloc
 
     def test_cap_blocks_after_limit(self):
-        """After exceeding configured cap in risk today, next request should be rejected."""
+        """After exceeding effective cap in risk today, next request should be rejected.
+
+        With pct=0.15 and balance=$2000 (200000c), effective cap = max($150, $300) = $300.
+        Need to exceed $300 to trigger the block.
+        """
         alloc = self._make_allocator(balance=200000)
-        # Record trades summing to the configured cap (15000 cents = $150)
-        for i in range(15):
+        # Effective cap = max(15000, 200000*0.15) = max(15000, 30000) = 30000 cents ($300)
+        for i in range(30):
             alloc.record_trade("weather", f"TICK-{i}", 1000, edge=0.10)
         budget = alloc.request_budget("weather", "TICK-NEW", edge=0.15)
         assert not budget.approved
         assert "absolute daily risk cap" in budget.reason
 
     def test_under_cap_allowed(self):
-        """Under configured cap should still allow trading."""
+        """Under effective cap should still allow trading."""
         alloc = self._make_allocator(balance=200000)
-        # Record $140 of risk (14000 cents, under $150 cap)
-        for i in range(14):
+        # Effective cap = 30000 cents ($300). Record $290 of risk.
+        for i in range(29):
             alloc.record_trade("weather", f"TICK-{i}", 1000, edge=0.10)
         budget = alloc.request_budget("weather", "TICK-NEW", edge=0.15)
         assert budget.approved
@@ -372,13 +377,13 @@ class TestConfigurableDailyLossCap:
         # Our config has absoluteDailyLossCap: 150, so cap should be 15000 cents
         assert cap == 15000
 
-    def test_safety_ceiling(self):
-        """Cap should be clamped at $500 max."""
+    def test_no_safety_ceiling(self):
+        """Cap should not be clamped — scales freely for large accounts."""
         with patch("capital_allocator.Path.exists", return_value=True):
             with patch("capital_allocator.Path.read_text",
                        return_value=json.dumps({"allocator": {"absoluteDailyLossCap": 9999}})):
                 cap = _load_absolute_cap()
-        assert cap == 50000  # $500 max
+        assert cap == 999900  # No ceiling, just converts to cents
 
     def test_safety_floor(self):
         """Cap should be clamped at $10 min."""
@@ -402,3 +407,71 @@ class TestConfigurableDailyLossCap:
             with patch("capital_allocator.Path.read_text", return_value="not json"):
                 cap = _load_absolute_cap()
         assert cap == 10000  # $100 default
+
+
+class TestAbsoluteCapPctLoading:
+    """Test _load_absolute_cap_pct() config loading."""
+
+    def test_loads_from_config(self):
+        """Should load absoluteDailyLossCapPct from config."""
+        pct = _load_absolute_cap_pct()
+        # Our config has absoluteDailyLossCapPct: 0.15
+        assert pct == 0.15
+
+    def test_safety_ceiling(self):
+        """Pct should be clamped at 50% max."""
+        with patch("capital_allocator.Path.exists", return_value=True):
+            with patch("capital_allocator.Path.read_text",
+                       return_value=json.dumps({"allocator": {"absoluteDailyLossCapPct": 0.90}})):
+                pct = _load_absolute_cap_pct()
+        assert pct == 0.50
+
+    def test_default_zero_when_missing(self):
+        """Missing pct key should return 0 (disabled)."""
+        with patch("capital_allocator.Path.exists", return_value=True):
+            with patch("capital_allocator.Path.read_text",
+                       return_value=json.dumps({"allocator": {}})):
+                pct = _load_absolute_cap_pct()
+        assert pct == 0.0
+
+
+class TestBankrollProportionalAbsoluteCap:
+    """Test that absolute cap scales with bankroll when pct is configured."""
+
+    def _make_allocator(self, balance=50000):
+        mock_client = MagicMock()
+        mock_client.get_balance.return_value = (balance, balance)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            json.dump({}, f)
+            state_path = f.name
+        alloc = PortfolioAllocator(client=mock_client, state_path=state_path)
+        alloc._daily_date = datetime.date.today().isoformat()
+        return alloc
+
+    def test_pct_scales_cap_with_bankroll(self):
+        """With $2000 balance and 15% pct, effective cap should be max($150, $300) = $300."""
+        alloc = self._make_allocator(balance=200000)  # $2000
+        # Static cap is $150 (15000 cents), pct cap = 200000 * 0.15 = 30000 cents ($300)
+        # Record $200 of risk (20000 cents) — exceeds static $150 but under dynamic $300
+        for i in range(20):
+            alloc.record_trade("weather", f"TICK-{i}", 1000, edge=0.10)
+        # With pct enabled, this should still be allowed (20000 < 30000)
+        with patch("capital_allocator.ABSOLUTE_DAILY_LOSS_CAP_PCT", 0.15):
+            budget = alloc.request_budget("weather", "TICK-NEW", edge=0.15)
+        assert budget.approved
+
+    def test_static_cap_is_floor(self):
+        """With small balance where pct < static, static cap should be the floor.
+
+        Balance=$1000 (100000c): pct cap = 100000*0.15 = 15000 ($150) = same as static.
+        Verify that with balance just below where pct kicks in, static cap still works.
+        """
+        alloc = self._make_allocator(balance=80000)  # $800
+        # Pct cap = 80000 * 0.15 = 12000 ($120), static = $150 (15000)
+        # max(15000, 12000) = 15000 — static wins
+        with patch("capital_allocator.ABSOLUTE_DAILY_LOSS_CAP_PCT", 0.15):
+            # Record $140 of risk (14000 < 15000 static cap)
+            for i in range(14):
+                alloc.record_trade("weather", f"TICK-{i}", 1000, edge=0.10)
+            budget = alloc.request_budget("weather", "TICK-NEW", edge=0.15)
+        assert budget.approved  # 14000 < 15000 static cap

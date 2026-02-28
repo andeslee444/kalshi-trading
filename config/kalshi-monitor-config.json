@@ -1,11 +1,13 @@
 {
   "mode": "demo",
   "maxTradeAmount": 25,
+  "maxTradeAmountPct": 0.05,
   "maxDailyTrades": 25,
   "maxDailyLoss": 50,
+  "maxDailyLossPct": 0.10,
   "sources": {
     "hdd": {
-      "enabled": true,
+      "enabled": false,
       "urls": ["https://www.hitsdailydouble.com/news", "https://www.hitsdailydouble.com/news/charts"],
       "sanityProject": "8aky18h3",
       "chartSlugs": ["hits-top-50", "midweek-20"],
@@ -29,7 +31,17 @@
         "CHI": "KMDW",
         "AUS": "KAUS",
         "DEN": "KDEN",
-        "HOU": "KHOU"
+        "HOU": "KHOU",
+        "ATL": "KATL",
+        "BOS": "KBOS",
+        "SF": "KSFO",
+        "SEA": "KSEA",
+        "LAS": "KLAS",
+        "DAL": "KDFW",
+        "DET": "KDTW",
+        "MSP": "KMSP",
+        "PHX": "KPHX",
+        "DC": "KDCA"
       },
       "intervalMinutes": 10
     }

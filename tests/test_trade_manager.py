@@ -141,6 +141,93 @@ class TestConfigValidation:
                 bot_name="mybot"
             )
 
+    def test_pct_keys_accepted(self):
+        """Config with valid percentage keys should pass validation."""
+        config = {"maxTradeAmount": 5, "maxDailyTrades": 10, "maxDailyLoss": 25,
+                  "maxTradeAmountPct": 0.02, "maxDailyLossPct": 0.05}
+        validate_trade_config(config)  # should not raise
+
+    def test_pct_none_accepted(self):
+        """Config with None percentage keys should pass validation."""
+        config = {"maxTradeAmount": 5, "maxDailyTrades": 10, "maxDailyLoss": 25,
+                  "maxTradeAmountPct": None, "maxDailyLossPct": None}
+        validate_trade_config(config)  # should not raise
+
+    def test_negative_pct_fails(self):
+        with pytest.raises(ValueError, match="maxTradeAmountPct"):
+            validate_trade_config({"maxTradeAmount": 5, "maxDailyTrades": 10,
+                                   "maxDailyLoss": 25, "maxTradeAmountPct": -0.01})
+
+    def test_excessive_pct_fails(self):
+        with pytest.raises(ValueError, match="maxDailyLossPct.*25%"):
+            validate_trade_config({"maxTradeAmount": 5, "maxDailyTrades": 10,
+                                   "maxDailyLoss": 25, "maxDailyLossPct": 0.50})
+
+
+# ===================================================================
+# Bankroll-proportional TradeManager limits tests
+# ===================================================================
+
+class TestBankrollProportionalLimits:
+
+    def test_effective_max_trade_uses_pct(self, tmp_path):
+        """When pct is set, effective max trade should scale with bankroll."""
+        mgr, client, _ = _make_manager(tmp_path, {
+            "maxTradeAmount": 5, "maxDailyTrades": 100, "maxDailyLoss": 100,
+            "maxTradeAmountPct": 0.02,  # 2% of bankroll
+        })
+        # Mock balance: $5000 = 500000 cents
+        client.get_balance.return_value = (500000, 500000)
+        effective = mgr._effective_max_trade_cents()
+        # 2% of 500000 = 10000 cents ($100), vs static $5 = 500 cents
+        assert effective == 10000
+
+    def test_effective_max_trade_static_floor(self, tmp_path):
+        """When bankroll is tiny, static value should be the floor."""
+        mgr, client, _ = _make_manager(tmp_path, {
+            "maxTradeAmount": 5, "maxDailyTrades": 100, "maxDailyLoss": 100,
+            "maxTradeAmountPct": 0.02,
+        })
+        # Mock balance: $10 = 1000 cents; 2% = 20 cents, less than static $5 = 500 cents
+        client.get_balance.return_value = (1000, 1000)
+        effective = mgr._effective_max_trade_cents()
+        assert effective == 500  # static floor wins
+
+    def test_effective_max_trade_no_pct(self, tmp_path):
+        """Without pct key, should use static value."""
+        mgr, client, _ = _make_manager(tmp_path, {
+            "maxTradeAmount": 5, "maxDailyTrades": 100, "maxDailyLoss": 100,
+        })
+        client.get_balance.return_value = (500000, 500000)
+        effective = mgr._effective_max_trade_cents()
+        assert effective == 500  # static only
+
+    def test_effective_max_daily_loss_uses_pct(self, tmp_path):
+        """When pct is set, effective max daily loss should scale with bankroll."""
+        mgr, client, _ = _make_manager(tmp_path, {
+            "maxTradeAmount": 5, "maxDailyTrades": 100, "maxDailyLoss": 25,
+            "maxDailyLossPct": 0.05,  # 5% of bankroll
+        })
+        client.get_balance.return_value = (500000, 500000)
+        effective = mgr._effective_max_daily_loss_cents()
+        # 5% of 500000 = 25000 cents ($250), vs static $25 = 2500 cents
+        assert effective == 25000
+
+    def test_cost_cap_scales_with_bankroll(self, tmp_path):
+        """place_order should allow larger trades when pct scaling is active."""
+        mgr, client, _ = _make_manager(tmp_path, {
+            "maxTradeAmount": 5, "maxDailyTrades": 100, "maxDailyLoss": 500,
+            "maxTradeAmountPct": 0.02,  # 2% of $5000 = $100
+            "maxDailyLossPct": 0.10,
+        })
+        client.get_balance.return_value = (500000, 500000)
+        # Place 10 contracts at 50c each = $5 total cost
+        # Without pct: max_cost = $5 = 500 cents, 500/50 = 10 contracts max
+        # With pct: max_cost = $100 = 10000 cents, 10000/50 = 200 contracts max
+        mgr.place_order("T1", "yes", 50, 20, "r1")
+        call_body = client.post.call_args[1]["body"]
+        assert call_body["count"] == 20  # allowed because pct scaling
+
 
 # ===================================================================
 # Atomic Write tests

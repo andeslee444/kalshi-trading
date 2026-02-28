@@ -63,8 +63,10 @@ health = HealthCheckMonitor(logger=log)
 order_monitor = OrderMonitor(client, log=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": MAX_TRADE,
+    "maxTradeAmountPct": crypto_config.get("maxTradeAmountPct"),
     "maxDailyTrades": MAX_DAILY_TRADES,
     "maxDailyLoss": MAX_DAILY_LOSS,
+    "maxDailyLossPct": crypto_config.get("maxDailyLossPct"),
 }, logger=log, cooldown_hours=0.5, order_monitor=order_monitor)  # short cooldown for fast markets
 trim_trade_log(TRADES_PATH)
 

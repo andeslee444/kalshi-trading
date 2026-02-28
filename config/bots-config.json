@@ -12,8 +12,10 @@
   "entertainment": {
     "enabled": true,
     "maxTradeAmount": 5,
+    "maxTradeAmountPct": 0.01,
     "maxDailyTrades": 10,
     "maxDailyLoss": 25,
+    "maxDailyLossPct": 0.05,
     "confidenceThreshold": 0.70,
     "scanIntervalMinutes": 15,
     "tickers": ["ALBUM", "BOX", "MOVIE", "STREAM", "MUSIC", "BILLBOARD", "OSCAR", "GRAMMY", "SPOTIFY", "FILM", "ENTERTAIN"],
@@ -29,8 +31,10 @@
   "beatrelease": {
     "checkIntervalHours": 1,
     "maxTradeCents": 500,
+    "maxTradeAmountPct": 0.01,
     "maxDailyTrades": 10,
     "maxDailyLoss": 25,
+    "maxDailyLossPct": 0.05,
     "notificationPhone": "4255336828",
     "blogUrls": [
       "https://www.beatrelease.com/blog/categories/kalshi-predictions",
@@ -47,8 +51,10 @@
   },
   "strategy": {
     "maxBetCents": 500,
+    "maxBetPct": 0.01,
     "maxDailyTrades": 20,
     "maxDailyLoss": 50,
+    "maxDailyLossPct": 0.10,
     "scanIntervalMinutes": 15,
     "exit": {
       "takeProfitCents": 80,
@@ -61,8 +67,10 @@
   },
   "crypto": {
     "maxTradeAmount": 10,
+    "maxTradeAmountPct": 0.02,
     "maxDailyTrades": 30,
     "maxDailyLoss": 50,
+    "maxDailyLossPct": 0.10,
     "scanIntervalMinutes": 5,
     "edgeThreshold": 0.08,
     "midRangeEdgeThreshold": 0.15,
@@ -84,8 +92,10 @@
   },
   "economics": {
     "maxTradeAmount": 15,
+    "maxTradeAmountPct": 0.03,
     "maxDailyTrades": 5,
     "maxDailyLoss": 75,
+    "maxDailyLossPct": 0.15,
     "scanIntervalMinutes": 360,
     "edgeThreshold": 0.08,
     "gasEdgeThreshold": 0.04,
@@ -103,8 +113,10 @@
     "minSpreadPct": 0.02,
     "executionEnabled": false,
     "maxTradeAmount": 10,
+    "maxTradeAmountPct": 0.02,
     "maxDailyTrades": 10,
-    "maxDailyLoss": 25
+    "maxDailyLoss": 25,
+    "maxDailyLossPct": 0.05
   },
   "position_monitor": {
     "scanIntervalMinutes": 15,
@@ -119,7 +131,8 @@
   },
   "allocator": {
     "maxConcurrentPositions": 20,
-    "absoluteDailyLossCap": 150
+    "absoluteDailyLossCap": 150,
+    "absoluteDailyLossCapPct": 0.15
   },
   "market_maker": {
     "enabled": false,
@@ -128,8 +141,10 @@
     "gamma": 0.3,
     "kParam": 1.5,
     "maxTradeAmount": 5,
+    "maxTradeAmountPct": 0.01,
     "maxDailyTrades": 50,
     "maxDailyLoss": 25,
+    "maxDailyLossPct": 0.05,
     "targetMarkets": ["KXHIGH"]
   }
 }

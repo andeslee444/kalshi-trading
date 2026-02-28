@@ -67,20 +67,39 @@ PORTFOLIO_DAILY_LOSS_FRACTION = 0.25
 def _load_absolute_cap():
     """Load absoluteDailyLossCap from bots-config.json allocator section.
 
-    Safety bounds: min $10, max $500. Falls back to $100 on missing/corrupt config.
+    Safety bounds: min $10. Falls back to $100 on missing/corrupt config.
     """
     try:
         config_path = Path(__file__).resolve().parent.parent.parent / "config" / "bots-config.json"
         if config_path.exists():
             cfg = json.loads(config_path.read_text())
             cap_dollars = cfg.get("allocator", {}).get("absoluteDailyLossCap", 100)
-            cap_dollars = max(10, min(500, int(cap_dollars)))
+            cap_dollars = max(10, int(cap_dollars))
             return cap_dollars * 100
     except Exception:
         pass
     return 10000  # $100 default
 
+
+def _load_absolute_cap_pct():
+    """Load absoluteDailyLossCapPct from bots-config.json allocator section.
+
+    Returns a fraction (e.g. 0.15 = 15% of bankroll). Returns 0 if not configured.
+    Safety bounds: 0 to 0.50 (50% max).
+    """
+    try:
+        config_path = Path(__file__).resolve().parent.parent.parent / "config" / "bots-config.json"
+        if config_path.exists():
+            cfg = json.loads(config_path.read_text())
+            pct = cfg.get("allocator", {}).get("absoluteDailyLossCapPct", 0)
+            return max(0.0, min(0.50, float(pct)))
+    except Exception:
+        pass
+    return 0.0
+
+
 ABSOLUTE_DAILY_LOSS_CAP_CENTS = _load_absolute_cap()
+ABSOLUTE_DAILY_LOSS_CAP_PCT = _load_absolute_cap_pct()
 
 
 # ─── City key extraction ───
@@ -199,7 +218,11 @@ class PortfolioAllocator:
         self._max_positions = max_positions
         self._position_count = None
         self._position_count_fetched_at = 0
-        self.log.info("Allocator: daily loss cap = $%.2f", ABSOLUTE_DAILY_LOSS_CAP_CENTS / 100)
+        if ABSOLUTE_DAILY_LOSS_CAP_PCT > 0:
+            self.log.info("Allocator: daily loss cap = $%.0f floor + %.0f%% of bankroll",
+                          ABSOLUTE_DAILY_LOSS_CAP_CENTS / 100, ABSOLUTE_DAILY_LOSS_CAP_PCT * 100)
+        else:
+            self.log.info("Allocator: daily loss cap = $%.0f (static)", ABSOLUTE_DAILY_LOSS_CAP_CENTS / 100)
 
     def _load_state(self):
         """Load shared state from disk with advisory file locking."""
@@ -477,9 +500,13 @@ class PortfolioAllocator:
         if remaining_portfolio <= 0:
             return BudgetResponse(False, reason="portfolio daily loss limit reached")
 
-        # 3b. Absolute daily risk cap ($100 hard cap regardless of balance)
-        if self._risk_today_cents() >= ABSOLUTE_DAILY_LOSS_CAP_CENTS:
-            return BudgetResponse(False, reason=f"absolute daily risk cap (${ABSOLUTE_DAILY_LOSS_CAP_CENTS/100:.0f}) reached")
+        # 3b. Absolute daily risk cap (scales with bankroll if pct configured)
+        effective_cap = ABSOLUTE_DAILY_LOSS_CAP_CENTS
+        if ABSOLUTE_DAILY_LOSS_CAP_PCT > 0 and available_balance > 0:
+            dynamic_cap = int(available_balance * ABSOLUTE_DAILY_LOSS_CAP_PCT)
+            effective_cap = max(ABSOLUTE_DAILY_LOSS_CAP_CENTS, dynamic_cap)
+        if self._risk_today_cents() >= effective_cap:
+            return BudgetResponse(False, reason=f"absolute daily risk cap (${effective_cap/100:.0f}) reached")
 
         # 4. Per-bot daily spending check (based on available)
         priority = BOT_PRIORITY.get(bot_name, 0.2)

@@ -41,8 +41,10 @@ health = HealthCheckMonitor(logger=log)
 order_monitor = OrderMonitor(client, log=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": config["maxTradeAmount"],
+    "maxTradeAmountPct": config.get("maxTradeAmountPct"),
     "maxDailyTrades": config["maxDailyTrades"],
     "maxDailyLoss": config["maxDailyLoss"],
+    "maxDailyLossPct": config.get("maxDailyLossPct"),
 }, logger=log, order_monitor=order_monitor)
 trim_trade_log(TRADES_PATH)
 

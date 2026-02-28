@@ -33,8 +33,10 @@ SPORTS_PREFIXES = ["KXNBA", "KXNFL", "KXNHL", "KXMLB", "KXUFC", "KXNCAA", "KXSPO
 TRADES_JSON_PATH = DATA_DIR / "kalshi-strategy-trades.json"
 trade_manager = TradeManager(client, TRADES_JSON_PATH, {
     "maxTradeAmount": MAX_BET / 100,
+    "maxTradeAmountPct": _bots_cfg.get("maxBetPct"),
     "maxDailyTrades": _bots_cfg.get("maxDailyTrades", 20),
     "maxDailyLoss": _bots_cfg.get("maxDailyLoss", 50),
+    "maxDailyLossPct": _bots_cfg.get("maxDailyLossPct"),
 }, logger=log, order_monitor=order_monitor)
 trim_trade_log(TRADES_JSON_PATH)
 

@@ -1,10 +1,12 @@
 {
   "mode": "demo",
   "maxTradeAmount": 15,
+  "maxTradeAmountPct": 0.03,
   "maxDailyTrades": 10,
   "maxDailyLoss": 35,
+  "maxDailyLossPct": 0.07,
   "scanIntervalMinutes": 30,
-  "edgeThreshold": 0.08,
+  "edgeThreshold": 0.06,
   "cities": {
     "MIA": { "lat": 25.76, "lon": -80.19, "name": "Miami" },
     "LAX": { "lat": 34.05, "lon": -118.24, "name": "Los Angeles" },
@@ -13,9 +15,19 @@
     "CHI": { "lat": 41.88, "lon": -87.63, "name": "Chicago" },
     "AUS": { "lat": 30.27, "lon": -97.74, "name": "Austin" },
     "DEN": { "lat": 39.74, "lon": -104.99, "name": "Denver" },
-    "HOU": { "lat": 29.76, "lon": -95.37, "name": "Houston" }
+    "HOU": { "lat": 29.76, "lon": -95.37, "name": "Houston" },
+    "ATL": { "lat": 33.75, "lon": -84.39, "name": "Atlanta" },
+    "BOS": { "lat": 42.36, "lon": -71.06, "name": "Boston" },
+    "SF": { "lat": 37.77, "lon": -122.42, "name": "San Francisco" },
+    "SEA": { "lat": 47.61, "lon": -122.33, "name": "Seattle" },
+    "LAS": { "lat": 36.17, "lon": -115.14, "name": "Las Vegas" },
+    "DAL": { "lat": 32.78, "lon": -96.80, "name": "Dallas" },
+    "DET": { "lat": 42.33, "lon": -83.05, "name": "Detroit" },
+    "MSP": { "lat": 44.98, "lon": -93.27, "name": "Minneapolis" },
+    "PHX": { "lat": 33.45, "lon": -112.07, "name": "Phoenix" },
+    "DC": { "lat": 38.91, "lon": -77.04, "name": "Washington DC" }
   },
-  "disableWeatherYes": true,
+  "disableWeatherYes": false,
   "ensemble": {
     "enabled": true,
     "models": ["gfs", "ecmwf", "icon"],
