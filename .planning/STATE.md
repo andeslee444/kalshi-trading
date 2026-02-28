@@ -8,7 +8,7 @@ progress:
   total_phases: 8
   completed_phases: 5
   total_plans: 21
-  completed_plans: 16
+  completed_plans: 17
 ---
 
 # Project State
@@ -18,16 +18,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-02-26)
 
 **Core value:** Every bot must produce consistent daily P&L -- bots trading regularly on validated edges, exits protecting capital, and measurable model calibration proving the math works.
-**Current focus:** Phase 6 in progress (Crypto Validation). Data pipeline and settlement audit complete, model backtest next.
+**Current focus:** Phase 6 complete (Crypto Validation). Model validated at Brier 0.0372, vol config confirmed near-optimal.
 
 ## Current Position
 
-Phase: 6 of 8 (Crypto Validation) -- IN PROGRESS
-Plan: 1 of 2 in current phase (1 complete)
-Status: 06-01 complete (data fetching + settlement audit), ready for 06-02 (model backtest)
-Last activity: 2026-02-28 -- Completed 06-01 (Data Fetching and Settlement Audit)
+Phase: 6 of 8 (Crypto Validation) -- COMPLETE
+Plan: 2 of 2 in current phase (2 complete)
+Status: Phase 06 complete. Both plans delivered: data pipeline + settlement audit (06-01), model backtest + vol sweep (06-02).
+Last activity: 2026-02-28 -- Completed 06-02 (Crypto Model Backtest and Vol Sweep)
 
-Progress: [████████████████] 76%
+Progress: [██████████████████] 86%
 
 ## Performance Metrics
 
@@ -60,6 +60,7 @@ Progress: [████████████████] 76%
 | Phase 05 P01 | 4min | 2 tasks | 3 files |
 | Phase 05 P02 | 5min | 2 tasks | 2 files |
 | Phase 06 P01 | 6min | 2 tasks | 1 files |
+| Phase 06 P02 | 16min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -114,6 +115,10 @@ Recent decisions affecting current work:
 - [Phase 06-01]: estimate_time_to_settlement() validated as correct -- uses close_time - now dynamically, no hardcoded T=2456min
 - [Phase 06-01]: 15-minute markets (KXBTC15M) have different ticker format not handled by parse_crypto_ticker -- documented, not blocking
 - [Phase 06-01]: SOL DVOL unavailable on Deribit -- SOL backtest will use realized vol only
+- [Phase 06-02]: Crypto model Brier score 0.0372 -- well below 0.20 target, model validated
+- [Phase 06-02]: Vol sweep shows production config (IV=0.6, RV=24h) is near-optimal -- best config improves only 0.4%
+- [Phase 06-02]: RV-DVOL correlation is negative (BTC=-0.39, ETH=-0.60) -- RV and IV measure different things, blend still valuable
+- [Phase 06-02]: Bracket markets parsed using floor_strike and rules_primary regex for accurate range extraction
 
 ### Pending Todos
 
@@ -126,5 +131,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-28
-Stopped at: Completed 06-01-PLAN.md (Data Fetching and Settlement Audit)
+Stopped at: Completed 06-02-PLAN.md (Crypto Model Backtest and Vol Sweep)
 Resume file: None

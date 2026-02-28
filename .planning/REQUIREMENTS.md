@@ -48,9 +48,9 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### Crypto Validation
 
-- [ ] **CRYP-01**: Crypto model backtested against historical BTC 15-min candles with documented Brier score
+- [x] **CRYP-01**: Crypto model backtested against historical BTC 15-min candles with documented Brier score
 - [x] **CRYP-02**: Time-to-settlement calculation validated (T=2456min claim checked against actual market durations)
-- [ ] **CRYP-03**: Realized vol computation validated against Deribit DVOL benchmark
+- [x] **CRYP-03**: Realized vol computation validated against Deribit DVOL benchmark
 
 ### New Strategies
 
@@ -132,9 +132,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CAL-01 | Phase 5 | Complete |
 | CAL-02 | Phase 5 | Complete |
 | CAL-03 | Phase 5 | Complete |
-| CRYP-01 | Phase 6 | Pending |
+| CRYP-01 | Phase 6 | Complete |
 | CRYP-02 | Phase 6 | Complete |
-| CRYP-03 | Phase 6 | Pending |
+| CRYP-03 | Phase 6 | Complete |
 | STRAT-01 | Phase 7 | Pending |
 | STRAT-02 | Phase 7 | Pending |
 | STRAT-03 | Phase 7 | Pending |
