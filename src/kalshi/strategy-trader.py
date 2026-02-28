@@ -272,13 +272,13 @@ def run_scan():
         log.info(f"  {i+1}. {c['ticker']} -- {c['title']}")
         log.info(f"     Bid: {c['yes_bid']}c / Ask: {c['yes_ask']}c | Spread: {c['spread']}c | Close: {c['hours_to_close']:.1f}h")
 
-    # Place trades — top 5 longshot sells
+    # Place trades — top 10 longshot sells
     log.info("\n" + "=" * 70)
-    log.info("PLACING TRADES (Top 5 Longshot Sells)")
+    log.info("PLACING TRADES (Top 10 Longshot Sells)")
     log.info("=" * 70)
 
     trades_executed = []
-    for c in longshots[:5]:
+    for c in longshots[:10]:
         ticker = c["ticker"]
         no_price = 100 - c["yes_price"]
         contracts = c["contracts"]
