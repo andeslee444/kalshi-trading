@@ -145,3 +145,139 @@ class TestHddStaleness:
         """Empty input should return empty output."""
         result = _check_hdd_staleness([])
         assert result == []
+
+
+def _make_market(yes_bid=0, yes_ask=0, no_ask=0, volume=0, last_price=0):
+    """Helper to create a market dict for liquidity tests."""
+    return {
+        "ticker": "KXALBUMSALES-TEST",
+        "title": "Test Market",
+        "subtitle": "",
+        "yes_bid": yes_bid,
+        "yes_ask": yes_ask,
+        "no_ask": no_ask,
+        "volume": volume,
+        "last_price": last_price,
+    }
+
+
+def _is_entertainment_liquid(market):
+    """Mirror of the inline liquidity check in entertainment-bot.match_and_trade."""
+    yes_ask = market.get("yes_ask", 0)
+    no_ask = market.get("no_ask", 0)
+    yes_bid = market.get("yes_bid", 0)
+
+    has_yes_side = yes_ask and yes_ask < 99
+    has_no_side = no_ask and no_ask < 99
+
+    if not has_yes_side and not has_no_side:
+        return False, "no_ask"
+
+    if yes_bid and yes_ask and (yes_ask - yes_bid) > 40:
+        return False, "wide_spread"
+
+    return True, "ok"
+
+
+def _entertainment_market_price(market):
+    """Mirror of the price calculation in entertainment-bot.match_and_trade."""
+    yes_bid = market.get("yes_bid", 0)
+    yes_ask = market.get("yes_ask", 0)
+    last = market.get("last_price", 0)
+
+    if yes_bid and yes_ask:
+        return (yes_bid + yes_ask) / 2 / 100
+    elif yes_ask:
+        return yes_ask / 100
+    elif last:
+        return last / 100
+    else:
+        return 0.5
+
+
+class TestEntertainmentLiquidity:
+
+    def test_ask_only_market_passes(self):
+        """Market with yes_ask but no bid should pass (common in entertainment)."""
+        m = _make_market(yes_ask=65, no_ask=35)
+        liquid, reason = _is_entertainment_liquid(m)
+        assert liquid is True
+
+    def test_ask_only_yes_side_passes(self):
+        """Market with only yes_ask (no no_ask, no bid) should pass."""
+        m = _make_market(yes_ask=50)
+        liquid, reason = _is_entertainment_liquid(m)
+        assert liquid is True
+
+    def test_ask_only_no_side_passes(self):
+        """Market with only no_ask should pass."""
+        m = _make_market(no_ask=40)
+        liquid, reason = _is_entertainment_liquid(m)
+        assert liquid is True
+
+    def test_no_ask_on_either_side_rejected(self):
+        """Market with no ask on either side should be rejected."""
+        m = _make_market(yes_bid=30)
+        liquid, reason = _is_entertainment_liquid(m)
+        assert liquid is False
+        assert reason == "no_ask"
+
+    def test_empty_market_rejected(self):
+        """Market with all zeros should be rejected."""
+        m = _make_market()
+        liquid, reason = _is_entertainment_liquid(m)
+        assert liquid is False
+
+    def test_ask_at_99_rejected(self):
+        """Ask at 99c is effectively no market — reject."""
+        m = _make_market(yes_ask=99)
+        liquid, reason = _is_entertainment_liquid(m)
+        assert liquid is False
+
+    def test_both_sides_with_narrow_spread_passes(self):
+        """Market with bid+ask and narrow spread should pass."""
+        m = _make_market(yes_bid=40, yes_ask=55, no_ask=45)
+        liquid, reason = _is_entertainment_liquid(m)
+        assert liquid is True
+
+    def test_wide_spread_rejected(self):
+        """Market with bid+ask but spread > 40c should be rejected."""
+        m = _make_market(yes_bid=10, yes_ask=60, no_ask=40)
+        liquid, reason = _is_entertainment_liquid(m)
+        assert liquid is False
+        assert reason == "wide_spread"
+
+    def test_spread_exactly_40_passes(self):
+        """Spread of exactly 40c should pass (> 40 is the threshold)."""
+        m = _make_market(yes_bid=20, yes_ask=60, no_ask=40)
+        liquid, reason = _is_entertainment_liquid(m)
+        assert liquid is True
+
+    def test_spread_check_skipped_when_no_bid(self):
+        """Spread check should not apply when there's no bid (ask-only market)."""
+        m = _make_market(yes_ask=95, no_ask=5)  # would be wide spread if bid existed
+        liquid, reason = _is_entertainment_liquid(m)
+        assert liquid is True
+
+
+class TestEntertainmentMarketPrice:
+
+    def test_midpoint_when_both_sides(self):
+        """Use midpoint when both bid and ask exist."""
+        m = _make_market(yes_bid=40, yes_ask=60)
+        assert _entertainment_market_price(m) == pytest.approx(0.50)
+
+    def test_ask_price_when_no_bid(self):
+        """Use ask directly when no bid exists."""
+        m = _make_market(yes_ask=65)
+        assert _entertainment_market_price(m) == pytest.approx(0.65)
+
+    def test_last_price_fallback(self):
+        """Fall back to last_price when no ask."""
+        m = _make_market(last_price=45)
+        assert _entertainment_market_price(m) == pytest.approx(0.45)
+
+    def test_default_when_nothing(self):
+        """Default to 0.5 when no price info at all."""
+        m = _make_market()
+        assert _entertainment_market_price(m) == pytest.approx(0.5)
