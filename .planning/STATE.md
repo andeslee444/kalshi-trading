@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: unknown
-last_updated: "2026-02-28T03:29:23.772Z"
+status: in-progress
+last_updated: "2026-02-28T03:52:37Z"
 progress:
-  total_phases: 3
+  total_phases: 4
   completed_phases: 3
-  total_plans: 9
-  completed_plans: 9
+  total_plans: 13
+  completed_plans: 10
 ---
 
 # Project State
@@ -18,21 +18,21 @@ progress:
 See: .planning/PROJECT.md (updated 2026-02-26)
 
 **Core value:** Every bot must produce consistent daily P&L -- bots trading regularly on validated edges, exits protecting capital, and measurable model calibration proving the math works.
-**Current focus:** Phase 3 complete (Position Management). All exit types implemented: take-profit, stop-loss, model-shift, trailing stop with illiquidity protection. Ready for Phase 4.
+**Current focus:** Phase 4 in progress (Bot Activation). Entertainment bot enabled with tuned thresholds. Activating remaining bots.
 
 ## Current Position
 
-Phase: 3 of 8 (Position Management) -- COMPLETE
-Plan: 2 of 2 in current phase (2 complete)
-Status: Phase 03 complete, ready for Phase 04
-Last activity: 2026-02-28 -- Completed 03-02 (Trailing Stop & Dashboard Exits)
+Phase: 4 of 8 (Bot Activation)
+Plan: 1 of 4 in current phase (1 complete)
+Status: Phase 04 in progress -- 04-01 complete
+Last activity: 2026-02-28 -- Completed 04-01 (Entertainment Bot Activation)
 
-Progress: [████░░░░░░] 36%
+Progress: [█████░░░░░] 40%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 8
+- Total plans completed: 9
 - Average duration: 5 min
 - Total execution time: 0.7 hours
 
@@ -43,7 +43,7 @@ Progress: [████░░░░░░] 36%
 | 01-feedback-loop | 5 | 30 min | 6 min |
 
 **Recent Trend:**
-- Last 5 plans: 4min, 2min, 4min, 7min, 4min
+- Last 5 plans: 2min, 4min, 7min, 4min, 2min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -53,6 +53,7 @@ Progress: [████░░░░░░] 36%
 | Phase 02 P02 | 4min | 2 tasks | 8 files |
 | Phase 03 P01 | 7min | 2 tasks | 5 files |
 | Phase 03 P02 | 4min | 2 tasks | 4 files |
+| Phase 04 P01 | 2min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -89,6 +90,7 @@ Recent decisions affecting current work:
 - [Phase 03-02]: Illiquidity skip at bid=0 or spread>20c to avoid bad fills
 - [Phase 03-02]: Grace period prevents stale peak data from triggering exits on restart
 - [Phase 03-02]: Trailing state renamed to trailing-state.json with auto-migration
+- [Phase 04-01]: Confidence threshold 0.70 captures realistic 5-10% data exceedances from HDD while still requiring meaningful signal
 
 ### Pending Todos
 
@@ -101,5 +103,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-28
-Stopped at: Completed 03-02-PLAN.md (Trailing Stop & Dashboard Exits -- Phase 03 complete)
+Stopped at: Completed 04-01-PLAN.md (Entertainment Bot Activation)
 Resume file: None

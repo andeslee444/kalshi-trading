@@ -84,13 +84,13 @@ Plans:
   5. Weather bot trades using calibrated per-city sigma parameters from calibration.json (not hardcoded defaults)
   6. Source monitor NWS arbitrage polls at 5-minute intervals during peak hours (10am-4pm local time)
   7. Decision logs for every bot show which specific filter in the cascade caused each market skip
-**Plans**: TBD
+**Plans:** 4 plans
 
 Plans:
-- [ ] 04-01: Debug entertainment bot filter cascade and liquidity thresholds
-- [ ] 04-02: Debug beatrelease scanner LLM pipeline and trade execution
-- [ ] 04-03: Debug economics bot Cleveland Fed scraper and market evaluation
-- [ ] 04-04: Scale strategy trader longshot bias and activate weather calibrated trading
+- [ ] 04-01-PLAN.md -- Entertainment bot filter cascade: enable bot, lower confidence threshold to 0.70, complete decision logging
+- [ ] 04-02-PLAN.md -- Beatrelease + Economics debugging: instrument decision logs, verify Cleveland Fed nowcast parser
+- [ ] 04-03-PLAN.md -- Strategy trader scaling: increase longshot cap from 5 to 10, add 6 missing decision log entries
+- [ ] 04-04-PLAN.md -- Weather calibration verification + NWS adaptive polling: 5-min peak-hour intervals, sigma logging
 
 ### Phase 5: Automated Calibration
 **Goal**: A daily pipeline automatically validates model quality and suggests recalibration when drift is detected
