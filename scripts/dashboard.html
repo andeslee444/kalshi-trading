@@ -104,6 +104,14 @@
       </div>
     </div>
 
+    <!-- Row 3.5: Active Exits -->
+    <div class="card" id="active-exits-card">
+      <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Active Exits</h2>
+      <div id="active-exits" class="text-sm">
+        <div class="text-gray-500">Loading...</div>
+      </div>
+    </div>
+
     <!-- Row 4: Trades + Decisions -->
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
 
@@ -474,6 +482,65 @@ async function loadPositions() {
       </div>
     </div>`;
   }).join('')}</div>`;
+}
+
+// ─── Active Exits ───
+
+async function loadExitState() {
+  const data = await fetchJson('/api/exit-state');
+  const el = document.getElementById('active-exits');
+
+  if (!data || data.error) {
+    el.innerHTML = '<div class="text-gray-500">Unable to load exit state</div>';
+    return;
+  }
+  if (!Array.isArray(data) || data.length === 0) {
+    el.innerHTML = '<div class="text-gray-500">No active exits</div>';
+    return;
+  }
+
+  let html = `<div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="text-gray-500 text-xs">
+    <th class="text-left py-1">Ticker</th>
+    <th class="text-center py-1">Side</th>
+    <th class="text-right py-1">Entry</th>
+    <th class="text-right py-1">Peak</th>
+    <th class="text-right py-1">TP</th>
+    <th class="text-right py-1">SL</th>
+    <th class="text-right py-1">Trail</th>
+    <th class="text-left py-1">Nearest</th>
+    <th class="text-right py-1">Updated</th>
+  </tr></thead><tbody>`;
+
+  for (const ex of data) {
+    // Color-code rows
+    let rowClass = '';
+    const nearest = ex.nearest_threshold || 'hold';
+    if (nearest.startsWith('trailing')) {
+      rowClass = 'bg-yellow-900/20';
+    } else if (ex.peak_bid >= ex.take_profit_threshold) {
+      rowClass = 'bg-green-900/20';
+    } else if (ex.peak_bid > 0 && ex.peak_bid <= ex.stop_loss_threshold) {
+      rowClass = 'bg-red-900/20';
+    }
+
+    const sideColor = ex.side === 'yes' ? 'text-green-400' : 'text-red-400';
+    const updated = ex.last_updated ? timeAgo(ex.last_updated) : '-';
+
+    html += `<tr class="border-t border-gray-800 ${rowClass}">
+      <td class="py-1 text-gray-200">${escapeHtml(ex.ticker)}</td>
+      <td class="text-center ${sideColor}">${(ex.side || '').toUpperCase()}</td>
+      <td class="text-right text-gray-300">${ex.entry_price}c</td>
+      <td class="text-right text-gray-200 font-semibold">${ex.peak_bid}c</td>
+      <td class="text-right text-green-400">${ex.take_profit_threshold}c</td>
+      <td class="text-right text-red-400">${ex.stop_loss_threshold}c</td>
+      <td class="text-right text-yellow-400">${ex.trailing_drop}c</td>
+      <td class="text-left text-gray-300">${escapeHtml(nearest)}</td>
+      <td class="text-right text-gray-500 text-xs">${updated}</td>
+    </tr>`;
+  }
+
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
 }
 
 // ─── Recent Trades ───
@@ -923,6 +990,7 @@ async function refreshAll() {
     loadRisk(),
     loadOrders(),
     loadPositions(),
+    loadExitState(),
     loadTrades(),
     loadDecisions(),
     loadHealth(),

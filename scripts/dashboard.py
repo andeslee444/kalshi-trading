@@ -855,6 +855,82 @@ async def api_positions():
         return {"error": str(e)}
 
 
+# ─── Exit State (Active Exits Panel) ───
+
+# Bot source name → bots-config.json key (mirrors position-monitor.py BOT_CONFIG_MAP)
+_EXIT_BOT_CONFIG_MAP = {
+    "weather": "weather",
+    "source-monitor": "weather",
+    "entertainment": "entertainment",
+    "crypto": "crypto",
+    "economics": "economics",
+    "strategy": "strategy",
+    "beatrelease": "beatrelease",
+}
+
+
+@app.get("/api/exit-state")
+async def api_exit_state():
+    """Return active exit state for all open positions.
+
+    Combines:
+    - Trailing state from data/trailing-state.json (peak bids, entry prices)
+    - Per-bot exit thresholds from bots-config.json
+    """
+    # Load trailing state
+    trailing_path = DATA_DIR / "trailing-state.json"
+    trailing = {}
+    if trailing_path.exists():
+        try:
+            trailing = json.loads(trailing_path.read_text())
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Load bots config for exit thresholds
+    bots_config = load_json_safe(BOTS_CONFIG_PATH) or {}
+    pm_cfg = bots_config.get("position_monitor", {})
+
+    # Build per-position exit state
+    result = []
+    for ticker, state in trailing.items():
+        entry_price = state.get("entry_price", 0)
+        peak_bid = state.get("peak_bid", 0)
+        source_bot = state.get("source_bot", "")
+        side = state.get("side", "yes")
+
+        # Look up exit thresholds for this bot
+        config_key = _EXIT_BOT_CONFIG_MAP.get(source_bot, "position_monitor")
+        bot_cfg = bots_config.get(config_key, {})
+        exit_cfg = bot_cfg.get("exit", {})
+
+        take_profit = exit_cfg.get("takeProfitCents", int(pm_cfg.get("takeProfitThreshold", 0.80) * 100))
+        stop_loss = exit_cfg.get("stopLossCents", int(pm_cfg.get("stopLossThreshold", 0.30) * 100))
+        trailing_drop = exit_cfg.get("trailingDropCents", pm_cfg.get("trailingDropCents", 10))
+        trailing_min_profit = exit_cfg.get("trailingMinProfitCents", pm_cfg.get("trailingMinProfitCents", 10))
+
+        # Determine nearest threshold
+        nearest = "hold"
+        if peak_bid > 0 and entry_price > 0:
+            if peak_bid >= entry_price + trailing_min_profit:
+                nearest = f"trailing ({peak_bid - trailing_drop}c)"
+
+        result.append({
+            "ticker": ticker,
+            "entry_price": entry_price,
+            "peak_bid": peak_bid,
+            "side": side,
+            "source_bot": source_bot,
+            "take_profit_threshold": take_profit,
+            "stop_loss_threshold": stop_loss,
+            "trailing_drop": trailing_drop,
+            "nearest_threshold": nearest,
+            "first_seen": state.get("first_seen", ""),
+            "last_updated": state.get("last_updated", ""),
+        })
+
+    return result
+
+
 # ─── Main ───
 
 def main():
