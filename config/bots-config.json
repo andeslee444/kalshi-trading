@@ -1,4 +1,14 @@
 {
+  "weather": {
+    "exit": {
+      "takeProfitCents": 80,
+      "stopLossCents": 30,
+      "modelShiftPp": 20,
+      "trailingDropCents": 10,
+      "trailingMinProfitCents": 10,
+      "takeProfitFraction": 0.50
+    }
+  },
   "entertainment": {
     "enabled": false,
     "maxTradeAmount": 5,
@@ -6,7 +16,15 @@
     "maxDailyLoss": 25,
     "confidenceThreshold": 0.85,
     "scanIntervalMinutes": 15,
-    "tickers": ["ALBUM", "BOX", "MOVIE", "STREAM", "MUSIC", "BILLBOARD", "OSCAR", "GRAMMY", "SPOTIFY", "FILM", "ENTERTAIN"]
+    "tickers": ["ALBUM", "BOX", "MOVIE", "STREAM", "MUSIC", "BILLBOARD", "OSCAR", "GRAMMY", "SPOTIFY", "FILM", "ENTERTAIN"],
+    "exit": {
+      "takeProfitCents": 80,
+      "stopLossCents": 30,
+      "modelShiftPp": 20,
+      "trailingDropCents": 10,
+      "trailingMinProfitCents": 10,
+      "takeProfitFraction": 0.50
+    }
   },
   "beatrelease": {
     "checkIntervalHours": 1,
@@ -17,24 +35,49 @@
     "blogUrls": [
       "https://www.beatrelease.com/blog/categories/kalshi-predictions",
       "https://www.beatrelease.com/blog"
-    ]
+    ],
+    "exit": {
+      "takeProfitCents": 80,
+      "stopLossCents": 30,
+      "modelShiftPp": 20,
+      "trailingDropCents": 10,
+      "trailingMinProfitCents": 10,
+      "takeProfitFraction": 0.50
+    }
   },
   "strategy": {
     "maxBetCents": 500,
     "maxDailyTrades": 20,
     "maxDailyLoss": 50,
-    "scanIntervalMinutes": 15
+    "scanIntervalMinutes": 15,
+    "exit": {
+      "takeProfitCents": 80,
+      "stopLossCents": 30,
+      "modelShiftPp": 20,
+      "trailingDropCents": 10,
+      "trailingMinProfitCents": 10,
+      "takeProfitFraction": 0.50
+    }
   },
   "crypto": {
     "maxTradeAmount": 10,
     "maxDailyTrades": 30,
-    "maxDailyLoss": 25,
+    "maxDailyLoss": 50,
     "scanIntervalMinutes": 5,
     "edgeThreshold": 0.08,
     "driftPct": 0.0,
     "settlementBufferMinutes": 1,
     "useOrnsteinUhlenbeck": true,
-    "ouHalfLifeMinutes": 120
+    "ouHalfLifeMinutes": 120,
+    "enableBrackets": false,
+    "exit": {
+      "takeProfitCents": 85,
+      "stopLossCents": 25,
+      "modelShiftPp": 15,
+      "trailingDropCents": 15,
+      "trailingMinProfitCents": 15,
+      "takeProfitFraction": 0.50
+    }
   },
   "economics": {
     "maxTradeAmount": 15,
@@ -42,7 +85,15 @@
     "maxDailyLoss": 75,
     "scanIntervalMinutes": 360,
     "edgeThreshold": 0.08,
-    "gasEdgeThreshold": 0.04
+    "gasEdgeThreshold": 0.04,
+    "exit": {
+      "takeProfitCents": 80,
+      "stopLossCents": 30,
+      "modelShiftPp": 20,
+      "trailingDropCents": 10,
+      "trailingMinProfitCents": 10,
+      "takeProfitFraction": 0.50
+    }
   },
   "cross_platform_arb": {
     "scanIntervalMinutes": 10,
@@ -54,10 +105,10 @@
   },
   "position_monitor": {
     "scanIntervalMinutes": 15,
-    "takeProfitThreshold": 0.85,
-    "stopLossThreshold": 0.20,
+    "takeProfitThreshold": 0.80,
+    "stopLossThreshold": 0.30,
     "stopLossPct": 0.40,
-    "modelShiftThreshold": 0.25,
+    "modelShiftThreshold": 0.20,
     "maxDailyExits": 20,
     "orderTtlMinutes": 120,
     "trailingDropCents": 10,

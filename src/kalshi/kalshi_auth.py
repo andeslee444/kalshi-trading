@@ -1202,7 +1202,7 @@ class TradeManager:
         return order_info
 
     def sell_position(self, ticker, side, price_cents, count, reasoning,
-                      **extra_fields):
+                      order_type="limit", **extra_fields):
         """Sell/exit an existing position with lighter safety checks.
 
         Exits free capital rather than consuming it, so daily trade limits
@@ -1215,6 +1215,8 @@ class TradeManager:
             price_cents: Limit price in cents (1-99).
             count: Number of contracts to sell.
             reasoning: Human-readable exit rationale.
+            order_type: "limit" (default) or "market". Market orders omit
+                price from the API body for immediate execution.
             **extra_fields: Additional fields for the trade record.
 
         Returns:
@@ -1247,13 +1249,15 @@ class TradeManager:
             "ticker": ticker,
             "action": "sell",
             "side": side,
-            "type": "limit",
+            "type": order_type,
             "count": count,
         }
-        if side == "yes":
-            order_body["yes_price"] = price_cents
-        else:
-            order_body["no_price"] = price_cents
+        # Only include price for limit orders; market orders execute at best available
+        if order_type == "limit":
+            if side == "yes":
+                order_body["yes_price"] = price_cents
+            else:
+                order_body["no_price"] = price_cents
 
         try:
             result = self.client.post("/portfolio/orders", body=order_body)
