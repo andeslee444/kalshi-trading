@@ -66,11 +66,11 @@ Plans:
   3. Position monitor exits positions when the current model probability disagrees with entry probability by more than 20 percentage points
   4. Trailing stop tracks peak bid value and triggers exit on a 10-cent drop from peak
   5. Resting orders older than the configured TTL (120 minutes default) are automatically cancelled
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 03-01: Take-profit, stop-loss, and model-shift exit execution
-- [ ] 03-02: Trailing stops and stale order cancellation
+- [ ] 03-01-PLAN.md -- Take-profit (partial exits, limit orders), stop-loss (market orders), model-shift (multi-model routing), per-bot exit config, WhatsApp alerts
+- [ ] 03-02-PLAN.md -- Trailing stops (illiquidity protection, peak persistence, market orders), stale order TTL, active exits dashboard panel
 
 ### Phase 4: Bot Activation
 **Goal**: All existing bots execute trades regularly on validated edges with instrumented decision logging
