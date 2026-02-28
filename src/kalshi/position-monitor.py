@@ -160,11 +160,23 @@ trim_trade_log(TRADES_PATH)
 # === Position Fetching ===
 
 def get_open_positions():
-    """Fetch all open positions from the Kalshi API."""
+    """Fetch all open positions from the Kalshi API.
+
+    The API returns a signed 'position' field (positive=YES, negative=NO).
+    We normalize to 'yes' and 'no' count fields for downstream evaluation.
+    """
     try:
         data = client.get("/portfolio/positions")
         positions = data.get("market_positions", [])
-        return [p for p in positions if p.get("total_traded", 0) > 0]
+        result = []
+        for p in positions:
+            pos_val = p.get("position", 0)
+            if pos_val == 0:
+                continue
+            p["yes"] = pos_val if pos_val > 0 else 0
+            p["no"] = abs(pos_val) if pos_val < 0 else 0
+            result.append(p)
+        return result
     except Exception as e:
         log.error(f"Failed to fetch positions: {e}")
         return []

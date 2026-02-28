@@ -302,7 +302,7 @@ def scan_and_trade():
     # Fetch spot prices
     log.info("\nFetching crypto prices...")
     spot_prices = {}
-    for asset in ["BTC", "ETH"]:
+    for asset in ["BTC", "ETH", "SOL"]:
         price = fetch_coinbase_spot(asset)
         if price:
             spot_prices[asset] = price
@@ -363,6 +363,8 @@ def scan_and_trade():
         parsed = parse_crypto_ticker(ticker)
         if not parsed:
             ss.skip("unparseable")
+            if ss.skipped.get("unparseable", 0) <= 10:
+                log.info(f"  Unparseable ticker: {ticker}")
             continue
 
         asset = parsed["asset"]
@@ -575,7 +577,7 @@ def main():
     args = parser.parse_args()
 
     log.info("=" * 60)
-    log.info("Kalshi Crypto Bot (BTC/ETH)")
+    log.info("Kalshi Crypto Bot (BTC/ETH/SOL)")
     log.info(f"  Max: ${MAX_TRADE}/trade | Edge: {EDGE_THRESHOLD*100:.0f}%")
     log.info(f"  Scan interval: {SCAN_INTERVAL} minutes")
     log.info("=" * 60)
