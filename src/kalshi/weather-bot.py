@@ -327,6 +327,9 @@ def scan_and_trade():
         city_code = opp["parsed"]["city"]
         is_calibrated = bool(cal.get("weather", {}).get("per_city", {}).get(city_code))
 
+        sigma_val = weather_sigma(opp["days_out"], opp["city"])
+        log.debug(f"  {ticker}: sigma={sigma_val:.2f} ({'calibrated' if is_calibrated else 'global'}) for {city_code}")
+
         if is_bracket:
             # Rec 3+10: Quarter-Kelly for brackets (always, regardless of calibration)
             count, risk, kelly_details = quarter_kelly(
@@ -386,6 +389,7 @@ def scan_and_trade():
             ensemble_forecasts=ensemble_data,
             ensemble_models=list(ensemble_data.keys()) if ensemble_data else None,
             sigma_used=round(weather_sigma(opp["days_out"], opp["city"]), 2),
+            is_calibrated=is_calibrated,
             days_out=opp["days_out"],
             city=opp["city"],
             market_type="bracket" if is_bracket else "threshold",
