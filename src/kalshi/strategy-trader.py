@@ -53,6 +53,8 @@ def find_longshot_sells(markets, bankroll):
         ticker = m.get("ticker", "")
 
         if yes_ask <= 0 or yes_ask > 15:
+            trade_manager.log_decision(ticker, "no", "skipped", "price_out_of_range",
+                                       yes_ask=yes_ask)
             continue
 
         close_str = m.get("close_time", "")
@@ -63,6 +65,8 @@ def find_longshot_sells(markets, bankroll):
             hours = 999
 
         if hours < 0.5:
+            trade_manager.log_decision(ticker, "no", "skipped", "too_close_to_settlement",
+                                       hours_to_close=round(hours, 2))
             continue
 
         # Category-adjusted Becker model: returns additive edge
@@ -75,6 +79,9 @@ def find_longshot_sells(markets, bankroll):
         fee_per_contract = kalshi_fee_cents(yes_ask)
         min_edge = 0.005  # 0.5% minimum edge (fees handled in Kelly sizing)
         if est_edge_prelim < min_edge:
+            trade_manager.log_decision(ticker, "no", "skipped", "low_edge_prelim",
+                                       edge=round(est_edge_prelim, 4), min_edge=min_edge,
+                                       yes_ask=yes_ask)
             continue
 
         # Place limit within the spread instead of at full ask
@@ -82,16 +89,23 @@ def find_longshot_sells(markets, bankroll):
         # Recompute edge at the actual entry price (limit may differ from ask)
         est_edge = longshot_edge(sell_price, ticker=ticker, hours_to_close=hours)
         if est_edge < min_edge:
+            trade_manager.log_decision(ticker, "no", "skipped", "low_edge_limit",
+                                       edge=round(est_edge, 4), min_edge=min_edge,
+                                       sell_price=sell_price)
             continue
         if sell_price <= 1:
             sell_price = max(yes_bid, yes_ask - 1) if yes_bid > 0 else yes_ask
         if sell_price <= 1:
+            trade_manager.log_decision(ticker, "no", "skipped", "sell_price_too_low",
+                                       sell_price=sell_price, yes_bid=yes_bid, yes_ask=yes_ask)
             continue
 
         # Rec 5: Only sell longshots when NO ≤ 96c (profit/risk ratio floor)
         # At NO=99c, profit:risk = 1:99. At NO=96c, ratio = 4:96 ≈ 4.2%
         no_price = 100 - sell_price
         if no_price > 96:
+            trade_manager.log_decision(ticker, "no", "skipped", "profit_risk_ratio",
+                                       no_price=no_price, sell_price=sell_price)
             continue
 
         # Request budget from portfolio allocator
