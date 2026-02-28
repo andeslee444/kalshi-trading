@@ -114,11 +114,11 @@ Plans:
   1. Crypto model has a documented Brier score computed from backtesting against historical BTC 15-minute candle data
   2. Time-to-settlement calculation is verified against actual Kalshi crypto market durations (the T=2456min claim is confirmed or corrected)
   3. Realized volatility computation output is compared against Deribit DVOL benchmark and the discrepancy is documented
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 06-01: Crypto model backtesting and time-to-settlement validation
-- [ ] 06-02: Realized vol validation against Deribit DVOL
+- [ ] 06-01-PLAN.md -- Data fetching/caching pipeline (Coinbase candles, Deribit DVOL, Kalshi historical markets) + time-to-settlement exhaustive audit
+- [ ] 06-02-PLAN.md -- Market replay backtest (Brier scores, calibration curves), vol parameter sweep (IV/RV blend + lookback optimization), Deribit DVOL benchmark
 
 ### Phase 7: New Strategies
 **Goal**: The system expands into new alpha sources after existing bots are validated and trading
