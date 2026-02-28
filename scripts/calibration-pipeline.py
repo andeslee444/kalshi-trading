@@ -3,16 +3,19 @@
 
 Runs reconcile -> backfill -> backtest -> calibrate as subprocesses,
 manages per-bot/per-city Brier score baselines, detects drift,
+generates calibration suggestions for human review,
 writes timestamped logs, and sends daily WhatsApp summaries.
 
 Usage:
     python3 scripts/calibration-pipeline.py              # Full run + WhatsApp
     python3 scripts/calibration-pipeline.py --dry-run     # Run stages, no WhatsApp
     python3 scripts/calibration-pipeline.py --update-baseline  # Re-snapshot baselines
+    python3 scripts/calibration-pipeline.py --apply-suggestion PATH  # Apply a suggestion file
 """
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -30,10 +33,17 @@ DATA_DIR = PROJECT_DIR / "data"
 BASELINES_PATH = DATA_DIR / "calibration-baselines.json"
 LOG_DIR = DATA_DIR / "logs" / "calibration"
 RESULTS_PATH = DATA_DIR / "backtest-results.json"
+SUGGESTION_DIR = DATA_DIR / "calibration-suggestions"
+CALIBRATION_PATH = PROJECT_DIR / "config" / "calibration.json"
+CALIBRATION_BACKUP_PATH = PROJECT_DIR / "config" / "calibration-backup.json"
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DRIFT_THRESHOLD = 0.10   # 10% degradation triggers drift alert
 MIN_SAMPLES = 10         # minimum trades before drift detection activates
+SUGGESTION_IMPROVEMENT_THRESHOLD = 0.05  # 5% Brier improvement required to generate suggestion
+
+# Calibration sections that may contain Brier scores
+CALIBRATION_SECTIONS = ["weather", "nws", "album_sales", "box_office", "ensemble"]
 
 # (name, script_path, args, timeout_seconds)
 STAGES = [
@@ -248,7 +258,7 @@ def _compare_entity(entity, entity_type, baseline_brier, baseline_n, current_bri
 
 # ── WhatsApp Summary ─────────────────────────────────────────────────────────
 
-def format_whatsapp_summary(stage_results, drift_findings, any_stage_failed):
+def format_whatsapp_summary(stage_results, drift_findings, any_stage_failed, suggestion_path=None):
     """Format a concise WhatsApp summary (<500 chars).
 
     Always sent -- both healthy and drift-detected messages.
@@ -281,12 +291,180 @@ def format_whatsapp_summary(stage_results, drift_findings, any_stage_failed):
         lines.append("")
         lines.append(f"All models healthy ({checked} entities checked)")
 
+    # Suggestion info
+    if suggestion_path:
+        lines.append("")
+        lines.append(f"Calibration suggestion generated -- review {suggestion_path}")
+
     return "\n".join(lines)
+
+
+# ── Suggestion Evaluation ────────────────────────────────────────────────────
+
+def evaluate_suggestion(proposed_calibration, current_calibration):
+    """Compare proposed vs current calibration to determine if a suggestion should be generated.
+
+    Returns dict with should_suggest, improvements, aggregate_improvement_pct.
+    Only suggests when aggregate Brier improvement > SUGGESTION_IMPROVEMENT_THRESHOLD (5%).
+    """
+    improvements = {}
+    total_improvement = 0.0
+    sections_with_data = 0
+
+    # If no current calibration exists, always suggest (first calibration)
+    if not current_calibration:
+        return {
+            "should_suggest": True,
+            "improvements": {"first_calibration": True},
+            "aggregate_improvement_pct": 1.0,
+        }
+
+    for section in CALIBRATION_SECTIONS:
+        proposed_section = proposed_calibration.get(section, {})
+        current_section = current_calibration.get(section, {})
+
+        # Skip sections with no data (n=0 or missing)
+        proposed_n = proposed_section.get("n", 0)
+        current_n = current_section.get("n", 0)
+        if proposed_n == 0 and current_n == 0:
+            continue
+
+        # Extract Brier scores -- calibrate-sigma.py uses "global_brier"
+        proposed_brier = proposed_section.get("global_brier")
+        current_brier = current_section.get("global_brier")
+
+        if proposed_brier is None or current_brier is None:
+            continue
+
+        if current_brier == 0:
+            continue
+
+        sections_with_data += 1
+        improvement_pct = (current_brier - proposed_brier) / current_brier
+
+        if improvement_pct > 0:
+            improvements[section] = {
+                "before": round(current_brier, 6),
+                "after": round(proposed_brier, 6),
+                "improvement_pct": round(improvement_pct * 100, 1),
+            }
+            total_improvement += improvement_pct
+
+    aggregate_improvement = total_improvement / sections_with_data if sections_with_data > 0 else 0.0
+
+    return {
+        "should_suggest": aggregate_improvement > SUGGESTION_IMPROVEMENT_THRESHOLD,
+        "improvements": improvements,
+        "aggregate_improvement_pct": round(aggregate_improvement, 4),
+    }
+
+
+def generate_suggestion(proposed_calibration, current_calibration, improvements):
+    """Write a timestamped suggestion file for human review.
+
+    Filenames are unique: calibration-suggestion-YYYY-MM-DD.json (appends -N if same-day exists).
+    Returns the suggestion file path.
+    """
+    SUGGESTION_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    date_str = now.strftime("%Y-%m-%d")
+
+    # Find unique filename (never overwrite)
+    base_name = f"calibration-suggestion-{date_str}"
+    suggestion_path = SUGGESTION_DIR / f"{base_name}.json"
+    counter = 2
+    while suggestion_path.exists():
+        suggestion_path = SUGGESTION_DIR / f"{base_name}-{counter}.json"
+        counter += 1
+
+    # Build trigger summary from improvements
+    trigger_parts = []
+    for section, imp in improvements.items():
+        if section == "first_calibration":
+            trigger_parts.append("First calibration -- no previous params")
+            continue
+        trigger_parts.append(
+            f"{section} Brier improved {imp['improvement_pct']:.0f}% "
+            f"({imp['before']:.4f} -> {imp['after']:.4f})"
+        )
+    trigger = "; ".join(trigger_parts) if trigger_parts else "Improvement detected"
+
+    suggestion = {
+        "generated_at": now.isoformat(),
+        "trigger": trigger,
+        "current_calibration": current_calibration,
+        "proposed_calibration": proposed_calibration,
+        "improvements": improvements,
+        "recommendation": (
+            f"Apply: {trigger}. "
+            f"Run: python3 scripts/calibration-pipeline.py "
+            f"--apply-suggestion {suggestion_path}"
+        ),
+    }
+
+    _atomic_write_json(suggestion_path, suggestion)
+    log.info(f"Calibration suggestion generated: {suggestion_path}")
+    return suggestion_path
+
+
+def apply_suggestion(suggestion_path):
+    """Apply a calibration suggestion file.
+
+    Backs up current config/calibration.json, writes proposed calibration,
+    then re-snapshots baselines from current backtest results.
+    Returns True on success.
+    """
+    suggestion_path = Path(suggestion_path)
+    if not suggestion_path.exists():
+        log.error(f"Suggestion file not found: {suggestion_path}")
+        return False
+
+    try:
+        suggestion = json.loads(suggestion_path.read_text())
+    except Exception as e:
+        log.error(f"Failed to parse suggestion file: {e}")
+        return False
+
+    proposed = suggestion.get("proposed_calibration")
+    if not proposed:
+        log.error("Suggestion file missing proposed_calibration")
+        return False
+
+    # Backup current calibration
+    if CALIBRATION_PATH.exists():
+        shutil.copy2(str(CALIBRATION_PATH), str(CALIBRATION_BACKUP_PATH))
+        log.info(f"Backed up current calibration to {CALIBRATION_BACKUP_PATH}")
+
+    # Write proposed calibration
+    _atomic_write_json(CALIBRATION_PATH, proposed)
+    log.info(f"Applied proposed calibration to {CALIBRATION_PATH}")
+
+    # Log which sections changed
+    current = suggestion.get("current_calibration", {})
+    for section in CALIBRATION_SECTIONS:
+        cur_brier = current.get(section, {}).get("global_brier")
+        new_brier = proposed.get(section, {}).get("global_brier")
+        if cur_brier is not None and new_brier is not None and cur_brier != new_brier:
+            log.info(f"  {section}: Brier {cur_brier:.4f} -> {new_brier:.4f}")
+
+    # Re-snapshot baselines from current backtest results
+    if RESULTS_PATH.exists():
+        try:
+            backtest_results = json.loads(RESULTS_PATH.read_text())
+            initialize_baselines(backtest_results)
+            log.info("Baselines re-initialized after applying suggestion")
+        except Exception as e:
+            log.warning(f"Could not re-initialize baselines: {e}")
+    else:
+        log.warning("No backtest results found -- baselines not updated")
+
+    return True
 
 
 # ── Pipeline Log ─────────────────────────────────────────────────────────────
 
-def write_pipeline_log(run_at, stage_results, drift_findings, whatsapp_sent, total_duration):
+def write_pipeline_log(run_at, stage_results, drift_findings, whatsapp_sent, total_duration,
+                       suggestion_generated=False, suggestion_path=None):
     """Write detailed pipeline log to data/logs/calibration/pipeline-YYYY-MM-DD.json."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     date_str = run_at.strftime("%Y-%m-%d")
@@ -296,6 +474,8 @@ def write_pipeline_log(run_at, stage_results, drift_findings, whatsapp_sent, tot
         "run_at": run_at.isoformat(),
         "total_duration_s": round(total_duration, 1),
         "whatsapp_sent": whatsapp_sent,
+        "suggestion_generated": suggestion_generated,
+        "suggestion_path": str(suggestion_path) if suggestion_path else None,
         "stages": {},
         "drift_findings": drift_findings,
     }
@@ -321,9 +501,25 @@ def main():
                         help="Run pipeline but don't send WhatsApp")
     parser.add_argument("--update-baseline", action="store_true",
                         help="Re-snapshot baselines from current results")
+    parser.add_argument("--apply-suggestion", type=str, metavar="PATH",
+                        help="Apply a calibration suggestion file")
     args = parser.parse_args()
 
     setup_unbuffered()
+
+    # ── Apply suggestion (separate flow) ────────────────────────────────────
+    if args.apply_suggestion:
+        success = apply_suggestion(args.apply_suggestion)
+        if success:
+            log.info("Suggestion applied successfully")
+            print(f"Applied calibration suggestion from {args.apply_suggestion}")
+            print(f"Backup saved to {CALIBRATION_BACKUP_PATH}")
+        else:
+            log.error("Failed to apply suggestion")
+            sys.exit(1)
+        return
+
+    # ── Normal pipeline flow ────────────────────────────────────────────────
     run_at = datetime.now(timezone.utc)
     pipeline_start = time.monotonic()
 
@@ -334,6 +530,7 @@ def main():
     # 1. Run all stages
     pipeline_result = run_pipeline()
     stage_results = pipeline_result["stages"]
+    proposed_calibration = pipeline_result["proposed_calibration"]
     any_stage_failed = any(not s["success"] for s in stage_results.values())
 
     # 2. Load backtest results (should be updated by backtest stage)
@@ -373,8 +570,36 @@ def main():
         log.info("Updating baselines (--update-baseline flag)")
         initialize_baselines(backtest_results)
 
-    # 6. WhatsApp summary
-    summary = format_whatsapp_summary(stage_results, drift_findings, any_stage_failed)
+    # 6. Evaluate calibration suggestion
+    suggestion_generated = False
+    suggestion_path = None
+
+    if proposed_calibration:
+        # Load current calibration for comparison
+        current_calibration = {}
+        if CALIBRATION_PATH.exists():
+            try:
+                current_calibration = json.loads(CALIBRATION_PATH.read_text())
+            except Exception as e:
+                log.warning(f"Could not load current calibration: {e}")
+
+        eval_result = evaluate_suggestion(proposed_calibration, current_calibration)
+        log.info(f"Suggestion evaluation: should_suggest={eval_result['should_suggest']}, "
+                 f"improvement={eval_result['aggregate_improvement_pct']:.1%}")
+
+        if eval_result["should_suggest"]:
+            suggestion_path = generate_suggestion(
+                proposed_calibration, current_calibration, eval_result["improvements"]
+            )
+            suggestion_generated = True
+    else:
+        log.info("No proposed calibration available -- suggestion evaluation skipped")
+
+    # 7. WhatsApp summary
+    summary = format_whatsapp_summary(
+        stage_results, drift_findings, any_stage_failed,
+        suggestion_path=suggestion_path,
+    )
     whatsapp_sent = False
 
     if args.dry_run:
@@ -386,11 +611,14 @@ def main():
         except Exception as e:
             log.error(f"WhatsApp send failed: {e}")
 
-    # 7. Write pipeline log
+    # 8. Write pipeline log
     total_duration = time.monotonic() - pipeline_start
-    write_pipeline_log(run_at, stage_results, drift_findings, whatsapp_sent, total_duration)
+    write_pipeline_log(
+        run_at, stage_results, drift_findings, whatsapp_sent, total_duration,
+        suggestion_generated=suggestion_generated, suggestion_path=suggestion_path,
+    )
 
-    # 8. Print summary
+    # 9. Print summary
     log.info("")
     log.info("=" * 60)
     log.info("Pipeline Summary")
