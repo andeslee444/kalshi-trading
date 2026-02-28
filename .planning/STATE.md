@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: unknown
-last_updated: "2026-02-27T23:31:36.986Z"
+status: in-progress
+last_updated: "2026-02-28T03:15:41Z"
 progress:
-  total_phases: 2
+  total_phases: 3
   completed_phases: 2
-  total_plans: 7
-  completed_plans: 7
+  total_plans: 9
+  completed_plans: 8
 ---
 
 # Project State
@@ -18,23 +18,23 @@ progress:
 See: .planning/PROJECT.md (updated 2026-02-26)
 
 **Core value:** Every bot must produce consistent daily P&L -- bots trading regularly on validated edges, exits protecting capital, and measurable model calibration proving the math works.
-**Current focus:** Phase 2 complete (Position Sizing). All bots migrated to quarter-Kelly default. Phase 3 (Exit Management) next.
+**Current focus:** Phase 3 in progress (Position Management). Take-profit, stop-loss, and model-shift exits implemented. Trailing stops and stale order TTL next.
 
 ## Current Position
 
-Phase: 3 of 8 (Exit Management)
-Plan: 0 of ? in current phase (0 complete)
-Status: Phase 02 complete, Phase 03 pending
-Last activity: 2026-02-27 -- Completed 02-02 (Bot Migration to Quarter-Kelly Default Sizing)
+Phase: 3 of 8 (Position Management)
+Plan: 1 of 2 in current phase (1 complete)
+Status: Phase 03 plan 01 complete, plan 02 pending
+Last activity: 2026-02-28 -- Completed 03-01 (Position Exit Execution)
 
-Progress: [███░░░░░░░] 28%
+Progress: [████░░░░░░] 32%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 7
+- Total plans completed: 8
 - Average duration: 5 min
-- Total execution time: 0.6 hours
+- Total execution time: 0.7 hours
 
 **By Phase:**
 
@@ -43,7 +43,7 @@ Progress: [███░░░░░░░] 28%
 | 01-feedback-loop | 5 | 30 min | 6 min |
 
 **Recent Trend:**
-- Last 5 plans: 5min, 15min, 4min, 2min, 4min
+- Last 5 plans: 15min, 4min, 2min, 4min, 7min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -51,6 +51,7 @@ Progress: [███░░░░░░░] 28%
 | Phase 01 P05 | 4min | 2 tasks | 8 files |
 | Phase 02 P01 | 2min | 1 tasks | 4 files |
 | Phase 02 P02 | 4min | 2 tasks | 8 files |
+| Phase 03 P01 | 7min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -78,6 +79,11 @@ Recent decisions affecting current work:
 - [Phase 02-02]: Weather bot uses calibration gate: _load_calibration() per-city check to decide sizing tier
 - [Phase 02-02]: Bracket markets always use quarter-Kelly regardless of calibration status
 - [Phase 02-02]: Descriptive sizing labels include calibration status (e.g. "half-Kelly (calibrated)")
+- [Phase 03-01]: Market orders for stop-loss (urgent exit), limit orders for take-profit/model-shift (patient exit)
+- [Phase 03-01]: 50% partial exit for take-profit; remainder rides to settlement or trailing stop
+- [Phase 03-01]: Crypto gets tighter thresholds (85c TP, 25c SL, 15pp model-shift) due to higher vol
+- [Phase 03-01]: Entertainment/beatrelease model-shift deferred (no live data source to recompute)
+- [Phase 03-01]: Removed hardcoded info-arb skip logic; per-bot exit config handles naturally
 
 ### Pending Todos
 
@@ -89,6 +95,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-27
-Stopped at: Completed 02-02-PLAN.md (Bot Migration to Quarter-Kelly Default Sizing -- Phase 02 complete)
+Last session: 2026-02-28
+Stopped at: Completed 03-01-PLAN.md (Position Exit Execution -- take-profit, stop-loss, model-shift)
 Resume file: None

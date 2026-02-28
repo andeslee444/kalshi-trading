@@ -24,9 +24,9 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### Position Management
 
-- [ ] **EXIT-01**: Position monitor executes take-profit exits when bid reaches 80% threshold
-- [ ] **EXIT-02**: Position monitor executes stop-loss exits at 30% threshold
-- [ ] **EXIT-03**: Position monitor executes model-shift exits when updated probability disagrees with entry by >20%
+- [x] **EXIT-01**: Position monitor executes take-profit exits when bid reaches 80% threshold
+- [x] **EXIT-02**: Position monitor executes stop-loss exits at 30% threshold
+- [x] **EXIT-03**: Position monitor executes model-shift exits when updated probability disagrees with entry by >20%
 - [ ] **EXIT-04**: Trailing stop logic tracks peak value and exits on 10-cent drop
 - [ ] **EXIT-05**: Stale resting orders are cancelled after configured TTL (120 min default)
 
@@ -117,9 +117,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SIZE-01 | Phase 2 | Complete |
 | SIZE-02 | Phase 2 | Complete |
 | SIZE-03 | Phase 2 | Complete |
-| EXIT-01 | Phase 3 | Pending |
-| EXIT-02 | Phase 3 | Pending |
-| EXIT-03 | Phase 3 | Pending |
+| EXIT-01 | Phase 3 | Complete |
+| EXIT-02 | Phase 3 | Complete |
+| EXIT-03 | Phase 3 | Complete |
 | EXIT-04 | Phase 3 | Pending |
 | EXIT-05 | Phase 3 | Pending |
 | EXEC-01 | Phase 4 | Pending |

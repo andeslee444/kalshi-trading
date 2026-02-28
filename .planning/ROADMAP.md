@@ -69,7 +69,7 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 03-01-PLAN.md -- Take-profit (partial exits, limit orders), stop-loss (market orders), model-shift (multi-model routing), per-bot exit config, WhatsApp alerts
+- [x] 03-01-PLAN.md -- Take-profit (partial exits, limit orders), stop-loss (market orders), model-shift (multi-model routing), per-bot exit config, WhatsApp alerts
 - [ ] 03-02-PLAN.md -- Trailing stops (illiquidity protection, peak persistence, market orders), stale order TTL, active exits dashboard panel
 
 ### Phase 4: Bot Activation
@@ -161,7 +161,7 @@ Note: Phase 2 and Phase 3 can execute in parallel (both depend only on Phase 1).
 |-------|----------------|--------|-----------|
 | 1. Feedback Loop | 4/5 | UAT gap closure | - |
 | 2. Position Sizing | 0/2 | Not started | - |
-| 3. Position Management | 0/2 | Not started | - |
+| 3. Position Management | 1/2 | In progress | - |
 | 4. Bot Activation | 0/4 | Not started | - |
 | 5. Automated Calibration | 0/2 | Not started | - |
 | 6. Crypto Validation | 0/2 | Not started | - |
