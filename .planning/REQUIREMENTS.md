@@ -33,8 +33,8 @@ Requirements for this milestone. Each maps to roadmap phases.
 ### Bot Execution
 
 - [x] **EXEC-01**: Entertainment bot skip rate drops below 80% (from current 99.7%) with correct liquidity filter tuning
-- [ ] **EXEC-02**: Beatrelease scanner executes at least 1 trade per week when blog content exists
-- [ ] **EXEC-03**: Economics bot successfully scrapes Cleveland Fed nowcast and evaluates CPI/GDP/Jobs markets
+- [x] **EXEC-02**: Beatrelease scanner executes at least 1 trade per week when blog content exists
+- [x] **EXEC-03**: Economics bot successfully scrapes Cleveland Fed nowcast and evaluates CPI/GDP/Jobs markets
 - [x] **EXEC-04**: Strategy trader scales longshot bias selling to 20+ trades per week across sports/entertainment
 - [x] **EXEC-05**: Weather bot trades with calibrated per-city sigma parameters (not hardcoded defaults)
 - [x] **EXEC-06**: Source monitor NWS arbitrage polls at 5-minute intervals during peak hours (10am-4pm local)
@@ -123,8 +123,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | EXIT-04 | Phase 3 | Complete |
 | EXIT-05 | Phase 3 | Complete |
 | EXEC-01 | Phase 4 | Complete |
-| EXEC-02 | Phase 4 | Pending |
-| EXEC-03 | Phase 4 | Pending |
+| EXEC-02 | Phase 4 | Complete |
+| EXEC-03 | Phase 4 | Complete |
 | EXEC-04 | Phase 4 | Complete |
 | EXEC-05 | Phase 4 | Complete |
 | EXEC-06 | Phase 4 | Complete |

@@ -113,5 +113,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-28
-Stopped at: Completed 04-04-PLAN.md (NWS Adaptive Polling & Weather Calibration Logging -- Phase 04 complete)
+Stopped at: Completed 04-02-PLAN.md (Bot Decision Logging -- Phase 04 complete)
 Resume file: None
