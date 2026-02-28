@@ -43,7 +43,7 @@ Requirements for this milestone. Each maps to roadmap phases.
 ### Automated Calibration
 
 - [x] **CAL-01**: Daily pipeline runs reconcile → backtest → compare Brier scores → alert on >10% degradation
-- [ ] **CAL-02**: Calibration auto-suggests new sigma parameters when improvement detected (human approves)
+- [x] **CAL-02**: Calibration auto-suggests new sigma parameters when improvement detected (human approves)
 - [x] **CAL-03**: Drift detection alerts via WhatsApp when any model's Brier score degrades >10% from baseline
 
 ### Crypto Validation
@@ -130,7 +130,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | EXEC-06 | Phase 4 | Complete |
 | EXEC-07 | Phase 4 | Complete |
 | CAL-01 | Phase 5 | Complete |
-| CAL-02 | Phase 5 | Pending |
+| CAL-02 | Phase 5 | Complete |
 | CAL-03 | Phase 5 | Complete |
 | CRYP-01 | Phase 6 | Pending |
 | CRYP-02 | Phase 6 | Pending |

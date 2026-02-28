@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: in-progress
-last_updated: "2026-02-28T07:11:21Z"
+last_updated: "2026-02-28T07:19:12Z"
 progress:
   total_phases: 5
-  completed_phases: 4
+  completed_phases: 5
   total_plans: 15
-  completed_plans: 14
+  completed_plans: 15
 ---
 
 # Project State
@@ -18,16 +18,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-02-26)
 
 **Core value:** Every bot must produce consistent daily P&L -- bots trading regularly on validated edges, exits protecting capital, and measurable model calibration proving the math works.
-**Current focus:** Phase 5 in progress (Automated Calibration). Daily pipeline operational, drift detection active.
+**Current focus:** Phase 5 complete (Automated Calibration). Daily pipeline with drift detection and suggestion generation operational.
 
 ## Current Position
 
-Phase: 5 of 8 (Automated Calibration) -- IN PROGRESS
-Plan: 1 of 2 in current phase (1 complete)
-Status: Plan 05-01 complete (Calibration Pipeline), ready for Plan 05-02
-Last activity: 2026-02-28 -- Completed 05-01 (Calibration Pipeline)
+Phase: 5 of 8 (Automated Calibration) -- COMPLETE
+Plan: 2 of 2 in current phase (2 complete)
+Status: Phase 05 complete, ready for Phase 06 (Crypto Validation)
+Last activity: 2026-02-28 -- Completed 05-02 (Calibration Suggestion Generation)
 
-Progress: [███████░░░] 56%
+Progress: [██████████] 60%
 
 ## Performance Metrics
 
@@ -58,6 +58,7 @@ Progress: [███████░░░] 56%
 | Phase 04 P04 | 2min | 2 tasks | 2 files |
 | Phase 04 P02 | 2min | 2 tasks | 2 files |
 | Phase 05 P01 | 4min | 2 tasks | 3 files |
+| Phase 05 P02 | 5min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -105,6 +106,10 @@ Recent decisions affecting current work:
 - [Phase 05-01]: Continue on stage failure -- failed reconcile should not prevent backtest from running
 - [Phase 05-01]: Baselines only update on explicit --update-baseline flag, never auto-update on detection runs
 - [Phase 05-01]: Calibrate stage runs with --json only (no --save) to prevent auto-applying calibration in pipeline
+- [Phase 05-02]: 5% aggregate Brier improvement threshold for suggestion generation -- filters noise
+- [Phase 05-02]: Suggestion files use date-stamped names with -N suffix for same-day duplicates
+- [Phase 05-02]: apply_suggestion re-snapshots baselines after applying -- ensures drift detection reflects new calibration
+- [Phase 05-02]: Calibration sections use global_brier field matching calibrate-sigma.py output structure
 
 ### Pending Todos
 
@@ -117,5 +122,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-28
-Stopped at: Completed 05-01-PLAN.md (Calibration Pipeline)
+Stopped at: Completed 05-02-PLAN.md (Calibration Suggestion Generation)
 Resume file: None
