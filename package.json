@@ -18,6 +18,8 @@
     "calibrate": "python3 scripts/calibrate-sigma.py",
     "backtest": "python3 scripts/backtest.py",
     "backtest:daily": "python3 scripts/daily-backtest.py",
+    "pipeline": "python3 scripts/calibration-pipeline.py",
+    "pipeline:dry": "python3 scripts/calibration-pipeline.py --dry-run",
     "report": "python3 scripts/daily-report.py",
     "report:notify": "python3 scripts/daily-report.py --notify --with-backtest",
     "audit": "python3 scripts/audit.py",
