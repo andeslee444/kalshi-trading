@@ -264,6 +264,8 @@ def ensemble_weather_probability(forecasts, threshold, direction, days_out=0, ci
         if w <= 0:
             continue
         prob = weather_probability(temp, threshold, direction, days_out, city=city)
+        if prob is None:
+            continue
         weighted_prob += w * prob
         total_weight += w
 
