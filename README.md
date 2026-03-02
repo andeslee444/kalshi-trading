@@ -224,3 +224,4 @@ The `research/` directory contains strategy documentation:
 - `kalshi-deep-dive.md` — Comprehensive Kalshi API analysis, community insights, strategy ranking
 - `kalshi-info-arbitrage.md` — Settlement source monitoring: which sources publish before Kalshi settles, timing windows, scraping methods
 - `kalshi-markets-research.md` — Academic findings (Becker 2025, Whelan 2025), strategy rankings, mathematical methods, cross-platform arbitrage analysis
+
