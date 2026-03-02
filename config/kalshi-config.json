@@ -1,9 +1,9 @@
 {
   "mode": "demo",
-  "maxTradeAmount": 15,
+  "maxTradeAmount": 30,
   "maxTradeAmountPct": 0.03,
   "maxDailyTrades": 10,
-  "maxDailyLoss": 35,
+  "maxDailyLoss": 75,
   "maxDailyLossPct": 0.07,
   "scanIntervalMinutes": 30,
   "edgeThreshold": 0.06,

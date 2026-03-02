@@ -48,17 +48,16 @@ BOT_PRIORITY = {
 }
 
 # Max fraction of bankroll any single bot can consume per day
-MAX_BOT_FRACTION = 0.40
+# Tightened from 0.40 to 0.30 for better cross-strategy diversification at $5K
+MAX_BOT_FRACTION = 0.30
 
 # Max fraction of bankroll in any single ticker
-# Reduced from 0.15 to 0.05 — prevents single-position blowups like
-# the Houston B77.5 position (66 contracts, $29 exposure on one bracket)
-MAX_TICKER_FRACTION = 0.05
+# $5K * 3% = $150 max per ticker (was $250 at 5%)
+MAX_TICKER_FRACTION = 0.03
 
 # Max fraction of bankroll in any single city (weather markets)
-# Multiple brackets on the same city (e.g., Houston B77, B78, B79) are
-# correlated — capping at 10% prevents over-concentration
-MAX_CITY_FRACTION = 0.10
+# Tightened from 0.10 to 0.07 for tighter correlation risk at scale
+MAX_CITY_FRACTION = 0.07
 
 # Portfolio-wide daily loss cap as fraction of bankroll
 PORTFOLIO_DAILY_LOSS_FRACTION = 0.25
