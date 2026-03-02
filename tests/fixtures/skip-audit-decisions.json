@@ -1,0 +1,12 @@
+[
+  {"timestamp": "2026-03-01T10:00:00", "ticker": "KXBTCD-26MAR0112-T85000", "side": "yes", "action": "skipped", "reason": "edge below threshold", "source_bot": "crypto", "edge": 0.05, "price_cents": 92},
+  {"timestamp": "2026-03-01T10:00:01", "ticker": "KXBTCD-26MAR0112-T90000", "side": "yes", "action": "skipped", "reason": "illiquid", "source_bot": "crypto", "edge": 0.12, "price_cents": 45},
+  {"timestamp": "2026-03-01T10:00:02", "ticker": "KXBTCD-26MAR0112-T80000", "side": "yes", "action": "placed", "reason": "edge above threshold", "source_bot": "crypto", "edge": 0.15, "price_cents": 60},
+  {"timestamp": "2026-03-01T10:00:03", "ticker": "KXHIGHMIA-26MAR02-T86", "side": "yes", "action": "skipped", "reason": "allocator_denied", "source_bot": "weather", "edge": 0.10, "price_cents": 55},
+  {"timestamp": "2026-03-01T10:00:04", "ticker": "KXHIGHMIA-26MAR02-T88", "side": "no", "action": "skipped", "reason": "kelly_zero", "source_bot": "weather", "edge": 0.02, "price_cents": 95},
+  {"timestamp": "2026-03-01T10:00:05", "ticker": "KXCPI-26MAR15-T3.5", "side": "yes", "action": "skipped", "reason": "execution_disabled", "source_bot": "cross-platform-arb", "edge": 0.04, "price_cents": 50},
+  {"timestamp": "2026-03-01T10:00:06", "ticker": "ALBUM-26MAR07-SALES", "side": "yes", "action": "skipped", "reason": "low_edge", "source_bot": "entertainment", "edge": 0.03, "price_cents": 70},
+  {"timestamp": "2026-03-01T10:00:07", "ticker": "ALBUM-26MAR07-SALES2", "side": "yes", "action": "skipped", "reason": "illiquid_no_ask", "source_bot": "entertainment", "edge": 0.20, "price_cents": null},
+  {"timestamp": "2026-03-01T10:00:08", "ticker": "KXBTCD-26MAR0112-T95000", "side": "yes", "action": "skipped", "reason": "no_price", "source_bot": "crypto"},
+  {"timestamp": "2026-03-01T10:00:09", "ticker": "KXBTCD-26MAR0112-T70000", "side": "no", "action": "skipped", "reason": "edge below mid-range threshold", "source_bot": "crypto", "edge": 0.10, "price_cents": 30}
+]
