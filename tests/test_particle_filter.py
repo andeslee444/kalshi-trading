@@ -12,6 +12,7 @@ from particle_filter import (
     ParticleFilter,
     FilteredEstimate,
     FilterConfig,
+    ci_kelly_multiplier,
 )
 
 
@@ -319,3 +320,48 @@ class TestStatePersistence:
         state = pf.serialize()
         assert state["config"]["process_noise"] == 0.03
         assert state["config"]["n_particles"] == 100
+
+
+class TestCIAwareKelly:
+    """Test CI-aware position sizing adjustments."""
+
+    def test_narrow_ci_no_reduction(self):
+        """Narrow CI -> full Kelly (multiplier = 1.0)."""
+        est = FilteredEstimate(prob=0.7, ci_low=0.65, ci_high=0.75,
+                               trend="none", n_updates=20)
+        mult = ci_kelly_multiplier(est)
+        assert mult == pytest.approx(1.0, abs=0.05)
+
+    def test_wide_ci_reduces_kelly(self):
+        """Wide CI -> reduced Kelly."""
+        est = FilteredEstimate(prob=0.7, ci_low=0.4, ci_high=1.0,
+                               trend="none", n_updates=5)
+        mult = ci_kelly_multiplier(est)
+        assert mult < 0.8
+
+    def test_very_wide_ci_minimum_multiplier(self):
+        """Very wide CI -> minimum multiplier (0.25)."""
+        est = FilteredEstimate(prob=0.5, ci_low=0.05, ci_high=0.95,
+                               trend="none", n_updates=1)
+        mult = ci_kelly_multiplier(est)
+        assert mult == pytest.approx(0.25, abs=0.05)
+
+    def test_trend_bonus(self):
+        """Confirmed trend gives a small multiplier bonus."""
+        est_trend = FilteredEstimate(prob=0.7, ci_low=0.55, ci_high=0.85,
+                                     trend="up", n_updates=10)
+        est_no_trend = FilteredEstimate(prob=0.7, ci_low=0.55, ci_high=0.85,
+                                        trend="none", n_updates=10)
+        mult_trend = ci_kelly_multiplier(est_trend)
+        mult_no = ci_kelly_multiplier(est_no_trend)
+        assert mult_trend >= mult_no
+
+    def test_few_updates_reduces_multiplier(self):
+        """Fewer updates -> less confident -> lower multiplier."""
+        est_many = FilteredEstimate(prob=0.7, ci_low=0.55, ci_high=0.85,
+                                     trend="none", n_updates=20)
+        est_few = FilteredEstimate(prob=0.7, ci_low=0.55, ci_high=0.85,
+                                    trend="none", n_updates=2)
+        mult_many = ci_kelly_multiplier(est_many)
+        mult_few = ci_kelly_multiplier(est_few)
+        assert mult_many >= mult_few

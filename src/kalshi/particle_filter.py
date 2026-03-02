@@ -280,3 +280,45 @@ class ParticleFilter:
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             _log.warning("Failed to load particle filter state: %s", e)
             return cls(config=config)
+
+
+def ci_kelly_multiplier(estimate: FilteredEstimate,
+                        narrow_threshold: float = 0.10,
+                        wide_threshold: float = 0.60,
+                        min_multiplier: float = 0.25,
+                        min_updates: int = 5) -> float:
+    """Compute a Kelly fraction multiplier based on filter CI width.
+
+    Narrow CI (< narrow_threshold) -> full Kelly (1.0)
+    Wide CI (> wide_threshold) -> minimum Kelly (min_multiplier)
+    In between -> linear interpolation
+
+    Also reduces for:
+      - Few updates (< min_updates): scales from 0.5 to 1.0
+      - No trend confirmation: no bonus
+
+    Returns:
+        Multiplier in [min_multiplier, 1.0] to apply to Kelly fraction.
+    """
+    ci_width = estimate.ci_width
+
+    # CI-based multiplier
+    if ci_width <= narrow_threshold:
+        ci_mult = 1.0
+    elif ci_width >= wide_threshold:
+        ci_mult = min_multiplier
+    else:
+        # Linear interpolation
+        fraction = (ci_width - narrow_threshold) / (wide_threshold - narrow_threshold)
+        ci_mult = 1.0 - fraction * (1.0 - min_multiplier)
+
+    # Update count adjustment: ramp from 0.5 to 1.0 over min_updates
+    if estimate.n_updates < min_updates:
+        update_mult = 0.5 + 0.5 * (estimate.n_updates / min_updates)
+    else:
+        update_mult = 1.0
+
+    # Trend bonus: confirmed trend -> 10% bonus (capped at 1.0)
+    trend_bonus = 1.1 if estimate.trend in ("up", "down") else 1.0
+
+    return min(1.0, max(min_multiplier, ci_mult * update_mult * trend_bonus))
