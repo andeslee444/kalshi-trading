@@ -133,3 +133,120 @@ class TestPredictionStep:
         var_low = sum((p - 0.5)**2 for p in pf_low.particles) / len(pf_low.particles)
         var_high = sum((p - 0.5)**2 for p in pf_high.particles) / len(pf_high.particles)
         assert var_high > var_low
+
+
+class TestUpdateStep:
+    """Test the update (observation) step with resampling."""
+
+    def test_update_shifts_estimate_toward_observation(self):
+        """After observing 0.8, estimate should move toward 0.8."""
+        pf = ParticleFilter(config=FilterConfig(
+            n_particles=2000, process_noise=0.01, observation_noise=0.05))
+        # Start uniform
+        est_before = pf.estimate()
+        assert est_before.prob == pytest.approx(0.5, abs=0.1)
+
+        pf.update(0.8)
+        est_after = pf.estimate()
+        assert est_after.prob > est_before.prob
+        assert est_after.prob > 0.6
+
+    def test_multiple_updates_converge(self):
+        """Repeated observations at 0.7 should converge the filter."""
+        pf = ParticleFilter(config=FilterConfig(
+            n_particles=1000, process_noise=0.01, observation_noise=0.05))
+
+        for _ in range(10):
+            pf.update(0.7)
+
+        est = pf.estimate()
+        assert est.prob == pytest.approx(0.7, abs=0.05)
+        assert est.ci_width < 0.15  # should be relatively narrow
+
+    def test_update_increments_count(self):
+        """Each update increments n_updates."""
+        pf = ParticleFilter()
+        assert pf.estimate().n_updates == 0
+        pf.update(0.5)
+        assert pf.estimate().n_updates == 1
+        pf.update(0.6)
+        assert pf.estimate().n_updates == 2
+
+    def test_conflicting_observations_center_estimate(self):
+        """Alternating high/low observations should center the estimate."""
+        pf = ParticleFilter(config=FilterConfig(
+            n_particles=1000, process_noise=0.02, observation_noise=0.05))
+
+        # Alternate between 0.3 and 0.7
+        for _ in range(5):
+            pf.update(0.3)
+            pf.update(0.7)
+
+        est = pf.estimate()
+        # Estimate should be near the mean of the conflicting observations
+        assert est.prob == pytest.approx(0.5, abs=0.1)
+        # Trend should be "none" (no consistent direction)
+        assert est.trend == "none"
+
+    def test_update_with_high_observation_noise(self):
+        """High observation noise -> slower convergence."""
+        pf_tight = ParticleFilter(config=FilterConfig(
+            n_particles=1000, process_noise=0.01, observation_noise=0.02))
+        pf_loose = ParticleFilter(config=FilterConfig(
+            n_particles=1000, process_noise=0.01, observation_noise=0.20))
+
+        for _ in range(5):
+            pf_tight.update(0.8)
+            pf_loose.update(0.8)
+
+        est_tight = pf_tight.estimate()
+        est_loose = pf_loose.estimate()
+        # Tight obs noise -> closer to 0.8 and narrower CI
+        assert est_tight.ci_width < est_loose.ci_width
+
+
+class TestSystematicResampling:
+    """Test systematic resampling algorithm."""
+
+    def test_resampling_preserves_particle_count(self):
+        """After resampling, still have N particles."""
+        pf = ParticleFilter(config=FilterConfig(n_particles=100))
+        # Make weights very uneven (should trigger resampling)
+        pf.weights = [0.0] * 99 + [1.0]
+        pf._systematic_resample()
+        assert len(pf.particles) == 100
+        assert len(pf.weights) == 100
+
+    def test_resampling_equalizes_weights(self):
+        """After resampling, weights should be uniform."""
+        pf = ParticleFilter(config=FilterConfig(n_particles=100))
+        pf.weights = [0.0] * 99 + [1.0]
+        pf._systematic_resample()
+        expected = 1.0 / 100
+        for w in pf.weights:
+            assert w == pytest.approx(expected, abs=1e-6)
+
+    def test_resampling_concentrates_on_high_weight(self):
+        """High-weight particle should be duplicated many times."""
+        pf = ParticleFilter(config=FilterConfig(n_particles=100))
+        pf.particles = [float(i) / 100 for i in range(100)]
+        # Give all weight to particle at 0.75
+        pf.weights = [0.0] * 100
+        pf.weights[75] = 1.0
+        pf._systematic_resample()
+        # Most particles should now be at 0.75
+        count_75 = sum(1 for p in pf.particles if abs(p - 0.75) < 0.01)
+        assert count_75 > 80
+
+    def test_ess_computation(self):
+        """Effective sample size with uniform weights = N."""
+        pf = ParticleFilter(config=FilterConfig(n_particles=100))
+        ess = pf._effective_sample_size()
+        assert ess == pytest.approx(100, abs=1.0)
+
+    def test_ess_with_degenerate_weights(self):
+        """ESS with one dominant weight -> near 1."""
+        pf = ParticleFilter(config=FilterConfig(n_particles=100))
+        pf.weights = [0.0001] * 99 + [1.0 - 0.0099]
+        ess = pf._effective_sample_size()
+        assert ess < 5

@@ -122,6 +122,91 @@ class ParticleFilter:
             self.particles[i] += random.gauss(0, noise)
             self.particles[i] = max(eps, min(1.0 - eps, self.particles[i]))
 
+    def _gaussian_likelihood(self, observation: float, particle: float) -> float:
+        """Gaussian likelihood: P(obs | particle) = N(obs; particle, sigma)."""
+        sigma = self.config.observation_noise
+        if sigma <= 0:
+            return 1.0 if abs(observation - particle) < 0.001 else 0.0
+        diff = observation - particle
+        return math.exp(-0.5 * (diff / sigma) ** 2)
+
+    def _effective_sample_size(self) -> float:
+        """Compute ESS = 1 / sum(w_i^2). Measures weight degeneracy."""
+        sum_sq = sum(w * w for w in self.weights)
+        if sum_sq <= 0:
+            return 0.0
+        return 1.0 / sum_sq
+
+    def _systematic_resample(self):
+        """Systematic resampling: deterministic O(N) algorithm.
+
+        More variance-efficient than multinomial resampling.
+        """
+        n = self.n_particles
+        cumulative = []
+        cum = 0.0
+        for w in self.weights:
+            cum += w
+            cumulative.append(cum)
+
+        # Systematic: one random offset, then evenly spaced
+        u0 = random.random() / n
+        new_particles = []
+        idx = 0
+        for i in range(n):
+            u = u0 + i / n
+            while idx < n - 1 and cumulative[idx] < u:
+                idx += 1
+            new_particles.append(self.particles[idx])
+
+        self.particles = new_particles
+        self.weights = [1.0 / n] * n
+
+    def update(self, observation: float):
+        """Update step: incorporate a new observation.
+
+        1. Predict (diffuse particles)
+        2. Compute likelihood weights
+        3. Resample if ESS is low
+
+        Args:
+            observation: New probability estimate from the model (0-1).
+        """
+        observation = max(0.001, min(0.999, observation))
+
+        # 1. Predict
+        self.predict()
+
+        # 2. Update weights with likelihood
+        for i in range(self.n_particles):
+            likelihood = self._gaussian_likelihood(observation, self.particles[i])
+            self.weights[i] *= likelihood
+
+        # Normalize weights
+        total = sum(self.weights)
+        if total > 0:
+            self.weights = [w / total for w in self.weights]
+        else:
+            # Weight collapse: reset to uniform
+            self.weights = [1.0 / self.n_particles] * self.n_particles
+            _log.warning("Particle weight collapse — resetting to uniform")
+
+        # 3. Resample if ESS drops below threshold
+        ess = self._effective_sample_size()
+        ess_ratio = ess / self.n_particles
+        if ess_ratio < self.config.resample_threshold:
+            self._systematic_resample()
+
+        # Track update direction for trend detection
+        new_prob = sum(p * w for p, w in zip(self.particles, self.weights))
+        direction = "up" if new_prob > self._last_prob + 0.005 else \
+                    "down" if new_prob < self._last_prob - 0.005 else "flat"
+        self._recent_directions.append(direction)
+        if len(self._recent_directions) > 10:
+            self._recent_directions = self._recent_directions[-10:]
+        self._last_prob = new_prob
+        self._update_count += 1
+
     def _detect_trend(self) -> str:
         """Detect trend from recent update directions."""
         window = self.config.trend_window
