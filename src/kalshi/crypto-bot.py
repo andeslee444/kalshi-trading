@@ -378,10 +378,18 @@ def scan_and_trade():
         threshold = parsed["threshold"]
         direction = parsed.get("direction", "T")
 
-        # Skip bracket markets if disabled (87% non-fill rate)
-        if direction == "B" and not crypto_config.get("enableBrackets", True):
-            ss.skip("brackets_disabled")
-            continue
+        # Bracket markets: gate on tighter liquidity (spread < 15c, volume > 10)
+        if direction == "B":
+            if not crypto_config.get("enableBrackets", True):
+                ss.skip("brackets_disabled")
+                continue
+            b_spread = (m.get("yes_ask", 0) - m.get("yes_bid", 0)) if m.get("yes_bid") else 999
+            b_volume = m.get("volume", 0) or 0
+            if b_spread > 15 or b_volume < 10:
+                ss.skip("bracket_illiquid")
+                trade_manager.log_decision(ticker, "yes", "skipped", "bracket_illiquid",
+                                           spread=b_spread, volume=b_volume)
+                continue
 
         # Estimate time to settlement
         minutes_to_settle = estimate_time_to_settlement(m)
@@ -469,6 +477,7 @@ def scan_and_trade():
                     "current_price": current_price, "threshold": threshold,
                     "minutes_to_settle": minutes_to_settle,
                     "vol_used": vol_to_use,
+                    "is_bracket": direction == "B",
                 })
             else:
                 reason = "edge below mid-range threshold" if eff_threshold > EDGE_THRESHOLD else "edge below threshold"
@@ -486,6 +495,7 @@ def scan_and_trade():
                     "current_price": current_price, "threshold": threshold,
                     "minutes_to_settle": minutes_to_settle,
                     "vol_used": vol_to_use,
+                    "is_bracket": direction == "B",
                 })
             else:
                 reason = "edge below mid-range threshold" if eff_threshold > EDGE_THRESHOLD else "edge below threshold"
@@ -517,7 +527,10 @@ def scan_and_trade():
                                        edge=edge, price_cents=yes_ask if side == "yes" else no_ask)
             continue
 
-        price = compute_limit_price(yes_bid, yes_ask, side, edge=edge) or (yes_ask if side == "yes" else no_ask)
+        if opp.get("is_bracket"):
+            price = yes_ask  # Bracket: always use ask for fill rate
+        else:
+            price = compute_limit_price(yes_bid, yes_ask, side, edge=edge) or (yes_ask if side == "yes" else no_ask)
         if not price or price <= 0:
             continue
 
@@ -563,7 +576,8 @@ def scan_and_trade():
                                             threshold=opp["threshold"],
                                             minutes_to_settle=opp["minutes_to_settle"],
                                             asset=opp["asset"],
-                                            vol_used=round(opp["vol_used"], 4))
+                                            vol_used=round(opp["vol_used"], 4),
+                                            bracket=opp.get("is_bracket", False))
         if result:
             ss.trades_placed += 1
             allocator.record_trade("crypto", ticker, risk, edge=edge)

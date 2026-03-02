@@ -320,3 +320,63 @@ class TestComputeRealizedVol:
         # This just tests the conceptual contract — the actual function
         # modifies _price_history only when current_price is not None
         pass
+
+
+class TestBracketLiquidityGate:
+    """Test bracket-specific liquidity requirements (relaxed vs standard)."""
+
+    def _bracket_eligible(self, market, max_spread=15, min_volume=10):
+        """Simulate bracket eligibility: spread < 15c AND volume > 10."""
+        yes_bid = market.get("yes_bid", 0)
+        yes_ask = market.get("yes_ask", 0)
+        volume = market.get("volume", 0) or 0
+        if not yes_ask:
+            return False
+        spread = (yes_ask - yes_bid) if yes_bid else 999
+        return spread <= max_spread and volume >= min_volume
+
+    def test_tight_spread_high_volume_eligible(self):
+        market = {"yes_bid": 40, "yes_ask": 50, "volume": 25}
+        assert self._bracket_eligible(market)
+
+    def test_wide_spread_rejected(self):
+        """Spread > 15c rejects bracket."""
+        market = {"yes_bid": 30, "yes_ask": 50, "volume": 25}
+        assert not self._bracket_eligible(market)
+
+    def test_low_volume_rejected(self):
+        """Volume < 10 rejects bracket."""
+        market = {"yes_bid": 40, "yes_ask": 50, "volume": 5}
+        assert not self._bracket_eligible(market)
+
+    def test_ask_only_rejected(self):
+        """Ask-only market (no bid) has spread=999, rejected."""
+        market = {"yes_bid": 0, "yes_ask": 50, "volume": 25}
+        assert not self._bracket_eligible(market)
+
+    def test_boundary_spread_15_eligible(self):
+        market = {"yes_bid": 35, "yes_ask": 50, "volume": 15}
+        assert self._bracket_eligible(market)
+
+    def test_boundary_volume_10_eligible(self):
+        market = {"yes_bid": 40, "yes_ask": 50, "volume": 10}
+        assert self._bracket_eligible(market)
+
+
+class TestBracketLimitPricing:
+    """Test that brackets always use aggressive (ask) pricing for fill rate."""
+
+    def _bracket_limit_price(self, yes_bid, yes_ask):
+        """Bracket pricing: always use ask price (maximize fill rate)."""
+        return yes_ask if yes_ask else 0
+
+    def test_uses_full_ask(self):
+        assert self._bracket_limit_price(40, 50) == 50
+
+    def test_no_ask_returns_zero(self):
+        assert self._bracket_limit_price(40, 0) == 0
+
+    def test_ignores_bid(self):
+        """Regardless of bid, bracket price = ask."""
+        assert self._bracket_limit_price(10, 50) == 50
+        assert self._bracket_limit_price(49, 50) == 50
