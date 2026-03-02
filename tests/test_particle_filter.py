@@ -250,3 +250,72 @@ class TestSystematicResampling:
         pf.weights = [0.0001] * 99 + [1.0 - 0.0099]
         ess = pf._effective_sample_size()
         assert ess < 5
+
+
+class TestStatePersistence:
+    """Test JSON state serialization/deserialization."""
+
+    def test_serialize_roundtrip(self):
+        """Serialize then deserialize preserves state."""
+        pf = ParticleFilter(config=FilterConfig(n_particles=50))
+        pf.update(0.7)
+        pf.update(0.7)
+
+        state = pf.serialize()
+        pf2 = ParticleFilter.deserialize(state)
+
+        est1 = pf.estimate()
+        est2 = pf2.estimate()
+        assert est1.prob == pytest.approx(est2.prob, abs=0.001)
+        assert est1.n_updates == est2.n_updates
+        assert len(pf2.particles) == 50
+
+    def test_save_and_load_file(self, tmp_path):
+        """Save to file and load back."""
+        pf = ParticleFilter(config=FilterConfig(n_particles=50))
+        pf.update(0.8)
+
+        filepath = tmp_path / "pf-test.json"
+        pf.save(filepath)
+        assert filepath.exists()
+
+        pf2 = ParticleFilter.load(filepath)
+        est = pf2.estimate()
+        assert est.n_updates == 1
+
+    def test_load_nonexistent_returns_new(self, tmp_path):
+        """Loading from nonexistent file returns fresh filter."""
+        filepath = tmp_path / "nonexistent.json"
+        pf = ParticleFilter.load(filepath)
+        assert pf.estimate().n_updates == 0
+
+    def test_load_corrupt_file_returns_new(self, tmp_path):
+        """Loading corrupt JSON returns fresh filter."""
+        filepath = tmp_path / "corrupt.json"
+        filepath.write_text("{invalid json")
+        pf = ParticleFilter.load(filepath)
+        assert pf.estimate().n_updates == 0
+
+    def test_staleness_check(self, tmp_path):
+        """State older than max_age is rejected."""
+        pf = ParticleFilter(config=FilterConfig(n_particles=50))
+        pf.update(0.8)
+
+        filepath = tmp_path / "pf-stale.json"
+        pf.save(filepath)
+
+        # Manually backdate the saved_at timestamp
+        data = json.loads(filepath.read_text())
+        data["saved_at"] = time.time() - 100000
+        filepath.write_text(json.dumps(data))
+
+        pf2 = ParticleFilter.load(filepath, max_age_seconds=3600)
+        assert pf2.estimate().n_updates == 0  # rejected as stale
+
+    def test_serialize_includes_config(self):
+        """Serialized state includes config for reconstruction."""
+        config = FilterConfig(n_particles=100, process_noise=0.03)
+        pf = ParticleFilter(config=config)
+        state = pf.serialize()
+        assert state["config"]["process_noise"] == 0.03
+        assert state["config"]["n_particles"] == 100

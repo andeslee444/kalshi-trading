@@ -218,3 +218,65 @@ class ParticleFilter:
         if all(d == "down" for d in recent):
             return "down"
         return "none"
+
+    def serialize(self) -> dict:
+        """Serialize filter state to a JSON-compatible dict."""
+        return {
+            "particles": self.particles,
+            "weights": self.weights,
+            "update_count": self._update_count,
+            "recent_directions": self._recent_directions,
+            "last_prob": self._last_prob,
+            "config": asdict(self.config),
+            "saved_at": time.time(),
+        }
+
+    @classmethod
+    def deserialize(cls, state: dict) -> "ParticleFilter":
+        """Reconstruct a filter from serialized state."""
+        config_data = state.get("config", {})
+        config = FilterConfig(**{k: v for k, v in config_data.items()
+                                  if k in FilterConfig.__dataclass_fields__})
+        pf = cls(config=config)
+        pf.particles = state.get("particles", pf.particles)
+        pf.weights = state.get("weights", pf.weights)
+        pf._update_count = state.get("update_count", 0)
+        pf._recent_directions = state.get("recent_directions", [])
+        pf._last_prob = state.get("last_prob", 0.5)
+        pf.n_particles = len(pf.particles)
+        return pf
+
+    def save(self, filepath: Path):
+        """Save filter state to a JSON file."""
+        try:
+            from kalshi_auth import _atomic_write_json
+            _atomic_write_json(filepath, self.serialize())
+        except ImportError:
+            # Fallback if kalshi_auth not available (e.g. in tests)
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            filepath.write_text(json.dumps(self.serialize(), indent=2))
+
+    @classmethod
+    def load(cls, filepath: Path, max_age_seconds: int = 86400,
+             config: Optional[FilterConfig] = None) -> "ParticleFilter":
+        """Load filter state from a JSON file.
+
+        Returns:
+            Restored filter, or fresh filter if file missing/stale/corrupt.
+        """
+        try:
+            if not filepath.exists():
+                return cls(config=config)
+            data = json.loads(filepath.read_text())
+            saved_at = data.get("saved_at", 0)
+            if time.time() - saved_at > max_age_seconds:
+                _log.info("Particle filter state stale (%.0fh old), starting fresh",
+                          (time.time() - saved_at) / 3600)
+                return cls(config=config)
+            pf = cls.deserialize(data)
+            if config:
+                pf.config = config
+            return pf
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            _log.warning("Failed to load particle filter state: %s", e)
+            return cls(config=config)
