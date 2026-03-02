@@ -203,3 +203,102 @@ class RSSFeedParser:
         except Exception as e:
             _log.error("  RSS fetch failed for %s: %s", url, e)
             return []
+
+
+@dataclass
+class SentimentResult:
+    """Result of LLM sentiment extraction from a single article."""
+    direction: str       # "higher", "lower", "neutral"
+    magnitude: int       # 1-5 (strength of signal)
+    confidence: float    # 0-1 (LLM's self-assessed confidence)
+    factors: List[str]   # Key factors driving the outlook
+    score: float = 0.0   # Computed: direction * magnitude/5, in [-1, +1]
+
+
+class SentimentExtractor:
+    """Extract CPI/inflation sentiment from article text using DeepSeek LLM.
+
+    Follows the same pattern as beatrelease-scanner.py for LLM calls.
+    """
+
+    DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+
+    PROMPT_TEMPLATE = """Analyze this article for its implications on US CPI inflation.
+
+Output a JSON object with:
+- "direction": "higher", "lower", or "neutral" (expected CPI direction)
+- "magnitude": 1-5 (1=barely, 5=strongly)
+- "confidence": 0.0-1.0 (your confidence in this assessment)
+- "factors": list of 1-3 key factors (e.g. "tariffs", "shelter costs", "energy prices")
+
+Only output the JSON object, no other text.
+
+Article:
+---
+{article_text}
+"""
+
+    def __init__(self, api_key: str = ""):
+        self.api_key = api_key
+
+    def _parse_response(self, raw: str) -> Optional[SentimentResult]:
+        """Parse DeepSeek response into SentimentResult."""
+        # Strip markdown code blocks
+        text = raw.strip()
+        if text.startswith("```"):
+            text = re.sub(r'^```(?:json)?\s*', '', text)
+            text = re.sub(r'\s*```$', '', text)
+
+        try:
+            data = json.loads(text)
+            direction = data.get("direction", "neutral")
+            magnitude = max(1, min(5, int(data.get("magnitude", 3))))
+            confidence = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
+            factors = data.get("factors", [])
+            if not isinstance(factors, list):
+                factors = [str(factors)]
+            score = self._direction_to_score(direction, magnitude)
+            return SentimentResult(
+                direction=direction,
+                magnitude=magnitude,
+                confidence=confidence,
+                factors=factors[:5],
+                score=score,
+            )
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return None
+
+    def _direction_to_score(self, direction: str, magnitude: int) -> float:
+        """Convert direction + magnitude to [-1, +1] score."""
+        if direction == "neutral":
+            return 0.0
+        raw = magnitude / 5.0
+        raw = max(0.0, min(1.0, raw))
+        return raw if direction == "higher" else -raw
+
+    def extract(self, article_text: str) -> Optional[SentimentResult]:
+        """Send article to DeepSeek and extract sentiment.
+
+        Returns SentimentResult, or None on error.
+        """
+        if not self.api_key:
+            return None
+
+        prompt = self.PROMPT_TEMPLATE.format(article_text=article_text[:30000])
+
+        try:
+            resp = retry_request("POST", self.DEEPSEEK_URL, headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }, json={
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 500,
+            }, timeout=60)
+
+            content = resp.json()["choices"][0]["message"]["content"].strip()
+            return self._parse_response(content)
+        except Exception as e:
+            _log.error("  DeepSeek sentiment extraction failed: %s", e)
+            return None

@@ -14,6 +14,8 @@ from macro_engine import (
     TruflationClient,
     RSSFeedParser,
     FeedEntry,
+    SentimentExtractor,
+    SentimentResult,
 )
 
 
@@ -200,3 +202,47 @@ class TestRSSFeedParser:
         parser = RSSFeedParser()
         entry = FeedEntry(title="Movie review: great film", url="", summary="", published="")
         assert not parser._is_relevant(entry)
+
+
+class TestSentimentExtractor:
+    """Tests for DeepSeek LLM sentiment extraction."""
+
+    def test_parse_valid_json_response(self):
+        """Parse a valid JSON response from DeepSeek."""
+        extractor = SentimentExtractor(api_key="test")
+        raw = '{"direction": "higher", "magnitude": 3, "confidence": 0.7, "factors": ["tariffs", "shelter"]}'
+        result = extractor._parse_response(raw)
+        assert result is not None
+        assert result.direction == "higher"
+        assert result.magnitude == 3
+        assert result.confidence == pytest.approx(0.7, abs=0.01)
+        assert "tariffs" in result.factors
+
+    def test_parse_response_with_markdown(self):
+        """Parse JSON wrapped in markdown code block."""
+        extractor = SentimentExtractor(api_key="test")
+        raw = '```json\n{"direction": "lower", "magnitude": 2, "confidence": 0.5, "factors": ["recession"]}\n```'
+        result = extractor._parse_response(raw)
+        assert result is not None
+        assert result.direction == "lower"
+
+    def test_parse_invalid_json_returns_none(self):
+        """Invalid JSON returns None."""
+        extractor = SentimentExtractor(api_key="test")
+        assert extractor._parse_response("This is not JSON") is None
+
+    def test_direction_to_score(self):
+        """Convert direction + magnitude to -1..+1 score."""
+        extractor = SentimentExtractor(api_key="test")
+        # higher with magnitude 3 (out of 5) = +0.6
+        assert extractor._direction_to_score("higher", 3) == pytest.approx(0.6, abs=0.01)
+        # lower with magnitude 4 = -0.8
+        assert extractor._direction_to_score("lower", 4) == pytest.approx(-0.8, abs=0.01)
+        # neutral = 0
+        assert extractor._direction_to_score("neutral", 3) == pytest.approx(0.0, abs=0.01)
+
+    def test_score_clamped_to_range(self):
+        """Score is clamped to [-1, +1]."""
+        extractor = SentimentExtractor(api_key="test")
+        assert extractor._direction_to_score("higher", 6) == pytest.approx(1.0, abs=0.01)
+        assert extractor._direction_to_score("lower", 6) == pytest.approx(-1.0, abs=0.01)
