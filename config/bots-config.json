@@ -110,8 +110,8 @@
   },
   "cross_platform_arb": {
     "scanIntervalMinutes": 10,
-    "minSpreadPct": 0.02,
-    "executionEnabled": false,
+    "minSpreadPct": 0.03,
+    "executionEnabled": true,
     "maxTradeAmount": 25,
     "maxTradeAmountPct": 0.05,
     "maxDailyTrades": 10,

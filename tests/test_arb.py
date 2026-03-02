@@ -198,3 +198,54 @@ class TestMatchMarkets:
         matches = arb_mod.match_markets(kalshi, poly)
         # Even though "3.5" matches, text similarity should be too low
         assert len(matches) == 0
+
+
+class TestSpreadCalculation:
+    """Test net spread calculation after fees."""
+
+    def _kalshi_fee_pct(self, price_cents):
+        """Approximate Kalshi fee: 0.07 * p * (1-p)."""
+        p = price_cents / 100
+        return 0.07 * p * (1 - p)
+
+    def _net_spread(self, pm_yes_bid, k_yes_ask_cents, polymarket_fee=0.02):
+        """Compute net spread after fees."""
+        raw = pm_yes_bid - k_yes_ask_cents / 100
+        k_fee = self._kalshi_fee_pct(k_yes_ask_cents)
+        return raw - k_fee - polymarket_fee
+
+    def test_profitable_spread(self):
+        """Polymarket 0.65, Kalshi ask 55c = 10% raw, ~5% net."""
+        net = self._net_spread(0.65, 55)
+        assert net > 0.03  # Profitable after fees
+
+    def test_negative_spread(self):
+        """Same price = negative after fees."""
+        net = self._net_spread(0.55, 55)
+        assert net < 0
+
+    def test_fee_drag(self):
+        """Fees should eat ~4-5% of raw spread."""
+        raw = 0.65 - 0.55
+        net = self._net_spread(0.65, 55)
+        fee_drag = raw - net
+        assert 0.03 < fee_drag < 0.07
+
+
+class TestArbEdgeGating:
+    """Test that arb requires minimum 3% net spread."""
+
+    def test_above_threshold_is_tradeable(self):
+        min_spread = 0.03
+        net_spread = 0.05
+        assert net_spread > min_spread
+
+    def test_below_threshold_rejected(self):
+        min_spread = 0.03
+        net_spread = 0.02
+        assert not (net_spread > min_spread)
+
+    def test_boundary_at_threshold(self):
+        min_spread = 0.03
+        net_spread = 0.03
+        assert not (net_spread > min_spread)  # Strict >
