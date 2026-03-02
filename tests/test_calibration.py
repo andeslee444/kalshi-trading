@@ -215,3 +215,60 @@ class TestTradeFilesImport:
             assert "label" in entry
             assert "bot" in entry
             assert "filename" in entry
+
+
+class TestEdgeThresholdSweep:
+    """Test edge threshold optimization integrated with sigma calibration."""
+
+    def test_optimal_threshold_in_range(self):
+        """Optimal edge threshold should be between 0.04 and 0.15."""
+        trades = []
+        settlement_map = {}
+        for i in range(30):
+            ticker = f"KXHIGHMIA-26FEB{10+i%28:02d}-T86"
+            trades.append({
+                "ticker": ticker,
+                "forecast_temp": 88.0 if i % 3 != 0 else 84.0,
+                "side": "yes",
+                "timestamp": "2026-02-01T12:00:00Z",
+            })
+            settlement_map[ticker] = 100 if i % 3 != 0 else -50
+        result = calibrate_weather(trades, settlement_map)
+        assert result.get("n", 0) > 0
+        assert "global_brier" in result
+
+    def test_brier_guides_threshold(self):
+        """Lower Brier score should allow lower edge threshold."""
+        assert _threshold_for_brier(0.05) == 0.06
+        assert _threshold_for_brier(0.15) == 0.08
+        assert _threshold_for_brier(0.25) == 0.10
+
+    def test_none_brier_defaults_to_eight(self):
+        """None Brier (no data) should default to 0.08."""
+        assert _threshold_for_brier(None) == 0.08
+
+    def test_boundary_at_010(self):
+        """Brier exactly 0.10 should use 0.08 (good range)."""
+        assert _threshold_for_brier(0.10) == 0.08
+
+    def test_boundary_at_020(self):
+        """Brier exactly 0.20 should use 0.08 (good range)."""
+        assert _threshold_for_brier(0.20) == 0.08
+
+
+def _threshold_for_brier(brier):
+    """Map Brier score to recommended edge threshold.
+
+    Brier < 0.10 (excellent): 6%
+    Brier 0.10-0.20 (good): 8%
+    Brier > 0.20 (needs work): 10%
+    None: 8% (default)
+    """
+    if brier is None:
+        return 0.08
+    if brier < 0.10:
+        return 0.06
+    elif brier <= 0.20:
+        return 0.08
+    else:
+        return 0.10

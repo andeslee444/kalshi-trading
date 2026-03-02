@@ -41,6 +41,23 @@ MONTHS = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
           "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
 
 
+def threshold_for_brier(brier):
+    """Map Brier score to recommended edge threshold.
+
+    Brier < 0.10 (excellent model): threshold 6%
+    Brier 0.10-0.20 (good model): threshold 8%
+    Brier > 0.20 (needs work): threshold 10%
+    """
+    if brier is None:
+        return 0.08
+    if brier < 0.10:
+        return 0.06
+    elif brier <= 0.20:
+        return 0.08
+    else:
+        return 0.10
+
+
 # ─── Helpers ───
 
 def load_trades_safe(filepath):
@@ -441,7 +458,7 @@ def calibrate_weather(trades, settlement_map):
             "shrinkage_weight": round(city_weight, 3),
         }
 
-    return {
+    result = {
         "global_sigma_intercept": best_intercept,
         "global_sigma_slope": best_slope,
         "df": best_df,
@@ -451,6 +468,8 @@ def calibrate_weather(trades, settlement_map):
         "per_city": per_city,
         "n": len(matched),
     }
+    result["recommended_edge_threshold"] = threshold_for_brier(result.get("global_brier"))
+    return result
 
 
 def calibrate_nws(trades, settlement_map):
