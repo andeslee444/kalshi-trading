@@ -12,6 +12,8 @@ from macro_engine import (
     FREDClient,
     MacroSignal,
     TruflationClient,
+    RSSFeedParser,
+    FeedEntry,
 )
 
 
@@ -140,3 +142,61 @@ class TestTruflationClient:
         mock_request.side_effect = Exception("timeout")
         client = TruflationClient()
         assert client.fetch() is None
+
+
+class TestRSSFeedParser:
+    """Tests for RSS/blog feed parsing."""
+
+    SAMPLE_RSS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0">
+    <channel>
+        <title>Test Feed</title>
+        <item>
+            <title>CPI rises to 2.9% on tariff pressure</title>
+            <link>https://example.com/article1</link>
+            <pubDate>Mon, 01 Mar 2026 12:00:00 GMT</pubDate>
+            <description>Consumer prices rose more than expected...</description>
+        </item>
+        <item>
+            <title>Market update: stocks flat</title>
+            <link>https://example.com/article2</link>
+            <pubDate>Sun, 28 Feb 2026 12:00:00 GMT</pubDate>
+            <description>Markets were mostly unchanged...</description>
+        </item>
+    </channel>
+    </rss>"""
+
+    def test_parse_rss_entries(self):
+        """Parse entries from RSS XML."""
+        parser = RSSFeedParser()
+        entries = parser.parse_feed_xml(self.SAMPLE_RSS_XML)
+        assert len(entries) == 2
+        assert entries[0].title == "CPI rises to 2.9% on tariff pressure"
+        assert entries[0].url == "https://example.com/article1"
+
+    def test_filter_relevant_entries(self):
+        """Only entries with CPI/inflation/tariff keywords pass filter."""
+        parser = RSSFeedParser()
+        entries = parser.parse_feed_xml(self.SAMPLE_RSS_XML)
+        relevant = parser.filter_relevant(entries)
+        assert len(relevant) == 1
+        assert "CPI" in relevant[0].title
+
+    def test_empty_feed(self):
+        """Empty RSS feed returns empty list."""
+        parser = RSSFeedParser()
+        entries = parser.parse_feed_xml("<rss><channel></channel></rss>")
+        assert entries == []
+
+    def test_filter_keywords(self):
+        """Various macro keywords trigger relevance."""
+        parser = RSSFeedParser()
+        for keyword in ["inflation", "CPI", "tariff", "Fed rate", "jobs report"]:
+            entry = FeedEntry(title=f"Article about {keyword}", url="", summary="", published="")
+            assert parser._is_relevant(entry), f"'{keyword}' should be relevant"
+
+    def test_non_relevant_filtered(self):
+        """Non-macro articles are filtered out."""
+        parser = RSSFeedParser()
+        entry = FeedEntry(title="Movie review: great film", url="", summary="", published="")
+        assert not parser._is_relevant(entry)

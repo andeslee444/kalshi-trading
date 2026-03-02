@@ -6,11 +6,13 @@ Produces MacroSignal with quantified bias adjustments for economics bot.
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional, List, Dict
 
+import feedparser
 import requests
 
 from kalshi_auth import retry_request, _atomic_write_json, PROJECT_DIR
@@ -143,3 +145,61 @@ class TruflationClient:
         except Exception as e:
             _log.error("  Truflation fetch failed: %s", e)
             return None
+
+
+@dataclass
+class FeedEntry:
+    """A single RSS/blog feed entry."""
+    title: str
+    url: str
+    summary: str
+    published: str
+
+
+# Keywords that indicate macro/inflation relevance
+_MACRO_KEYWORDS = re.compile(
+    r'(?:cpi|inflation|tariff|trade.?war|fed\s+rate|fomc|interest.?rate|'
+    r'jobs?\s+report|nonfarm|employment|gdp|recession|price.?index|'
+    r'consumer.?price|import.?price|pce|shelter|rent|wage|labor.?market|'
+    r'treasury|bond.?yield|breakeven|deficit|fiscal|monetary.?policy)',
+    re.IGNORECASE,
+)
+
+
+class RSSFeedParser:
+    """Parse RSS/Atom feeds and filter for macro-relevant articles."""
+
+    def parse_feed_xml(self, xml_text: str) -> List[FeedEntry]:
+        """Parse RSS/Atom XML into FeedEntry list."""
+        feed = feedparser.parse(xml_text)
+        entries = []
+        for entry in feed.entries:
+            entries.append(FeedEntry(
+                title=entry.get("title", ""),
+                url=entry.get("link", ""),
+                summary=entry.get("summary", entry.get("description", "")),
+                published=entry.get("published", ""),
+            ))
+        return entries
+
+    def _is_relevant(self, entry: FeedEntry) -> bool:
+        """Check if a feed entry is relevant to macro/inflation analysis."""
+        text = f"{entry.title} {entry.summary}".lower()
+        return bool(_MACRO_KEYWORDS.search(text))
+
+    def filter_relevant(self, entries: List[FeedEntry]) -> List[FeedEntry]:
+        """Filter entries to only macro-relevant ones."""
+        return [e for e in entries if self._is_relevant(e)]
+
+    def fetch_feed(self, url: str) -> List[FeedEntry]:
+        """Fetch and parse an RSS/Atom feed URL.
+
+        Returns list of FeedEntry, empty on error.
+        """
+        try:
+            resp = retry_request("GET", url, timeout=15,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+            return self.parse_feed_xml(resp.text)
+        except Exception as e:
+            _log.error("  RSS fetch failed for %s: %s", url, e)
+            return []
