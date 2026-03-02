@@ -32,6 +32,7 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 PID_DIR = PROJECT_DIR / "data" / "pids"
 PID_DIR.mkdir(parents=True, exist_ok=True)
 HEALTH_STATE_PATH = PROJECT_DIR / "data" / "health-state.json"
+SUPERVISOR_STATE_PATH = PID_DIR / "supervisor-state.json"
 
 # Bot definitions — maps name -> command (derived from package.json)
 BOT_COMMANDS = {
@@ -190,17 +191,21 @@ class BotProcess:
             return False
 
     def stop(self):
-        """Stop the bot process (SIGTERM, then SIGKILL after 10s)."""
+        """Stop the bot process (SIGTERM to process group, then SIGKILL after 10s)."""
         pid = self._read_pid()
         if pid is None:
             return
 
         log.info(f"  Stopping {self.name} (PID {pid})...")
         try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            self._remove_pid()
-            return
+            # Kill entire process group (bots use start_new_session=True)
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                self._remove_pid()
+                return
 
         # Wait up to 10s for graceful shutdown
         for _ in range(20):
@@ -210,12 +215,15 @@ class BotProcess:
             except ProcessLookupError:
                 break
         else:
-            # Still running — force kill
+            # Still running — force kill process group
             try:
                 log.warning(f"  {self.name} didn't stop, sending SIGKILL")
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
         self._remove_pid()
         self.process = None
@@ -319,6 +327,58 @@ class Supervisor:
         }
         self._running = True
         self._last_calibration_check = 0
+        self._load_state()
+
+    def _load_state(self):
+        """Restore started_at and restart_count for running bots from state file."""
+        if not SUPERVISOR_STATE_PATH.exists():
+            return
+        try:
+            state = json.loads(SUPERVISOR_STATE_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            return
+        for name, bot in self.bots.items():
+            bot_state = state.get(name)
+            if bot_state and bot.is_running():
+                bot.started_at = bot_state.get("started_at")
+                bot.restart_count = bot_state.get("restart_count", 0)
+
+    def _save_state(self):
+        """Persist started_at and restart_count for all bots to state file."""
+        state = {}
+        for name, bot in self.bots.items():
+            if bot.started_at is not None:
+                state[name] = {
+                    "started_at": bot.started_at,
+                    "restart_count": bot.restart_count,
+                }
+        try:
+            tmp = SUPERVISOR_STATE_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, indent=2))
+            tmp.replace(SUPERVISOR_STATE_PATH)
+        except OSError as e:
+            log.warning(f"Failed to save supervisor state: {e}")
+
+    def _adopt_or_kill_orphans(self):
+        """Adopt running orphan processes or clean up stale PID files.
+
+        Called on startup before start_bots() to handle processes left
+        behind by a previous supervisor instance.
+        """
+        for name, bot in self.bots.items():
+            pid = bot._read_pid()
+            if pid is None:
+                continue
+            if bot.is_running():
+                # Adopt: restore started_at from state (already done in _load_state),
+                # fall back to current time if no state was saved
+                if bot.started_at is None:
+                    bot.started_at = time.time()
+                log.info(f"  Adopted orphan {name} (PID {pid})")
+            else:
+                # Dead process — clean up stale PID file
+                bot._remove_pid()
+                log.info(f"  Removed stale PID file for {name} (PID {pid})")
 
     def _resolve_names(self, names=None):
         """Resolve bot names, defaulting to all enabled if none specified."""
@@ -339,6 +399,7 @@ class Supervisor:
         log.info(f"Starting {len(targets)} bot(s)...")
         for name in targets:
             self.bots[name].start()
+        self._save_state()
 
     def stop_bots(self, names=None):
         """Stop specified bots (or all)."""
@@ -383,11 +444,17 @@ class Supervisor:
             uptime = bot.uptime_str()
             restarts = str(bot.restart_count) if bot.restart_count else "-"
 
-            # Last heartbeat from health-state.json
-            bot_health = health.get("bots", {}).get(name, {})
+            # Last heartbeat from health-state.json (use HEARTBEAT_NAMES mapping)
+            hb_name = HEARTBEAT_NAMES.get(name, name)
+            bot_health = health.get("bots", {}).get(hb_name, {})
             heartbeat = bot_health.get("last_heartbeat", "-")
             if heartbeat != "-" and len(heartbeat) > 19:
                 heartbeat = heartbeat[:19]  # trim timezone
+
+            # Flag stale heartbeats
+            is_stale, _ = bot.is_heartbeat_stale(health)
+            if is_stale:
+                heartbeat = f"{heartbeat} STALE"
 
             print(f"{name:<16} {status:<10} {pid_str:<8} {uptime:<8} {restarts:<10} {heartbeat}")
 
@@ -403,6 +470,7 @@ class Supervisor:
         signal.signal(signal.SIGTERM, _shutdown)
         signal.signal(signal.SIGINT, _shutdown)
 
+        self._adopt_or_kill_orphans()
         self.start_bots()
         log.info(f"Supervisor running (checking every {CHECK_INTERVAL}s, Ctrl+C to stop)")
 
@@ -436,10 +504,14 @@ class Supervisor:
 
             # Auto-restart crashed or hung daemons
             health = self._load_health()
+            any_restarted = False
             for name, bot in self.bots.items():
                 if name in DISABLED_BY_DEFAULT:
                     continue
-                bot.check_and_restart(health_data=health)
+                if bot.check_and_restart(health_data=health):
+                    any_restarted = True
+            if any_restarted:
+                self._save_state()
 
             # Check calibration staleness
             self.check_calibration_staleness()
