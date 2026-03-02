@@ -322,3 +322,85 @@ def ci_kelly_multiplier(estimate: FilteredEstimate,
     trend_bonus = 1.1 if estimate.trend in ("up", "down") else 1.0
 
     return min(1.0, max(min_multiplier, ci_mult * update_mult * trend_bonus))
+
+
+class FilterManager:
+    """Manages per-market particle filters for a bot.
+
+    Each market ticker gets its own filter instance. State is persisted
+    to a single JSON file per bot in the state directory.
+
+    Usage:
+        mgr = FilterManager(bot_name="crypto", state_dir=PROJECT_DIR / "data")
+        mgr.load_all()
+
+        pf = mgr.get_filter("KXBTC-MAR-T90000")
+        pf.update(model_prob)
+        est = pf.estimate()
+
+        mgr.save_all()
+    """
+
+    def __init__(self, bot_name: str, state_dir: Path,
+                 default_config: Optional[FilterConfig] = None):
+        self.bot_name = bot_name
+        self.state_dir = state_dir
+        self.default_config = default_config or FilterConfig()
+        self._filters: dict = {}  # ticker -> ParticleFilter
+        self._state_path = state_dir / f"pf-state-{bot_name}.json"
+
+    def get_filter(self, ticker: str) -> ParticleFilter:
+        """Get or create a filter for a market ticker."""
+        if ticker not in self._filters:
+            self._filters[ticker] = ParticleFilter(config=FilterConfig(
+                n_particles=self.default_config.n_particles,
+                process_noise=self.default_config.process_noise,
+                observation_noise=self.default_config.observation_noise,
+                resample_threshold=self.default_config.resample_threshold,
+                trend_window=self.default_config.trend_window,
+            ))
+        return self._filters[ticker]
+
+    def save_all(self):
+        """Save all filter states to a single JSON file."""
+        data = {
+            "bot_name": self.bot_name,
+            "saved_at": time.time(),
+            "filters": {
+                ticker: pf.serialize()
+                for ticker, pf in self._filters.items()
+            },
+        }
+        try:
+            from kalshi_auth import _atomic_write_json
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            _atomic_write_json(self._state_path, data)
+        except ImportError:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            self._state_path.write_text(json.dumps(data, indent=2))
+
+    def load_all(self, max_age_seconds: int = 86400):
+        """Load all filter states from disk."""
+        try:
+            if not self._state_path.exists():
+                return
+            data = json.loads(self._state_path.read_text())
+            saved_at = data.get("saved_at", 0)
+            if time.time() - saved_at > max_age_seconds:
+                _log.info("Filter state stale (%.0fh), starting fresh",
+                          (time.time() - saved_at) / 3600)
+                return
+            for ticker, state in data.get("filters", {}).items():
+                self._filters[ticker] = ParticleFilter.deserialize(state)
+            _log.info("Loaded %d particle filters for %s",
+                      len(self._filters), self.bot_name)
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            _log.warning("Failed to load filter states: %s", e)
+
+    def cleanup(self, active_tickers: set):
+        """Remove filters for tickers no longer in active markets."""
+        expired = [t for t in self._filters if t not in active_tickers]
+        for t in expired:
+            del self._filters[t]
+        if expired:
+            _log.info("Cleaned up %d expired filters", len(expired))

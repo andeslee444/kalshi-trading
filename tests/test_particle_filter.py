@@ -12,6 +12,7 @@ from particle_filter import (
     ParticleFilter,
     FilteredEstimate,
     FilterConfig,
+    FilterManager,
     ci_kelly_multiplier,
 )
 
@@ -365,3 +366,60 @@ class TestCIAwareKelly:
         mult_many = ci_kelly_multiplier(est_many)
         mult_few = ci_kelly_multiplier(est_few)
         assert mult_many >= mult_few
+
+
+class TestFilterManager:
+    """Test per-market filter management."""
+
+    def test_get_or_create_new(self):
+        """Getting a new ticker creates a fresh filter."""
+        mgr = FilterManager(bot_name="crypto", state_dir=Path("/tmp"))
+        pf = mgr.get_filter("KXBTC-MAR-T90000")
+        assert isinstance(pf, ParticleFilter)
+        assert pf.estimate().n_updates == 0
+
+    def test_get_same_ticker_returns_same_filter(self):
+        """Getting the same ticker twice returns the same filter."""
+        mgr = FilterManager(bot_name="crypto", state_dir=Path("/tmp"))
+        pf1 = mgr.get_filter("KXBTC-MAR-T90000")
+        pf1.update(0.7)
+        pf2 = mgr.get_filter("KXBTC-MAR-T90000")
+        assert pf2.estimate().n_updates == 1
+
+    def test_different_tickers_independent(self):
+        """Different tickers get independent filters."""
+        mgr = FilterManager(bot_name="crypto", state_dir=Path("/tmp"))
+        pf1 = mgr.get_filter("KXBTC-MAR-T90000")
+        pf2 = mgr.get_filter("KXETH-MAR-T3000")
+        pf1.update(0.8)
+        assert pf1.estimate().n_updates == 1
+        assert pf2.estimate().n_updates == 0
+
+    def test_save_and_load_all(self, tmp_path):
+        """Save all filters, then load them back."""
+        mgr = FilterManager(bot_name="test", state_dir=tmp_path)
+        pf1 = mgr.get_filter("TICKER1")
+        pf1.update(0.7)
+        pf2 = mgr.get_filter("TICKER2")
+        pf2.update(0.3)
+
+        mgr.save_all()
+
+        # Create new manager, load from same dir
+        mgr2 = FilterManager(bot_name="test", state_dir=tmp_path)
+        mgr2.load_all()
+
+        pf1_loaded = mgr2.get_filter("TICKER1")
+        assert pf1_loaded.estimate().n_updates == 1
+
+    def test_cleanup_expired_filters(self, tmp_path):
+        """Filters for settled markets are cleaned up."""
+        mgr = FilterManager(bot_name="test", state_dir=tmp_path)
+        mgr.get_filter("ACTIVE_TICKER")
+        mgr.get_filter("EXPIRED_TICKER")
+
+        active_tickers = {"ACTIVE_TICKER"}
+        mgr.cleanup(active_tickers)
+
+        assert "ACTIVE_TICKER" in mgr._filters
+        assert "EXPIRED_TICKER" not in mgr._filters
