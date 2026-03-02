@@ -13,6 +13,8 @@ from typing import Optional, List, Dict
 
 import requests
 
+from kalshi_auth import retry_request, _atomic_write_json, PROJECT_DIR
+
 _log = logging.getLogger("macro_engine")
 
 
@@ -62,3 +64,46 @@ class FREDClient:
             return float(value_str)
         except (ValueError, TypeError):
             return None
+
+    def fetch_series(self, series_key: str) -> Optional[float]:
+        """Fetch the latest value for a FRED series.
+
+        Args:
+            series_key: Key from SERIES dict (e.g. "tips_breakeven_10y").
+
+        Returns:
+            Latest value as float, or None on error.
+        """
+        series_id = self.SERIES.get(series_key)
+        if not series_id:
+            _log.warning("Unknown FRED series key: %s", series_key)
+            return None
+
+        params = {
+            "series_id": series_id,
+            "sort_order": "desc",
+            "limit": "1",
+            "file_type": "json",
+        }
+        if self.api_key:
+            params["api_key"] = self.api_key
+
+        try:
+            resp = retry_request("GET", self.BASE_URL, params=params, timeout=15)
+            data = resp.json()
+            value = self._parse_observation(data)
+            if value is not None:
+                _log.info("  FRED %s (%s): %.3f", series_key, series_id, value)
+            return value
+        except Exception as e:
+            _log.error("  FRED fetch failed for %s: %s", series_key, e)
+            return None
+
+    def fetch_all(self) -> Dict[str, float]:
+        """Fetch all configured FRED series. Returns {key: value} dict."""
+        results = {}
+        for key in self.SERIES:
+            value = self.fetch_series(key)
+            if value is not None:
+                results[key] = value
+        return results

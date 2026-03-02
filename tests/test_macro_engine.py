@@ -58,3 +58,43 @@ class TestFREDClient:
         resp = self._make_fred_response(-1.5)
         result = client._parse_observation(resp)
         assert result == pytest.approx(-1.5, abs=0.01)
+
+
+class TestFREDClientFetch:
+    """Test actual fetch methods with mocked HTTP."""
+
+    @patch("macro_engine.retry_request")
+    def test_fetch_tips_breakeven(self, mock_request):
+        """fetch_series returns parsed value from FRED."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "observations": [{"date": "2026-03-01", "value": "2.35"}]
+        }
+        mock_request.return_value = mock_resp
+
+        client = FREDClient()
+        result = client.fetch_series("tips_breakeven_10y")
+        assert result == pytest.approx(2.35, abs=0.01)
+        mock_request.assert_called_once()
+
+    @patch("macro_engine.retry_request")
+    def test_fetch_handles_http_error(self, mock_request):
+        """fetch_series returns None on HTTP error."""
+        mock_request.side_effect = Exception("Connection failed")
+        client = FREDClient()
+        result = client.fetch_series("tips_breakeven_10y")
+        assert result is None
+
+    @patch("macro_engine.retry_request")
+    def test_fetch_all_returns_dict(self, mock_request):
+        """fetch_all returns dict of available series."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "observations": [{"date": "2026-03-01", "value": "2.35"}]
+        }
+        mock_request.return_value = mock_resp
+
+        client = FREDClient()
+        result = client.fetch_all()
+        assert isinstance(result, dict)
+        assert len(result) > 0
