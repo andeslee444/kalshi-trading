@@ -108,6 +108,20 @@ class ParticleFilter:
             results.append(indexed[-1][0])
         return results
 
+    def predict(self):
+        """Prediction step: diffuse particles with process noise.
+
+        Each particle p_i += N(0, process_noise).
+        Clamped to (epsilon, 1-epsilon) to avoid degeneracy.
+        """
+        noise = self.config.process_noise
+        if noise <= 0:
+            return
+        eps = 0.001
+        for i in range(self.n_particles):
+            self.particles[i] += random.gauss(0, noise)
+            self.particles[i] = max(eps, min(1.0 - eps, self.particles[i]))
+
     def _detect_trend(self) -> str:
         """Detect trend from recent update directions."""
         window = self.config.trend_window

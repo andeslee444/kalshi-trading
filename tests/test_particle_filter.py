@@ -75,3 +75,61 @@ class TestFilteredEstimate:
         est = FilteredEstimate(prob=0.6, ci_low=0.3, ci_high=0.9,
                                trend="none", n_updates=2)
         assert not est.is_confident(threshold=0.15)
+
+
+class TestPredictionStep:
+    """Test the prediction (diffusion) step."""
+
+    def test_predict_adds_noise(self):
+        """After prediction, particles should spread out."""
+        pf = ParticleFilter(config=FilterConfig(
+            n_particles=1000, process_noise=0.05))
+        # Set all particles to 0.5
+        pf.particles = [0.5] * pf.n_particles
+        pf.weights = [1.0 / pf.n_particles] * pf.n_particles
+
+        pf.predict()
+
+        # Particles should no longer all be 0.5
+        unique = len(set(pf.particles))
+        assert unique > 1
+        # Mean should still be near 0.5
+        mean = sum(pf.particles) / len(pf.particles)
+        assert mean == pytest.approx(0.5, abs=0.05)
+
+    def test_predict_clamps_to_valid_range(self):
+        """Particles should stay in (0, 1) after prediction."""
+        pf = ParticleFilter(config=FilterConfig(
+            n_particles=500, process_noise=0.1))
+        # Set particles near boundaries
+        pf.particles = [0.01] * 250 + [0.99] * 250
+
+        pf.predict()
+
+        for p in pf.particles:
+            assert 0.0 < p < 1.0
+
+    def test_predict_with_zero_noise(self):
+        """Zero process noise -> particles unchanged."""
+        pf = ParticleFilter(config=FilterConfig(
+            n_particles=100, process_noise=0.0))
+        pf.particles = [0.5] * pf.n_particles
+        original = list(pf.particles)
+
+        pf.predict()
+
+        assert pf.particles == original
+
+    def test_predict_spread_scales_with_noise(self):
+        """Higher process noise -> wider particle spread."""
+        pf_low = ParticleFilter(config=FilterConfig(n_particles=2000, process_noise=0.01))
+        pf_high = ParticleFilter(config=FilterConfig(n_particles=2000, process_noise=0.10))
+        pf_low.particles = [0.5] * pf_low.n_particles
+        pf_high.particles = [0.5] * pf_high.n_particles
+
+        pf_low.predict()
+        pf_high.predict()
+
+        var_low = sum((p - 0.5)**2 for p in pf_low.particles) / len(pf_low.particles)
+        var_high = sum((p - 0.5)**2 for p in pf_high.particles) / len(pf_high.particles)
+        assert var_high > var_low
