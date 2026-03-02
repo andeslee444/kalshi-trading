@@ -365,7 +365,7 @@ def scan_and_trade():
         parsed = parse_crypto_ticker(ticker)
         if not parsed:
             ss.skip("unparseable")
-            if ss.skipped.get("unparseable", 0) <= 10:
+            if ss.skips.get("unparseable", 0) <= 10:
                 log.info(f"  Unparseable ticker: {ticker}")
             continue
 
