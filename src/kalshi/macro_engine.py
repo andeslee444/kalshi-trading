@@ -107,3 +107,39 @@ class FREDClient:
             if value is not None:
                 results[key] = value
         return results
+
+
+class TruflationClient:
+    """Fetch real-time CPI from Truflation public API."""
+
+    BASE_URL = "https://truflation.com/api/data"
+
+    def _parse_cpi(self, data: dict) -> Optional[float]:
+        """Parse CPI YoY from Truflation response."""
+        value = data.get("currentCpiYoY")
+        if value is None:
+            return None
+        try:
+            v = float(value)
+            if 0.0 < v < 20.0:
+                return v
+            return None
+        except (ValueError, TypeError):
+            return None
+
+    def fetch(self) -> Optional[float]:
+        """Fetch current real-time CPI estimate.
+
+        Returns CPI YoY as percentage (e.g. 2.75), or None on error.
+        """
+        try:
+            resp = retry_request("GET", self.BASE_URL, timeout=15,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+            data = resp.json()
+            value = self._parse_cpi(data)
+            if value is not None:
+                _log.info("  Truflation CPI: %.2f%%", value)
+            return value
+        except Exception as e:
+            _log.error("  Truflation fetch failed: %s", e)
+            return None

@@ -11,6 +11,7 @@ from pathlib import Path
 from macro_engine import (
     FREDClient,
     MacroSignal,
+    TruflationClient,
 )
 
 
@@ -98,3 +99,44 @@ class TestFREDClientFetch:
         result = client.fetch_all()
         assert isinstance(result, dict)
         assert len(result) > 0
+
+
+class TestTruflationClient:
+    """Tests for Truflation real-time CPI data."""
+
+    def test_parse_cpi_response(self):
+        """Parse Truflation CPI value from API response."""
+        client = TruflationClient()
+        data = {"currentCpiYoY": 2.75}
+        result = client._parse_cpi(data)
+        assert result == pytest.approx(2.75, abs=0.01)
+
+    def test_parse_handles_missing_field(self):
+        """Missing field returns None."""
+        client = TruflationClient()
+        result = client._parse_cpi({})
+        assert result is None
+
+    def test_parse_rejects_extreme_values(self):
+        """Values outside 0-20% are rejected."""
+        client = TruflationClient()
+        assert client._parse_cpi({"currentCpiYoY": -5.0}) is None
+        assert client._parse_cpi({"currentCpiYoY": 25.0}) is None
+
+    @patch("macro_engine.retry_request")
+    def test_fetch_returns_value(self, mock_request):
+        """fetch() returns CPI value from API."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"currentCpiYoY": 2.80}
+        mock_request.return_value = mock_resp
+
+        client = TruflationClient()
+        result = client.fetch()
+        assert result == pytest.approx(2.80, abs=0.01)
+
+    @patch("macro_engine.retry_request")
+    def test_fetch_handles_error(self, mock_request):
+        """fetch() returns None on error."""
+        mock_request.side_effect = Exception("timeout")
+        client = TruflationClient()
+        assert client.fetch() is None
