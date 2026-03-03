@@ -598,6 +598,19 @@ def fetch_boxoffice_data():
     return all_movies
 
 
+def scan_boxoffice(prefetched_markets=None, ss=None):
+    """Run a box office scan cycle: fetch data, match to markets, evaluate trades."""
+    try:
+        box_data = fetch_boxoffice_data()
+        if not box_data:
+            log.info("  No box office data available")
+            return
+        log.info(f"  Box office: {len(box_data)} movies fetched")
+        match_boxoffice_to_markets(box_data, prefetched_markets=prefetched_markets, ss=ss)
+    except Exception as e:
+        log.error(f"  Box office scan failed: {e}")
+
+
 def match_boxoffice_to_markets(box_data, prefetched_markets=None, ss=None):
     """Match box office data to Kalshi markets."""
     try:
@@ -1263,7 +1276,15 @@ def main():
                 last_hdd = now
 
             if need_box:
-                _check_with_retry(check_boxoffice, "boxoffice", prefetched, ss)
+                # Box office scan — only on active days when weekend data is available
+                boxoffice_config = config["sources"]["boxoffice"]
+                dow = datetime.datetime.now().weekday()
+                active_days = boxoffice_config.get("activeDays", ["Friday", "Saturday", "Sunday", "Monday"])
+                day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                if day_names[dow] in active_days:
+                    _check_with_retry(scan_boxoffice, "boxoffice", prefetched, ss)
+                else:
+                    log.info(f"  Box office: skipping (not an active day)")
                 last_boxoffice = now
 
             if need_nws:
