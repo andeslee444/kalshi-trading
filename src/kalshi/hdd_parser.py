@@ -247,6 +247,21 @@ def compute_data_age_hours(chart_date_str):
         return 0
 
 
+def check_sanity_health(project_id="8aky18h3"):
+    """Check if the Sanity CMS endpoint is reachable.
+
+    Makes a minimal GROQ query to verify connectivity.
+    Returns True if healthy, False otherwise.
+    """
+    url = f"https://{project_id}.api.sanity.io/v2023-05-03/data/query/production"
+    params = {"query": '*[_type == "chart"][0]{_id}'}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
 def get_album_sales(logger=None):
     """Fetch album sales data from HDD charts and articles.
 
