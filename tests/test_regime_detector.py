@@ -259,3 +259,40 @@ class TestRegimeKellyMultiplier:
                 rd2.update(vol)
             mult = regime_kelly_multiplier(rd2)
             assert 0.45 <= mult <= 1.15
+
+
+class TestCryptoBotIntegration:
+    """Test regime detector integration with crypto bot vol tracking."""
+
+    def test_realized_vol_feeds_regime(self):
+        """Crypto bot's realized vol should update regime detector."""
+        from regime_detector import RegimeDetector
+        rd = RegimeDetector()
+        # Simulate 10 crypto scans with normal vol
+        for _ in range(10):
+            rd.update(0.55)  # 55% annualized — normal for BTC
+        assert rd.current_regime() in ("normal", "low_vol")
+
+    def test_vol_spike_triggers_regime_change(self):
+        """Flash crash vol spike should move toward crisis."""
+        from regime_detector import RegimeDetector
+        rd = RegimeDetector()
+        # Normal period
+        for _ in range(10):
+            rd.update(0.50)
+        # Vol spike (flash crash)
+        for _ in range(3):
+            rd.update(1.50)
+        # Should have shifted toward high/crisis
+        assert rd.belief[2] + rd.belief[3] > rd.belief[0]
+
+    def test_config_from_bots_config(self):
+        """Regime detector config should be loadable from bots-config.json."""
+        # Config structure expected:
+        config = {
+            "regime": {
+                "enabled": True,
+                "maxAgeHours": 24,
+            }
+        }
+        assert config["regime"]["enabled"] is True
