@@ -141,11 +141,11 @@ class TestBankrollUsesAvailable:
         return alloc
 
     def test_bankroll_equals_available(self):
-        """When total=10000, available=2000, bankroll should be 2000."""
-        alloc = self._make_allocator(total=10000, available=2000)
+        """When total=100000, available=5000, bankroll should be 5000."""
+        alloc = self._make_allocator(total=100000, available=5000)
         budget = alloc.request_budget("weather", "TICK-NEW", edge=0.10)
         assert budget.approved
-        assert budget.bankroll_cents == 2000
+        assert budget.bankroll_cents == 5000
 
     def test_bankroll_not_total(self):
         """Bankroll should NOT be total balance."""
@@ -525,8 +525,8 @@ class TestCorrelationIntegration:
         alloc = self._make_allocator(balance=500000)
         # Record $800 in CPI trades (80000 cents > 75000 cluster limit)
         for i in range(8):
-            alloc.record_trade("source-monitor", f"KXCPI-26MAY-T2{i}", 10000, edge=0.10)
-        result = alloc.request_budget("economics", "KXCPI-26MAY-T25", edge=0.10, confidence=0.90)
+            alloc.record_trade("source-monitor", f"KXCPI-26MAY-T3{i}", 10000, edge=0.10)
+        result = alloc.request_budget("economics", "KXCPI-26MAY-T50", edge=0.10, confidence=0.90)
         assert not result.approved
         assert "cluster" in result.reason.lower()
 
@@ -536,7 +536,7 @@ class TestCorrelationIntegration:
         """BTC trade should be allowed even if CPI cluster is full."""
         alloc = self._make_allocator(balance=500000)
         for i in range(8):
-            alloc.record_trade("economics", f"KXCPI-26MAY-T2{i}", 10000, edge=0.10)
+            alloc.record_trade("economics", f"KXCPI-26MAY-T3{i}", 10000, edge=0.10)
         result = alloc.request_budget("crypto", "KXBTC-26MAR3-T95000", edge=0.10, confidence=0.80)
         assert result.approved
 
