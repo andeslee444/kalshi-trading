@@ -310,3 +310,35 @@ class TestTailDependence:
         """
         td = self.engine.compute_tail_dependence("CPI", "CPI")  # rho=0.90
         assert td > 0.30  # Known to be substantial for high corr + low df
+
+
+class TestStatePersistence:
+    """Test save/load of correlation engine state."""
+
+    def test_save_and_load_cluster_risk(self):
+        from correlation_engine import CorrelationEngine
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            state_path = f.name
+
+        engine1 = CorrelationEngine(state_path=state_path)
+        engine1.record_trade("KXCPI-26MAY-T20", risk_cents=50000)
+        engine1.record_trade("KXBTC-26MAR3-T95000", risk_cents=20000)
+        engine1.save_state()
+
+        engine2 = CorrelationEngine(state_path=state_path)
+        engine2.load_state()
+        assert engine2.get_cluster_risk("CPI") == 50000
+        assert engine2.get_cluster_risk("BTC") == 20000
+        os.unlink(state_path)
+
+    def test_load_missing_file_is_noop(self):
+        from correlation_engine import CorrelationEngine
+        engine = CorrelationEngine(state_path="/tmp/nonexistent_corr.json")
+        engine.load_state()  # Should not raise
+        assert engine.get_cluster_risk("CPI") == 0
+
+    def test_save_without_path_is_noop(self):
+        from correlation_engine import CorrelationEngine
+        engine = CorrelationEngine(state_path=None)
+        engine.record_trade("KXCPI-26MAY-T20", risk_cents=50000)
+        engine.save_state()  # Should not raise
