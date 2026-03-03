@@ -180,3 +180,33 @@ class TestFetchBoxOfficeData:
             result = mod.fetch_boxoffice_data()
         titles = [m["title"] for m in result]
         assert len(titles) == len(set(titles))
+
+
+class TestBoxOfficeScanIntegration:
+    """Test that box office data flows through the full scan pipeline."""
+
+    def test_scan_calls_fetch_and_match(self):
+        """Verify scan_boxoffice() calls fetch_boxoffice_data then match_boxoffice_to_markets."""
+        mod = _load_source_monitor()
+        mock_data = [{"title": "Test Movie", "gross": 50_000_000, "source": "the_numbers"}]
+        with patch.object(mod, "fetch_boxoffice_data", return_value=mock_data) as mock_fetch, \
+             patch.object(mod, "match_boxoffice_to_markets") as mock_match:
+            mod.scan_boxoffice()
+            mock_fetch.assert_called_once()
+            mock_match.assert_called_once_with(mock_data, prefetched_markets=None, ss=None)
+
+    def test_scan_skips_on_empty_data(self):
+        """Verify scan_boxoffice() doesn't call match when no data."""
+        mod = _load_source_monitor()
+        with patch.object(mod, "fetch_boxoffice_data", return_value=[]) as mock_fetch, \
+             patch.object(mod, "match_boxoffice_to_markets") as mock_match:
+            mod.scan_boxoffice()
+            mock_fetch.assert_called_once()
+            mock_match.assert_not_called()
+
+    def test_scan_handles_fetch_exception(self):
+        """Verify scan_boxoffice() handles fetch errors gracefully."""
+        mod = _load_source_monitor()
+        with patch.object(mod, "fetch_boxoffice_data", side_effect=Exception("network error")):
+            # Should not raise
+            mod.scan_boxoffice()
