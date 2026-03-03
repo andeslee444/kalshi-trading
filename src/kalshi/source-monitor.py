@@ -507,6 +507,97 @@ def check_boxoffice(prefetched_markets=None, ss=None):
     if box_office_data:
         match_boxoffice_to_markets(box_office_data, prefetched_markets=prefetched_markets, ss=ss)
 
+# ─── Box office web scraping ───
+
+def parse_the_numbers_html(html):
+    """Parse weekend domestic box office data from The Numbers HTML.
+
+    Extracts movie titles and weekend gross revenue from the weekend
+    box office chart table. Returns list of {"title": str, "gross": float}.
+    """
+    results = []
+    # Pattern: movie title in <a> tag, followed by money cell with $X,XXX,XXX
+    pattern = r'<a[^>]*>([^<]{3,60})</a>\s*</td>\s*<td[^>]*>\s*\$?([\d,]+)'
+    for match in re.finditer(pattern, html):
+        title = match.group(1).strip()
+        gross_str = match.group(2).replace(",", "")
+        try:
+            gross = float(gross_str)
+            if gross > 100_000:  # Filter noise — real movies gross > $100K
+                results.append({"title": title, "gross": gross})
+        except ValueError:
+            continue
+    return results
+
+
+def parse_mojo_html(html):
+    """Parse weekend domestic box office data from Box Office Mojo HTML.
+
+    Handles both raw numbers ($163,830,000) and abbreviated ($163.8M).
+    Returns list of {"title": str, "gross": float}.
+    """
+    results = []
+    pattern = r'<a[^>]*>([^<]{3,60})</a>.*?\$([\d,.]+)\s*([MmBb])?'
+    for match in re.finditer(pattern, html, re.DOTALL):
+        title = match.group(1).strip()
+        amount_str = match.group(2).replace(",", "")
+        suffix = match.group(3)
+        try:
+            amount = float(amount_str)
+            if suffix and suffix.upper() == "M":
+                amount *= 1_000_000
+            elif suffix and suffix.upper() == "B":
+                amount *= 1_000_000_000
+            if amount > 100_000:
+                results.append({"title": title, "gross": amount})
+        except ValueError:
+            continue
+    return results
+
+
+def fetch_boxoffice_data():
+    """Fetch weekend domestic box office data with fallback.
+
+    Tries The Numbers first (more structured HTML), falls back to
+    Box Office Mojo. Deduplicates by title across sources.
+    Returns list of {"title": str, "gross": float, "source": str}.
+    """
+    sources = [
+        ("the_numbers", "https://www.the-numbers.com/market/",
+         parse_the_numbers_html),
+        ("mojo", "https://www.boxofficemojo.com/weekend/",
+         parse_mojo_html),
+    ]
+
+    all_movies = []
+    seen_titles = set()
+
+    for source_name, url, parser in sources:
+        try:
+            resp = requests.get(url, timeout=15, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; KalshiBot/1.0)"
+            })
+            if resp.status_code != 200:
+                log.warning(f"  Box office {source_name} returned {resp.status_code}")
+                continue
+            movies = parser(resp.text)
+            for m in movies:
+                title_key = m["title"].lower().strip()
+                if title_key not in seen_titles:
+                    seen_titles.add(title_key)
+                    m["source"] = source_name
+                    all_movies.append(m)
+            if movies:
+                log.info(f"  Box office: got {len(movies)} movies from {source_name}")
+                health.record_source_success("boxoffice")
+                break  # Got data from primary source, skip fallback
+        except Exception as e:
+            log.warning(f"  Box office {source_name} fetch failed: {e}")
+            health.record_source_error("boxoffice", str(e))
+
+    return all_movies
+
+
 def match_boxoffice_to_markets(box_data, prefetched_markets=None, ss=None):
     """Match box office data to Kalshi markets."""
     try:
