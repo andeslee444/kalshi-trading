@@ -253,3 +253,60 @@ class TestMarginalVaR:
             available_balance_cents=500000,
         )
         assert allowed
+
+
+class TestTailDependence:
+    """Test tail dependence computation and Kelly reduction."""
+
+    def setup_method(self):
+        from correlation_engine import CorrelationEngine, CorrelationConfig
+        self.engine = CorrelationEngine(config=CorrelationConfig(
+            tail_dep_kelly_threshold=0.15,
+            tail_dep_kelly_cut=0.25,
+            copula_df=5,
+        ))
+
+    def test_high_correlation_high_tail_dep(self):
+        """Intra-factor correlation (0.90) should have high tail dependence."""
+        td = self.engine.compute_tail_dependence("CPI", "CPI")
+        assert td > 0.15  # Should trigger Kelly reduction
+
+    def test_zero_correlation_zero_tail_dep(self):
+        """Uncorrelated factors should have ~0 tail dependence."""
+        td = self.engine.compute_tail_dependence("CPI", "BTC")
+        assert td < 0.05
+
+    def test_moderate_correlation_moderate_tail_dep(self):
+        """BTC/ETH at 0.75 correlation should have moderate tail dependence."""
+        td = self.engine.compute_tail_dependence("BTC", "ETH")
+        assert 0.05 < td < 0.50
+
+    def test_kelly_multiplier_no_existing_positions(self):
+        """No existing positions -> full Kelly (multiplier = 1.0)."""
+        mult = self.engine.get_tail_risk_multiplier("KXBTC-26MAR3-T95000", [])
+        assert mult == 1.0
+
+    def test_kelly_multiplier_with_correlated_position(self):
+        """Adding to a factor with high tail dep -> 75% Kelly."""
+        existing = [
+            {"ticker": "KXCPI-26MAY-T20", "risk_cents": 50000, "loss_prob": 0.20},
+        ]
+        mult = self.engine.get_tail_risk_multiplier("KXCPI-26MAY-T21", existing)
+        assert mult == pytest.approx(1.0 - 0.25, rel=0.01)  # 0.75
+
+    def test_kelly_multiplier_with_uncorrelated_position(self):
+        """Adding to uncorrelated factor -> full Kelly."""
+        existing = [
+            {"ticker": "KXCPI-26MAY-T20", "risk_cents": 50000, "loss_prob": 0.20},
+        ]
+        mult = self.engine.get_tail_risk_multiplier("KXBTC-26MAR3-T95000", existing)
+        assert mult == 1.0
+
+    def test_tail_dep_formula_known_values(self):
+        """Verify tail dependence formula against known analytical values.
+
+        For nu=5, rho=0.9:
+        lambda = 2 * t_6(-sqrt(6 * 0.1 / 1.9)) ~ substantial
+        """
+        td = self.engine.compute_tail_dependence("CPI", "CPI")  # rho=0.90
+        assert td > 0.30  # Known to be substantial for high corr + low df
