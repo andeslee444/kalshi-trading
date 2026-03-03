@@ -151,3 +151,111 @@ class TestRegimeClassification:
         for _ in range(10):
             rd.update(1.00)
         assert rd.is_elevated_vol() is True
+
+
+class TestRegimePersistence:
+    """Test state serialization and file I/O."""
+
+    def test_serialize_roundtrip(self):
+        from regime_detector import RegimeDetector
+        rd = RegimeDetector()
+        for _ in range(5):
+            rd.update(0.50)
+        data = rd.serialize()
+        rd2 = RegimeDetector.deserialize(data)
+        assert rd2.belief == rd.belief
+        assert rd2.n_updates == rd.n_updates
+
+    def test_save_and_load(self):
+        from regime_detector import RegimeDetector
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "regime-state.json"
+            rd = RegimeDetector()
+            for _ in range(5):
+                rd.update(0.50)
+            rd.save(str(path))
+            rd2 = RegimeDetector()
+            loaded = rd2.load(str(path))
+            assert loaded is True
+            assert rd2.belief == rd.belief
+
+    def test_load_missing_file(self):
+        from regime_detector import RegimeDetector
+        rd = RegimeDetector()
+        loaded = rd.load("/nonexistent/path.json")
+        assert loaded is False
+        assert rd.n_updates == 0  # Unchanged
+
+    def test_stale_state_rejected(self):
+        from regime_detector import RegimeDetector
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "regime-state.json"
+            rd = RegimeDetector()
+            rd.update(0.50)
+            # Write state with old timestamp
+            data = rd.serialize()
+            data["last_updated"] = "2020-01-01T00:00:00"
+            with open(path, "w") as f:
+                json.dump(data, f)
+            rd2 = RegimeDetector()
+            loaded = rd2.load(str(path), max_age_hours=24)
+            assert loaded is False
+
+
+class TestRegimeKellyMultiplier:
+    """Test regime-adjusted Kelly sizing."""
+
+    def test_low_vol_boost(self):
+        """Low vol regime should increase Kelly slightly."""
+        from regime_detector import RegimeDetector, regime_kelly_multiplier
+        rd = RegimeDetector()
+        for _ in range(20):
+            rd.update(0.15)
+        mult = regime_kelly_multiplier(rd)
+        assert mult > 1.0  # Slight boost
+
+    def test_normal_regime_near_one(self):
+        """Normal regime should give multiplier near 1.0."""
+        from regime_detector import RegimeDetector, regime_kelly_multiplier
+        rd = RegimeDetector()
+        for _ in range(20):
+            rd.update(0.50)
+        mult = regime_kelly_multiplier(rd)
+        assert 0.9 <= mult <= 1.1
+
+    def test_high_vol_reduction(self):
+        """High vol should reduce Kelly by ~25%."""
+        from regime_detector import RegimeDetector, regime_kelly_multiplier
+        rd = RegimeDetector()
+        for _ in range(20):
+            rd.update(0.85)
+        mult = regime_kelly_multiplier(rd)
+        assert mult < 0.90  # Meaningful reduction
+
+    def test_crisis_severe_reduction(self):
+        """Crisis should reduce Kelly by ~50%."""
+        from regime_detector import RegimeDetector, regime_kelly_multiplier
+        rd = RegimeDetector()
+        for _ in range(20):
+            rd.update(1.50)
+        mult = regime_kelly_multiplier(rd)
+        assert mult < 0.70  # Severe reduction
+
+    def test_uncertain_belief_near_one(self):
+        """With uniform belief (uncertain), multiplier should be near 1.0."""
+        from regime_detector import RegimeDetector, regime_kelly_multiplier
+        rd = RegimeDetector()
+        # No updates — uniform belief
+        mult = regime_kelly_multiplier(rd)
+        assert 0.95 <= mult <= 1.05
+
+    def test_multiplier_bounded(self):
+        """Multiplier should always be in [0.5, 1.1]."""
+        from regime_detector import RegimeDetector, regime_kelly_multiplier
+        rd = RegimeDetector()
+        for vol in [0.05, 0.15, 0.50, 0.85, 1.50, 3.00]:
+            rd2 = RegimeDetector()
+            for _ in range(20):
+                rd2.update(vol)
+            mult = regime_kelly_multiplier(rd2)
+            assert 0.45 <= mult <= 1.15

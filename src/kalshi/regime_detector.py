@@ -152,7 +152,7 @@ class RegimeDetector:
     def save(self, path):
         """Save state to JSON file with atomic write."""
         from kalshi_auth import _atomic_write_json
-        _atomic_write_json(path, self.serialize())
+        _atomic_write_json(Path(path), self.serialize())
 
     def load(self, path, max_age_hours=24):
         """Load state from JSON file with staleness check.
