@@ -212,6 +212,56 @@ class CorrelationEngine:
 
         return (True, "")
 
+    # === Portfolio VaR ===
+
+    def compute_portfolio_var(self, positions: List[Dict], confidence: Optional[float] = None) -> float:
+        """Compute portfolio Value-at-Risk using variance-covariance method.
+
+        Each position dict has:
+          - ticker: market ticker
+          - risk_cents: maximum loss in cents (cost basis)
+          - loss_prob: probability of losing (1 - model probability of winning)
+
+        For binary contracts:
+          - Variance per position = risk^2 * loss_prob * (1 - loss_prob)
+          - Covariance(i,j) = corr(i,j) * std(i) * std(j)
+
+        Returns VaR in cents (positive number = potential loss).
+        """
+        if not positions:
+            return 0.0
+
+        conf = confidence or self.config.var_confidence
+
+        n = len(positions)
+        # Compute standard deviation of loss for each position
+        stds = []
+        for pos in positions:
+            risk = pos["risk_cents"]
+            p_loss = pos["loss_prob"]
+            # Bernoulli variance
+            std = risk * math.sqrt(p_loss * (1 - p_loss))
+            stds.append(std)
+
+        # Build variance-covariance sum
+        portfolio_variance = 0.0
+        for i in range(n):
+            for j in range(n):
+                corr = self.get_ticker_correlation(
+                    positions[i]["ticker"], positions[j]["ticker"]
+                )
+                portfolio_variance += corr * stds[i] * stds[j]
+
+        portfolio_std = math.sqrt(max(0.0, portfolio_variance))
+
+        # z-score for confidence level
+        from scipy.stats import norm
+        z = norm.ppf(conf)
+
+        var = z * portfolio_std
+        self._portfolio_var = var
+        return var
+
     def reset_daily(self) -> None:
         """Reset daily risk tracking."""
         self._cluster_risk.clear()
