@@ -423,3 +423,52 @@ class TestFilterManager:
 
         assert "ACTIVE_TICKER" in mgr._filters
         assert "EXPIRED_TICKER" not in mgr._filters
+
+
+class TestCryptoBotIntegration:
+    """Test the crypto-bot integration pattern."""
+
+    def test_filtered_prob_replaces_raw(self):
+        """Filtered prob should be used instead of raw model prob."""
+        pf = ParticleFilter(config=FilterConfig(
+            n_particles=1000, process_noise=0.02, observation_noise=0.05))
+
+        # Simulate 5 scans with raw model prob ~0.7
+        for _ in range(5):
+            pf.update(0.70 + random.gauss(0, 0.02))
+
+        est = pf.estimate()
+        # Filtered prob should be near 0.7
+        assert est.prob == pytest.approx(0.7, abs=0.05)
+        # CI should be tighter than initial
+        assert est.ci_width < 0.30
+
+    def test_ci_aware_sizing_reduces_on_uncertainty(self):
+        """When CI is wide, Kelly multiplier should reduce position size."""
+        # Few updates -> wide CI -> lower multiplier
+        est_uncertain = FilteredEstimate(prob=0.7, ci_low=0.4, ci_high=1.0,
+                                          trend="none", n_updates=2)
+        # Many updates -> narrow CI -> higher multiplier
+        est_confident = FilteredEstimate(prob=0.7, ci_low=0.65, ci_high=0.75,
+                                          trend="up", n_updates=20)
+
+        mult_uncertain = ci_kelly_multiplier(est_uncertain)
+        mult_confident = ci_kelly_multiplier(est_confident)
+
+        assert mult_confident > mult_uncertain
+        assert mult_confident >= 0.9
+        assert mult_uncertain < 0.7
+
+    def test_bot_config_mapping(self):
+        """Verify bot-specific filter configs are reasonable."""
+        configs = {
+            "crypto": FilterConfig(n_particles=200, process_noise=0.02,
+                                   observation_noise=0.05),
+            "weather": FilterConfig(n_particles=200, process_noise=0.01,
+                                    observation_noise=0.03),
+            "economics": FilterConfig(n_particles=200, process_noise=0.005,
+                                      observation_noise=0.02),
+        }
+        # Crypto should have highest process noise (fast-moving)
+        assert configs["crypto"].process_noise > configs["weather"].process_noise
+        assert configs["weather"].process_noise > configs["economics"].process_noise
