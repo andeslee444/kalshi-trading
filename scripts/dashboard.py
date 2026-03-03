@@ -731,7 +731,27 @@ async def api_settlements(limit: int = Query(50, ge=1, le=200)):
 async def api_health():
     health_data = load_json_safe(HEALTH_STATE_PATH)
     if health_data is None:
-        return {"sources": {}, "bots": {}}
+        health_data = {"sources": {}, "bots": {}}
+
+    # Add regime detector state
+    regime_path = PROJECT_DIR / "data" / "regime-state.json"
+    regime_info = {"regime": "unknown", "confidence": 0.0, "n_updates": 0}
+    try:
+        with open(regime_path) as f:
+            regime_data = json.load(f)
+        belief = regime_data.get("belief", [0.25] * 4)
+        states = ["low_vol", "normal", "high_vol", "crisis"]
+        max_idx = belief.index(max(belief))
+        regime_info = {
+            "regime": states[max_idx],
+            "confidence": belief[max_idx],
+            "n_updates": regime_data.get("n_updates", 0),
+            "belief": dict(zip(states, belief)),
+        }
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    health_data["regime"] = regime_info
     return health_data
 
 
