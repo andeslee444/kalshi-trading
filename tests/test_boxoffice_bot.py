@@ -18,6 +18,12 @@ from pathlib import Path
 
 def _load_source_monitor():
     """Load source-monitor.py with stubbed dependencies."""
+    stub_names = ["kalshi_auth", "probability", "capital_allocator",
+                  "hdd_parser", "macro_engine", "correlation_engine", "ticker_utils"]
+
+    # Save originals
+    originals = {name: sys.modules.get(name) for name in stub_names}
+
     # Stub kalshi_auth before import
     mock_auth = MagicMock()
     mock_client = MagicMock()
@@ -50,6 +56,7 @@ def _load_source_monitor():
     sys.modules["hdd_parser"] = MagicMock()
     sys.modules["macro_engine"] = MagicMock()
     sys.modules["correlation_engine"] = MagicMock()
+    sys.modules["ticker_utils"] = MagicMock()
 
     spec = importlib.util.spec_from_file_location(
         "source_monitor",
@@ -57,6 +64,14 @@ def _load_source_monitor():
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+
+    # Restore originals
+    for name in stub_names:
+        if originals[name] is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = originals[name]
+
     return mod
 
 

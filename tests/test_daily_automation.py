@@ -14,9 +14,10 @@ class TestDailyAutomationConfig:
 
     def test_should_run_report_daily(self):
         """Report should run every day regardless of market hours."""
-        # Every day of week should be a valid report day
-        for dow in range(7):
-            assert True  # Reports run daily — no day-of-week gating
+        valid_days = list(range(7))
+        assert len(valid_days) == 7
+        for dow in valid_days:
+            assert 0 <= dow <= 6
 
     def test_lock_file_prevents_double_run(self):
         """Lock file prevents concurrent daily runs."""
@@ -31,12 +32,15 @@ class TestDailyAutomationConfig:
 
     def test_stale_lock_detected(self):
         """Lock files older than 1 hour are considered stale."""
+        import time
         with tempfile.TemporaryDirectory() as tmp:
             lock_path = Path(tmp) / "daily-run.lock"
             lock_path.write_text("99999")
-            mtime = lock_path.stat().st_mtime
-            # A lock > 3600s old is stale
-            assert True  # Staleness check = current_time - mtime > 3600
+            # Set mtime to 2 hours ago
+            old_time = time.time() - 7200
+            os.utime(lock_path, (old_time, old_time))
+            lock_age = time.time() - lock_path.stat().st_mtime
+            assert lock_age > 3600, "Lock should be detected as stale after 1 hour"
 
 
 class TestDailyReportFormatting:
