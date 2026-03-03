@@ -17,7 +17,12 @@ mkdir -p "$(dirname "$LOG_FILE")"
 
 # Lock file check (prevent double-run)
 if [ -f "$LOCK_FILE" ]; then
-    lock_age=$(( $(date +%s) - $(stat -f %m "$LOCK_FILE" 2>/dev/null || echo 0) ))
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        lock_mtime=$(stat -f %m "$LOCK_FILE" 2>/dev/null || echo 0)
+    else
+        lock_mtime=$(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0)
+    fi
+    lock_age=$(( $(date +%s) - lock_mtime ))
     if [ "$lock_age" -lt 3600 ]; then
         echo "$(date): Lock file exists and is fresh ($lock_age seconds old). Skipping." >> "$LOG_FILE"
         exit 0
@@ -30,6 +35,13 @@ echo $$ > "$LOCK_FILE"
 trap 'rm -f "$LOCK_FILE"' EXIT
 
 cd "$PROJECT_DIR"
+
+# Source environment variables (needed for LaunchAgent which lacks shell env)
+if [ -f "$PROJECT_DIR/.env" ]; then
+    set -a
+    source "$PROJECT_DIR/.env"
+    set +a
+fi
 
 echo "$(date): Starting daily automation" >> "$LOG_FILE"
 
