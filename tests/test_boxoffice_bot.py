@@ -161,7 +161,7 @@ class TestFetchBoxOfficeData:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.text = THE_NUMBERS_HTML
-        with patch("requests.get", return_value=mock_resp):
+        with patch.object(mod, "retry_request", return_value=mock_resp):
             result = mod.fetch_boxoffice_data()
         assert len(result) >= 2
         assert result[0]["source"] == "the_numbers"
@@ -173,7 +173,7 @@ class TestFetchBoxOfficeData:
         mock_success = MagicMock()
         mock_success.status_code = 200
         mock_success.text = MOJO_HTML
-        with patch("requests.get", side_effect=[mock_fail, mock_success]):
+        with patch.object(mod, "retry_request", side_effect=[mock_fail, mock_success]):
             result = mod.fetch_boxoffice_data()
         assert len(result) >= 1
         assert result[0]["source"] == "mojo"
@@ -182,7 +182,7 @@ class TestFetchBoxOfficeData:
         mod = _load_source_monitor()
         mock_fail = MagicMock()
         mock_fail.status_code = 503
-        with patch("requests.get", return_value=mock_fail):
+        with patch.object(mod, "retry_request", return_value=mock_fail):
             result = mod.fetch_boxoffice_data()
         assert result == []
 
@@ -191,7 +191,7 @@ class TestFetchBoxOfficeData:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.text = THE_NUMBERS_HTML
-        with patch("requests.get", return_value=mock_resp):
+        with patch.object(mod, "retry_request", return_value=mock_resp):
             result = mod.fetch_boxoffice_data()
         titles = [m["title"] for m in result]
         assert len(titles) == len(set(titles))
@@ -234,13 +234,13 @@ class TestHddAutoReEnable:
         """If HDD was disabled due to errors but Sanity is now healthy, re-enable."""
         mod = _load_source_monitor()
         # Simulate HDD being error-disabled
-        with patch("hdd_parser.check_sanity_health", return_value=True):
+        with patch.object(mod, "check_sanity_health", return_value=True):
             result = mod.should_retry_hdd()
             assert result is True
 
     def test_hdd_stays_disabled_if_still_unhealthy(self):
         """If Sanity is still down, keep HDD disabled."""
         mod = _load_source_monitor()
-        with patch("hdd_parser.check_sanity_health", return_value=False):
+        with patch.object(mod, "check_sanity_health", return_value=False):
             result = mod.should_retry_hdd()
             assert result is False

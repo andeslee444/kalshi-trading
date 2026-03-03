@@ -10,13 +10,12 @@ Sources:
 """
 
 import json, time, datetime, os, sys, re, hashlib, traceback
-import requests
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, quarter_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, nws_sigma_for_hour
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
-from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_threshold
+from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_threshold, check_sanity_health
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -137,7 +136,6 @@ def should_retry_hdd():
 
     Calls the Sanity CMS health check. If healthy, returns True.
     """
-    from hdd_parser import check_sanity_health
     hdd_config = config.get("sources", {}).get("hdd", {})
     project_id = hdd_config.get("sanityProject", "8aky18h3")
     return check_sanity_health(project_id)
@@ -435,88 +433,6 @@ def _fetch_tmdb_boxoffice():
         log.warning(f"  TMDb fetch failed: {e}, falling back to HTML scraping")
         return None
 
-def check_boxoffice(prefetched_markets=None, ss=None):
-    """Check box office data from Box Office Mojo and The Numbers."""
-    now = datetime.datetime.now()
-    day_name = now.strftime("%A")
-
-    active_days = config["sources"]["boxoffice"]["activeDays"]
-    if day_name not in active_days:
-        log.info(f"\n[BOX OFFICE] Skipping -- {day_name} not in active days {active_days}")
-        return
-
-    log.info(f"\n[BOX OFFICE] Checking box office data ({day_name})...")
-
-    box_office_data = []
-
-    # Try TMDb API first (structured data, more reliable than HTML scraping)
-    if config["sources"]["boxoffice"].get("tmdbEnabled", False):
-        tmdb_data = _fetch_tmdb_boxoffice()
-        if tmdb_data is None:
-            log.info("  TMDb: no API key or fetch failed, using HTML scraping")
-        elif not tmdb_data:
-            log.info("  TMDb: no revenue data returned, using HTML scraping")
-        else:
-            box_office_data = tmdb_data
-
-    # Fall back to HTML scraping if TMDb didn't return data
-    if not box_office_data:
-        user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-
-        # Check The Numbers
-        try:
-            url = "https://www.the-numbers.com/market/"
-            r = retry_request("GET", url, headers={"User-Agent": user_agent}, timeout=20)
-            save_snapshot("boxoffice_thenumbers", r.text)
-
-            gross_pattern = r'(?:>)([^<]{3,50})</a>\s*</td>\s*<td[^>]*>\s*\$?([\d,]+)'
-            matches = re.findall(gross_pattern, r.text)
-
-            for title, gross in matches[:10]:
-                title = title.strip()
-                gross_val = int(gross.replace(",", ""))
-                if gross_val > 100000:
-                    box_office_data.append({"title": title, "gross": gross_val, "source": "the-numbers.com"})
-
-            if box_office_data:
-                log.info(f"  The Numbers: {len(box_office_data)} movies found")
-                for d in box_office_data[:5]:
-                    log.info(f"    -> {d['title']}: ${d['gross']:,}")
-        except Exception as e:
-            log.error(f"  The Numbers check failed: {e}")
-
-        # Check Box Office Mojo
-        try:
-            url = "https://www.boxofficemojo.com/"
-            r = retry_request("GET", url, headers={"User-Agent": user_agent}, timeout=20)
-            save_snapshot("boxoffice_mojo", r.text)
-
-            movies = re.findall(r'(?:>)([^<]{3,50})</a>.*?\$([\d,.]+)\s*([MmBb])?', r.text, re.DOTALL)
-
-            mojo_data = []
-            for match in movies[:10]:
-                title = match[0].strip()
-                gross_clean = match[1].replace(",", "")
-                suffix = match[2].upper() if match[2] else ""
-                try:
-                    gross_val = float(gross_clean)
-                    if suffix == "B":
-                        gross_val *= 1_000_000_000
-                    elif suffix == "M":
-                        gross_val *= 1_000_000
-                    mojo_data.append({"title": title, "gross": int(gross_val), "source": "boxofficemojo.com"})
-                except (ValueError, TypeError):
-                    pass
-
-            if mojo_data:
-                log.info(f"  Box Office Mojo: {len(mojo_data)} movies found")
-                box_office_data.extend(mojo_data)
-        except Exception as e:
-            log.error(f"  Box Office Mojo check failed: {e}")
-
-    if box_office_data:
-        match_boxoffice_to_markets(box_office_data, prefetched_markets=prefetched_markets, ss=ss)
-
 # ─── Box office web scraping ───
 
 def parse_the_numbers_html(html):
@@ -547,8 +463,8 @@ def parse_mojo_html(html):
     Returns list of {"title": str, "gross": float}.
     """
     results = []
-    pattern = r'<a[^>]*>([^<]{3,60})</a>.*?\$([\d,.]+)\s*([MmBb])?'
-    for match in re.finditer(pattern, html, re.DOTALL):
+    pattern = r'<a[^>]*>([^<]{3,60})</a>(?:[^$]{0,200})\$([\d,.]+)\s*([MmBb])?'
+    for match in re.finditer(pattern, html):
         title = match.group(1).strip()
         amount_str = match.group(2).replace(",", "")
         suffix = match.group(3)
@@ -584,7 +500,7 @@ def fetch_boxoffice_data():
 
     for source_name, url, parser in sources:
         try:
-            resp = requests.get(url, timeout=15, headers={
+            resp = retry_request("GET", url, timeout=15, headers={
                 "User-Agent": "Mozilla/5.0 (compatible; KalshiBot/1.0)"
             })
             if resp.status_code != 200:
