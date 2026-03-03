@@ -32,6 +32,7 @@
     "dashboard": "python3 scripts/dashboard.py",
     "backfill": "python3 scripts/backfill-settlements.py",
     "skip-audit": "python3 scripts/skip-audit.py",
+    "daily": "bash scripts/daily-automation.sh",
     "test": "pytest tests/ -v"
   },
   "dependencies": {},

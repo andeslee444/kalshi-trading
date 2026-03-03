@@ -2,6 +2,7 @@
 
 import logging
 import pytest
+from unittest.mock import MagicMock, patch
 from hdd_parser import parse_chart_data, clean_number, extract_sales_from_text, get_album_sales, compute_data_age_hours, parse_album_threshold
 
 
@@ -225,3 +226,31 @@ class TestParseAlbumThreshold:
     def test_thousand_word_pattern(self):
         """'200 thousand' should parse to 200000."""
         assert parse_album_threshold("Will sales reach 200 thousand") == 200000
+
+
+# ===================================================================
+# HDD Sanity CMS health check tests
+# ===================================================================
+
+class TestHddHealthCheck:
+    """Test HDD Sanity CMS health check functions."""
+
+    def test_check_sanity_health_success(self):
+        """Health check returns True when Sanity responds."""
+        from hdd_parser import check_sanity_health
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, json=lambda: {"result": []})
+            assert check_sanity_health("8aky18h3") is True
+
+    def test_check_sanity_health_failure(self):
+        """Health check returns False on timeout/error."""
+        from hdd_parser import check_sanity_health
+        with patch("requests.get", side_effect=Exception("timeout")):
+            assert check_sanity_health("8aky18h3") is False
+
+    def test_check_sanity_health_bad_status(self):
+        """Health check returns False on non-200 response."""
+        from hdd_parser import check_sanity_health
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=500)
+            assert check_sanity_health("8aky18h3") is False
