@@ -159,5 +159,15 @@
     "maxDailyLoss": 25,
     "maxDailyLossPct": 0.05,
     "targetMarkets": ["KXHIGH"]
+  },
+  "correlation": {
+    "clusterMaxFraction": 0.15,
+    "marginalVarLimitFraction": 0.05,
+    "tailDepKellyThreshold": 0.15,
+    "tailDepKellyCut": 0.25,
+    "varConfidence": 0.99,
+    "copulaDf": 5,
+    "minTradesForEmpirical": 10,
+    "empiricalWeightCap": 0.50
   }
 }
