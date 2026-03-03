@@ -150,3 +150,57 @@ class TestClusterRisk:
         self.engine.record_trade("KXCPI-26MAY-T20", risk_cents=50000)
         self.engine.reset_daily()
         assert self.engine.get_cluster_risk("CPI") == 0
+
+
+class TestPortfolioVaR:
+    """Test portfolio VaR computation."""
+
+    def setup_method(self):
+        from correlation_engine import CorrelationEngine, CorrelationConfig
+        self.engine = CorrelationEngine(config=CorrelationConfig(var_confidence=0.99))
+
+    def test_single_position_var(self):
+        """VaR of a single position = its max loss * loss probability."""
+        positions = [
+            {"ticker": "KXCPI-26MAY-T20", "risk_cents": 50000, "loss_prob": 0.10},
+        ]
+        var = self.engine.compute_portfolio_var(positions)
+        assert var > 0
+        assert var <= 50000  # VaR cannot exceed max loss
+
+    def test_uncorrelated_positions_diversify(self):
+        """Two uncorrelated positions should have lower VaR than sum."""
+        positions = [
+            {"ticker": "KXCPI-26MAY-T20", "risk_cents": 30000, "loss_prob": 0.20},
+            {"ticker": "KXBTC-26MAR3-T95000", "risk_cents": 30000, "loss_prob": 0.20},
+        ]
+        var = self.engine.compute_portfolio_var(positions)
+        # VaR should be less than 60000 (sum) due to diversification
+        assert var < 60000
+
+    def test_correlated_positions_no_diversification(self):
+        """Two perfectly correlated positions: VaR ~ sum of individual VaRs."""
+        positions = [
+            {"ticker": "KXCPI-26MAY-T20", "risk_cents": 30000, "loss_prob": 0.20},
+            {"ticker": "KXCPI-26MAY-T21", "risk_cents": 30000, "loss_prob": 0.20},
+        ]
+        var_correlated = self.engine.compute_portfolio_var(positions)
+
+        uncorr_positions = [
+            {"ticker": "KXCPI-26MAY-T20", "risk_cents": 30000, "loss_prob": 0.20},
+            {"ticker": "KXBTC-26MAR3-T95000", "risk_cents": 30000, "loss_prob": 0.20},
+        ]
+        var_uncorr = self.engine.compute_portfolio_var(uncorr_positions)
+
+        # Correlated VaR should be higher than uncorrelated VaR
+        assert var_correlated > var_uncorr
+
+    def test_empty_portfolio_var_zero(self):
+        var = self.engine.compute_portfolio_var([])
+        assert var == 0.0
+
+    def test_var_increases_with_position_size(self):
+        """Doubling position size should increase VaR."""
+        pos_small = [{"ticker": "KXBTC-26MAR3-T95000", "risk_cents": 10000, "loss_prob": 0.30}]
+        pos_large = [{"ticker": "KXBTC-26MAR3-T95000", "risk_cents": 20000, "loss_prob": 0.30}]
+        assert self.engine.compute_portfolio_var(pos_large) > self.engine.compute_portfolio_var(pos_small)
