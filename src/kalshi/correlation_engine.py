@@ -262,6 +262,34 @@ class CorrelationEngine:
         self._portfolio_var = var
         return var
 
+    # === Marginal VaR ===
+
+    def check_marginal_var(self, ticker: str, proposed_risk_cents: int,
+                           loss_prob: float, current_positions: List[Dict],
+                           available_balance_cents: int) -> Tuple[bool, str]:
+        """Check #7: Marginal VaR threshold.
+
+        Computes VaR before and after adding the proposed position.
+        Blocks if the marginal increase exceeds marginal_var_limit_fraction * balance.
+        """
+        var_before = self.compute_portfolio_var(current_positions)
+
+        new_position = {
+            "ticker": ticker,
+            "risk_cents": proposed_risk_cents,
+            "loss_prob": loss_prob,
+        }
+        var_after = self.compute_portfolio_var(current_positions + [new_position])
+
+        marginal_var = var_after - var_before
+        max_marginal = int(available_balance_cents * self.config.marginal_var_limit_fraction)
+
+        if marginal_var > max_marginal:
+            return (False, f"marginal VaR ${marginal_var/100:.0f} exceeds limit "
+                          f"${max_marginal/100:.0f} ({self.config.marginal_var_limit_fraction*100:.0f}% of balance)")
+
+        return (True, "")
+
     def reset_daily(self) -> None:
         """Reset daily risk tracking."""
         self._cluster_risk.clear()
