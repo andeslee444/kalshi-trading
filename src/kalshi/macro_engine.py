@@ -302,3 +302,241 @@ Article:
         except Exception as e:
             _log.error("  DeepSeek sentiment extraction failed: %s", e)
             return None
+
+
+# Default RSS feed URLs
+DEFAULT_RSS_FEEDS = [
+    "https://www.reuters.com/arc/outboundfeeds/v3/all/",  # Reuters headlines
+]
+KOBEISSI_URL = "https://thekobeissiletter.com/blog"
+
+# Cache settings
+MACRO_CACHE_PATH = PROJECT_DIR / "data" / "macro-cache.json"
+MACRO_CACHE_TTL = 4 * 3600  # 4 hours
+
+
+class MacroEngine:
+    """Autonomous macro sentiment engine.
+
+    Fetches from FRED, Truflation, RSS feeds, and Kobeissi blog.
+    Produces a MacroSignal with CPI bias adjustments for the economics bot.
+
+    Usage:
+        engine = MacroEngine()
+        signal = engine.compute_signal(cleveland_nowcast=2.8)
+        adjusted_nowcast = 2.8 + signal.cpi_bias
+        sigma_mult = engine.compute_sigma_multiplier(signal.confidence)
+        adjusted_sigma = base_sigma * sigma_mult
+    """
+
+    def __init__(self, config: Optional[dict] = None):
+        self._config = config or {}
+        self._fred = FREDClient(api_key=self._config.get("fred_api_key", ""))
+        self._truflation = TruflationClient()
+        self._rss = RSSFeedParser()
+        self._deepseek_key = self._load_deepseek_key()
+        self._sentiment = SentimentExtractor(api_key=self._deepseek_key)
+
+    def _load_deepseek_key(self) -> str:
+        """Load DeepSeek API key (same path as beatrelease scanner)."""
+        key_path = PROJECT_DIR / "config" / "keys" / "deepseek.txt"
+        try:
+            key = key_path.read_text().strip()
+            if key and key != "PASTE_YOUR_DEEPSEEK_API_KEY_HERE":
+                return key
+        except (FileNotFoundError, OSError):
+            pass
+        import os
+        return os.environ.get("DEEPSEEK_API_KEY", "")
+
+    def _tips_breakeven_bias(self, breakeven: float, nowcast: float) -> float:
+        """Compute CPI bias from TIPS breakeven vs Cleveland Fed nowcast.
+
+        Returns bias in percentage points. Scaled by 0.3 because TIPS
+        breakevens reflect long-term expectations, not next-month CPI.
+        """
+        if breakeven is None or nowcast is None:
+            return 0.0
+        return (breakeven - nowcast) * 0.3
+
+    def _truflation_bias(self, truflation: float, nowcast: float) -> float:
+        """Compute CPI bias from Truflation real-time CPI vs nowcast.
+
+        Returns bias in percentage points. Truflation tracks the same
+        basket, so the scaling factor is higher (0.5).
+        """
+        if truflation is None or nowcast is None:
+            return 0.0
+        return (truflation - nowcast) * 0.5
+
+    def _aggregate_confidence(self, biases: List[float], source_count: int,
+                               total_sources: int) -> float:
+        """Compute confidence from bias agreement and source coverage.
+
+        Higher when:
+          - More sources available (coverage)
+          - Sources agree on direction (agreement)
+        """
+        if not biases or source_count == 0:
+            return 0.0
+
+        # Coverage: fraction of sources that returned data
+        coverage = source_count / max(1, total_sources)
+
+        # Agreement: what fraction of biases agree on sign?
+        positive = sum(1 for b in biases if b > 0.005)
+        negative = sum(1 for b in biases if b < -0.005)
+        total = len(biases)
+        agreement = max(positive, negative) / total if total > 0 else 0.0
+
+        # Combine: sqrt(coverage * agreement) gives a 0-1 score
+        import math
+        return min(1.0, math.sqrt(coverage * agreement))
+
+    def compute_sigma_multiplier(self, confidence: float) -> float:
+        """Compute sigma adjustment multiplier based on macro confidence.
+
+        Higher confidence -> tighter sigma (up to 30% reduction).
+        Low confidence -> no change (multiplier = 1.0).
+
+        Returns: multiplier in [0.7, 1.0]
+        """
+        if confidence <= 0.3:
+            return 1.0
+        # Linear interpolation: conf 0.3 -> 1.0, conf 1.0 -> 0.7
+        return 1.0 - 0.3 * ((confidence - 0.3) / 0.7)
+
+    def compute_signal(self, cleveland_nowcast: Optional[float] = None) -> MacroSignal:
+        """Fetch all sources and compute aggregated macro signal.
+
+        Args:
+            cleveland_nowcast: Current Cleveland Fed nowcast value (e.g. 2.8%).
+                Used as anchor for relative bias computation.
+
+        Returns:
+            MacroSignal with cpi_bias, confidence, and individual source values.
+        """
+        import datetime
+
+        signal = MacroSignal(timestamp=datetime.datetime.now().isoformat())
+        biases = []
+
+        # 1. FRED data
+        fred_data = self._fred.fetch_all()
+        if "tips_breakeven_10y" in fred_data:
+            signal.tips_breakeven = fred_data["tips_breakeven_10y"]
+            signal.sources_available += 1
+            if cleveland_nowcast is not None:
+                bias = self._tips_breakeven_bias(signal.tips_breakeven, cleveland_nowcast)
+                biases.append(bias)
+
+        if "umich_expectations" in fred_data:
+            signal.umich_expectations = fred_data["umich_expectations"]
+            signal.sources_available += 1
+            if cleveland_nowcast is not None:
+                bias = (signal.umich_expectations - cleveland_nowcast) * 0.2
+                biases.append(bias)
+
+        if "gdpnow" in fred_data:
+            signal.gdpnow = fred_data["gdpnow"]
+            signal.sources_available += 1
+
+        # 2. Truflation
+        truflation = self._truflation.fetch()
+        if truflation is not None:
+            signal.truflation_cpi = truflation
+            signal.sources_available += 1
+            if cleveland_nowcast is not None:
+                bias = self._truflation_bias(truflation, cleveland_nowcast)
+                biases.append(bias)
+
+        # 3. RSS sentiment
+        all_sentiments = []
+        rss_urls = self._config.get("rss_feeds", DEFAULT_RSS_FEEDS)
+        for url in rss_urls:
+            entries = self._rss.fetch_feed(url)
+            relevant = self._rss.filter_relevant(entries)
+            for entry in relevant[:3]:  # cap per feed
+                sentiment = self._sentiment.extract(
+                    f"{entry.title}\n\n{entry.summary}"
+                )
+                if sentiment:
+                    all_sentiments.append(sentiment)
+
+        # 4. Kobeissi blog (HTML scrape, not RSS)
+        kobeissi_sentiments = self._fetch_kobeissi_sentiment()
+        all_sentiments.extend(kobeissi_sentiments)
+
+        if all_sentiments:
+            signal.sources_available += 1
+            avg_score = sum(s.score for s in all_sentiments) / len(all_sentiments)
+            avg_conf = sum(s.confidence for s in all_sentiments) / len(all_sentiments)
+            signal.sentiment_score = avg_score
+            # Sentiment score -> CPI bias: +1 score -> +0.05pp bias
+            bias = avg_score * 0.05
+            biases.append(bias)
+
+        # 5. Aggregate
+        if biases:
+            signal.cpi_bias = sum(biases) / len(biases)
+            # Clamp bias to [-0.15, +0.15] pp
+            signal.cpi_bias = max(-0.15, min(0.15, signal.cpi_bias))
+        signal.confidence = self._aggregate_confidence(
+            biases, signal.sources_available, signal.sources_total
+        )
+
+        _log.info("  Macro signal: bias=%.3f%%, confidence=%.2f, sources=%d/%d",
+                   signal.cpi_bias, signal.confidence,
+                   signal.sources_available, signal.sources_total)
+
+        # Cache the signal
+        self._save_cache(signal)
+
+        return signal
+
+    def _fetch_kobeissi_sentiment(self) -> List[SentimentResult]:
+        """Fetch and analyze Kobeissi Letter blog posts."""
+        results = []
+        try:
+            from bs4 import BeautifulSoup
+            resp = retry_request("GET", KOBEISSI_URL, timeout=15,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # Extract article links and text
+            for article in soup.find_all("article")[:3]:
+                text = article.get_text(separator="\n", strip=True)
+                if len(text) < 50:
+                    continue
+                # Quick relevance check
+                if not _MACRO_KEYWORDS.search(text):
+                    continue
+                sentiment = self._sentiment.extract(text)
+                if sentiment:
+                    results.append(sentiment)
+        except Exception as e:
+            _log.warning("  Kobeissi fetch/parse failed: %s", e)
+        return results
+
+    def _save_cache(self, signal: MacroSignal):
+        """Cache the signal to disk."""
+        try:
+            _atomic_write_json(MACRO_CACHE_PATH, {
+                "cached_at": time.time(),
+                "signal": asdict(signal),
+            })
+        except Exception as e:
+            _log.warning("  Failed to cache macro signal: %s", e)
+
+    def load_cached_signal(self) -> Optional[MacroSignal]:
+        """Load cached signal if fresh (within TTL)."""
+        try:
+            if not MACRO_CACHE_PATH.exists():
+                return None
+            data = json.loads(MACRO_CACHE_PATH.read_text())
+            if time.time() - data.get("cached_at", 0) > MACRO_CACHE_TTL:
+                return None
+            s = data.get("signal", {})
+            return MacroSignal(**{k: v for k, v in s.items()
+                                  if k in MacroSignal.__dataclass_fields__})
+        except Exception:
+            return None

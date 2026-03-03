@@ -16,6 +16,7 @@ from macro_engine import (
     FeedEntry,
     SentimentExtractor,
     SentimentResult,
+    MacroEngine,
 )
 
 
@@ -246,3 +247,77 @@ class TestSentimentExtractor:
         extractor = SentimentExtractor(api_key="test")
         assert extractor._direction_to_score("higher", 6) == pytest.approx(1.0, abs=0.01)
         assert extractor._direction_to_score("lower", 6) == pytest.approx(-1.0, abs=0.01)
+
+
+class TestMacroEngineAggregation:
+    """Tests for MacroEngine signal aggregation."""
+
+    def test_cpi_bias_from_tips_breakeven(self):
+        """TIPS breakeven above Cleveland Fed nowcast -> positive CPI bias."""
+        engine = MacroEngine.__new__(MacroEngine)
+        # Cleveland nowcast: 2.8%, TIPS breakeven: 3.1%
+        # Bias should be positive (market expects higher inflation)
+        bias = engine._tips_breakeven_bias(breakeven=3.1, nowcast=2.8)
+        assert bias > 0
+        assert bias < 0.5  # should be moderate
+
+    def test_cpi_bias_from_tips_below_nowcast(self):
+        """TIPS breakeven below nowcast -> negative bias."""
+        engine = MacroEngine.__new__(MacroEngine)
+        bias = engine._tips_breakeven_bias(breakeven=2.5, nowcast=2.8)
+        assert bias < 0
+
+    def test_cpi_bias_tips_equal_nowcast(self):
+        """TIPS == nowcast -> zero bias."""
+        engine = MacroEngine.__new__(MacroEngine)
+        bias = engine._tips_breakeven_bias(breakeven=2.8, nowcast=2.8)
+        assert bias == pytest.approx(0.0, abs=0.01)
+
+    def test_truflation_bias(self):
+        """Truflation above nowcast -> positive bias."""
+        engine = MacroEngine.__new__(MacroEngine)
+        bias = engine._truflation_bias(truflation=3.0, nowcast=2.8)
+        assert bias > 0
+
+    def test_aggregate_confidence_scales_with_sources(self):
+        """Confidence is higher when more sources agree."""
+        engine = MacroEngine.__new__(MacroEngine)
+        # All positive biases -> higher confidence
+        conf = engine._aggregate_confidence(
+            biases=[0.05, 0.03, 0.02],
+            source_count=3,
+            total_sources=6,
+        )
+        assert conf > 0.3
+
+    def test_aggregate_confidence_low_when_sources_disagree(self):
+        """Mixed positive/negative biases -> lower confidence."""
+        engine = MacroEngine.__new__(MacroEngine)
+        conf = engine._aggregate_confidence(
+            biases=[0.05, -0.03, 0.02],
+            source_count=3,
+            total_sources=6,
+        )
+        # Should be lower than all-agreeing case
+        conf_agree = engine._aggregate_confidence(
+            biases=[0.05, 0.03, 0.02],
+            source_count=3,
+            total_sources=6,
+        )
+        assert conf < conf_agree
+
+    def test_aggregate_confidence_zero_when_no_sources(self):
+        """No sources -> zero confidence."""
+        engine = MacroEngine.__new__(MacroEngine)
+        conf = engine._aggregate_confidence(biases=[], source_count=0, total_sources=6)
+        assert conf == 0.0
+
+    def test_sigma_adjustment(self):
+        """High confidence should tighten sigma, low confidence widen it."""
+        engine = MacroEngine.__new__(MacroEngine)
+        # High confidence -> tighter sigma (multiplier < 1)
+        tight = engine.compute_sigma_multiplier(confidence=0.8)
+        assert tight < 1.0
+        # Low confidence -> no tightening
+        wide = engine.compute_sigma_multiplier(confidence=0.2)
+        assert wide >= 1.0
