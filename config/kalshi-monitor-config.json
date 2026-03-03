@@ -7,7 +7,7 @@
   "maxDailyLossPct": 0.10,
   "sources": {
     "hdd": {
-      "enabled": false,
+      "enabled": true,
       "urls": ["https://www.hitsdailydouble.com/news", "https://www.hitsdailydouble.com/news/charts"],
       "sanityProject": "8aky18h3",
       "chartSlugs": ["hits-top-50", "midweek-20"],

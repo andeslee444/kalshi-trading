@@ -10,7 +10,7 @@
     }
   },
   "entertainment": {
-    "enabled": true,
+    "enabled": false,
     "maxTradeAmount": 15,
     "maxTradeAmountPct": 0.03,
     "maxDailyTrades": 10,
