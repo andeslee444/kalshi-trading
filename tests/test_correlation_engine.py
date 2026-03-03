@@ -204,3 +204,52 @@ class TestPortfolioVaR:
         pos_small = [{"ticker": "KXBTC-26MAR3-T95000", "risk_cents": 10000, "loss_prob": 0.30}]
         pos_large = [{"ticker": "KXBTC-26MAR3-T95000", "risk_cents": 20000, "loss_prob": 0.30}]
         assert self.engine.compute_portfolio_var(pos_large) > self.engine.compute_portfolio_var(pos_small)
+
+
+class TestMarginalVaR:
+    """Test marginal VaR threshold check."""
+
+    def setup_method(self):
+        from correlation_engine import CorrelationEngine, CorrelationConfig
+        self.engine = CorrelationEngine(config=CorrelationConfig(
+            marginal_var_limit_fraction=0.05
+        ))
+
+    def test_first_trade_allowed(self):
+        """First trade should always be allowed (marginal VaR from 0)."""
+        allowed, reason = self.engine.check_marginal_var(
+            ticker="KXBTC-26MAR3-T95000",
+            proposed_risk_cents=5000,
+            loss_prob=0.30,
+            current_positions=[],
+            available_balance_cents=500000,
+        )
+        assert allowed
+
+    def test_large_correlated_trade_blocked(self):
+        """Adding a large correlated position should be blocked."""
+        existing = [
+            {"ticker": "KXCPI-26MAY-T20", "risk_cents": 50000, "loss_prob": 0.20},
+        ]
+        allowed, reason = self.engine.check_marginal_var(
+            ticker="KXCPI-26MAY-T21",
+            proposed_risk_cents=50000,
+            loss_prob=0.20,
+            current_positions=existing,
+            available_balance_cents=500000,
+        )
+        assert not allowed
+
+    def test_small_uncorrelated_trade_allowed(self):
+        """A small uncorrelated position should be allowed."""
+        existing = [
+            {"ticker": "KXCPI-26MAY-T20", "risk_cents": 30000, "loss_prob": 0.20},
+        ]
+        allowed, reason = self.engine.check_marginal_var(
+            ticker="KXBTC-26MAR3-T95000",
+            proposed_risk_cents=5000,
+            loss_prob=0.30,
+            current_positions=existing,
+            available_balance_cents=500000,
+        )
+        assert allowed
