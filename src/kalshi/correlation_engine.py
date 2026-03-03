@@ -150,3 +150,69 @@ class CorrelationEngine:
         fa = self.ticker_to_factor(ticker_a)
         fb = self.ticker_to_factor(ticker_b)
         return self.get_factor_correlation(fa, fb)
+
+    # === Cluster Risk Tracking ===
+
+    def _get_super_cluster(self, factor: str) -> List[str]:
+        """Get all factors that should be grouped with this one due to high correlation.
+
+        Factors with inter-factor correlation >= 0.70 are merged into a "super cluster"
+        for concentration limit purposes. Uses BFS for transitive closure — if A-B and
+        B-C are both >= 0.70, then A, B, C all share a cluster.
+        """
+        MERGE_THRESHOLD = 0.70
+        visited = set()
+        queue = [factor]
+        while queue:
+            current = queue.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+            for (fa, fb), corr in INTER_FACTOR_CORRELATIONS.items():
+                if corr >= MERGE_THRESHOLD:
+                    if fa == current and fb not in visited:
+                        queue.append(fb)
+                    elif fb == current and fa not in visited:
+                        queue.append(fa)
+        return sorted(visited)
+
+    def _cluster_key(self, factor: str) -> str:
+        """Get the canonical cluster key for a factor (handles super-clusters)."""
+        members = self._get_super_cluster(factor)
+        return "+".join(members)
+
+    def record_trade(self, ticker: str, risk_cents: int) -> None:
+        """Record risk from a trade into the appropriate cluster."""
+        factor = self.ticker_to_factor(ticker)
+        key = self._cluster_key(factor)
+        self._cluster_risk[key] = self._cluster_risk.get(key, 0) + risk_cents
+
+    def get_cluster_risk(self, factor: str) -> int:
+        """Get total risk in the cluster containing this factor."""
+        key = self._cluster_key(factor)
+        return self._cluster_risk.get(key, 0)
+
+    def check_cluster_limit(self, ticker: str, proposed_risk_cents: int,
+                            available_balance_cents: int) -> Tuple[bool, str]:
+        """Check #6: Cluster concentration limit.
+
+        Returns (allowed, reason). Blocks if adding this trade would push
+        the cluster above cluster_max_fraction of available balance.
+        """
+        factor = self.ticker_to_factor(ticker)
+        key = self._cluster_key(factor)
+        current_risk = self._cluster_risk.get(key, 0)
+        max_cluster_risk = int(available_balance_cents * self.config.cluster_max_fraction)
+        projected = current_risk + proposed_risk_cents
+
+        if projected > max_cluster_risk:
+            return (False, f"cluster {key} would reach ${projected/100:.0f} "
+                          f"(limit ${max_cluster_risk/100:.0f} = "
+                          f"{self.config.cluster_max_fraction*100:.0f}% of ${available_balance_cents/100:.0f})")
+
+        return (True, "")
+
+    def reset_daily(self) -> None:
+        """Reset daily risk tracking."""
+        self._cluster_risk.clear()
+        self._portfolio_var = 0.0

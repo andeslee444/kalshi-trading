@@ -77,3 +77,76 @@ class TestFactorMapping:
         f1 = self.engine.ticker_to_factor("KXCPI-26MAY-T20")
         f2 = self.engine.ticker_to_factor("KXBTC-26MAR3-T95000")
         assert f1 != f2
+
+
+class TestClusterRisk:
+    """Test cluster risk tracking and concentration limits."""
+
+    def setup_method(self):
+        from correlation_engine import CorrelationEngine, CorrelationConfig
+        self.engine = CorrelationEngine(config=CorrelationConfig(cluster_max_fraction=0.15))
+
+    def test_record_trade_adds_to_cluster(self):
+        self.engine.record_trade("KXCPI-26MAY-T20", risk_cents=50000)
+        cluster_risk = self.engine.get_cluster_risk("CPI")
+        assert cluster_risk == 50000
+
+    def test_same_cluster_accumulates(self):
+        """Two CPI trades should accumulate in the same cluster."""
+        self.engine.record_trade("KXCPI-26MAY-T20", risk_cents=50000)
+        self.engine.record_trade("KXCPI-26MAY-T21", risk_cents=30000)
+        assert self.engine.get_cluster_risk("CPI") == 80000
+
+    def test_different_clusters_independent(self):
+        """CPI and BTC trades should be in separate clusters."""
+        self.engine.record_trade("KXCPI-26MAY-T20", risk_cents=50000)
+        self.engine.record_trade("KXBTC-26MAR3-T95000", risk_cents=20000)
+        assert self.engine.get_cluster_risk("CPI") == 50000
+        assert self.engine.get_cluster_risk("BTC") == 20000
+
+    def test_check_cluster_limit_allows(self):
+        """Under limit: $500 CPI risk with $5000 balance -> 10% < 15% limit."""
+        allowed, reason = self.engine.check_cluster_limit(
+            "KXCPI-26MAY-T22", proposed_risk_cents=10000, available_balance_cents=500000
+        )
+        assert allowed
+
+    def test_check_cluster_limit_blocks(self):
+        """Over limit: $800 CPI risk with $5000 balance -> 16% > 15% limit."""
+        self.engine.record_trade("KXCPI-26MAY-T20", risk_cents=70000)
+        allowed, reason = self.engine.check_cluster_limit(
+            "KXCPI-26MAY-T21", proposed_risk_cents=10000, available_balance_cents=500000
+        )
+        assert not allowed
+        assert "cluster" in reason.lower()
+
+    def test_cluster_limit_prevents_cpi_concentration(self):
+        """The CPI blowup scenario: $1720 in CPI on $5090 balance = 33.8%.
+        Should have been blocked after ~$763 (15% of $5090)."""
+        self.engine.record_trade("KXCPI-26MAY-T20", risk_cents=76000)
+        allowed, _ = self.engine.check_cluster_limit(
+            "KXCPI-26MAY-T21", proposed_risk_cents=1000, available_balance_cents=509000
+        )
+        assert not allowed
+
+    def test_correlated_factors_share_cluster(self):
+        """CPI and CORE_CPI should share risk since they are correlated > 0.70."""
+        self.engine.record_trade("KXCPI-26MAY-T20", risk_cents=40000)
+        self.engine.record_trade("KXCORECPI-26JUN-T23", risk_cents=40000)
+        # If combined exposure is checked, 80k on 500k = 16% > 15%
+        allowed, _ = self.engine.check_cluster_limit(
+            "KXCPI-26MAY-T21", proposed_risk_cents=1000, available_balance_cents=500000
+        )
+        assert not allowed
+
+    def test_weather_region_clusters(self):
+        """Houston and Austin weather should share WEATHER_SOUTH_TX cluster."""
+        self.engine.record_trade("KXHIGHHOU-26MAR3-T86", risk_cents=30000)
+        self.engine.record_trade("KXHIGHAUS-26MAR3-T75", risk_cents=30000)
+        assert self.engine.get_cluster_risk("WEATHER_SOUTH_TX") == 60000
+
+    def test_reset_daily(self):
+        """Daily reset should clear all cluster risk."""
+        self.engine.record_trade("KXCPI-26MAY-T20", risk_cents=50000)
+        self.engine.reset_daily()
+        assert self.engine.get_cluster_risk("CPI") == 0
