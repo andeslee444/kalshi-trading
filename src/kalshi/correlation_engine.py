@@ -262,6 +262,54 @@ class CorrelationEngine:
         self._portfolio_var = var
         return var
 
+    # === Tail Dependence ===
+
+    def compute_tail_dependence(self, factor_a: str, factor_b: str) -> float:
+        """Compute lower tail dependence coefficient using Student-t copula.
+
+        For a bivariate t-copula with correlation rho and nu degrees of freedom:
+          lambda = 2 * t_{nu+1}(-sqrt((nu+1)(1-rho)/(1+rho)))
+
+        Returns lambda in [0, 1]. Higher = more tail dependence = more crisis correlation.
+        """
+        rho = self.get_factor_correlation(factor_a, factor_b)
+
+        if abs(rho) < 1e-6:
+            return 0.0
+
+        nu = self.config.copula_df
+
+        from scipy.stats import t as t_dist
+
+        arg = -math.sqrt((nu + 1) * (1 - rho) / (1 + rho))
+        lam = 2.0 * t_dist.cdf(arg, df=nu + 1)
+
+        return max(0.0, min(1.0, lam))
+
+    def get_tail_risk_multiplier(self, ticker: str,
+                                  current_positions: List[Dict]) -> float:
+        """Check #8: Tail-risk Kelly reduction.
+
+        Returns a multiplier in [0.75, 1.0] to apply to Kelly fraction.
+        If any existing position shares high tail dependence with the proposed
+        ticker, reduce Kelly by tail_dep_kelly_cut (default 25%).
+        """
+        if not current_positions:
+            return 1.0
+
+        new_factor = self.ticker_to_factor(ticker)
+
+        max_tail_dep = 0.0
+        for pos in current_positions:
+            existing_factor = self.ticker_to_factor(pos["ticker"])
+            td = self.compute_tail_dependence(new_factor, existing_factor)
+            max_tail_dep = max(max_tail_dep, td)
+
+        if max_tail_dep > self.config.tail_dep_kelly_threshold:
+            return 1.0 - self.config.tail_dep_kelly_cut
+
+        return 1.0
+
     # === Marginal VaR ===
 
     def check_marginal_var(self, ticker: str, proposed_risk_cents: int,
