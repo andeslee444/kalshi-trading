@@ -27,6 +27,8 @@ import datetime
 import logging
 from pathlib import Path
 
+from correlation_engine import CorrelationEngine, CorrelationConfig
+
 _log = logging.getLogger("capital_allocator")
 
 # Default path for shared state file (all bots converge here)
@@ -217,11 +219,50 @@ class PortfolioAllocator:
         self._max_positions = max_positions
         self._position_count = None
         self._position_count_fetched_at = 0
+        # Correlation engine for portfolio risk checks
+        corr_config = self._load_correlation_config()
+        corr_state = str(self.state_path.parent / "correlation-state.json") if self.state_path else None
+        self._correlation_engine = CorrelationEngine(config=corr_config, state_path=corr_state, logger=self.log)
+        self._correlation_engine.load_state()
+
         if ABSOLUTE_DAILY_LOSS_CAP_PCT > 0:
             self.log.info("Allocator: daily loss cap = $%.0f floor + %.0f%% of bankroll",
                           ABSOLUTE_DAILY_LOSS_CAP_CENTS / 100, ABSOLUTE_DAILY_LOSS_CAP_PCT * 100)
         else:
             self.log.info("Allocator: daily loss cap = $%.0f (static)", ABSOLUTE_DAILY_LOSS_CAP_CENTS / 100)
+
+    def _load_correlation_config(self):
+        """Load correlation engine config from bots-config.json."""
+        try:
+            config_path = Path(__file__).resolve().parent.parent.parent / "config" / "bots-config.json"
+            if config_path.exists():
+                cfg = json.loads(config_path.read_text())
+                corr = cfg.get("correlation", {})
+                return CorrelationConfig(
+                    cluster_max_fraction=corr.get("clusterMaxFraction", 0.15),
+                    marginal_var_limit_fraction=corr.get("marginalVarLimitFraction", 0.05),
+                    tail_dep_kelly_threshold=corr.get("tailDepKellyThreshold", 0.15),
+                    tail_dep_kelly_cut=corr.get("tailDepKellyCut", 0.25),
+                    var_confidence=corr.get("varConfidence", 0.99),
+                    copula_df=corr.get("copulaDf", 5),
+                )
+        except Exception:
+            pass
+        return CorrelationConfig()
+
+    def _get_positions_for_var(self):
+        """Get current positions formatted for VaR computation."""
+        positions = []
+        for ticker, info in self._traded_tickers.items():
+            risk = info.get("risk_cents", 0) if isinstance(info, dict) else 0
+            edge = info.get("edge", 0.10) if isinstance(info, dict) else 0.10
+            loss_prob = max(0.01, 1.0 - (0.5 + edge))
+            positions.append({
+                "ticker": ticker,
+                "risk_cents": risk,
+                "loss_prob": loss_prob,
+            })
+        return positions
 
     def _load_state(self):
         """Load shared state from disk with advisory file locking."""
@@ -315,6 +356,7 @@ class PortfolioAllocator:
             self._total_risk_cents = 0
             self._daily_date = today
             self._pending_exits = []
+            self._correlation_engine.reset_daily()
             self._save_state()
 
     def _get_balance(self):
@@ -406,6 +448,9 @@ class PortfolioAllocator:
             region = _CITY_TO_REGION.get(city_code)
             if region:
                 self._region_risk[region] = self._region_risk.get(region, 0) + risk_cents
+        # Update correlation engine cluster risk
+        self._correlation_engine.record_trade(ticker, risk_cents)
+        self._correlation_engine.save_state()
 
     def _risk_today_cents(self):
         """Sum risk_cents from all today's entries in traded tickers."""
@@ -539,6 +584,23 @@ class PortfolioAllocator:
                     return BudgetResponse(False, reason=f"region exposure limit reached for {region}")
                 remaining_city = min(remaining_city, max_region_risk - region_spent)
 
+        # 5d. Cluster concentration check (correlation engine)
+        cluster_ok, cluster_reason = self._correlation_engine.check_cluster_limit(
+            ticker, bot_max_cost_cents, available_balance
+        )
+        if not cluster_ok:
+            return BudgetResponse(False, reason=cluster_reason)
+
+        # 5e. Marginal VaR check
+        current_positions = self._get_positions_for_var()
+        var_ok, var_reason = self._correlation_engine.check_marginal_var(
+            ticker, bot_max_cost_cents, loss_prob=max(0.01, 1.0 - confidence),
+            current_positions=current_positions,
+            available_balance_cents=available_balance,
+        )
+        if not var_ok:
+            return BudgetResponse(False, reason=var_reason)
+
         # 6. Compute allocated budget
         # The allocation is the minimum of all constraints
         constraints = {
@@ -577,6 +639,12 @@ class PortfolioAllocator:
 
         if allocated <= 0:
             return BudgetResponse(False, reason="computed allocation is zero")
+
+        # 8. Tail-risk Kelly reduction
+        tail_mult = self._correlation_engine.get_tail_risk_multiplier(ticker, current_positions)
+        if tail_mult < 1.0:
+            bankroll = int(bankroll * tail_mult)
+            self.log.info("Tail risk reduction: %s mult=%.2f -> bankroll $%.2f", ticker, tail_mult, bankroll / 100)
 
         return BudgetResponse(
             approved=True,

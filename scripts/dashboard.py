@@ -933,6 +933,18 @@ async def api_exit_state():
 
 # ─── Main ───
 
+@app.get("/api/correlation")
+async def api_correlation():
+    """Return correlation engine state for monitoring."""
+    state_path = DATA_DIR / "correlation-state.json"
+    if state_path.exists():
+        try:
+            return json.loads(state_path.read_text())
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return {"cluster_risk": {}, "portfolio_var": 0, "last_updated": ""}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Kalshi Trading Dashboard")
     parser.add_argument("--port", type=int, default=3456, help="Port (default: 3456)")

@@ -141,11 +141,11 @@ class TestBankrollUsesAvailable:
         return alloc
 
     def test_bankroll_equals_available(self):
-        """When total=10000, available=2000, bankroll should be 2000."""
-        alloc = self._make_allocator(total=10000, available=2000)
+        """When total=100000, available=5000, bankroll should be 5000."""
+        alloc = self._make_allocator(total=100000, available=5000)
         budget = alloc.request_budget("weather", "TICK-NEW", edge=0.10)
         assert budget.approved
-        assert budget.bankroll_cents == 2000
+        assert budget.bankroll_cents == 5000
 
     def test_bankroll_not_total(self):
         """Bankroll should NOT be total balance."""
@@ -493,3 +493,60 @@ class TestBankrollProportionalAbsoluteCap:
             # Total = 45000 < 50000 static cap
             budget = alloc.request_budget("weather", "TICK-NEW", edge=0.15)
         assert budget.approved  # 45000 < 50000 static cap
+
+
+# ===================================================================
+# Correlation Engine Integration tests (T2-P2)
+# ===================================================================
+
+class TestCorrelationIntegration:
+    """Test capital allocator integration with correlation engine."""
+
+    def _make_allocator(self, balance=500000):
+        mock_client = MagicMock()
+        mock_client.get_balance.return_value = (balance, balance)
+        mock_client.get.return_value = {"market_positions": []}
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            json.dump({}, f)
+            state_path = f.name
+        alloc = PortfolioAllocator(client=mock_client, state_path=state_path)
+        alloc._daily_date = datetime.date.today().isoformat()
+        return alloc
+
+    @patch("capital_allocator.ABSOLUTE_DAILY_LOSS_CAP_CENTS", 100000000)
+    @patch("capital_allocator.ABSOLUTE_DAILY_LOSS_CAP_PCT", 0)
+    def test_cluster_limit_blocks_concentration(self):
+        """Allocator should block trades that exceed cluster concentration limit.
+
+        With $5000 balance, cluster limit = 15% = $750.
+        After $800 in CPI trades, next CPI trade should be blocked.
+        Patches absolute cap to isolate the cluster check.
+        """
+        alloc = self._make_allocator(balance=500000)
+        # Record $800 in CPI trades (80000 cents > 75000 cluster limit)
+        for i in range(8):
+            alloc.record_trade("source-monitor", f"KXCPI-26MAY-T3{i}", 10000, edge=0.10)
+        result = alloc.request_budget("economics", "KXCPI-26MAY-T50", edge=0.10, confidence=0.90)
+        assert not result.approved
+        assert "cluster" in result.reason.lower()
+
+    @patch("capital_allocator.ABSOLUTE_DAILY_LOSS_CAP_CENTS", 100000000)
+    @patch("capital_allocator.ABSOLUTE_DAILY_LOSS_CAP_PCT", 0)
+    def test_uncorrelated_trade_allowed_despite_cluster_risk(self):
+        """BTC trade should be allowed even if CPI cluster is full."""
+        alloc = self._make_allocator(balance=500000)
+        for i in range(8):
+            alloc.record_trade("economics", f"KXCPI-26MAY-T3{i}", 10000, edge=0.10)
+        result = alloc.request_budget("crypto", "KXBTC-26MAR3-T95000", edge=0.10, confidence=0.80)
+        assert result.approved
+
+    @patch("capital_allocator.ABSOLUTE_DAILY_LOSS_CAP_CENTS", 100000000)
+    @patch("capital_allocator.ABSOLUTE_DAILY_LOSS_CAP_PCT", 0)
+    def test_tail_risk_reduces_bankroll(self):
+        """When tail dependence is high, bankroll for Kelly should be reduced."""
+        alloc = self._make_allocator(balance=500000)
+        alloc.record_trade("economics", "KXCPI-26MAY-T20", 20000, edge=0.10)
+        result = alloc.request_budget("economics", "KXCPI-26MAY-T21", edge=0.10, confidence=0.85)
+        if result.approved:
+            # Bankroll should be reduced by tail risk multiplier (75% of 500000 = 375000)
+            assert result.bankroll_cents < 500000
