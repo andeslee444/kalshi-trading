@@ -277,6 +277,25 @@ def ensemble_weather_probability(forecasts, threshold, direction, days_out=0, ci
     return weighted_prob / total_weight
 
 
+def ensemble_spread_sigma_multiplier(spread_f):
+    """Compute sigma multiplier based on ensemble model spread.
+
+    When GFS, ECMWF, and ICON disagree, forecast uncertainty is higher.
+    Wider ensemble spread → wider sigma → more conservative trading.
+
+    Args:
+        spread_f: Max - min forecast temperature across models (°F).
+
+    Returns:
+        Multiplier >= 1.0. Applied to base sigma in weather_probability().
+    """
+    if spread_f <= 2.0:
+        return 1.0  # Models agree — no adjustment
+    # Linear ramp: spread 2→10°F maps to multiplier 1.0→2.0
+    raw = 1.0 + (spread_f - 2.0) * 0.125
+    return min(raw, 2.5)  # Cap at 2.5x
+
+
 def nws_sigma_for_hour(hour_of_day):
     """NWS temperature uncertainty (sigma in degrees F) for a given hour.
 
