@@ -27,6 +27,7 @@ from probability import (
 )
 from ticker_utils import parse_crypto_ticker
 from capital_allocator import PortfolioAllocator
+from particle_filter import FilterManager, FilterConfig, ci_kelly_multiplier
 
 setup_unbuffered()
 log = setup_logging("crypto")
@@ -69,6 +70,16 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxDailyLossPct": crypto_config.get("maxDailyLossPct"),
 }, logger=log, cooldown_hours=0.5, order_monitor=order_monitor)  # short cooldown for fast markets
 trim_trade_log(TRADES_PATH)
+
+# Particle filter for Bayesian belief tracking
+pf_config = FilterConfig(
+    n_particles=crypto_config.get("pfParticles", 200),
+    process_noise=crypto_config.get("pfProcessNoise", 0.02),
+    observation_noise=crypto_config.get("pfObservationNoise", 0.05),
+)
+filter_mgr = FilterManager(bot_name="crypto", state_dir=PROJECT_DIR / "data",
+                            default_config=pf_config)
+filter_mgr.load_all()
 
 # === Market ticker prefixes ===
 CRYPTO_PREFIXES = ["KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXXRP", "KXCRYPTO"]
@@ -452,6 +463,13 @@ def scan_and_trade():
             )
             prob = prob_above_low - prob_above_high
 
+        # Particle filter: update belief state and use filtered prob
+        pf = filter_mgr.get_filter(ticker)
+        pf.update(prob)
+        filtered_est = pf.estimate()
+        raw_prob = prob
+        prob = filtered_est.prob  # use filtered probability for edge computation
+
         yes_ask = m.get("yes_ask", 0)
         no_ask = m.get("no_ask", 0)
         yes_bid = m.get("yes_bid", 0)
@@ -478,6 +496,7 @@ def scan_and_trade():
                     "minutes_to_settle": minutes_to_settle,
                     "vol_used": vol_to_use,
                     "is_bracket": direction == "B",
+                    "raw_prob": raw_prob, "filtered_est": filtered_est,
                 })
             else:
                 reason = "edge below mid-range threshold" if eff_threshold > EDGE_THRESHOLD else "edge below threshold"
@@ -496,6 +515,7 @@ def scan_and_trade():
                     "minutes_to_settle": minutes_to_settle,
                     "vol_used": vol_to_use,
                     "is_bracket": direction == "B",
+                    "raw_prob": raw_prob, "filtered_est": filtered_est,
                 })
             else:
                 reason = "edge below mid-range threshold" if eff_threshold > EDGE_THRESHOLD else "edge below threshold"
@@ -537,6 +557,12 @@ def scan_and_trade():
         # Use quarter-Kelly for crypto (high volatility uncertainty)
         fee = kalshi_fee_cents(price)
         count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+
+        # CI-aware sizing: reduce position when filter is uncertain
+        filtered_est = opp["filtered_est"]
+        kelly_mult = ci_kelly_multiplier(filtered_est)
+        count = max(0, int(count * kelly_mult))
+
         if count <= 0:
             ss.skip("kelly_zero")
             trade_manager.log_decision(ticker, side, "skipped", "kelly_zero: edge too small for price",
@@ -577,10 +603,19 @@ def scan_and_trade():
                                             minutes_to_settle=opp["minutes_to_settle"],
                                             asset=opp["asset"],
                                             vol_used=round(opp["vol_used"], 4),
-                                            bracket=opp.get("is_bracket", False))
+                                            bracket=opp.get("is_bracket", False),
+                                            pf_prob=round(filtered_est.prob, 4),
+                                            pf_ci_low=round(filtered_est.ci_low, 4),
+                                            pf_ci_high=round(filtered_est.ci_high, 4),
+                                            pf_trend=filtered_est.trend,
+                                            pf_updates=filtered_est.n_updates,
+                                            pf_kelly_mult=round(kelly_mult, 4))
         if result:
             ss.trades_placed += 1
             allocator.record_trade("crypto", ticker, risk, edge=edge)
+
+    # Save particle filter state
+    filter_mgr.save_all()
 
     ss.finalize()
 

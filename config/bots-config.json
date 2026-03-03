@@ -81,6 +81,10 @@
     "useOrnsteinUhlenbeck": true,
     "ouHalfLifeMinutes": 120,
     "enableBrackets": true,
+    "pfProcessNoise": 0.02,
+    "pfObservationNoise": 0.05,
+    "pfParticles": 200,
+    "pfStalenessHours": 24,
     "exit": {
       "takeProfitCents": 85,
       "stopLossCents": 25,
@@ -99,6 +103,15 @@
     "scanIntervalMinutes": 360,
     "edgeThreshold": 0.08,
     "gasEdgeThreshold": 0.04,
+    "macro": {
+      "enabled": true,
+      "cacheTtlHours": 4,
+      "rssFeedUrls": [],
+      "fredApiKey": "",
+      "maxSentimentArticles": 5,
+      "biasClampPp": 0.15,
+      "sigmaTighteningMax": 0.30
+    },
     "exit": {
       "takeProfitCents": 80,
       "stopLossCents": 30,

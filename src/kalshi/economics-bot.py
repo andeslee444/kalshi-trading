@@ -25,6 +25,7 @@ from probability import (
     kalshi_fee_cents, gas_price_probability,
 )
 from capital_allocator import PortfolioAllocator
+from macro_engine import MacroEngine
 
 setup_unbuffered()
 log = setup_logging("economics")
@@ -49,6 +50,7 @@ GAS_EDGE_THRESHOLD = econ_config.get("gasEdgeThreshold", 0.04)
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
 health = HealthCheckMonitor(logger=log)
+macro = MacroEngine(config=econ_config.get("macro", {}))
 order_monitor = OrderMonitor(client, log=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": MAX_TRADE,
@@ -582,6 +584,18 @@ def scan_and_trade():
     if gas_price:
         ss.source_ok("aaa-gas")
 
+    # Macro adjustment (if available)
+    macro_signal = None
+    try:
+        macro_signal = macro.compute_signal(cleveland_nowcast=nowcast.get("cpi_yoy") if nowcast else None)
+        if macro_signal and macro_signal.confidence > 0.2 and nowcast:
+            if "cpi_yoy" in nowcast:
+                nowcast["cpi_yoy"] += macro_signal.cpi_bias
+                log.info(f"  Macro-adjusted CPI nowcast: {nowcast['cpi_yoy']:.3f}% "
+                         f"(bias={macro_signal.cpi_bias:+.3f}%, conf={macro_signal.confidence:.2f})")
+    except Exception as e:
+        log.warning(f"  Macro engine error (non-fatal): {e}")
+
     if not nowcast and not gas_price:
         log.info("No data sources available (nowcast + gas), skipping scan.")
         ss.finalize()
@@ -658,6 +672,10 @@ def scan_and_trade():
             continue
         else:
             sigma = cpi_nowcast_sigma(days_to_release)  # default fallback
+
+        # Macro-adjusted sigma tightening
+        if macro_signal and macro_signal.confidence > 0.3:
+            sigma *= macro.compute_sigma_multiplier(macro_signal.confidence)
 
         # Compute probability
         if direction_type == "T":
