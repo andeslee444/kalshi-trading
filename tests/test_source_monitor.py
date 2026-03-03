@@ -83,6 +83,10 @@ def _load_source_monitor():
     # Create empty trades file
     (data_dir / "kalshi-monitor-trades.json").write_text("[]")
 
+    # Save originals before stubbing
+    stub_names = ["kalshi_auth", "capital_allocator", "hdd_parser", "ticker_utils"]
+    originals = {name: sys.modules.get(name) for name in stub_names}
+
     # Inject stubs
     sys.modules["kalshi_auth"] = mock_auth
     sys.modules["capital_allocator"] = mock_allocator_mod
@@ -96,6 +100,14 @@ def _load_source_monitor():
     spec = importlib.util.spec_from_file_location("source_monitor", src_dir / "source-monitor.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+
+    # Restore originals
+    for name in stub_names:
+        if originals[name] is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = originals[name]
+
     _sm_module = mod
     return mod
 

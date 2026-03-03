@@ -400,14 +400,14 @@ class TestPortfolioAllocator:
 
     def test_portfolio_daily_limit(self):
         """Total risk across all bots should be bounded."""
-        alloc = self._make_allocator(balance=1000)
-        # Portfolio limit = 25% of 1000 = 250c
-        # source-monitor has priority=1.0, so per-bot limit = 1000*0.40*1.0 = 400c
-        alloc.record_trade("source-monitor", "T1", 200)
-        # 200c used portfolio-wide, 50c remaining in portfolio (250-200)
+        alloc = self._make_allocator(balance=10000)
+        # Portfolio limit = 25% of 10000 = 2500c
+        # source-monitor has priority=1.0, so per-bot limit = 10000*0.30*1.0 = 3000c
+        alloc.record_trade("source-monitor", "T1", 2300)
+        # 2300c used portfolio-wide, 200c remaining in portfolio (2500-2300)
         budget = alloc.request_budget("source-monitor", "T2", edge=0.10)
         assert budget.approved
-        assert budget.max_cost_cents <= 50
+        assert budget.max_cost_cents <= 300
 
     def test_portfolio_limit_exhausted(self):
         alloc = self._make_allocator(balance=1000)
@@ -418,7 +418,7 @@ class TestPortfolioAllocator:
 
     def test_high_confidence_gets_larger_budget(self):
         """High-confidence info-arb should get more capital."""
-        alloc = self._make_allocator(balance=10000)
+        alloc = self._make_allocator(balance=20000)
         normal = alloc.request_budget("entertainment", "T1", edge=0.10, confidence=0.70)
         high = alloc.request_budget("entertainment", "T2", edge=0.20, confidence=0.95)
         assert high.approved
@@ -656,9 +656,9 @@ class TestIsMarketLiquid:
 
 class TestConcentrationLimit:
 
-    def test_max_ticker_fraction_is_005(self):
-        """MAX_TICKER_FRACTION should be 0.05 (reduced from 0.15)."""
-        assert MAX_TICKER_FRACTION == 0.05
+    def test_max_ticker_fraction_is_003(self):
+        """MAX_TICKER_FRACTION should be 0.03 (reduced from 0.05)."""
+        assert MAX_TICKER_FRACTION == 0.03
 
     def test_single_ticker_budget_capped(self):
         """Single ticker should get at most 5% of bankroll."""
@@ -855,8 +855,8 @@ class TestCityExposureLimit:
         key = _extract_city_key("KXALBUMSALES-WUT-15000")
         assert key is None
 
-    def test_max_city_fraction_is_010(self):
-        assert MAX_CITY_FRACTION == 0.10
+    def test_max_city_fraction_is_007(self):
+        assert MAX_CITY_FRACTION == 0.07
 
     def test_same_city_brackets_capped(self):
         """Multiple brackets on same city should be capped at city limit."""
@@ -864,12 +864,12 @@ class TestCityExposureLimit:
         client.get_balance.return_value = (10000, 10000)
         alloc = PortfolioAllocator(client=client, state_path=_temp_state_path())
 
-        # City limit = 10% of 10000 = 1000c
+        # City limit = 7% of 10000 = 700c
         # Record trades on same city, different brackets
-        alloc.record_trade("weather", "KXHIGHHOU-26FEB16-B77", 500)
-        alloc.record_trade("weather", "KXHIGHHOU-26FEB16-B78", 400)
+        alloc.record_trade("weather", "KXHIGHHOU-26FEB16-B77", 300)
+        alloc.record_trade("weather", "KXHIGHHOU-26FEB16-B78", 300)
 
-        # 900c used for HOU, 100c remaining
+        # 600c used for HOU, 100c remaining
         budget = alloc.request_budget("weather", "KXHIGHHOU-26FEB16-B79", edge=0.10)
         assert budget.approved
         assert budget.max_cost_cents <= 100

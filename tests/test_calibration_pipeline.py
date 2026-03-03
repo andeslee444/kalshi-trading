@@ -30,6 +30,9 @@ def _load_pipeline():
     if _mod is not None:
         return _mod
 
+    # Save original before stubbing
+    orig_auth = sys.modules.get("kalshi_auth")
+
     mock_auth = types.ModuleType("kalshi_auth")
     mock_auth.notify_whatsapp = lambda *a, **kw: None
     mock_auth._atomic_write_json = MagicMock()
@@ -41,6 +44,13 @@ def _load_pipeline():
     spec = importlib.util.spec_from_file_location("calibration_pipeline", SCRIPT_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+
+    # Restore original
+    if orig_auth is None:
+        sys.modules.pop("kalshi_auth", None)
+    else:
+        sys.modules["kalshi_auth"] = orig_auth
+
     _mod = mod
     return mod
 
