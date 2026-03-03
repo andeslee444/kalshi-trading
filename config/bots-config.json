@@ -169,5 +169,9 @@
     "copulaDf": 5,
     "minTradesForEmpirical": 10,
     "empiricalWeightCap": 0.50
+  },
+  "regime": {
+    "enabled": true,
+    "maxAgeHours": 24
   }
 }

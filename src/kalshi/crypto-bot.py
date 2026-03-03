@@ -28,6 +28,7 @@ from probability import (
 from ticker_utils import parse_crypto_ticker
 from capital_allocator import PortfolioAllocator
 from particle_filter import FilterManager, FilterConfig, ci_kelly_multiplier
+from regime_detector import RegimeDetector, regime_kelly_multiplier
 
 setup_unbuffered()
 log = setup_logging("crypto")
@@ -80,6 +81,11 @@ pf_config = FilterConfig(
 filter_mgr = FilterManager(bot_name="crypto", state_dir=PROJECT_DIR / "data",
                             default_config=pf_config)
 filter_mgr.load_all()
+
+# Regime detector
+regime_detector = RegimeDetector()
+regime_state_path = PROJECT_DIR / "data" / "regime-state.json"
+regime_detector.load(str(regime_state_path))
 
 # === Market ticker prefixes ===
 CRYPTO_PREFIXES = ["KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXXRP", "KXCRYPTO"]
@@ -344,6 +350,16 @@ def scan_and_trade():
         if rv:
             realized_vols[asset] = rv
             log.info(f"  {asset} realized vol: {rv*100:.1f}%")
+
+    # Update regime detector with latest vol observation
+    realized_vol = realized_vols.get("BTC") or realized_vols.get("ETH")
+    if realized_vol is not None:
+        regime_detector.update(realized_vol)
+        regime_detector.save(str(regime_state_path))
+        log.info("  Regime: %s (conf=%.2f, mult=%.2f)",
+                 regime_detector.current_regime(),
+                 regime_detector.regime_confidence(),
+                 regime_kelly_multiplier(regime_detector))
 
     # Compute trailing drift per asset
     drift_by_asset = {}
