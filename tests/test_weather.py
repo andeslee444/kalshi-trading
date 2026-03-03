@@ -219,3 +219,50 @@ class TestComputeProbability:
         """Forecast 4 degrees from center -> ~0.06."""
         prob = compute_probability(89.5, 85, "B")
         assert prob <= 0.10
+
+
+# ===================================================================
+# ensemble spread sigma multiplier tests
+# ===================================================================
+
+class TestEnsembleSpreadSigma:
+    """Test ensemble spread tracking for adaptive weather sigma."""
+
+    def setup_method(self):
+        from probability import _reset_calibration
+        _reset_calibration()
+
+    def teardown_method(self):
+        from probability import _reset_calibration
+        _reset_calibration()
+
+    def test_tight_ensemble_no_sigma_increase(self):
+        """When models agree (spread < 2°F), no sigma increase."""
+        from probability import ensemble_spread_sigma_multiplier
+        # Models within 1°F of each other
+        mult = ensemble_spread_sigma_multiplier(spread_f=1.0)
+        assert mult == pytest.approx(1.0, abs=0.05)
+
+    def test_moderate_spread_mild_increase(self):
+        """When models diverge moderately (3-5°F), mild sigma increase."""
+        from probability import ensemble_spread_sigma_multiplier
+        mult = ensemble_spread_sigma_multiplier(spread_f=4.0)
+        assert 1.1 < mult < 1.5
+
+    def test_large_spread_significant_increase(self):
+        """When models diverge significantly (>8°F), large sigma increase."""
+        from probability import ensemble_spread_sigma_multiplier
+        mult = ensemble_spread_sigma_multiplier(spread_f=10.0)
+        assert mult > 1.5
+
+    def test_zero_spread_no_increase(self):
+        """Zero spread should give multiplier of 1.0."""
+        from probability import ensemble_spread_sigma_multiplier
+        mult = ensemble_spread_sigma_multiplier(spread_f=0.0)
+        assert mult == pytest.approx(1.0)
+
+    def test_multiplier_capped(self):
+        """Multiplier should be capped at reasonable maximum (e.g., 2.5)."""
+        from probability import ensemble_spread_sigma_multiplier
+        mult = ensemble_spread_sigma_multiplier(spread_f=20.0)
+        assert mult <= 2.5
