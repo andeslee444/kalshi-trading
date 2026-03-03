@@ -1450,11 +1450,14 @@ class HealthCheckMonitor:
         logger: Optional logger.
     """
 
-    def __init__(self, state_path=None, staleness_minutes=60, auto_halt=False, logger=None):
+    def __init__(self, state_path=None, staleness_minutes=60, auto_halt=False, logger=None,
+                 alert_cooldown_minutes=30):
         self.state_path = Path(state_path) if state_path else HEALTH_STATE_PATH
         self.staleness_minutes = staleness_minutes
         self.auto_halt = auto_halt
         self.log = logger or _log
+        self._alert_cooldown_minutes = alert_cooldown_minutes
+        self._alerts_sent = {}  # key -> datetime of last alert
         self._state = {
             "sources": {},      # source -> {"last_success": ts, "last_error": ts, "error_count": int}
             "bots": {},         # bot -> {"last_heartbeat": ts}
@@ -1514,6 +1517,62 @@ class HealthCheckMonitor:
         """Record a bot heartbeat (proves the bot loop is running)."""
         self._state["bots"][bot] = {"last_heartbeat": datetime.datetime.now().isoformat()}
         self._save()
+
+    def should_send_alert(self, alert_key):
+        """Check if an alert should be sent (respects cooldown window)."""
+        if alert_key not in self._alerts_sent:
+            return True
+        elapsed = (datetime.datetime.now() - self._alerts_sent[alert_key]).total_seconds() / 60
+        return elapsed >= self._alert_cooldown_minutes
+
+    def record_alert_sent(self, alert_key):
+        """Record that an alert was sent (for deduplication)."""
+        self._alerts_sent[alert_key] = datetime.datetime.now()
+
+    def get_summary(self):
+        """Get a structured health summary for dashboard display.
+
+        Returns dict with sources, bots, and overall status.
+        """
+        summary = {"sources": {}, "bots": {}, "overall": "healthy"}
+
+        issues = 0
+        for source, data in self._state.get("sources", {}).items():
+            error_count = data.get("error_count", 0)
+            status = "error" if error_count >= 5 else ("warning" if error_count > 0 else "ok")
+            if status == "error":
+                issues += 1
+            summary["sources"][source] = {
+                "status": status,
+                "error_count": error_count,
+                "last_success": data.get("last_success"),
+                "last_error": data.get("last_error"),
+            }
+
+        for bot, data in self._state.get("bots", {}).items():
+            last_hb = data.get("last_heartbeat")
+            stale = False
+            if last_hb:
+                try:
+                    age_min = (datetime.datetime.now() -
+                               datetime.datetime.fromisoformat(last_hb)).total_seconds() / 60
+                    stale = age_min > self.staleness_minutes
+                except (ValueError, TypeError):
+                    pass
+            status = "stale" if stale else "ok"
+            if stale:
+                issues += 1
+            summary["bots"][bot] = {
+                "status": status,
+                "last_heartbeat": last_hb,
+            }
+
+        if issues >= 2:
+            summary["overall"] = "critical"
+        elif issues >= 1:
+            summary["overall"] = "degraded"
+
+        return summary
 
     def check_health(self, staleness_minutes=None):
         """Check for health issues. Returns list of issue strings.
