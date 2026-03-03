@@ -321,3 +321,42 @@ class TestMacroEngineAggregation:
         # Low confidence -> no tightening
         wide = engine.compute_sigma_multiplier(confidence=0.2)
         assert wide >= 1.0
+
+
+class TestEconomicsBotIntegration:
+    """Test the macro-adjusted nowcast computation."""
+
+    def test_adjusted_nowcast_with_positive_bias(self):
+        """Positive CPI bias increases the nowcast."""
+        nowcast = 2.8
+        signal = MacroSignal(cpi_bias=0.05, confidence=0.6)
+        adjusted = nowcast + signal.cpi_bias
+        assert adjusted == pytest.approx(2.85, abs=0.01)
+
+    def test_adjusted_nowcast_with_negative_bias(self):
+        """Negative CPI bias decreases the nowcast."""
+        nowcast = 2.8
+        signal = MacroSignal(cpi_bias=-0.03, confidence=0.5)
+        adjusted = nowcast + signal.cpi_bias
+        assert adjusted == pytest.approx(2.77, abs=0.01)
+
+    def test_sigma_tighter_with_high_confidence(self):
+        """High confidence signal should tighten sigma."""
+        engine = MacroEngine.__new__(MacroEngine)
+        base_sigma = 0.10
+        mult = engine.compute_sigma_multiplier(confidence=0.8)
+        adjusted_sigma = base_sigma * mult
+        assert adjusted_sigma < base_sigma
+        assert adjusted_sigma > base_sigma * 0.5  # not more than 50% reduction
+
+    def test_sigma_unchanged_with_low_confidence(self):
+        """Low confidence signal should not change sigma."""
+        engine = MacroEngine.__new__(MacroEngine)
+        mult = engine.compute_sigma_multiplier(confidence=0.1)
+        assert mult == pytest.approx(1.0, abs=0.01)
+
+    def test_zero_bias_zero_confidence(self):
+        """No macro data -> zero bias, zero confidence, unchanged nowcast."""
+        signal = MacroSignal()
+        assert signal.cpi_bias == 0.0
+        assert signal.confidence == 0.0
