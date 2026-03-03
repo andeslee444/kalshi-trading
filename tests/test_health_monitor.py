@@ -199,3 +199,67 @@ class TestHealthStateLoad:
             staleness_minutes=120,
         )
         assert hm.staleness_minutes == 120
+
+
+class TestAlertDeduplication:
+    """Test that duplicate alerts are suppressed within cooldown window."""
+
+    def _make_monitor(self, tmp_path, **kwargs):
+        state_path = tmp_path / "health-state.json"
+        return HealthCheckMonitor(state_path=str(state_path), **kwargs)
+
+    def test_first_alert_not_suppressed(self, tmp_path):
+        mon = self._make_monitor(tmp_path)
+        assert mon.should_send_alert("source_stale:hdd") is True
+
+    def test_duplicate_alert_suppressed(self, tmp_path):
+        mon = self._make_monitor(tmp_path)
+        mon.record_alert_sent("source_stale:hdd")
+        assert mon.should_send_alert("source_stale:hdd") is False
+
+    def test_alert_allowed_after_cooldown(self, tmp_path):
+        mon = self._make_monitor(tmp_path, alert_cooldown_minutes=0)
+        mon.record_alert_sent("source_stale:hdd")
+        # With 0-minute cooldown, should be allowed immediately
+        assert mon.should_send_alert("source_stale:hdd") is True
+
+
+class TestHealthSummary:
+    """Test health summary for dashboard endpoint."""
+
+    def _make_monitor(self, tmp_path, **kwargs):
+        state_path = tmp_path / "health-state.json"
+        return HealthCheckMonitor(state_path=str(state_path), **kwargs)
+
+    def test_summary_includes_all_sources(self, tmp_path):
+        mon = self._make_monitor(tmp_path)
+        mon.record_source_success("hdd")
+        mon.record_source_success("nws")
+        for _ in range(5):
+            mon.record_source_error("boxoffice", "timeout")
+        summary = mon.get_summary()
+        assert "hdd" in summary["sources"]
+        assert "nws" in summary["sources"]
+        assert "boxoffice" in summary["sources"]
+        assert summary["sources"]["hdd"]["status"] == "ok"
+        assert summary["sources"]["boxoffice"]["status"] == "error"
+
+    def test_summary_includes_bots(self, tmp_path):
+        mon = self._make_monitor(tmp_path)
+        mon.record_bot_heartbeat("weather")
+        summary = mon.get_summary()
+        assert "weather" in summary["bots"]
+
+    def test_summary_overall_healthy(self, tmp_path):
+        mon = self._make_monitor(tmp_path)
+        mon.record_source_success("hdd")
+        mon.record_bot_heartbeat("weather")
+        summary = mon.get_summary()
+        assert summary["overall"] == "healthy"
+
+    def test_summary_overall_degraded_on_source_errors(self, tmp_path):
+        mon = self._make_monitor(tmp_path)
+        for _ in range(5):
+            mon.record_source_error("hdd", "timeout")
+        summary = mon.get_summary()
+        assert summary["overall"] in ("degraded", "critical")
