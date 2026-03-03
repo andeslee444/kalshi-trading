@@ -380,3 +380,117 @@ class TestBracketLimitPricing:
         """Regardless of bid, bracket price = ask."""
         assert self._bracket_limit_price(10, 50) == 50
         assert self._bracket_limit_price(49, 50) == 50
+
+
+class TestJumpDiffusionCrypto:
+    """Test Merton jump-diffusion model for crypto price probability."""
+
+    def setup_method(self):
+        from probability import _reset_calibration
+        _reset_calibration()
+
+    def teardown_method(self):
+        from probability import _reset_calibration
+        _reset_calibration()
+
+    def test_basic_probability_range(self):
+        """JD probability should be in [0, 1]."""
+        from probability import crypto_price_probability_jd
+        prob = crypto_price_probability_jd(
+            current_price=90000, threshold=95000, direction="above",
+            time_horizon_minutes=1440, realized_vol_pct=0.60,
+        )
+        assert 0.0 <= prob <= 1.0
+
+    def test_at_threshold_near_half(self):
+        """When price equals threshold, probability should be near 0.5."""
+        from probability import crypto_price_probability_jd
+        prob = crypto_price_probability_jd(
+            current_price=90000, threshold=90000, direction="above",
+            time_horizon_minutes=1440, realized_vol_pct=0.60,
+        )
+        assert 0.35 < prob < 0.65
+
+    def test_deep_itm_high_prob(self):
+        """Deep ITM (price >> threshold) should give high probability."""
+        from probability import crypto_price_probability_jd
+        prob = crypto_price_probability_jd(
+            current_price=100000, threshold=80000, direction="above",
+            time_horizon_minutes=1440, realized_vol_pct=0.60,
+        )
+        assert prob > 0.80
+
+    def test_deep_otm_low_prob(self):
+        """Deep OTM (price << threshold) should give low probability."""
+        from probability import crypto_price_probability_jd
+        prob = crypto_price_probability_jd(
+            current_price=80000, threshold=100000, direction="above",
+            time_horizon_minutes=1440, realized_vol_pct=0.60,
+        )
+        assert prob < 0.20
+
+    def test_fatter_tails_than_gbm(self):
+        """JD model should give higher tail probabilities than GBM for far-OTM."""
+        from probability import crypto_price_probability, crypto_price_probability_jd
+        # Far OTM: price 90K, threshold 120K (33% away)
+        gbm_prob = crypto_price_probability(
+            current_price=90000, threshold=120000, direction="above",
+            time_horizon_minutes=1440, realized_vol_pct=0.60,
+        )
+        jd_prob = crypto_price_probability_jd(
+            current_price=90000, threshold=120000, direction="above",
+            time_horizon_minutes=1440, realized_vol_pct=0.60,
+        )
+        # JD should give higher probability due to jump component
+        assert jd_prob > gbm_prob
+
+    def test_below_direction(self):
+        """'below' direction should be 1 - P(above)."""
+        from probability import crypto_price_probability_jd
+        p_above = crypto_price_probability_jd(
+            current_price=90000, threshold=95000, direction="above",
+            time_horizon_minutes=1440, realized_vol_pct=0.60,
+        )
+        p_below = crypto_price_probability_jd(
+            current_price=90000, threshold=95000, direction="below",
+            time_horizon_minutes=1440, realized_vol_pct=0.60,
+        )
+        assert abs(p_above + p_below - 1.0) < 0.01
+
+    def test_zero_jump_intensity_matches_gbm(self):
+        """With λ=0 (no jumps), JD should match GBM."""
+        from probability import crypto_price_probability, crypto_price_probability_jd
+        gbm = crypto_price_probability(
+            current_price=90000, threshold=95000, direction="above",
+            time_horizon_minutes=1440, realized_vol_pct=0.60,
+        )
+        jd = crypto_price_probability_jd(
+            current_price=90000, threshold=95000, direction="above",
+            time_horizon_minutes=1440, realized_vol_pct=0.60,
+            jump_intensity=0.0,
+        )
+        assert abs(gbm - jd) < 0.02  # Should be very close
+
+    def test_higher_intensity_fatter_tails(self):
+        """Higher jump intensity should produce fatter tails."""
+        from probability import crypto_price_probability_jd
+        low_lambda = crypto_price_probability_jd(
+            current_price=90000, threshold=120000, direction="above",
+            time_horizon_minutes=1440, realized_vol_pct=0.60,
+            jump_intensity=0.5,
+        )
+        high_lambda = crypto_price_probability_jd(
+            current_price=90000, threshold=120000, direction="above",
+            time_horizon_minutes=1440, realized_vol_pct=0.60,
+            jump_intensity=2.0,
+        )
+        assert high_lambda > low_lambda
+
+    def test_short_horizon(self):
+        """Very short horizon should give extreme probability (near 0 or 1)."""
+        from probability import crypto_price_probability_jd
+        prob = crypto_price_probability_jd(
+            current_price=90000, threshold=100000, direction="above",
+            time_horizon_minutes=5, realized_vol_pct=0.60,
+        )
+        assert prob < 0.10  # Very unlikely in 5 minutes

@@ -550,3 +550,42 @@ class TestCorrelationIntegration:
         if result.approved:
             # Bankroll should be reduced by tail risk multiplier (75% of 500000 = 375000)
             assert result.bankroll_cents < 500000
+
+
+# ===================================================================
+# Regime-Adjusted Kelly tests (T2-P3)
+# ===================================================================
+
+class TestRegimeKellyIntegration:
+    """Test that regime detector multiplier is applied in budget allocation."""
+
+    def test_crisis_regime_reduces_bankroll(self):
+        """During crisis regime, bankroll should be reduced."""
+        # Mock regime detector returning crisis multiplier
+        from unittest.mock import MagicMock, patch
+        mock_detector = MagicMock()
+        mock_detector.current_regime.return_value = "crisis"
+        mock_detector.regime_confidence.return_value = 0.9
+
+        from regime_detector import regime_kelly_multiplier
+        mult = regime_kelly_multiplier(mock_detector)
+        assert mult < 0.70  # Crisis with high confidence
+
+    def test_normal_regime_no_reduction(self):
+        """During normal regime, bankroll should not be reduced."""
+        from unittest.mock import MagicMock
+        mock_detector = MagicMock()
+        mock_detector.current_regime.return_value = "normal"
+        mock_detector.regime_confidence.return_value = 0.8
+
+        from regime_detector import regime_kelly_multiplier
+        mult = regime_kelly_multiplier(mock_detector)
+        assert 0.9 <= mult <= 1.1
+
+    def test_regime_mult_stacks_with_tail_risk(self):
+        """Regime multiplier should stack with tail-risk multiplier."""
+        tail_mult = 0.75  # From correlation engine
+        regime_mult = 0.60  # Crisis regime
+        combined = tail_mult * regime_mult
+        assert combined < 0.50  # Severe combined reduction
+        assert combined == pytest.approx(0.45, abs=0.01)

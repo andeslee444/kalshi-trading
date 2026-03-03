@@ -277,6 +277,25 @@ def ensemble_weather_probability(forecasts, threshold, direction, days_out=0, ci
     return weighted_prob / total_weight
 
 
+def ensemble_spread_sigma_multiplier(spread_f):
+    """Compute sigma multiplier based on ensemble model spread.
+
+    When GFS, ECMWF, and ICON disagree, forecast uncertainty is higher.
+    Wider ensemble spread → wider sigma → more conservative trading.
+
+    Args:
+        spread_f: Max - min forecast temperature across models (°F).
+
+    Returns:
+        Multiplier >= 1.0. Applied to base sigma in weather_probability().
+    """
+    if spread_f <= 2.0:
+        return 1.0  # Models agree — no adjustment
+    # Linear ramp: spread 2→10°F maps to multiplier 1.0→2.0
+    raw = 1.0 + (spread_f - 2.0) * 0.125
+    return min(raw, 2.5)  # Cap at 2.5x
+
+
 def nws_sigma_for_hour(hour_of_day):
     """NWS temperature uncertainty (sigma in degrees F) for a given hour.
 
@@ -615,6 +634,97 @@ def crypto_price_probability(current_price, threshold, direction="above",
     # d2 with configurable drift (default 0.0 = risk-neutral)
     d2 = (math.log(current_price / threshold) + (drift_pct - 0.5 * sigma**2) * T) / sigma_sqrt_T
     prob_above = _norm_cdf(d2)
+
+    if direction == "below":
+        return 1.0 - prob_above
+    return prob_above
+
+
+def crypto_price_probability_jd(current_price, threshold, direction="above",
+                                  time_horizon_minutes=1440, realized_vol_pct=None,
+                                  iv_pct=None, drift_pct=0.0,
+                                  jump_intensity=1.0, jump_mean=-0.05,
+                                  jump_std=0.10, max_jumps=10):
+    """Merton jump-diffusion probability for crypto price markets.
+
+    Extends GBM with Poisson jump process for fatter tails. Better pricing
+    for far-OTM crypto markets where flash crashes/rallies are underpriced
+    by pure GBM.
+
+    The model: dS/S = (mu - lambda*k)dt + sigma*dW + J*dN
+    where J ~ N(jump_mean, jump_std), N ~ Poisson(lambda*T).
+
+    P(S_T > K) = sum_{n=0}^{N_max} P(N=n) * P_n(S_T > K | n jumps)
+
+    where P_n is a GBM probability with adjusted sigma and drift.
+
+    Args:
+        current_price: Current spot price.
+        threshold: Market threshold price.
+        direction: "above" or "below".
+        time_horizon_minutes: Minutes to settlement.
+        realized_vol_pct: Annualized vol as decimal (e.g., 0.60).
+        iv_pct: Implied vol (takes precedence over realized).
+        drift_pct: Annualized drift rate.
+        jump_intensity: Average jumps per year (lambda). Default 1.0.
+        jump_mean: Mean log-jump size (default -0.05 = -5%, slight downward bias).
+        jump_std: Std of log-jump size (default 0.10 = 10%).
+        max_jumps: Max number of jumps to sum over (default 10).
+
+    Returns:
+        Probability (0-1).
+    """
+    if current_price <= 0 or threshold <= 0:
+        return 0.5
+
+    # Select volatility
+    if iv_pct is not None and iv_pct > 0:
+        sigma = iv_pct
+    elif realized_vol_pct is not None and realized_vol_pct > 0:
+        sigma = realized_vol_pct
+    else:
+        sigma = 0.60
+
+    T = time_horizon_minutes / (365.25 * 24 * 60)
+    if T <= 0:
+        return 1.0 if current_price > threshold else 0.0
+
+    # Compensator: k = E[e^J - 1] = exp(jump_mean + 0.5*jump_std^2) - 1
+    k = math.exp(jump_mean + 0.5 * jump_std ** 2) - 1
+    lambda_T = jump_intensity * T
+
+    log_S_K = math.log(current_price / threshold)
+    prob_above = 0.0
+
+    for n in range(max_jumps + 1):
+        # Poisson probability P(N = n)
+        if n == 0:
+            poisson_p = math.exp(-lambda_T)
+        else:
+            # log(P(N=n)) = n*log(lambda_T) - lambda_T - sum(log(1..n))
+            log_p = n * math.log(max(lambda_T, 1e-300)) - lambda_T
+            for i in range(1, n + 1):
+                log_p -= math.log(i)
+            poisson_p = math.exp(log_p)
+
+        if poisson_p < 1e-15:
+            break  # Negligible contribution
+
+        # Conditional GBM with n jumps:
+        # sigma_n^2 = sigma^2 + n * jump_std^2 / T
+        sigma_n_sq = sigma ** 2 + n * jump_std ** 2 / max(T, 1e-15)
+        sigma_n = math.sqrt(sigma_n_sq)
+
+        # drift_n = drift - lambda*k + n*jump_mean/T
+        drift_n = drift_pct - jump_intensity * k + n * jump_mean / max(T, 1e-15)
+
+        # d2 = (log(S/K) + (drift_n - 0.5*sigma_n^2)*T) / (sigma_n * sqrt(T))
+        sqrt_T = math.sqrt(T)
+        d2 = (log_S_K + (drift_n - 0.5 * sigma_n_sq) * T) / (sigma_n * sqrt_T)
+        prob_above += poisson_p * _norm_cdf(d2)
+
+    # Clamp to [0, 1]
+    prob_above = max(0.0, min(1.0, prob_above))
 
     if direction == "below":
         return 1.0 - prob_above

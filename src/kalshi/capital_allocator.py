@@ -28,6 +28,7 @@ import logging
 from pathlib import Path
 
 from correlation_engine import CorrelationEngine, CorrelationConfig
+from regime_detector import RegimeDetector, regime_kelly_multiplier
 
 _log = logging.getLogger("capital_allocator")
 
@@ -224,6 +225,11 @@ class PortfolioAllocator:
         corr_state = str(self.state_path.parent / "correlation-state.json") if self.state_path else None
         self._correlation_engine = CorrelationEngine(config=corr_config, state_path=corr_state, logger=self.log)
         self._correlation_engine.load_state()
+
+        # Initialize regime detector
+        self._regime_detector = RegimeDetector()
+        regime_state_path = self.state_path.parent / "regime-state.json"
+        self._regime_detector.load(str(regime_state_path))
 
         if ABSOLUTE_DAILY_LOSS_CAP_PCT > 0:
             self.log.info("Allocator: daily loss cap = $%.0f floor + %.0f%% of bankroll",
@@ -646,12 +652,30 @@ class PortfolioAllocator:
             bankroll = int(bankroll * tail_mult)
             self.log.info("Tail risk reduction: %s mult=%.2f -> bankroll $%.2f", ticker, tail_mult, bankroll / 100)
 
+        # Check 8b: regime-adjusted Kelly
+        regime_mult = regime_kelly_multiplier(self._regime_detector)
+        if regime_mult < 1.0:
+            bankroll = int(bankroll * regime_mult)
+            self.log.info("  Regime adjustment: %s (conf %.2f) → bankroll × %.2f",
+                         self._regime_detector.current_regime(),
+                         self._regime_detector.regime_confidence(),
+                         regime_mult)
+
         return BudgetResponse(
             approved=True,
             max_cost_cents=allocated,
             bankroll_cents=bankroll,  # total equity for Kelly sizing
             binding_constraint=binding,
         )
+
+    def update_regime(self, realized_vol):
+        """Update the regime detector with a new vol observation.
+
+        Should be called by bots that compute realized vol (crypto, weather).
+        """
+        self._regime_detector.update(realized_vol)
+        regime_state_path = self.state_path.parent / "regime-state.json"
+        self._regime_detector.save(str(regime_state_path))
 
     def get_status(self):
         """Return current allocation status for logging/monitoring."""
