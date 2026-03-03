@@ -210,3 +210,22 @@ class TestBoxOfficeScanIntegration:
         with patch.object(mod, "fetch_boxoffice_data", side_effect=Exception("network error")):
             # Should not raise
             mod.scan_boxoffice()
+
+
+class TestHddAutoReEnable:
+    """Test that HDD scanning auto-re-enables after Sanity recovers."""
+
+    def test_hdd_re_enabled_after_health_check_passes(self):
+        """If HDD was disabled due to errors but Sanity is now healthy, re-enable."""
+        mod = _load_source_monitor()
+        # Simulate HDD being error-disabled
+        with patch("hdd_parser.check_sanity_health", return_value=True):
+            result = mod.should_retry_hdd()
+            assert result is True
+
+    def test_hdd_stays_disabled_if_still_unhealthy(self):
+        """If Sanity is still down, keep HDD disabled."""
+        mod = _load_source_monitor()
+        with patch("hdd_parser.check_sanity_health", return_value=False):
+            result = mod.should_retry_hdd()
+            assert result is False
