@@ -12,6 +12,7 @@ Provides three checks for capital_allocator.py:
 
 import json
 import math
+import os
 import re
 import time
 import logging
@@ -337,6 +338,38 @@ class CorrelationEngine:
                           f"${max_marginal/100:.0f} ({self.config.marginal_var_limit_fraction*100:.0f}% of balance)")
 
         return (True, "")
+
+    # === State Persistence ===
+
+    def save_state(self) -> None:
+        """Persist correlation state to disk."""
+        if not self.state_path:
+            return
+
+        state = {
+            "cluster_risk": self._cluster_risk,
+            "portfolio_var": self._portfolio_var,
+            "last_updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+
+        tmp_path = self.state_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp_path, self.state_path)
+
+    def load_state(self) -> None:
+        """Load correlation state from disk."""
+        if not self.state_path:
+            return
+
+        try:
+            with open(self.state_path, "r") as f:
+                state = json.load(f)
+            self._cluster_risk = state.get("cluster_risk", {})
+            self._portfolio_var = state.get("portfolio_var", 0.0)
+            self._last_updated = state.get("last_updated", "")
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass  # Start fresh
 
     def reset_daily(self) -> None:
         """Reset daily risk tracking."""
