@@ -132,6 +132,16 @@ def check_hdd(prefetched_markets=None, ss=None):
     except Exception as e:
         log.error(f"  HDD check failed: {e}")
 
+def should_retry_hdd():
+    """Check if HDD scanning should be re-enabled after previous errors.
+
+    Calls the Sanity CMS health check. If healthy, returns True.
+    """
+    from hdd_parser import check_sanity_health
+    hdd_config = config.get("sources", {}).get("hdd", {})
+    project_id = hdd_config.get("sanityProject", "8aky18h3")
+    return check_sanity_health(project_id)
+
 def match_hdd_to_markets(sales_data, prefetched_markets=None, ss=None):
     """Match parsed album sales data to open Kalshi markets."""
     try:
