@@ -192,6 +192,10 @@ Key functions:
 
 **`src/kalshi/polymarket_client.py`** — Polymarket CLOB API client for cross-platform arbitrage.
 
+**`src/kalshi/macro_engine.py`** — Macro/geopolitics sentiment engine (~300 lines). Fetches from FRED API (TIPS breakevens, UMich expectations, GDPNow), Truflation real-time CPI, and curated blog/RSS feeds. DeepSeek LLM extracts sentiment. Produces `MacroSignal` with CPI bias and confidence for economics bot nowcast adjustment.
+
+**`src/kalshi/particle_filter.py`** — Sequential Monte Carlo (particle filter) for Bayesian belief tracking (~400 lines). Maintains weighted particle distributions per market, carries memory across scans. `FilterManager` manages per-ticker filters with JSON state persistence. `ci_kelly_multiplier()` reduces Kelly fraction when filter CI is wide. Integrates with crypto-bot (5-min scans), extensible to weather/economics.
+
 ### Bot Structure
 
 Each bot in `src/kalshi/` follows the same pattern:
