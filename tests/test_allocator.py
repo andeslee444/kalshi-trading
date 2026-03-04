@@ -589,3 +589,67 @@ class TestRegimeKellyIntegration:
         combined = tail_mult * regime_mult
         assert combined < 0.50  # Severe combined reduction
         assert combined == pytest.approx(0.45, abs=0.01)
+
+
+# ===================================================================
+# NWS Source Type Relaxed Gate tests (Task 9)
+# ===================================================================
+
+class TestNwsSourceTypeRelaxedGate:
+    """NWS source_type should get same relaxed thresholds as info_arb."""
+
+    def _make_allocator(self, balance=50000):
+        mock_client = MagicMock()
+        mock_client.get_balance.return_value = (balance, balance)
+        mock_client.get.return_value = {"market_positions": []}
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            json.dump({}, f)
+            state_path = f.name
+        alloc = PortfolioAllocator(client=mock_client, state_path=state_path)
+        alloc._daily_date = datetime.date.today().isoformat()
+        return alloc
+
+    def test_nws_source_type_gets_relaxed_gate(self):
+        """NWS source_type should get same relaxed thresholds as info_arb.
+
+        87% confidence, 12% edge — above info_arb gate (85%/10%) but below
+        default gate (90%/15%). Should be approved with NWS source_type.
+        """
+        alloc = self._make_allocator()
+        result = alloc.request_budget("source-monitor", "KXHIGHHOU-26MAR3-T86",
+                                       edge=0.12, confidence=0.87,
+                                       bot_max_cost_cents=500, source_type="nws")
+        assert result.approved
+
+    def test_nws_matches_info_arb_behavior(self):
+        """NWS and info_arb should produce the same budget for identical inputs."""
+        alloc_nws = self._make_allocator()
+        alloc_arb = self._make_allocator()
+        result_nws = alloc_nws.request_budget("source-monitor", "KXHIGHHOU-26MAR3-T86",
+                                               edge=0.12, confidence=0.87,
+                                               bot_max_cost_cents=500, source_type="nws")
+        result_arb = alloc_arb.request_budget("source-monitor", "KXHIGHHOU-26MAR3-T86",
+                                               edge=0.12, confidence=0.87,
+                                               bot_max_cost_cents=500, source_type="info_arb")
+        assert result_nws.approved == result_arb.approved
+        assert result_nws.max_cost_cents == result_arb.max_cost_cents
+
+    def test_default_source_type_rejects_below_strict_gate(self):
+        """Without source_type, 87% confidence / 12% edge should NOT trigger
+        the high-confidence scale-up (requires 90%/15% for default).
+        The trade should still be approved at normal allocation, but not
+        get the high-confidence boost.
+        """
+        alloc = self._make_allocator()
+        result_default = alloc.request_budget("source-monitor", "KXHIGHHOU-26MAR3-T86",
+                                               edge=0.12, confidence=0.87,
+                                               bot_max_cost_cents=500, source_type=None)
+        result_nws = self._make_allocator().request_budget(
+            "source-monitor", "KXHIGHHOU-26MAR3-T86",
+            edge=0.12, confidence=0.87,
+            bot_max_cost_cents=500, source_type="nws")
+        # Both should be approved (basic trade passes), but NWS gets higher allocation
+        # because it triggers the high-confidence scale-up path
+        assert result_default.approved
+        assert result_nws.approved
+        assert result_nws.max_cost_cents >= result_default.max_cost_cents

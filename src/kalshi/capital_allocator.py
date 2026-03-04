@@ -664,7 +664,7 @@ class PortfolioAllocator:
         # 7. Scale up for high-confidence trades
         # Info-arb (source_type="info_arb") uses relaxed thresholds since
         # edge is based on observed settlement data, not model predictions.
-        if source_type == "info_arb":
+        if source_type in ("info_arb", "nws"):
             high_conf_threshold = 0.85
             high_edge_threshold = 0.10
         else:
