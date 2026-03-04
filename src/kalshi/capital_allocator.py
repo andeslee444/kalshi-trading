@@ -29,6 +29,7 @@ from pathlib import Path
 
 from correlation_engine import CorrelationEngine, CorrelationConfig
 from regime_detector import RegimeDetector, regime_kelly_multiplier
+from edge_monitor import EdgeMonitor
 
 _log = logging.getLogger("capital_allocator")
 
@@ -230,6 +231,14 @@ class PortfolioAllocator:
         self._regime_detector = RegimeDetector()
         regime_state_path = self.state_path.parent / "regime-state.json"
         self._regime_detector.load(str(regime_state_path))
+
+        # Edge monitor for dynamic priority weights
+        self._edge_monitor = EdgeMonitor(
+            state_path=str(self.state_path.parent / "edge-monitor-state.json")
+        )
+        self._edge_monitor.load_state()
+        self._edge_weights = self._edge_monitor.optimal_strategy_weights()
+        self._edge_weights_loaded_at = time.time()
 
         if ABSOLUTE_DAILY_LOSS_CAP_PCT > 0:
             self.log.info("Allocator: daily loss cap = $%.0f floor + %.0f%% of bankroll",
@@ -458,6 +467,36 @@ class PortfolioAllocator:
         self._correlation_engine.record_trade(ticker, risk_cents)
         self._correlation_engine.save_state()
 
+    def _get_edge_weight(self, bot_name):
+        """Get dynamic priority weight for a bot based on edge durability.
+
+        Returns a multiplier in [0.5, 1.5] applied to the bot's base priority.
+        Refreshes edge monitor weights every 6 hours.
+        """
+        if time.time() - self._edge_weights_loaded_at > 6 * 3600:
+            self._edge_monitor.load_state()
+            self._edge_weights = self._edge_monitor.optimal_strategy_weights()
+            self._edge_weights_loaded_at = time.time()
+
+        if not self._edge_weights:
+            return 1.0
+
+        bot_to_market = {
+            "weather": "weather", "source-monitor": "weather",
+            "crypto": "crypto", "economics": "economics",
+            "entertainment": "entertainment", "strategy": "other",
+            "beatrelease": "entertainment",
+        }
+        market_type = bot_to_market.get(bot_name)
+        if not market_type or market_type not in self._edge_weights:
+            return 1.0
+
+        n = len(self._edge_weights)
+        avg_weight = 1.0 / n if n > 0 else 1.0
+        weight = self._edge_weights.get(market_type, avg_weight)
+        multiplier = weight / avg_weight if avg_weight > 0 else 1.0
+        return max(0.5, min(1.5, multiplier))
+
     def _risk_today_cents(self):
         """Sum risk_cents from all today's entries in traded tickers."""
         today = datetime.date.today().isoformat()
@@ -560,7 +599,10 @@ class PortfolioAllocator:
 
         # 4. Per-bot daily spending check (based on available)
         priority = BOT_PRIORITY.get(bot_name, 0.2)
-        max_bot_risk = int(available_balance * MAX_BOT_FRACTION * priority)
+        # Adjust priority based on edge durability
+        edge_mult = self._get_edge_weight(bot_name)
+        effective_priority = priority * edge_mult
+        max_bot_risk = int(available_balance * MAX_BOT_FRACTION * effective_priority)
         bot_spent = self._bot_spend.get(bot_name, 0)
         remaining_bot = max_bot_risk - bot_spent
         if remaining_bot <= 0:
