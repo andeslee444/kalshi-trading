@@ -98,7 +98,7 @@ def _load_entry_records():
     entries = {}
     for log_path in ALL_TRADE_LOGS:
         trades = load_trades(log_path)
-        for t in trades:
+        for t in sorted(trades, key=lambda x: x.get("timestamp", "")):
             if t.get("action") != "sell":  # buy records have no "action" key
                 entries[t.get("ticker", "")] = t  # last write wins (most recent)
     return entries

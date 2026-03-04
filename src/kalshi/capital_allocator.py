@@ -212,7 +212,7 @@ class PortfolioAllocator:
         self._bot_spend = {}            # bot_name -> cents risked today
         self._city_risk = {}            # city_key -> cents risked today
         self._region_risk = {}          # region -> cents risked today
-        self._total_risk_cents = 0      # portfolio-wide risk today
+        # _total_risk_cents removed — use _risk_today_cents() (timestamp-derived, self-correcting)
         self._daily_date = None
         self._cached_balance = None
         self._cached_available = None
@@ -308,7 +308,6 @@ class PortfolioAllocator:
             self._bot_spend = data.get("bot_spend", {})
             self._city_risk = data.get("city_risk", {})
             self._region_risk = data.get("region_risk", {})
-            self._total_risk_cents = data.get("total_risk_cents", 0)
             self._daily_date = data.get("daily_date")
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             self.log.warning("Corrupt state file, resetting: %s", e)
@@ -316,7 +315,6 @@ class PortfolioAllocator:
             self._bot_spend = {}
             self._city_risk = {}
             self._region_risk = {}
-            self._total_risk_cents = 0
             self._daily_date = None
 
     def _save_state(self):
@@ -328,7 +326,6 @@ class PortfolioAllocator:
             "bot_spend": self._bot_spend,
             "city_risk": self._city_risk,
             "region_risk": self._region_risk,
-            "total_risk_cents": self._total_risk_cents,
             "daily_date": self._daily_date,
         }
         try:
@@ -363,12 +360,11 @@ class PortfolioAllocator:
         if self._daily_date != today:
             if self._daily_date is not None:
                 self.log.info("Allocator daily reset: %d tickers, $%.2f risk cleared",
-                              len(self._traded_tickers), self._total_risk_cents / 100)
+                              len(self._traded_tickers), self._risk_today_cents() / 100)
             self._traded_tickers = {}
             self._bot_spend = {}
             self._city_risk = {}
             self._region_risk = {}
-            self._total_risk_cents = 0
             self._daily_date = today
             self._pending_exits = []
             self._correlation_engine.reset_daily()
@@ -435,6 +431,7 @@ class PortfolioAllocator:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 try:
                     self._load_state()  # refresh from disk
+                    self._correlation_engine.load_state()  # refresh cluster risk from disk
                     self._record_trade_inner(bot_name, ticker, risk_cents, edge)
                     self._save_state()
                 finally:
@@ -454,7 +451,6 @@ class PortfolioAllocator:
             "risk_cents": risk_cents,
         }
         self._bot_spend[bot_name] = self._bot_spend.get(bot_name, 0) + risk_cents
-        self._total_risk_cents += risk_cents
         # Track city-level and region-level exposure for weather tickers
         city_key = _extract_city_key(ticker)
         if city_key:
@@ -585,7 +581,7 @@ class PortfolioAllocator:
 
         # 3. Portfolio-level daily loss check (based on available)
         max_portfolio_risk = int(available_balance * PORTFOLIO_DAILY_LOSS_FRACTION)
-        remaining_portfolio = max_portfolio_risk - self._total_risk_cents
+        remaining_portfolio = max_portfolio_risk - self._risk_today_cents()
         if remaining_portfolio <= 0:
             return BudgetResponse(False, reason="portfolio daily loss limit reached")
 
@@ -735,7 +731,7 @@ class PortfolioAllocator:
             "bankroll_cents": available,
             "total_balance_cents": total,
             "available_cents": available,
-            "total_risk_today_cents": self._total_risk_cents,
+            "total_risk_today_cents": self._risk_today_cents(),
             "portfolio_risk_limit_cents": int(available * PORTFOLIO_DAILY_LOSS_FRACTION) if available else 0,
             "tickers_traded_today": len(self._traded_tickers),
             "bot_spend": dict(self._bot_spend),

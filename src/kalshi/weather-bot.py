@@ -197,6 +197,9 @@ def scan_and_trade():
             our_prob = ensemble_weather_probability(forecast_data, parsed["threshold"], parsed["direction"], days_out, city=city)
             valid_temps = [t for t in forecast_data.values() if t is not None]
             forecast_temp = sum(valid_temps) / len(valid_temps) if valid_temps else None  # mean for logging
+            if forecast_temp is None:
+                ss.skip("null_forecast")
+                continue
             if our_prob is None:
                 # Ensemble failed (zero weight) — fall back to single-model
                 log.warning("Ensemble returned None for %s, falling back to single-model", ticker)

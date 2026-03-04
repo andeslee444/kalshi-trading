@@ -12,8 +12,6 @@ from probability import (
     info_arb_probability,
     album_data_sigma,
     boxoffice_data_sigma,
-    half_kelly,
-    half_kelly_sell,
     _reset_calibration,
     gas_price_probability,
     cpi_nowcast_sigma,
@@ -286,98 +284,10 @@ class TestDaySigma:
 
 
 # ===================================================================
-# half_kelly tests
+# Kelly tests — comprehensive tests live in test_kelly.py
 # ===================================================================
-
-class TestHalfKelly:
-
-    def test_zero_edge_returns_zero(self):
-        contracts, risk = half_kelly(0, 50, 500)
-        assert contracts == 0
-        assert risk == 0
-
-    def test_negative_edge_returns_zero(self):
-        contracts, risk = half_kelly(-0.10, 50, 500)
-        assert contracts == 0
-        assert risk == 0
-
-    def test_positive_edge_returns_positive(self):
-        contracts, risk = half_kelly(0.20, 30, 500)
-        assert contracts > 0
-        assert risk > 0
-
-    def test_respects_max_cost(self):
-        """Contracts * price should not exceed max_cost_cents."""
-        contracts, risk = half_kelly(0.30, 20, 200)
-        assert risk <= 200
-
-    def test_returns_tuple(self):
-        result = half_kelly(0.15, 40, 500)
-        assert isinstance(result, tuple)
-        assert len(result) == 2
-
-    def test_price_at_boundary(self):
-        """Price at 100 should return zero."""
-        contracts, risk = half_kelly(0.20, 100, 500)
-        assert contracts == 0
-
-    def test_with_bankroll(self):
-        """Bankroll constraint should limit contracts."""
-        c_no_bank, _ = half_kelly(0.20, 10, 10000)
-        c_small_bank, _ = half_kelly(0.20, 10, 10000, bankroll_cents=500)
-        assert c_small_bank <= c_no_bank
-
-
-# ===================================================================
-# half_kelly_sell tests
-# ===================================================================
-
-class TestHalfKellySell:
-
-    def test_zero_edge_returns_zero(self):
-        contracts, risk = half_kelly_sell(0, 5, 500)
-        assert contracts == 0
-        assert risk == 0
-
-    def test_negative_edge_returns_zero(self):
-        contracts, risk = half_kelly_sell(-0.10, 5, 500)
-        assert contracts == 0
-        assert risk == 0
-
-    def test_valid_edge_returns_positive(self):
-        contracts, risk = half_kelly_sell(0.20, 5, 500, bankroll_cents=50000)
-        assert contracts > 0
-        assert risk > 0
-
-    def test_returns_tuple(self):
-        result = half_kelly_sell(0.15, 10, 500, bankroll_cents=50000)
-        assert isinstance(result, tuple)
-        assert len(result) == 2
-
-    def test_risk_equals_contracts_times_no_price(self):
-        """Risk = contracts * (100 - sell_price)."""
-        contracts, risk = half_kelly_sell(0.20, 10, 5000, bankroll_cents=50000)
-        if contracts > 0:
-            assert risk == contracts * (100 - 10)
-
-    def test_respects_max_cost_cap(self):
-        contracts, risk = half_kelly_sell(0.50, 5, 500, bankroll_cents=10_000_000)
-        assert risk <= 500
-
-    def test_boundary_price_100(self):
-        contracts, risk = half_kelly_sell(0.20, 100, 500)
-        assert contracts == 0
-
-    def test_bankroll_scaling(self):
-        c1, _ = half_kelly_sell(0.20, 5, 50000, bankroll_cents=10000)
-        c2, _ = half_kelly_sell(0.20, 5, 50000, bankroll_cents=20000)
-        assert c2 >= c1
-
-    def test_symmetry_at_50c(self):
-        """At 50c, sell-side and buy-side produce same sizing."""
-        buy_c, _ = half_kelly(0.10, 50, 5000, bankroll_cents=50000)
-        sell_c, _ = half_kelly_sell(0.10, 50, 5000, bankroll_cents=50000)
-        assert buy_c == sell_c
+# See tests/test_kelly.py for full half_kelly, half_kelly_sell, quarter_kelly_sell,
+# and exact-value pinning tests. Only a basic smoke test is kept here.
 
 
 # ===================================================================
@@ -494,6 +404,21 @@ class TestCpiNowcastSigma:
         prob = econ_nowcast_probability(2.80, sigma, 2.85, "above")
         # nowcast (2.80) is below threshold (2.85), so P(above 2.85) < 0.5
         assert prob < 0.5
+
+    def test_econ_nowcast_complementarity(self):
+        """P(above) + P(below) must equal 1.0 for any inputs."""
+        test_cases = [
+            (2.80, 0.10, 2.85),
+            (3.0, 0.06, 2.5),
+            (2.5, 0.03, 2.5),
+            (1.0, 0.10, 1.5),
+            (5.0, 0.20, 4.0),
+        ]
+        for nowcast, sigma, threshold in test_cases:
+            p_above = econ_nowcast_probability(nowcast, sigma, threshold, "above")
+            p_below = econ_nowcast_probability(nowcast, sigma, threshold, "below")
+            assert abs(p_above + p_below - 1.0) < 1e-10, \
+                f"P(above)+P(below)={p_above+p_below} != 1.0 for ({nowcast}, {sigma}, {threshold})"
 
 
 # ===================================================================

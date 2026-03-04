@@ -922,7 +922,11 @@ def half_kelly_sell(edge, sell_price_cents, max_cost_cents, bankroll_cents=None,
     if half_f <= 0:
         return _zero
 
-    risk_per = 100 - sell_price_cents
+    risk_per = 100 - int(sell_price_cents)
+    if risk_per <= 1:
+        if return_details:
+            return (0, 0, {"kelly_fraction": 0.0, "bankroll_used": bankroll_cents or 0})
+        return _zero
 
     # Max contracts from Kelly fraction (if bankroll provided)
     if bankroll_cents is not None and bankroll_cents > 0:
@@ -993,7 +997,7 @@ def quarter_kelly_sell(edge, sell_price_cents, max_cost_cents, bankroll_cents=No
     contracts = contracts // 2
     details["kelly_fraction"] = details["kelly_fraction"] / 2
     # Hard-cap exposure (risk per contract = 100 - sell_price for sell side)
-    risk_per = 100 - sell_price_cents
+    risk_per = 100 - int(sell_price_cents)
     if risk_per > 0 and contracts * risk_per > max_exposure_cents:
         contracts = max_exposure_cents // risk_per
     risk = contracts * risk_per if risk_per > 0 else 0

@@ -3,6 +3,7 @@ TradeManager, atomic writes, and trade log trimming."""
 
 import json
 import re
+import tempfile
 import time
 import datetime
 import types
@@ -431,6 +432,42 @@ class TestTradeManager:
 
 
 # ===================================================================
+# Sell (NO-side) path tests
+# ===================================================================
+
+class TestSellPosition:
+    """Test TradeManager.place_order with side='no' (sell YES / buy NO)."""
+
+    def test_no_side_places_order(self, tmp_path):
+        """Placing a NO order should succeed and log with side='no'."""
+        mgr, mock_client, _ = _make_manager(tmp_path, {"maxTradeAmount": 5, "maxDailyTrades": 10, "maxDailyLoss": 100})
+        result = mgr.place_order("TICK-1", "no", 30, 2, "test no-side")
+        assert result is not None
+        # Check API was called with side=no
+        body = mock_client.post.call_args[1]["body"]
+        assert body["side"] == "no"
+        assert body["count"] == 2
+
+    def test_no_side_risk_accounting(self, tmp_path):
+        """NO-side risk = price_cents per contract (purchase cost), not 100-price."""
+        mgr, _, _ = _make_manager(tmp_path, {"maxTradeAmount": 5, "maxDailyTrades": 10, "maxDailyLoss": 100})
+        mgr.place_order("TICK-1", "no", 20, 1, "buy NO at 20c")
+        # Risk should be 20 cents (purchase cost), not 80 cents
+        assert mgr._daily_spend_cents == 20
+
+    def test_no_side_trade_log_fields(self, tmp_path):
+        """Trade log for NO orders should have correct fields."""
+        mgr, _, _ = _make_manager(tmp_path, {"maxTradeAmount": 5, "maxDailyTrades": 10, "maxDailyLoss": 100})
+        mgr.place_order("TICK-1", "no", 40, 3, "test no-side logging")
+        trades = json.loads((tmp_path / "trades.json").read_text())
+        assert len(trades) == 1
+        trade = trades[0]
+        assert trade["side"] == "no"
+        assert trade["price_cents"] == 40
+        assert trade["count"] == 3
+
+
+# ===================================================================
 # RecentTradeTracker timezone tests (Fix 3)
 # ===================================================================
 
@@ -650,65 +687,126 @@ class TestOrderMonitor:
 # Entry-Price-Relative Stop Loss tests (Phase 4.1)
 # ===================================================================
 
-# Import evaluate_stop_loss via importlib since position-monitor uses hyphens
+# Import evaluate_stop_loss and evaluate_trailing_stop from production code.
+# position-monitor.py uses hyphens and has heavy module-level init, so we need importlib + stubs.
+import importlib.util
+import types
+
+_pm_module = None
+
 def _load_position_monitor():
-    """Load position-monitor.py for testing evaluate_stop_loss."""
-    import importlib.util
-    # We need to stub kalshi_auth module-level imports and KalshiClient
-    # Instead, test the logic directly with a minimal function
-    # that mirrors evaluate_stop_loss
-    pass
+    """Load position-monitor.py, stubbing module-level side effects."""
+    global _pm_module
+    if _pm_module is not None:
+        return _pm_module
+    import logging
+
+    orig_auth = sys.modules.get("kalshi_auth")
+    orig_prob = sys.modules.get("probability")
+    orig_ticker = sys.modules.get("ticker_utils")
+    orig_alloc = sys.modules.get("capital_allocator")
+
+    fake_auth = types.ModuleType("kalshi_auth")
+    fake_auth.KalshiClient = lambda *a, **kw: MagicMock()
+    fake_auth.setup_unbuffered = lambda: None
+    fake_auth.setup_signal_handlers = lambda: None
+    fake_auth.setup_logging = lambda *a, **kw: logging.getLogger("test")
+    fake_auth.PROJECT_DIR = Path(tempfile.mkdtemp())
+    fake_auth.load_trades = lambda *a, **kw: []
+    fake_auth.save_trade = MagicMock()
+    fake_auth.TradeManager = MagicMock()
+    fake_auth.trim_trade_log = MagicMock()
+    fake_auth.CITY_TIMEZONES = {}
+    fake_auth._local_today = lambda *a: "2026-03-04"
+    fake_auth.round_half_up = lambda x: round(x)
+    fake_auth.retry_request = MagicMock()
+    fake_auth.fetch_parallel = MagicMock(return_value={})
+    fake_auth.HealthCheckMonitor = MagicMock()
+    fake_auth._atomic_write_json = MagicMock()
+    fake_auth.ScanSummary = MagicMock()
+    fake_auth.notify_whatsapp = MagicMock()
+
+    # Create config directories and files
+    config_dir = fake_auth.PROJECT_DIR / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "bots-config.json").write_text(json.dumps({"position_monitor": {}}))
+    (config_dir / "kalshi-config.json").write_text(json.dumps({"cities": {}}))
+    data_dir = fake_auth.PROJECT_DIR / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    fake_prob = types.ModuleType("probability")
+    fake_prob.weather_probability = MagicMock(return_value=0.5)
+    fake_prob.nws_probability = MagicMock(return_value=0.5)
+    fake_prob.half_kelly = MagicMock(return_value=(1, 50))
+    fake_prob.kalshi_fee_cents = MagicMock(return_value=0)
+
+    fake_ticker = types.ModuleType("ticker_utils")
+    fake_ticker.parse_weather_ticker = MagicMock(return_value=None)
+
+    fake_alloc = types.ModuleType("capital_allocator")
+    fake_alloc.PortfolioAllocator = MagicMock()
+
+    sys.modules["kalshi_auth"] = fake_auth
+    sys.modules["probability"] = fake_prob
+    sys.modules["ticker_utils"] = fake_ticker
+    sys.modules["capital_allocator"] = fake_alloc
+
+    try:
+        bot_path = Path(__file__).resolve().parent.parent / "src" / "kalshi" / "position-monitor.py"
+        spec = importlib.util.spec_from_file_location("position_monitor", str(bot_path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _pm_module = mod
+        return mod
+    finally:
+        if orig_auth is not None:
+            sys.modules["kalshi_auth"] = orig_auth
+        else:
+            sys.modules.pop("kalshi_auth", None)
+        if orig_prob is not None:
+            sys.modules["probability"] = orig_prob
+        else:
+            sys.modules.pop("probability", None)
+        if orig_ticker is not None:
+            sys.modules["ticker_utils"] = orig_ticker
+        else:
+            sys.modules.pop("ticker_utils", None)
+        if orig_alloc is not None:
+            sys.modules["capital_allocator"] = orig_alloc
+        else:
+            sys.modules.pop("capital_allocator", None)
 
 
 class TestEntryPriceStopLoss:
-    """Test entry-price-relative stop loss logic (4.1)."""
+    """Test entry-price-relative stop loss using production evaluate_stop_loss."""
 
-    def _evaluate_stop_loss(self, position, market, entry_price_cents=None, stop_loss_pct=0.40, absolute_stop=20):
-        """Minimal reimplementation of evaluate_stop_loss for unit testing."""
-        yes_count = position.get("yes", 0)
-        no_count = position.get("no", 0)
-        yes_bid = market.get("yes_bid", 0)
-        no_bid = market.get("no_bid", 0) if market.get("no_bid") else (100 - market.get("yes_ask", 100))
-
-        if yes_count > 0 and yes_bid > 0:
-            if entry_price_cents:
-                stop_price = int(entry_price_cents * (1 - stop_loss_pct))
-            else:
-                stop_price = absolute_stop
-            if yes_bid <= stop_price:
-                return {"action": "stop_loss", "side": "yes", "count": yes_count, "price": yes_bid}
-
-        if no_count > 0 and no_bid > 0:
-            if entry_price_cents:
-                stop_price = int(entry_price_cents * (1 - stop_loss_pct))
-            else:
-                stop_price = absolute_stop
-            if no_bid <= stop_price:
-                return {"action": "stop_loss", "side": "no", "count": no_count, "price": no_bid}
-
-        return None
+    def _evaluate_stop_loss(self, position, market, entry_price_cents=None, stop_loss_cents=20):
+        """Call production evaluate_stop_loss from position-monitor.py."""
+        pm = _load_position_monitor()
+        exit_config = {"stop_loss_cents": stop_loss_cents}
+        return pm.evaluate_stop_loss(position, market, exit_config, entry_price_cents=entry_price_cents)
 
     def test_entry_price_stop_triggers(self):
-        """Entry at 80c, 40% loss threshold -> stop at 48c. Bid of 40c triggers."""
+        """Bid of 15c triggers absolute stop at 20c."""
         pos = {"ticker": "KXHIGHHOU-26FEB16-B77", "yes": 5, "no": 0}
-        market = {"yes_bid": 40, "yes_ask": 50}
-        result = self._evaluate_stop_loss(pos, market, entry_price_cents=80, stop_loss_pct=0.40)
+        market = {"yes_bid": 15, "yes_ask": 25}
+        result = self._evaluate_stop_loss(pos, market, stop_loss_cents=20)
         assert result is not None
         assert result["action"] == "stop_loss"
         assert result["side"] == "yes"
 
     def test_entry_price_stop_no_trigger(self):
-        """Entry at 80c, 40% loss threshold -> stop at 48c. Bid of 55c does NOT trigger."""
+        """Bid of 55c does NOT trigger stop at 20c."""
         pos = {"ticker": "KXHIGHHOU-26FEB16-B77", "yes": 5, "no": 0}
         market = {"yes_bid": 55, "yes_ask": 60}
-        result = self._evaluate_stop_loss(pos, market, entry_price_cents=80, stop_loss_pct=0.40)
+        result = self._evaluate_stop_loss(pos, market, stop_loss_cents=20)
         assert result is None
 
     def test_fallback_to_absolute_when_no_entry(self):
-        """Without entry price, falls back to absolute stop (20c)."""
+        """Without entry price, uses absolute stop_loss_cents threshold."""
         pos = {"ticker": "KXHIGHHOU-26FEB16-B77", "yes": 5, "no": 0}
         market = {"yes_bid": 15, "yes_ask": 25}
-        result = self._evaluate_stop_loss(pos, market, entry_price_cents=None, absolute_stop=20)
+        result = self._evaluate_stop_loss(pos, market, entry_price_cents=None, stop_loss_cents=20)
         assert result is not None
         assert result["action"] == "stop_loss"
 
@@ -744,37 +842,17 @@ class TestInfoArbTakeProfitSkip:
 # ===================================================================
 
 class TestTrailingStop:
-    """Test trailing stop logic."""
+    """Test trailing stop using production evaluate_trailing_stop."""
 
     def _evaluate_trailing_stop(self, position, market, peak_info,
                                  trailing_drop=10, trailing_min_profit=10):
-        """Minimal reimplementation for unit testing."""
-        yes_count = position.get("yes", 0)
-        no_count = position.get("no", 0)
-
-        if yes_count > 0:
-            current_bid = market.get("yes_bid", 0)
-            side = "yes"
-            count = yes_count
-        elif no_count > 0:
-            current_bid = market.get("no_bid", 0) or (100 - market.get("yes_ask", 100))
-            side = "no"
-            count = no_count
-        else:
-            return None, peak_info
-
-        entry_price = peak_info.get("entry_price", 0)
-        peak_bid = peak_info.get("peak_bid", current_bid)
-
-        if current_bid > peak_bid:
-            peak_info["peak_bid"] = current_bid
-            peak_bid = current_bid
-
-        if (peak_bid - current_bid >= trailing_drop
-                and peak_bid >= entry_price + trailing_min_profit):
-            return {"action": "trailing_stop", "side": side, "count": count, "price": current_bid}, peak_info
-
-        return None, peak_info
+        """Call production evaluate_trailing_stop from position-monitor.py."""
+        pm = _load_position_monitor()
+        exit_config = {
+            "trailing_drop_cents": trailing_drop,
+            "trailing_min_profit_cents": trailing_min_profit,
+        }
+        return pm.evaluate_trailing_stop(position, market, peak_info, exit_config)
 
     def test_triggers_on_drop_from_peak(self):
         """Peak=90, entry=65, current=80 -> drop=10 >= 10, peak=90 >= 65+10=75 -> trigger."""

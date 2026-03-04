@@ -405,6 +405,8 @@ def run_scan():
     log.info(f"STRATEGY TRADER COMPLETE -- {len(trades_executed)} trades placed")
     log.info(f"{'='*70}")
 
+    return len(trades_executed)
+
 def main():
     parser = argparse.ArgumentParser(description="Kalshi Strategy Trader")
     parser.add_argument("--once", action="store_true", help="Run single scan and exit")

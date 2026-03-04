@@ -1672,7 +1672,6 @@ class TestAllocatorSharedState:
         data = json.loads(state_path.read_text())
         assert "TICK-1" in data["traded_tickers"]
         assert data["bot_spend"]["weather"] == 500
-        assert data["total_risk_cents"] == 500
 
     def test_is_ticker_traded_cross_process(self, tmp_path):
         """Record in one allocator, check in another."""

@@ -88,9 +88,7 @@ def update_inventory():
         positions = data.get("market_positions", [])
         for p in positions:
             ticker = p.get("ticker", "")
-            yes_count = p.get("yes", 0)
-            no_count = p.get("no", 0)
-            _inventory[ticker] = yes_count - no_count
+            _inventory[ticker] = p.get("position", 0)
     except Exception as e:
         log.error(f"Failed to sync inventory: {e}")
 

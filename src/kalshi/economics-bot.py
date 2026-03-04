@@ -716,7 +716,10 @@ def scan_and_trade():
                 )
         else:
             no_prob = 1.0 - prob
-            edge = no_prob - (no_ask / 100 if no_ask else 1.0)
+            if not no_ask:
+                trade_manager.log_decision(ticker, "no", "skipped", "no_no_ask", price_cents=0)
+                continue
+            edge = no_prob - no_ask / 100
             if edge > EDGE_THRESHOLD:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "no",
@@ -760,7 +763,10 @@ def scan_and_trade():
                     })
             else:
                 no_prob = 1.0 - prob
-                edge = no_prob - (no_ask / 100 if no_ask else 1.0)
+                if not no_ask:
+                    trade_manager.log_decision(ticker, "no", "skipped", "no_no_ask", price_cents=0)
+                    continue
+                edge = no_prob - no_ask / 100
                 if edge > GAS_EDGE_THRESHOLD:
                     opportunities.append({
                         "ticker": ticker, "market": gm, "side": "no",

@@ -6,6 +6,7 @@ Produces MacroSignal with quantified bias adjustments for economics bot.
 
 import json
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass, field, asdict
@@ -395,7 +396,6 @@ class MacroEngine:
         agreement = max(positive, negative) / total if total > 0 else 0.0
 
         # Combine: sqrt(coverage * agreement) gives a 0-1 score
-        import math
         return min(1.0, math.sqrt(coverage * agreement))
 
     def compute_sigma_multiplier(self, confidence: float) -> float:
@@ -447,7 +447,7 @@ class MacroEngine:
 
         if "gdpnow" in fred_data:
             signal.gdpnow = fred_data["gdpnow"]
-            signal.sources_available += 1
+            # Don't count as available source — GDPNow doesn't produce CPI bias
 
         # 2. Truflation
         truflation = self._truflation.fetch()

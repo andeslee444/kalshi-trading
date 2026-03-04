@@ -51,7 +51,7 @@ BOT_COMMANDS = {
 }
 
 # Daemon bots auto-restart on crash; one-shot bots do not
-DAEMON_BOTS = {"weather", "crypto", "economics", "positions", "monitor", "beatrelease", "arb"}
+DAEMON_BOTS = {"weather", "crypto", "economics", "positions", "monitor", "beatrelease", "arb", "entertainment"}
 ONESHOT_BOTS = {"strategy", "hdd"}
 
 # Disabled by default (can be started explicitly)

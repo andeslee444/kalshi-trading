@@ -501,8 +501,8 @@ def scan_and_trade():
         ss.markets_evaluated += 1
 
         # Determine trade direction and edge (raw edge, fees handled in Kelly)
-        eff_threshold = _effective_edge_threshold(prob)
         if prob > 0.5 and yes_ask:
+            eff_threshold = _effective_edge_threshold(prob)
             edge = prob - yes_ask / 100
             if edge > eff_threshold:
                 opportunities.append({
@@ -522,6 +522,7 @@ def scan_and_trade():
                 )
         elif prob <= 0.5 and no_ask:
             no_prob = 1.0 - prob
+            eff_threshold = _effective_edge_threshold(no_prob)
             edge = no_prob - no_ask / 100
             if edge > eff_threshold:
                 opportunities.append({

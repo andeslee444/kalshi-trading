@@ -307,8 +307,9 @@ def scan_spreads():
                 yes_ask = spread["kalshi_yes_ask"]
                 price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
                 fee = kalshi_fee_cents(price)
-                count, risk = quarter_kelly(edge, price, budget.max_cost_cents,
-                                          bankroll_cents=budget.bankroll_cents, fee_cents=fee)
+                count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents,
+                                          bankroll_cents=budget.bankroll_cents, fee_cents=fee,
+                                          return_details=True)
                 if count > 0:
                     reasoning = (
                         f"Cross-platform arb: Kalshi {k_ticker} YES@{price}c vs "
@@ -318,7 +319,8 @@ def scan_spreads():
                     result = trade_manager.place_order(k_ticker, "yes", price, count, reasoning,
                                                         market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                                         model_prob=round(0.5 + edge, 4), raw_edge=round(edge, 4),
-                                                        fee_cents=round(kalshi_fee_cents(price), 2), sizing_method="quarter_kelly")
+                                                        fee_cents=round(kalshi_fee_cents(price), 2), sizing_method="quarter_kelly",
+                                                        kelly_details=kelly_details)
                     if result:
                         ss.trades_placed += 1
                         allocator.record_trade("cross-platform-arb", k_ticker, risk, edge=edge)

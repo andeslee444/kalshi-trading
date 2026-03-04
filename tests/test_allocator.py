@@ -143,14 +143,14 @@ class TestBankrollUsesAvailable:
     def test_bankroll_equals_available(self):
         """When total=100000, available=5000, bankroll should be 5000."""
         alloc = self._make_allocator(total=100000, available=5000)
-        budget = alloc.request_budget("weather", "TICK-NEW", edge=0.10)
+        budget = alloc.request_budget("weather", "KXHIGHNY-26FEB16-T40", edge=0.10)
         assert budget.approved
         assert budget.bankroll_cents == 5000
 
     def test_bankroll_not_total(self):
         """Bankroll should NOT be total balance."""
         alloc = self._make_allocator(total=50000, available=5000)
-        budget = alloc.request_budget("weather", "TICK-NEW2", edge=0.10)
+        budget = alloc.request_budget("weather", "KXHIGHLA-26FEB16-T50", edge=0.10)
         assert budget.approved
         assert budget.bankroll_cents == 5000
         assert budget.bankroll_cents != 50000
@@ -203,13 +203,14 @@ class TestAbsoluteDailyLossCap:
         """
         alloc = self._make_allocator(balance=600000)
         # Effective cap = max(50000, 600000*0.10) = max(50000, 60000) = 60000 cents ($600)
-        # Spread across multiple bots to avoid per-bot daily limit
+        # Spread across multiple bots to avoid per-bot daily limit.
+        # Use varied ticker prefixes to avoid cluster limits.
         for i in range(30):
-            alloc.record_trade("source-monitor", f"TICK-A{i}", 1000, edge=0.10)
+            alloc.record_trade("source-monitor", f"SRCMON-A{i}", 1000, edge=0.10)
         for i in range(31):
-            alloc.record_trade("economics", f"TICK-B{i}", 1000, edge=0.10)
+            alloc.record_trade("economics", f"KXCPI-B{i}", 1000, edge=0.10)
         # Total risk = 61000 > 60000 effective cap
-        budget = alloc.request_budget("weather", "TICK-NEW", edge=0.15)
+        budget = alloc.request_budget("weather", "KXHIGHNY-26FEB16-T40", edge=0.15)
         assert not budget.approved
         assert "absolute daily risk cap" in budget.reason
 
@@ -217,13 +218,13 @@ class TestAbsoluteDailyLossCap:
         """Under effective cap should still allow trading."""
         alloc = self._make_allocator(balance=600000)
         # Effective cap = max(50000, 600000*0.10) = 60000 cents ($600).
-        # Record $590 of risk spread across bots.
+        # Record $590 of risk spread across bots. Use varied ticker prefixes to avoid cluster limits.
         for i in range(29):
-            alloc.record_trade("source-monitor", f"TICK-A{i}", 1000, edge=0.10)
+            alloc.record_trade("source-monitor", f"SRCMON-A{i}", 1000, edge=0.10)
         for i in range(29):
-            alloc.record_trade("economics", f"TICK-B{i}", 1000, edge=0.10)
+            alloc.record_trade("economics", f"KXCPI-B{i}", 1000, edge=0.10)
         # Total risk = 58000 < 60000 effective cap
-        budget = alloc.request_budget("weather", "TICK-NEW", edge=0.15)
+        budget = alloc.request_budget("weather", "KXHIGHNY-26FEB16-T40", edge=0.15)
         assert budget.approved
 
 
@@ -465,12 +466,12 @@ class TestBankrollProportionalAbsoluteCap:
         # Record $550 of risk (55000 cents) — exceeds static $500 but under dynamic $600
         # Spread across bots to avoid per-bot limits
         for i in range(27):
-            alloc.record_trade("source-monitor", f"TICK-A{i}", 1000, edge=0.10)
+            alloc.record_trade("source-monitor", f"SRCMON-A{i}", 1000, edge=0.10)
         for i in range(28):
-            alloc.record_trade("economics", f"TICK-B{i}", 1000, edge=0.10)
+            alloc.record_trade("economics", f"KXCPI-B{i}", 1000, edge=0.10)
         # Total = 55000, with pct enabled should still be allowed (55000 < 60000)
         with patch("capital_allocator.ABSOLUTE_DAILY_LOSS_CAP_PCT", 0.10):
-            budget = alloc.request_budget("weather", "TICK-NEW", edge=0.15)
+            budget = alloc.request_budget("weather", "KXHIGHNY-26FEB16-T40", edge=0.15)
         assert budget.approved
 
     def test_static_cap_is_floor(self):
@@ -487,11 +488,11 @@ class TestBankrollProportionalAbsoluteCap:
             # Record $450 of risk (45000 < 50000 static cap)
             # Spread across bots to avoid per-bot limits
             for i in range(22):
-                alloc.record_trade("source-monitor", f"TICK-A{i}", 1000, edge=0.10)
+                alloc.record_trade("source-monitor", f"SRCMON-A{i}", 1000, edge=0.10)
             for i in range(23):
-                alloc.record_trade("economics", f"TICK-B{i}", 1000, edge=0.10)
+                alloc.record_trade("economics", f"KXCPI-B{i}", 1000, edge=0.10)
             # Total = 45000 < 50000 static cap
-            budget = alloc.request_budget("weather", "TICK-NEW", edge=0.15)
+            budget = alloc.request_budget("weather", "KXHIGHNY-26FEB16-T40", edge=0.15)
         assert budget.approved  # 45000 < 50000 static cap
 
 

@@ -7,7 +7,7 @@ conftest.py adds src/kalshi/ to sys.path so direct import works.
 import math
 import pytest
 
-from probability import half_kelly, half_kelly_sell, quarter_kelly_sell
+from probability import half_kelly, half_kelly_sell, quarter_kelly, quarter_kelly_sell
 
 
 # ---------------------------------------------------------------------------
@@ -239,3 +239,69 @@ class TestQuarterKellySell:
         contracts, risk = quarter_kelly_sell(0.10, 100, 500)
         assert contracts == 0
         assert risk == 0
+
+
+# ---------------------------------------------------------------------------
+# Exact-value Kelly formula pinning tests
+# ---------------------------------------------------------------------------
+
+class TestKellyExactValues:
+    """Pin concrete Kelly outputs against manually verified formula calculations."""
+
+    def test_half_kelly_exact(self):
+        """half_kelly(0.20, 30, 500, bankroll=10000).
+
+        our_prob = 0.50, b = 70/30, f* = (b*p-q)/b = 0.2857, f*/2 = 0.1429
+        max_kelly = int(0.1429 * 10000 / 30) = 47
+        max_cap = 500 // 30 = 16 (binding)
+        => (16, 480)
+        """
+        count, risk = half_kelly(0.20, 30, 500, bankroll_cents=10000)
+        assert count == 16
+        assert risk == 480
+
+    def test_half_kelly_sell_exact(self):
+        """half_kelly_sell(0.20, 10, 5000, bankroll=50000).
+
+        p_true = 10/100 - 0.20 = -0.10, clamped to 0.001
+        win_prob = 1 - 0.001 = 0.999, win_amount = 10 - 0 = 10, loss = 90
+        b = 10/90, f* = (b*0.999 - 0.001)/b, half_f
+        risk_per = 90, contracts from Kelly and cap
+        => (55, 4950)
+        """
+        count, risk = half_kelly_sell(0.20, 10, 5000, bankroll_cents=50000)
+        assert count == 55
+        assert risk == 4950
+
+    def test_quarter_kelly_exact(self):
+        """quarter_kelly(0.20, 30, 500, bankroll=10000).
+
+        Halves half_kelly result: half_kelly gives 16, quarter = 16 // 2 = 8
+        => (8, 240)
+        """
+        count, risk = quarter_kelly(0.20, 30, 500, bankroll_cents=10000)
+        assert count == 8
+        assert risk == 240
+
+    def test_quarter_kelly_sell_exact(self):
+        """quarter_kelly_sell(0.20, 10, 5000, bankroll=50000).
+
+        Halves half_kelly_sell result: half gives 55, quarter = 55 // 2 = 27
+        risk_per = 90, risk = 27 * 90 = 2430
+        => (27, 2430)
+        """
+        count, risk = quarter_kelly_sell(0.20, 10, 5000, bankroll_cents=50000)
+        assert count == 27
+        assert risk == 2430
+
+    def test_half_kelly_sell_at_99_returns_zero(self):
+        """sell_price=99 means risk_per=1 which is <= 1, returns zero."""
+        count, risk = half_kelly_sell(0.10, 99, 500, bankroll_cents=10000)
+        assert count == 0
+        assert risk == 0
+
+    def test_half_kelly_sell_at_50_reasonable(self):
+        """sell_price=50 with 10% edge should produce reasonable sizing."""
+        count, risk = half_kelly_sell(0.10, 50, 500, bankroll_cents=10000)
+        assert count == 10
+        assert risk == 500

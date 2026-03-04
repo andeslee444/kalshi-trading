@@ -97,10 +97,11 @@ def importance_sample_probability(mean, std, threshold, n_samples=10000,
     # Weighted estimate
     prob = sum(weights) / n
 
-    # Standard error via sample variance of weighted indicator
+    # Standard error via sample variance of weighted indicator (iid approximation)
     mean_w = prob
     var_w = sum((w - mean_w) ** 2 for w in weights) / (n - 1) if n > 1 else 0.0
     std_err = math.sqrt(var_w / n) if var_w > 0 else 0.0
+    std_err = max(std_err, 1.0 / n)  # Floor: at least 1/n uncertainty
 
     return (max(0.0, min(1.0, prob)), std_err)
 

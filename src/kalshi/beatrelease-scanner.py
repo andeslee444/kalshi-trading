@@ -394,13 +394,9 @@ def execute_exits(exit_trades):
     pos_map = {}
     for p in positions:
         t = p.get("ticker", "")
-        # Position has yes/no quantities
-        yes_qty = p.get("market_exposure", {}).get("yes", 0) if isinstance(p.get("market_exposure"), dict) else 0
-        no_qty = p.get("market_exposure", {}).get("no", 0) if isinstance(p.get("market_exposure"), dict) else 0
-        # Also check simpler format
-        if not yes_qty and not no_qty:
-            yes_qty = p.get("yes_count", 0) or p.get("position", 0)
-            no_qty = p.get("no_count", 0)
+        pos_val = p.get("position", 0)
+        yes_qty = pos_val if pos_val > 0 else 0
+        no_qty = abs(pos_val) if pos_val < 0 else 0
         if t and (yes_qty or no_qty):
             pos_map[t] = {"yes": yes_qty, "no": no_qty}
 
