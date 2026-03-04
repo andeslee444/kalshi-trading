@@ -315,6 +315,7 @@ class TestMacroEngineAggregation:
     def test_sigma_adjustment(self):
         """High confidence should tighten sigma, low confidence widen it."""
         engine = MacroEngine.__new__(MacroEngine)
+        engine._sigma_tightening_max = 0.30  # default config value
         # High confidence -> tighter sigma (multiplier < 1)
         tight = engine.compute_sigma_multiplier(confidence=0.8)
         assert tight < 1.0
@@ -343,6 +344,7 @@ class TestEconomicsBotIntegration:
     def test_sigma_tighter_with_high_confidence(self):
         """High confidence signal should tighten sigma."""
         engine = MacroEngine.__new__(MacroEngine)
+        engine._sigma_tightening_max = 0.30  # default config value
         base_sigma = 0.10
         mult = engine.compute_sigma_multiplier(confidence=0.8)
         adjusted_sigma = base_sigma * mult
@@ -352,6 +354,7 @@ class TestEconomicsBotIntegration:
     def test_sigma_unchanged_with_low_confidence(self):
         """Low confidence signal should not change sigma."""
         engine = MacroEngine.__new__(MacroEngine)
+        engine._sigma_tightening_max = 0.30  # default config value
         mult = engine.compute_sigma_multiplier(confidence=0.1)
         assert mult == pytest.approx(1.0, abs=0.01)
 
@@ -360,3 +363,46 @@ class TestEconomicsBotIntegration:
         signal = MacroSignal()
         assert signal.cpi_bias == 0.0
         assert signal.confidence == 0.0
+
+
+class TestMacroEngineConfig:
+    """Tests for MacroEngine config wiring."""
+
+    def test_disabled_engine_returns_empty_signal(self):
+        """When macro.enabled is false, compute_signal returns zero-bias signal."""
+        engine = MacroEngine(config={"enabled": False})
+        signal = engine.compute_signal(cleveland_nowcast=2.8)
+        assert signal.cpi_bias == 0.0
+        assert signal.confidence == 0.0
+
+    def test_custom_bias_clamp(self):
+        """Custom biasClampPp is used instead of hardcoded 0.15."""
+        engine = MacroEngine(config={"biasClampPp": 0.05})
+        assert engine._bias_clamp == 0.05
+
+    def test_custom_sigma_tightening_max(self):
+        """Custom sigmaTighteningMax is used instead of hardcoded 0.30."""
+        engine = MacroEngine(config={"sigmaTighteningMax": 0.20})
+        assert engine._sigma_tightening_max == 0.20
+        # At max confidence (1.0), sigma multiplier = 1.0 - 0.20 = 0.80
+        mult = engine.compute_sigma_multiplier(confidence=1.0)
+        assert mult == pytest.approx(0.80, abs=0.01)
+
+    def test_custom_cache_ttl(self):
+        """Custom cacheTtlHours is converted to seconds."""
+        engine = MacroEngine(config={"cacheTtlHours": 2})
+        assert engine._cache_ttl == 2 * 3600
+
+    def test_custom_max_sentiment_articles(self):
+        """Custom maxSentimentArticles is stored."""
+        engine = MacroEngine(config={"maxSentimentArticles": 10})
+        assert engine._max_sentiment_articles == 10
+
+    def test_default_config_values(self):
+        """Default config values match historical hardcoded values."""
+        engine = MacroEngine(config={})
+        assert engine._enabled is True
+        assert engine._bias_clamp == 0.15
+        assert engine._sigma_tightening_max == 0.30
+        assert engine._cache_ttl == 4 * 3600
+        assert engine._max_sentiment_articles == 5

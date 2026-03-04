@@ -331,6 +331,11 @@ class MacroEngine:
 
     def __init__(self, config: Optional[dict] = None):
         self._config = config or {}
+        self._enabled = self._config.get("enabled", True)
+        self._cache_ttl = self._config.get("cacheTtlHours", 4) * 3600
+        self._bias_clamp = self._config.get("biasClampPp", 0.15)
+        self._sigma_tightening_max = self._config.get("sigmaTighteningMax", 0.30)
+        self._max_sentiment_articles = self._config.get("maxSentimentArticles", 5)
         self._fred = FREDClient(api_key=self._config.get("fred_api_key", ""))
         self._truflation = TruflationClient()
         self._rss = RSSFeedParser()
@@ -396,15 +401,15 @@ class MacroEngine:
     def compute_sigma_multiplier(self, confidence: float) -> float:
         """Compute sigma adjustment multiplier based on macro confidence.
 
-        Higher confidence -> tighter sigma (up to 30% reduction).
+        Higher confidence -> tighter sigma (up to sigmaTighteningMax reduction).
         Low confidence -> no change (multiplier = 1.0).
 
-        Returns: multiplier in [0.7, 1.0]
+        Returns: multiplier in [1.0 - sigmaTighteningMax, 1.0]
         """
         if confidence <= 0.3:
             return 1.0
-        # Linear interpolation: conf 0.3 -> 1.0, conf 1.0 -> 0.7
-        return 1.0 - 0.3 * ((confidence - 0.3) / 0.7)
+        # Linear interpolation: conf 0.3 -> 1.0, conf 1.0 -> (1.0 - sigmaTighteningMax)
+        return 1.0 - self._sigma_tightening_max * ((confidence - 0.3) / 0.7)
 
     def compute_signal(self, cleveland_nowcast: Optional[float] = None) -> MacroSignal:
         """Fetch all sources and compute aggregated macro signal.
@@ -417,6 +422,9 @@ class MacroEngine:
             MacroSignal with cpi_bias, confidence, and individual source values.
         """
         import datetime
+
+        if not self._enabled:
+            return MacroSignal(timestamp=datetime.datetime.now().isoformat())
 
         signal = MacroSignal(timestamp=datetime.datetime.now().isoformat())
         biases = []
@@ -456,7 +464,7 @@ class MacroEngine:
         for url in rss_urls:
             entries = self._rss.fetch_feed(url)
             relevant = self._rss.filter_relevant(entries)
-            for entry in relevant[:3]:  # cap per feed
+            for entry in relevant[:self._max_sentiment_articles]:  # cap per feed
                 sentiment = self._sentiment.extract(
                     f"{entry.title}\n\n{entry.summary}"
                 )
@@ -479,8 +487,8 @@ class MacroEngine:
         # 5. Aggregate
         if biases:
             signal.cpi_bias = sum(biases) / len(biases)
-            # Clamp bias to [-0.15, +0.15] pp
-            signal.cpi_bias = max(-0.15, min(0.15, signal.cpi_bias))
+            # Clamp bias to [-biasClampPp, +biasClampPp] pp
+            signal.cpi_bias = max(-self._bias_clamp, min(self._bias_clamp, signal.cpi_bias))
         signal.confidence = self._aggregate_confidence(
             biases, signal.sources_available, signal.sources_total
         )
@@ -533,7 +541,7 @@ class MacroEngine:
             if not MACRO_CACHE_PATH.exists():
                 return None
             data = json.loads(MACRO_CACHE_PATH.read_text())
-            if time.time() - data.get("cached_at", 0) > MACRO_CACHE_TTL:
+            if time.time() - data.get("cached_at", 0) > self._cache_ttl:
                 return None
             s = data.get("signal", {})
             return MacroSignal(**{k: v for k, v in s.items()
