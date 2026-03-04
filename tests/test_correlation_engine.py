@@ -42,6 +42,16 @@ class TestFactorMapping:
         assert self.engine.ticker_to_factor("KXHIGHNY-26MAR3-T55") == "WEATHER_NE"
         assert self.engine.ticker_to_factor("KXHIGHPHI-26MAR3-T50") == "WEATHER_NE"  # PHI = Philadelphia
 
+    def test_phil_ticker_maps_to_northeast(self):
+        """KXHIGHPHIL tickers should map to WEATHER_NE factor."""
+        factor = self.engine.ticker_to_factor("KXHIGHPHIL-26MAR3-T50")
+        assert factor == "WEATHER_NE"
+
+    def test_phil_ny_correlated(self):
+        """Philadelphia and New York should be correlated (same region)."""
+        corr = self.engine.get_ticker_correlation("KXHIGHPHIL-26MAR3-T50", "KXHIGHNY-26MAR3-T50")
+        assert corr == 0.90  # same factor = intra-factor
+
     def test_weather_southeast(self):
         assert self.engine.ticker_to_factor("KXHIGHMIA-26MAR3-T85") == "WEATHER_SE"
 

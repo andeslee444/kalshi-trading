@@ -50,6 +50,7 @@ WEATHER_CITY_FACTORS = {
     "AUS": "WEATHER_SOUTH_TX",
     "NY": "WEATHER_NE",
     "PHI": "WEATHER_NE",
+    "PHIL": "WEATHER_NE",
     "MIA": "WEATHER_SE",
     "LAX": "WEATHER_W",
     "CHI": "WEATHER_MW",
