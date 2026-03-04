@@ -13,25 +13,11 @@ Usage:
 
 import json
 import logging
-from collections import defaultdict
 from pathlib import Path
 
+from pnl_attribution import _load_trades_safe
+
 log = logging.getLogger("execution-quality")
-
-
-def _load_trades_safe(filepath):
-    """Load a JSON trade file. Returns list or empty list."""
-    try:
-        p = Path(filepath)
-        if not p.exists():
-            return []
-        text = p.read_text().strip()
-        if not text:
-            return []
-        data = json.loads(text)
-        return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, ValueError, OSError):
-        return []
 
 
 class ExecutionAnalyzer:
@@ -52,8 +38,8 @@ class ExecutionAnalyzer:
         else:
             self._trades = []
 
-    def _filtered(self, bot=None, edge_bucket=None):
-        """Filter trades by bot and/or edge bucket."""
+    def _filtered(self, bot=None):
+        """Filter trades by bot."""
         trades = self._trades
         if bot:
             trades = [t for t in trades if t.get("source_bot") == bot]

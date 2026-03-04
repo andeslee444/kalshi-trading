@@ -20,6 +20,7 @@ Usage:
 import json
 import math
 import logging
+import os
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -54,9 +55,13 @@ def _linear_regression(xs, ys):
 
 
 def _parse_timestamp(ts):
-    """Parse ISO timestamp to datetime. Returns None on failure."""
+    """Parse ISO timestamp to naive datetime (assumes UTC). Returns None on failure."""
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00").replace("+00:00", ""))
+        # Strip timezone suffixes to get naive datetime for consistent comparison
+        cleaned = ts.replace("Z", "")
+        if "+" in cleaned:
+            cleaned = cleaned[:cleaned.index("+")]
+        return datetime.fromisoformat(cleaned)
     except (ValueError, AttributeError):
         return None
 
@@ -227,7 +232,6 @@ class EdgeMonitor:
         tmp = str(p) + ".tmp"
         with open(tmp, "w") as f:
             json.dump(data, f, indent=2)
-        import os
         os.replace(tmp, str(p))
 
     def load_state(self):

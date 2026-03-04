@@ -132,13 +132,14 @@ class PnLAttributor:
         else:
             self._all_trades = []
 
-        # Filter to settled trades
+        # Filter to settled trades (copy dicts to avoid mutating caller's data)
         self._trades = []
         for t in self._all_trades:
             pnl, is_settled = _compute_pnl_cents(t)
             if is_settled:
-                t["_pnl_cents"] = pnl
-                self._trades.append(t)
+                settled = dict(t)
+                settled["_pnl_cents"] = pnl
+                self._trades.append(settled)
 
     def _accumulate(self, key_fn):
         """Generic accumulation by a key function."""

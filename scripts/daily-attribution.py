@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -108,7 +109,6 @@ def main():
         out_path = DATA_DIR / "attribution-report.json"
         with open(str(out_path) + ".tmp", "w") as f:
             json.dump(report, f, indent=2)
-        import os
         os.replace(str(out_path) + ".tmp", str(out_path))
         print(f"\nSaved to {out_path}")
 
