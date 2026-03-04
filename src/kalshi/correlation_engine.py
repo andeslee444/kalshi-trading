@@ -148,6 +148,8 @@ class CorrelationEngine:
 
     def get_ticker_correlation(self, ticker_a: str, ticker_b: str) -> float:
         """Get correlation between two tickers via their factor groups."""
+        if ticker_a.upper() == ticker_b.upper():
+            return 1.0
         fa = self.ticker_to_factor(ticker_a)
         fb = self.ticker_to_factor(ticker_b)
         return self.get_factor_correlation(fa, fb)

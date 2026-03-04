@@ -79,6 +79,24 @@ class TestFactorMapping:
         assert f1 != f2
 
 
+class TestTickerCorrelation:
+    """Test ticker-level correlation lookup."""
+
+    def setup_method(self):
+        from correlation_engine import CorrelationEngine
+        self.engine = CorrelationEngine()
+
+    def test_same_ticker_correlation_is_one(self):
+        """A ticker is perfectly correlated with itself."""
+        corr = self.engine.get_ticker_correlation("KXCPI-26MAY-T20", "KXCPI-26MAY-T20")
+        assert corr == 1.0
+
+    def test_same_factor_different_tickers_is_intra(self):
+        """Two different tickers in same factor get intra-factor (0.90)."""
+        corr = self.engine.get_ticker_correlation("KXCPI-26MAY-T20", "KXCPI-26MAY-T21")
+        assert corr == 0.90
+
+
 class TestClusterRisk:
     """Test cluster risk tracking and concentration limits."""
 
