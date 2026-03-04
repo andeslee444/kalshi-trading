@@ -311,17 +311,7 @@ class TestCrossMarketConsistency:
 
 
 class TestNWSEdgeThresholds:
-    """Test CI-based edge threshold logic from source-monitor.py (lines 938-950).
-
-    The logic:
-      sigma = nws_sigma_for_hour(hour)
-      margin = abs(running_high - threshold)
-      ci_99 = 2.576 * sigma
-      if margin > ci_99:        min_edge = 0.05 (very confident)
-      elif margin > ci_99 * 0.5: min_edge = 0.10 (moderate)
-      else:                      min_edge = 0.15 (uncertain)
-      Brackets always: min_edge = 0.20
-    """
+    """Test _nws_min_edge from source-monitor.py."""
 
     def setup_method(self):
         _reset_calibration()
@@ -329,49 +319,35 @@ class TestNWSEdgeThresholds:
     def teardown_method(self):
         _reset_calibration()
 
-    def _compute_min_edge(self, running_high, threshold, hour, is_bracket=False):
-        """Replicate the edge threshold logic for testing."""
-        if is_bracket:
-            return 0.20
-        sigma = nws_sigma_for_hour(hour)
-        margin = abs(running_high - threshold)
-        ci_99 = 2.576 * sigma
-        if margin > ci_99:
-            return 0.05
-        elif margin > ci_99 * 0.5:
-            return 0.10
-        else:
-            return 0.15
-
     def test_very_confident_afternoon(self):
         """Hour 15, margin 5F >> ci_99 ~1.8F -> min_edge 0.05."""
-        min_edge = self._compute_min_edge(90, 85, 15)
-        assert min_edge == 0.05
+        sm = _load_source_monitor()
+        assert sm._nws_min_edge(90, 85, 15, False) == 0.05
 
     def test_moderate_confidence_midday(self):
         """Hour 12, margin 2F, ci_99 ~3.6F, margin > ci/2 -> min_edge 0.10."""
-        min_edge = self._compute_min_edge(82, 80, 12)
-        assert min_edge == 0.10
+        sm = _load_source_monitor()
+        assert sm._nws_min_edge(82, 80, 12, False) == 0.10
 
     def test_uncertain_morning(self):
         """Hour 8, margin 1F, ci_99 ~6.8F -> min_edge 0.15."""
-        min_edge = self._compute_min_edge(81, 80, 8)
-        assert min_edge == 0.15
+        sm = _load_source_monitor()
+        assert sm._nws_min_edge(81, 80, 8, False) == 0.15
 
     def test_bracket_always_020(self):
         """Bracket markets always require 20% edge."""
-        min_edge = self._compute_min_edge(80, 80, 18, is_bracket=True)
-        assert min_edge == 0.20
+        sm = _load_source_monitor()
+        assert sm._nws_min_edge(80, 80, 18, True) == 0.20
 
     def test_evening_confident(self):
         """Hour 18, sigma=0.5, ci_99=1.29, margin 5F -> very confident."""
-        min_edge = self._compute_min_edge(85, 80, 18)
-        assert min_edge == 0.05
+        sm = _load_source_monitor()
+        assert sm._nws_min_edge(85, 80, 18, False) == 0.05
 
     def test_overnight_uncertain(self):
         """Hour 4, sigma=5.0, ci_99=12.88, margin 3F -> uncertain."""
-        min_edge = self._compute_min_edge(83, 80, 4)
-        assert min_edge == 0.15
+        sm = _load_source_monitor()
+        assert sm._nws_min_edge(83, 80, 4, False) == 0.15
 
 
 class TestDataFreshness:

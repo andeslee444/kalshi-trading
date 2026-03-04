@@ -107,6 +107,26 @@ def _validate_market_cluster(entity_key, market_signals):
             return []
     return sorted_signals
 
+def _nws_min_edge(running_high, threshold, hour, is_bracket):
+    """Compute minimum edge threshold for NWS trades based on CI confidence.
+
+    Uses 99% CI of NWS observation error:
+      very confident (margin > ci_99):    5% min edge
+      moderate (margin > ci_99 * 0.5):   10% min edge
+      uncertain:                         15% min edge
+      brackets:                          20% min edge (always)
+    """
+    if is_bracket:
+        return 0.20
+    sigma = nws_sigma_for_hour(hour)
+    ci_margin = abs(running_high - threshold)
+    ci_99 = 2.576 * sigma
+    if ci_margin > ci_99:
+        return 0.05
+    elif ci_margin > ci_99 * 0.5:
+        return 0.10
+    return 0.15
+
 # === Kalshi Market Helpers ===
 def get_markets_by_prefix(prefix, status="open"):
     """Get all open markets matching a ticker prefix."""
@@ -965,19 +985,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                 if prob > 0.5 and yes_ask and yes_ask < 99:
                     # Buy YES (raw edge, fees handled in Kelly)
                     edge = prob - yes_ask / 100
-                    # CI-based edge threshold: margin-aware instead of hour-17 step
-                    if is_bracket:
-                        min_edge = 0.20
-                    else:
-                        sigma = nws_sigma_for_hour(now.hour)
-                        margin = abs(running_high - threshold)
-                        ci_99 = 2.576 * sigma
-                        if margin > ci_99:
-                            min_edge = 0.05   # Very confident
-                        elif margin > ci_99 * 0.5:
-                            min_edge = 0.10   # Moderate
-                        else:
-                            min_edge = 0.15   # Uncertain
+                    min_edge = _nws_min_edge(running_high, threshold, now.hour, is_bracket)
                     if edge <= min_edge:
                         if ss:
                             ss.skip("low_edge")
@@ -1040,19 +1048,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     # Buy NO (raw edge, fees handled in Kelly)
                     no_prob = 1.0 - prob
                     edge = no_prob - no_ask / 100
-                    # CI-based edge threshold: margin-aware instead of hour-17 step
-                    if is_bracket:
-                        min_edge = 0.20
-                    else:
-                        sigma = nws_sigma_for_hour(now.hour)
-                        margin = abs(running_high - threshold)
-                        ci_99 = 2.576 * sigma
-                        if margin > ci_99:
-                            min_edge = 0.05   # Very confident
-                        elif margin > ci_99 * 0.5:
-                            min_edge = 0.10   # Moderate
-                        else:
-                            min_edge = 0.15   # Uncertain
+                    min_edge = _nws_min_edge(running_high, threshold, now.hour, is_bracket)
                     if edge <= min_edge:
                         if ss:
                             ss.skip("low_edge")
