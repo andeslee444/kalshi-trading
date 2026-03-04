@@ -5,6 +5,7 @@ import time
 import datetime
 import os
 import signal
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -252,76 +253,71 @@ class TestStatePersistence:
         assert sup.bots["weather"].started_at is None
 
 
-class TestOrphanAdoption:
+class TestOrphanCleanup:
 
-    def test_orphan_adoption_restores_state(self, tmp_path):
-        """Running orphan should be adopted with started_at from state file."""
-        state_file = tmp_path / "supervisor-state.json"
-        started = time.time() - 1800  # 30 min ago
-        state = {"weather": {"started_at": started, "restart_count": 5}}
-        state_file.write_text(json.dumps(state))
-
-        with patch.object(supervisor, "SUPERVISOR_STATE_PATH", state_file):
-            sup = Supervisor.__new__(Supervisor)
-            sup.bots = {
-                name: BotProcess(name, cmd)
-                for name, cmd in supervisor.BOT_COMMANDS.items()
-            }
-            sup._running = True
-            sup._last_calibration_check = 0
-            sup._load_state = Supervisor._load_state.__get__(sup, Supervisor)
-
-            # Weather has a PID file and is running
-            with patch.object(sup.bots["weather"], "_read_pid", return_value=9999), \
-                 patch.object(sup.bots["weather"], "is_running", return_value=True):
-                sup._load_state()
-                sup._adopt_or_kill_orphans()
-
-        # started_at should come from state file (loaded by _load_state)
-        assert sup.bots["weather"].started_at == started
-        assert sup.bots["weather"].restart_count == 5
-
-    def test_orphan_dead_process_cleans_pid(self):
-        """Dead orphan should have its PID file removed."""
+    def test_kills_orphan_found_by_pgrep(self):
+        """Orphan processes found by pattern should be killed."""
         sup = Supervisor.__new__(Supervisor)
-        sup.bots = {"weather": BotProcess("weather", ["python3", "test.py"])}
+        sup.bots = {"weather": BotProcess("weather", ["python3", "src/kalshi/weather-bot.py"])}
         sup._running = True
         sup._last_calibration_check = 0
 
-        with patch.object(sup.bots["weather"], "_read_pid", return_value=9999), \
-             patch.object(sup.bots["weather"], "is_running", return_value=False), \
-             patch.object(sup.bots["weather"], "_remove_pid") as mock_remove:
+        with patch.object(supervisor, "_find_bot_processes", return_value=[1234, 5678]), \
+             patch.object(supervisor.os, "kill") as mock_kill, \
+             patch.object(supervisor.time, "sleep"):
+            sup._adopt_or_kill_orphans()
+
+        # Should have tried to kill both orphans
+        kill_calls = [c for c in mock_kill.call_args_list if c[0][1] == signal.SIGTERM]
+        assert len(kill_calls) == 2
+
+    def test_cleans_pid_files(self):
+        """All PID files should be cleaned up during orphan cleanup."""
+        sup = Supervisor.__new__(Supervisor)
+        bot = BotProcess("weather", ["python3", "src/kalshi/weather-bot.py"])
+        sup.bots = {"weather": bot}
+        sup._running = True
+        sup._last_calibration_check = 0
+
+        with patch.object(supervisor, "_find_bot_processes", return_value=[]), \
+             patch.object(bot, "_remove_pid") as mock_remove:
             sup._adopt_or_kill_orphans()
 
         mock_remove.assert_called_once()
 
-    def test_orphan_no_pid_file_skipped(self):
-        """Bot with no PID file should be skipped during orphan cleanup."""
+    def test_handles_already_dead_process(self):
+        """Should not crash if orphan dies between pgrep and kill."""
         sup = Supervisor.__new__(Supervisor)
-        sup.bots = {"weather": BotProcess("weather", ["python3", "test.py"])}
+        sup.bots = {"weather": BotProcess("weather", ["python3", "src/kalshi/weather-bot.py"])}
         sup._running = True
         sup._last_calibration_check = 0
 
-        with patch.object(sup.bots["weather"], "_read_pid", return_value=None), \
-             patch.object(sup.bots["weather"], "_remove_pid") as mock_remove:
-            sup._adopt_or_kill_orphans()
+        with patch.object(supervisor, "_find_bot_processes", return_value=[1234]), \
+             patch.object(supervisor.os, "kill", side_effect=ProcessLookupError), \
+             patch.object(supervisor.time, "sleep"):
+            sup._adopt_or_kill_orphans()  # should not raise
 
-        mock_remove.assert_not_called()
-
-    def test_orphan_adoption_fallback_to_current_time(self):
-        """Orphan with no saved state should get started_at = now."""
+    def test_sigkill_after_sigterm_timeout(self):
+        """Should SIGKILL processes that survive SIGTERM."""
         sup = Supervisor.__new__(Supervisor)
-        sup.bots = {"weather": BotProcess("weather", ["python3", "test.py"])}
+        sup.bots = {"weather": BotProcess("weather", ["python3", "src/kalshi/weather-bot.py"])}
         sup._running = True
         sup._last_calibration_check = 0
 
-        before = time.time()
-        with patch.object(sup.bots["weather"], "_read_pid", return_value=9999), \
-             patch.object(sup.bots["weather"], "is_running", return_value=True):
-            sup._adopt_or_kill_orphans()
-        after = time.time()
+        kill_calls = []
 
-        assert before <= sup.bots["weather"].started_at <= after
+        def track_kill(pid, sig):
+            kill_calls.append((pid, sig))
+            if sig == 0:
+                return  # process still alive
+
+        with patch.object(supervisor, "_find_bot_processes", return_value=[1234]), \
+             patch.object(supervisor.os, "kill", side_effect=track_kill), \
+             patch.object(supervisor.time, "sleep"):
+            sup._adopt_or_kill_orphans()
+
+        assert (1234, signal.SIGTERM) in kill_calls
+        assert (1234, signal.SIGKILL) in kill_calls
 
 
 class TestProcessGroupShutdown:
@@ -400,3 +396,150 @@ class TestProcessGroupShutdown:
         # Both SIGTERM and SIGKILL should go through killpg
         assert (12345, signal.SIGTERM) in killpg_calls
         assert (12345, signal.SIGKILL) in killpg_calls
+
+
+class TestFindBotProcesses:
+
+    def test_finds_matching_pids(self):
+        """Should return PIDs from pgrep output."""
+        output = b"1234\n5678\n"
+        with patch.object(supervisor.subprocess, "check_output", return_value=output), \
+             patch.object(supervisor.os, "getpid", return_value=9999):
+            pids = supervisor._find_bot_processes(["python3", "src/kalshi/weather-bot.py"])
+        assert pids == [1234, 5678]
+
+    def test_excludes_own_pid(self):
+        """Should exclude the supervisor's own PID from results."""
+        output = b"1234\n9999\n5678\n"
+        with patch.object(supervisor.subprocess, "check_output", return_value=output), \
+             patch.object(supervisor.os, "getpid", return_value=9999):
+            pids = supervisor._find_bot_processes(["python3", "src/kalshi/weather-bot.py"])
+        assert pids == [1234, 5678]
+
+    def test_returns_empty_when_no_matches(self):
+        """pgrep exits non-zero when no matches — should return empty list."""
+        with patch.object(supervisor.subprocess, "check_output",
+                          side_effect=subprocess.CalledProcessError(1, "pgrep")), \
+             patch.object(supervisor.os, "getpid", return_value=9999):
+            pids = supervisor._find_bot_processes(["python3", "src/kalshi/weather-bot.py"])
+        assert pids == []
+
+    def test_handles_blank_lines(self):
+        """Should handle trailing newlines and blank lines."""
+        output = b"1234\n\n"
+        with patch.object(supervisor.subprocess, "check_output", return_value=output), \
+             patch.object(supervisor.os, "getpid", return_value=9999):
+            pids = supervisor._find_bot_processes(["python3", "src/kalshi/weather-bot.py"])
+        assert pids == [1234]
+
+
+class TestSingletonLock:
+
+    def test_acquire_lock_succeeds(self, tmp_path):
+        """First supervisor should acquire lock successfully."""
+        sup = Supervisor.__new__(Supervisor)
+        sup.bots = {}
+        sup._running = True
+        sup._last_calibration_check = 0
+        sup._lock_file = None
+        with patch.object(supervisor, "PID_DIR", tmp_path):
+            sup._acquire_lock()
+        assert sup._lock_file is not None
+        sup._release_lock()
+
+    def test_acquire_lock_fails_when_held(self, tmp_path):
+        """Second supervisor should fail to acquire lock."""
+        import fcntl
+        lock_path = tmp_path / "supervisor.lock"
+
+        # Hold the lock from "another process"
+        held = open(lock_path, "w")
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        sup = Supervisor.__new__(Supervisor)
+        sup.bots = {}
+        sup._running = True
+        sup._last_calibration_check = 0
+        sup._lock_file = None
+        with patch.object(supervisor, "PID_DIR", tmp_path):
+            with pytest.raises(SystemExit):
+                sup._acquire_lock()
+
+        held.close()
+
+    def test_release_lock(self, tmp_path):
+        """Lock should be released cleanly."""
+        sup = Supervisor.__new__(Supervisor)
+        sup.bots = {}
+        sup._running = True
+        sup._last_calibration_check = 0
+        sup._lock_file = None
+        with patch.object(supervisor, "PID_DIR", tmp_path):
+            sup._acquire_lock()
+            sup._release_lock()
+        assert sup._lock_file is None
+
+
+class TestStartKillsExisting:
+
+    def test_start_kills_existing_process_before_launch(self):
+        """start() should kill any existing process matching this bot before launching."""
+        bot = BotProcess("weather", ["python3", "src/kalshi/weather-bot.py"])
+
+        popen_mock = MagicMock()
+        popen_mock.pid = 9999
+
+        with patch.object(supervisor, "_find_bot_processes", return_value=[1234]) as mock_find, \
+             patch.object(supervisor.os, "kill") as mock_kill, \
+             patch.object(supervisor.time, "sleep"), \
+             patch.object(supervisor.subprocess, "Popen", return_value=popen_mock), \
+             patch.object(bot, "_write_pid"), \
+             patch("builtins.open", MagicMock()):
+            bot.start()
+
+        # Should have killed the existing process
+        mock_kill.assert_any_call(1234, signal.SIGTERM)
+
+    def test_start_proceeds_when_no_existing_process(self):
+        """start() should work normally when no existing process found."""
+        bot = BotProcess("weather", ["python3", "src/kalshi/weather-bot.py"])
+
+        popen_mock = MagicMock()
+        popen_mock.pid = 9999
+
+        with patch.object(supervisor, "_find_bot_processes", return_value=[]), \
+             patch.object(supervisor.subprocess, "Popen", return_value=popen_mock), \
+             patch.object(bot, "_write_pid"), \
+             patch("builtins.open", MagicMock()):
+            result = bot.start()
+
+        assert result is True
+
+
+class TestCheckAndRestartDedup:
+
+    def test_skips_restart_if_process_already_running_by_pattern(self):
+        """If pgrep finds the bot running, don't restart even if PID file is stale."""
+        bot = BotProcess("weather", ["python3", "src/kalshi/weather-bot.py"])
+        bot.recent_crashes = []
+
+        with patch.object(bot, "is_running", return_value=False), \
+             patch.object(supervisor, "_find_bot_processes", return_value=[1234]), \
+             patch.object(bot, "start") as mock_start:
+            result = bot.check_and_restart()
+
+        mock_start.assert_not_called()
+        assert result is False
+
+    def test_restarts_when_no_process_found_by_pattern(self):
+        """If pgrep finds nothing, proceed with restart."""
+        bot = BotProcess("weather", ["python3", "src/kalshi/weather-bot.py"])
+        bot.recent_crashes = []
+
+        with patch.object(bot, "is_running", return_value=False), \
+             patch.object(supervisor, "_find_bot_processes", return_value=[]), \
+             patch.object(bot, "start", return_value=True) as mock_start:
+            result = bot.check_and_restart()
+
+        mock_start.assert_called_once()
+        assert result is True

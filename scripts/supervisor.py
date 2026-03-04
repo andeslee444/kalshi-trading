@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import fcntl
 import json
 import os
 import signal
@@ -90,6 +91,30 @@ BOT_SCAN_INTERVALS = {
 HEARTBEAT_GRACE_PERIOD = 300  # 5 min startup grace before checking heartbeats
 
 
+def _find_bot_processes(cmd):
+    """Find PIDs of running processes matching a bot command.
+
+    Uses pgrep -f with the full command string. Excludes the current
+    process (supervisor) to avoid false positives.
+
+    Returns list of integer PIDs (may be empty).
+    """
+    pattern = " ".join(cmd)
+    my_pid = os.getpid()
+    try:
+        output = subprocess.check_output(["pgrep", "-f", pattern])
+        pids = []
+        for line in output.decode().strip().split("\n"):
+            line = line.strip()
+            if line:
+                pid = int(line)
+                if pid != my_pid:
+                    pids.append(pid)
+        return pids
+    except subprocess.CalledProcessError:
+        return []
+
+
 class BotProcess:
     """Tracks a single bot's process state."""
 
@@ -161,10 +186,22 @@ class BotProcess:
             return False
 
     def start(self):
-        """Start the bot process."""
-        if self.is_running():
-            log.info(f"  {self.name} already running (PID {self._read_pid()})")
-            return True
+        """Start the bot process, killing any existing instances first."""
+        # Kill any existing processes matching this bot's command
+        existing = _find_bot_processes(self.cmd)
+        for pid in existing:
+            log.warning(f"  Killing existing {self.name} (PID {pid}) before start")
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        if existing:
+            time.sleep(1)
+            for pid in existing:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
 
         log.info(f"  Starting {self.name}...")
         try:
@@ -259,7 +296,12 @@ class BotProcess:
         needs_restart = False
 
         if not self.is_running():
-            needs_restart = True
+            # Double-check: maybe process is running but PID file is stale
+            if _find_bot_processes(self.cmd):
+                log.info(f"  {self.name} PID file stale but process found by pgrep, skipping restart")
+                needs_restart = False
+            else:
+                needs_restart = True
         elif health_data is not None:
             is_stale, age_min = self.is_heartbeat_stale(health_data)
             if is_stale:
@@ -327,6 +369,7 @@ class Supervisor:
         }
         self._running = True
         self._last_calibration_check = 0
+        self._lock_file = None
         self._load_state()
 
     def _load_state(self):
@@ -359,26 +402,58 @@ class Supervisor:
         except OSError as e:
             log.warning(f"Failed to save supervisor state: {e}")
 
-    def _adopt_or_kill_orphans(self):
-        """Adopt running orphan processes or clean up stale PID files.
+    def _acquire_lock(self):
+        """Acquire singleton lock. Exit if another supervisor is running."""
+        lock_path = PID_DIR / "supervisor.lock"
+        self._lock_file = open(lock_path, "w")
+        try:
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._lock_file.write(str(os.getpid()))
+            self._lock_file.flush()
+        except (IOError, OSError):
+            log.error("Another supervisor is already running. Exiting.")
+            self._lock_file.close()
+            self._lock_file = None
+            sys.exit(1)
 
-        Called on startup before start_bots() to handle processes left
-        behind by a previous supervisor instance.
+    def _release_lock(self):
+        """Release singleton lock."""
+        if self._lock_file:
+            try:
+                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+                self._lock_file.close()
+            except Exception:
+                pass
+            self._lock_file = None
+
+    def _adopt_or_kill_orphans(self):
+        """Kill any orphan bot processes and clean up PID files.
+
+        Called on startup before start_bots(). Scans for ALL running
+        processes matching each bot's command pattern and kills them.
+        Fresh start is safer than adopting stale processes.
         """
         for name, bot in self.bots.items():
-            pid = bot._read_pid()
-            if pid is None:
-                continue
-            if bot.is_running():
-                # Adopt: restore started_at from state (already done in _load_state),
-                # fall back to current time if no state was saved
-                if bot.started_at is None:
-                    bot.started_at = time.time()
-                log.info(f"  Adopted orphan {name} (PID {pid})")
-            else:
-                # Dead process — clean up stale PID file
-                bot._remove_pid()
-                log.info(f"  Removed stale PID file for {name} (PID {pid})")
+            # Kill any running processes matching this bot's command
+            orphan_pids = _find_bot_processes(bot.cmd)
+            for pid in orphan_pids:
+                log.warning(f"  Killing orphan {name} (PID {pid})")
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    continue
+            # Brief wait for SIGTERM, then SIGKILL stragglers
+            if orphan_pids:
+                time.sleep(2)
+                for pid in orphan_pids:
+                    try:
+                        os.kill(pid, 0)  # check if still alive
+                        log.warning(f"  Force-killing orphan {name} (PID {pid})")
+                        os.kill(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+            # Clean up PID file regardless
+            bot._remove_pid()
 
     def _resolve_names(self, names=None):
         """Resolve bot names, defaulting to all enabled if none specified."""
@@ -470,6 +545,7 @@ class Supervisor:
         signal.signal(signal.SIGTERM, _shutdown)
         signal.signal(signal.SIGINT, _shutdown)
 
+        self._acquire_lock()
         self._adopt_or_kill_orphans()
         self.start_bots()
         log.info(f"Supervisor running (checking every {CHECK_INTERVAL}s, Ctrl+C to stop)")
@@ -519,6 +595,7 @@ class Supervisor:
         # Graceful shutdown
         log.info("Stopping all bots...")
         self.stop_bots()
+        self._release_lock()
         log.info("Supervisor stopped.")
 
     def check_calibration_staleness(self):
