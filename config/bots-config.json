@@ -126,7 +126,7 @@
     "enabled": false,
     "scanIntervalMinutes": 10,
     "minSpreadPct": 0.03,
-    "executionEnabled": true,
+    "executionEnabled": false,
     "maxTradeAmount": 25,
     "maxTradeAmountPct": 0.05,
     "maxDailyTrades": 10,

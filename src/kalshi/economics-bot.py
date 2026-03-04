@@ -77,7 +77,10 @@ def _classify_econ_market(ticker):
     return "other"
 
 # === Market ticker prefixes ===
-ECON_PREFIXES = ["KXCPI", "KXGDP", "KXJOBS", "KXFED", "KXINFLATION", "KXECON", "KXGAS"]
+# Note: KXFED removed — CME FedWatch is a JavaScript SPA, HTML scraper returns garbage.
+# Re-enable when a proper FedWatch data source (JSON API or FRED SOFR futures) is wired up.
+# KXJOBS kept — will skip gracefully when no nowcast source is connected.
+ECON_PREFIXES = ["KXCPI", "KXGDP", "KXJOBS", "KXINFLATION", "KXECON", "KXGAS"]
 
 # === Nowcast cache ===
 NOWCAST_CACHE_PATH = PROJECT_DIR / "data" / "econ-nowcast-cache.json"
@@ -407,33 +410,13 @@ def parse_econ_threshold(market):
 
 
 def estimate_days_to_release(market):
-    """Estimate days until the economic data release this market tracks."""
-    # Parse month/date hints from ticker
-    ticker = market.get("ticker", "")
-    title = market.get("title", "")
+    """Estimate days until the economic data release this market tracks.
 
-    # Check for month indicators
-    months = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
-              "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
-
-    for abbr, num in months.items():
-        if abbr in ticker.upper():
-            # BLS typically releases CPI mid-month for prior month
-            # Rough estimate: target is ~15th of next month
-            now = datetime.date.today()
-            target_year = now.year
-            target_month = num + 1
-            if target_month > 12:
-                target_month = 1
-                target_year += 1
-            try:
-                target_date = datetime.date(target_year, target_month, 15)
-                days = (target_date - now).days
-                return max(0, days)
-            except ValueError:
-                pass
-
-    # Fallback: use market close_time if available
+    Prefers market close_time (which tracks the actual data release) over
+    month-parsing heuristics. CPI/GDP/Jobs markets on Kalshi close on or
+    near the BLS release date.
+    """
+    # Primary: use market close_time — most accurate, tracks actual release
     close_time = market.get("close_time", "")
     if close_time:
         try:
@@ -443,7 +426,32 @@ def estimate_days_to_release(market):
         except (ValueError, TypeError):
             pass
 
-    # Last resort default
+    # Fallback: parse month from ticker and estimate ~13th of next month
+    ticker = market.get("ticker", "")
+    months = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+              "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+
+    for abbr, num in months.items():
+        if abbr in ticker.upper():
+            now = datetime.date.today()
+            target_year = now.year
+            target_month = num + 1
+            if target_month > 12:
+                target_month = 1
+                target_year += 1
+            # Handle year boundary: if target is in the past, bump year
+            try:
+                target_date = datetime.date(target_year, target_month, 13)
+                days = (target_date - now).days
+                if days < -30:
+                    # Target is far in the past — likely need next year
+                    target_date = datetime.date(target_year + 1, target_month, 13)
+                    days = (target_date - now).days
+                return max(0, days)
+            except ValueError:
+                pass
+
+    # Conservative default
     return 7
 
 
@@ -646,9 +654,15 @@ def scan_and_trade():
         if "CPI" in ticker.upper() or "INFLATION" in ticker.upper():
             nowcast_value = nowcast.get("cpi_yoy") or nowcast.get("core_cpi_yoy")
         elif "GDP" in ticker.upper():
+            # Primary: Cleveland Fed GDP nowcast. Fallback: Atlanta Fed GDPNow via macro engine
             nowcast_value = nowcast.get("gdp_growth")
+            if nowcast_value is None and macro_signal and hasattr(macro_signal, 'gdpnow') and macro_signal.gdpnow:
+                nowcast_value = macro_signal.gdpnow
+                log.info(f"  Using GDPNow from macro engine for {ticker}: {nowcast_value:.2f}%")
         elif "JOBS" in ticker.upper() or "EMPLOYMENT" in ticker.upper():
-            nowcast_value = nowcast.get("nonfarm_payrolls")
+            # Jobs nowcast not yet available — skip with clear log message
+            log.info(f"  Skipping {ticker}: no Jobs/NFP nowcast data source connected")
+            nowcast_value = None
 
         if nowcast_value is None:
             ss.skip("no_nowcast")

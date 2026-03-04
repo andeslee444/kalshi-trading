@@ -48,8 +48,8 @@ MAX_DAILY_TRADES = crypto_config.get("maxDailyTrades", 30)
 MAX_DAILY_LOSS = crypto_config.get("maxDailyLoss", 25)
 SCAN_INTERVAL = crypto_config.get("scanIntervalMinutes", 5)
 EDGE_THRESHOLD = crypto_config.get("edgeThreshold", 0.06)
-# 1 min buffer: Kalshi closes 15s before settlement + ~30s clock/network margin
-SETTLEMENT_BUFFER_MINUTES = crypto_config.get("settlementBufferMinutes", 1)
+# Buffer must exceed market cache TTL (60s) to prevent race condition
+SETTLEMENT_BUFFER_MINUTES = max(3, crypto_config.get("settlementBufferMinutes", 3))
 USE_OU = crypto_config.get("useOrnsteinUhlenbeck", False)
 OU_HALF_LIFE = crypto_config.get("ouHalfLifeMinutes", 120)
 DRIFT_PCT = crypto_config.get("driftPct", 0.0)
@@ -80,7 +80,8 @@ pf_config = FilterConfig(
 )
 filter_mgr = FilterManager(bot_name="crypto", state_dir=PROJECT_DIR / "data",
                             default_config=pf_config)
-filter_mgr.load_all()
+pf_staleness_seconds = int(crypto_config.get("pfStalenessHours", 24) * 3600)
+filter_mgr.load_all(max_age_seconds=pf_staleness_seconds)
 
 # Regime detector
 regime_detector = RegimeDetector()
@@ -578,7 +579,10 @@ def scan_and_trade():
         # CI-aware sizing: reduce position when filter is uncertain
         filtered_est = opp["filtered_est"]
         kelly_mult = ci_kelly_multiplier(filtered_est)
-        count = max(0, int(count * kelly_mult))
+        # Apply regime detector Kelly multiplier (crisis/high_vol regimes reduce size)
+        regime_mult = regime_kelly_multiplier(regime_detector)
+        combined_mult = kelly_mult * regime_mult
+        count = max(0, int(count * combined_mult))
 
         if count <= 0:
             ss.skip("kelly_zero")
@@ -626,7 +630,9 @@ def scan_and_trade():
                                             pf_ci_high=round(filtered_est.ci_high, 4),
                                             pf_trend=filtered_est.trend,
                                             pf_updates=filtered_est.n_updates,
-                                            pf_kelly_mult=round(kelly_mult, 4))
+                                            pf_kelly_mult=round(kelly_mult, 4),
+                                            regime_mult=round(regime_mult, 4),
+                                            regime=regime_detector.current_regime())
         if result:
             ss.trades_placed += 1
             allocator.record_trade("crypto", ticker, risk, edge=edge)

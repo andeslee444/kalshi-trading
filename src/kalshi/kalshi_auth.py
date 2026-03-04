@@ -575,7 +575,7 @@ def per_bot_halt_path(bot_name):
 
 # === Circuit breaker ===
 
-SHARED_BREAKER_PATH = PROJECT_DIR / "data" / "allocator-state.json"
+SHARED_BREAKER_PATH = PROJECT_DIR / "data" / "circuit-breaker-state.json"
 
 
 class CircuitBreaker:

@@ -105,6 +105,25 @@ ABSOLUTE_DAILY_LOSS_CAP_CENTS = _load_absolute_cap()
 ABSOLUTE_DAILY_LOSS_CAP_PCT = _load_absolute_cap_pct()
 
 
+def _load_per_bot_daily_limits():
+    """Load perBotDailyLimit from bots-config.json allocator section.
+
+    Returns dict of bot_name -> limit_cents, or empty dict on missing/corrupt config.
+    """
+    try:
+        config_path = Path(__file__).resolve().parent.parent.parent / "config" / "bots-config.json"
+        if config_path.exists():
+            cfg = json.loads(config_path.read_text())
+            raw = cfg.get("allocator", {}).get("perBotDailyLimit", {})
+            return {k: int(v * 100) for k, v in raw.items() if v > 0}
+    except Exception:
+        pass
+    return {}
+
+
+PER_BOT_DAILY_LIMITS = _load_per_bot_daily_limits()
+
+
 # ─── City key extraction ───
 
 # ─── Signal quality factors ───
@@ -245,6 +264,10 @@ class PortfolioAllocator:
                           ABSOLUTE_DAILY_LOSS_CAP_CENTS / 100, ABSOLUTE_DAILY_LOSS_CAP_PCT * 100)
         else:
             self.log.info("Allocator: daily loss cap = $%.0f (static)", ABSOLUTE_DAILY_LOSS_CAP_CENTS / 100)
+
+        if PER_BOT_DAILY_LIMITS:
+            self.log.info("Allocator: per-bot daily limits: %s",
+                          {k: f"${v/100:.0f}" for k, v in PER_BOT_DAILY_LIMITS.items()})
 
     def _load_correlation_config(self):
         """Load correlation engine config from bots-config.json."""
@@ -601,6 +624,15 @@ class PortfolioAllocator:
         max_bot_risk = int(available_balance * MAX_BOT_FRACTION * effective_priority)
         bot_spent = self._bot_spend.get(bot_name, 0)
         remaining_bot = max_bot_risk - bot_spent
+
+        # 4b. Enforce hard per-bot daily limit from config (overrides dynamic allocation)
+        config_limit = PER_BOT_DAILY_LIMITS.get(bot_name)
+        if config_limit is not None:
+            remaining_config = config_limit - bot_spent
+            if remaining_config <= 0:
+                return BudgetResponse(False, reason=f"{bot_name} config daily limit (${config_limit/100:.0f}) exhausted")
+            remaining_bot = min(remaining_bot, remaining_config)
+
         if remaining_bot <= 0:
             return BudgetResponse(False, reason=f"{bot_name} daily allocation exhausted")
 

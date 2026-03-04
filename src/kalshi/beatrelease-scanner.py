@@ -631,7 +631,7 @@ def scan_cycle():
             # Compute real edge from blog confidence vs market price
             yes_ask = market.get("yes_ask", 0)
             yes_bid = market.get("yes_bid", 0)
-            no_ask = 100 - yes_bid if yes_bid else 0
+            no_ask = market.get("no_ask", 0) or (100 - yes_ask if yes_ask else 0)
 
             if side == "yes":
                 actual_price = yes_ask if yes_ask and yes_ask > 0 else limit_price
@@ -641,7 +641,16 @@ def scan_cycle():
                     trade_manager.log_decision(ticker, side, "skipped", "stale_blog_price",
                                                price_cents=actual_price, blog_price=limit_price)
                     continue
-                blog_confidence = min(0.95, limit_price / 100.0 + 0.15)
+                # Blog confidence: use LLM-extracted reasoning strength if available,
+                # otherwise estimate from the edge between limit price and current market
+                llm_confidence = t.get("confidence_pct")
+                if llm_confidence and 0 < llm_confidence <= 100:
+                    blog_confidence = min(0.95, llm_confidence / 100.0)
+                else:
+                    # Estimate confidence from how far the blog's limit price is from market
+                    # A blog willing to pay 40c for a market at 30c implies 10c of conviction
+                    price_edge = abs(limit_price - actual_price) / 100.0
+                    blog_confidence = min(0.95, max(0.55, 0.50 + price_edge * 2.0))
                 edge = blog_confidence - actual_price / 100.0
             else:  # no
                 actual_price = no_ask if no_ask and no_ask > 0 else limit_price
@@ -651,7 +660,16 @@ def scan_cycle():
                     trade_manager.log_decision(ticker, side, "skipped", "stale_blog_price",
                                                price_cents=actual_price, blog_price=limit_price)
                     continue
-                blog_confidence = min(0.95, limit_price / 100.0 + 0.15)
+                # Blog confidence: use LLM-extracted reasoning strength if available,
+                # otherwise estimate from the edge between limit price and current market
+                llm_confidence = t.get("confidence_pct")
+                if llm_confidence and 0 < llm_confidence <= 100:
+                    blog_confidence = min(0.95, llm_confidence / 100.0)
+                else:
+                    # Estimate confidence from how far the blog's limit price is from market
+                    # A blog willing to pay 40c for a market at 30c implies 10c of conviction
+                    price_edge = abs(limit_price - actual_price) / 100.0
+                    blog_confidence = min(0.95, max(0.55, 0.50 + price_edge * 2.0))
                 edge = blog_confidence - actual_price / 100.0
 
             # Discount LLM-stated confidence — blog posts are systematically overconfident
@@ -685,8 +703,18 @@ def scan_cycle():
                                            edge=round(edge, 4), price_cents=actual_price)
                 continue
 
+            # Apply Kelly-bounded sizing (don't blindly use LLM-recommended quantity)
+            from probability import quarter_kelly, kalshi_fee_cents
+            fee = kalshi_fee_cents(limit_price)
+            kelly_count, kelly_risk, _ = quarter_kelly(
+                edge, limit_price, budget.max_cost_cents,
+                bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True,
+            )
+            # Use the lesser of LLM-recommended and Kelly-bounded quantity
+            bounded_qty = min(t["quantity"], kelly_count) if kelly_count > 0 else t["quantity"]
+
             result = trade_manager.place_order(
-                ticker, side, limit_price, t["quantity"],
+                ticker, side, limit_price, bounded_qty,
                 t.get("reasoning", ""), source_url=url,
                 sizing_method="llm_recommended",
                 confidence=round(blog_confidence, 4),

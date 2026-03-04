@@ -14,7 +14,10 @@ import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 PORT = 3458
-WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "kalshi-deploy-2026")
+WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+if not WEBHOOK_SECRET:
+    print("WARNING: GITHUB_WEBHOOK_SECRET not set — webhook signature verification disabled")
+    print("Set GITHUB_WEBHOOK_SECRET env var for production security")
 AUTO_PULL_SCRIPT = "/Users/andeslee/.openclaw/workspace/scripts/github-auto-pull.sh"
 RELOAD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reload-bots.sh")
 LOG = "/tmp/github-webhook.log"
@@ -23,7 +26,6 @@ LOG = "/tmp/github-webhook.log"
 def log(msg):
     import datetime
     line = f"[{datetime.datetime.now().isoformat()}] {msg}"
-    print(line, flush=True)
     with open(LOG, "a") as f:
         f.write(line + "\n")
 

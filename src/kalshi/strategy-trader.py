@@ -153,7 +153,7 @@ def find_longshot_sells(markets, bankroll):
             "reasoning": f"Longshot bias: YES@{sell_price}c implies {implied_prob*100:.1f}% prob, Becker model est true prob ~{true_prob*100:.2f}%. Sell YES (buy NO@{100-sell_price}c) for ~{est_edge*100:.2f}% edge."
         })
 
-    candidates.sort(key=lambda x: -x["est_edge"] * math.log1p(x["volume"]))
+    candidates.sort(key=lambda x: -x["est_edge"] * math.log1p(max(x.get("volume", 0), 1)))
     return candidates
 
 def find_near_settlement(markets):
