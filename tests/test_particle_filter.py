@@ -322,6 +322,18 @@ class TestStatePersistence:
         assert state["config"]["process_noise"] == 0.03
         assert state["config"]["n_particles"] == 100
 
+    def test_deserialize_mismatched_lengths_resets(self):
+        """Mismatched particles/weights should create a fresh filter."""
+        state = {
+            "config": {"n_particles": 200},
+            "particles": [0.5] * 200,
+            "weights": [0.005] * 150,  # 150 != 200
+            "update_count": 10,
+        }
+        pf = ParticleFilter.deserialize(state)
+        assert len(pf.particles) == len(pf.weights)
+        assert pf._update_count == 0  # reset to fresh
+
 
 class TestCIAwareKelly:
     """Test CI-aware position sizing adjustments."""

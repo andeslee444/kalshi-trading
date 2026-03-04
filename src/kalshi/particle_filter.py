@@ -238,8 +238,14 @@ class ParticleFilter:
         config = FilterConfig(**{k: v for k, v in config_data.items()
                                   if k in FilterConfig.__dataclass_fields__})
         pf = cls(config=config)
-        pf.particles = state.get("particles", pf.particles)
-        pf.weights = state.get("weights", pf.weights)
+        particles = state.get("particles", pf.particles)
+        weights = state.get("weights", pf.weights)
+        if len(particles) != len(weights):
+            _log.warning("Particle/weight length mismatch (%d vs %d), starting fresh",
+                         len(particles), len(weights))
+            return cls(config=config)
+        pf.particles = particles
+        pf.weights = weights
         pf._update_count = state.get("update_count", 0)
         pf._recent_directions = state.get("recent_directions", [])
         pf._last_prob = state.get("last_prob", 0.5)
