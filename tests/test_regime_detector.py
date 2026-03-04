@@ -34,7 +34,7 @@ class TestRegimeDetectorInit:
             assert abs(sum(row) - 1.0) < 1e-9
 
     def test_default_emission_params(self):
-        """Each state has a mean and std for vol emission (log-normal)."""
+        """Each state has a mean and std for vol emission (Gaussian)."""
         from regime_detector import RegimeDetector
         rd = RegimeDetector()
         assert len(rd.emission_params) == 4
@@ -259,6 +259,19 @@ class TestRegimeKellyMultiplier:
                 rd2.update(vol)
             mult = regime_kelly_multiplier(rd2)
             assert 0.45 <= mult <= 1.15
+
+
+class TestNegativeVolGuard:
+    """Test that negative volatility observations are rejected."""
+
+    def test_negative_vol_ignored(self):
+        """Negative volatility should be silently ignored."""
+        from regime_detector import RegimeDetector
+        rd = RegimeDetector()
+        initial_belief = rd.belief[:]
+        rd.update(-0.5)
+        assert rd.belief == initial_belief
+        assert rd.n_updates == 0  # should not count as an update
 
 
 class TestCryptoBotIntegration:

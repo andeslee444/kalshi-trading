@@ -24,7 +24,7 @@ import json
 import datetime
 from pathlib import Path
 
-# Default emission parameters (log-normal: vol observations given regime)
+# Default emission parameters (Gaussian: vol observations given regime)
 # mean = center of vol range for that regime, std = observation noise
 DEFAULT_EMISSION_PARAMS = {
     "low_vol":  {"mean": 0.20, "std": 0.08},
@@ -80,6 +80,9 @@ class RegimeDetector:
         Args:
             observed_vol: Realized annualized vol as decimal (e.g., 0.60 = 60%).
         """
+        if observed_vol < 0:
+            return
+
         # Prediction step: belief = T^T @ belief
         predicted = [0.0] * self.n_states
         for j in range(self.n_states):
