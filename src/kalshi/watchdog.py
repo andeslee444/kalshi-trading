@@ -17,6 +17,9 @@ import signal
 import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 
 # === Configuration ===
 WATCHDOG_STATE = Path("/tmp/watchdog-state.json")
@@ -50,13 +53,25 @@ def load_state():
     if WATCHDOG_STATE.exists():
         try:
             return json.loads(WATCHDOG_STATE.read_text())
-        except:
+        except (json.JSONDecodeError, OSError, ValueError):
             pass
     return {"alerts": {}, "cpu_history": {}}
 
 
 def save_state(state):
-    WATCHDOG_STATE.write_text(json.dumps(state, indent=2, default=str))
+    import tempfile
+    data = json.dumps(state, indent=2, default=str)
+    fd, tmp_path = tempfile.mkstemp(dir=str(WATCHDOG_STATE.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        os.replace(tmp_path, str(WATCHDOG_STATE))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def is_alive(pid):
@@ -77,7 +92,7 @@ def get_cpu(pid):
             capture_output=True, text=True, timeout=5
         )
         return float(result.stdout.strip()) if result.stdout.strip() else 0
-    except:
+    except (subprocess.SubprocessError, ValueError, OSError):
         return 0
 
 
@@ -86,25 +101,30 @@ def get_log_age(log_file):
     try:
         mtime = os.path.getmtime(log_file)
         return time.time() - mtime
-    except:
+    except (OSError, TypeError):
         return float("inf")
 
 
 def send_alert(message):
     """Alert via OpenClaw CLI."""
     print(f"[ALERT] {message}")
+    phone = os.environ.get("NOTIFICATION_PHONE", "")
+    if not phone:
+        print("[ALERT] No NOTIFICATION_PHONE set, skipping WhatsApp")
+        with open("/tmp/watchdog-alerts.log", "a") as f:
+            f.write(f"[{datetime.now().isoformat()}] {message}\n")
+        return
     try:
         subprocess.run(
             ["/opt/homebrew/bin/openclaw", "message", "send",
              "--channel", "whatsapp",
-             "--to", "+14255336828",
+             "--to", phone,
              "--message", f"🚨 Watchdog: {message}"],
             timeout=15,
             capture_output=True
         )
     except Exception as e:
         print(f"[ALERT FAILED] {e}")
-        # Fallback: write to alert log
         with open("/tmp/watchdog-alerts.log", "a") as f:
             f.write(f"[{datetime.now().isoformat()}] {message}\n")
 
@@ -117,7 +137,7 @@ def should_alert(state, key):
     try:
         last_time = datetime.fromisoformat(last)
         return datetime.now() - last_time > timedelta(minutes=ALERT_COOLDOWN_MIN)
-    except:
+    except (ValueError, TypeError):
         return True
 
 
@@ -143,7 +163,7 @@ def run_check():
 
         try:
             pid = int(open(pid_file).read().strip())
-        except:
+        except (OSError, ValueError):
             continue
 
         # 2. Check if process is alive
@@ -155,6 +175,8 @@ def run_check():
                 send_alert(f"{issue} — attempting restart")
                 mark_alerted(state, f"dead:{name}")
                 try:
+                    # shell=True required: restart_cmd uses nohup, pipes, $! expansion.
+                    # Safe: commands are hardcoded in PROCESSES dict, not user input.
                     subprocess.run(config["restart_cmd"], shell=True, timeout=15)
                     time.sleep(2)
                     # Verify restart
@@ -164,7 +186,7 @@ def run_check():
                             send_alert(f"✅ {name} restarted successfully (PID {new_pid})")
                         else:
                             send_alert(f"❌ {name} restart FAILED — still dead")
-                    except:
+                    except (OSError, ValueError):
                         send_alert(f"❌ {name} restart FAILED — no PID")
                 except Exception as e:
                     send_alert(f"❌ {name} restart error: {e}")

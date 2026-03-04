@@ -55,7 +55,7 @@ DAEMON_BOTS = {"weather", "crypto", "economics", "positions", "monitor", "beatre
 ONESHOT_BOTS = {"strategy", "hdd"}
 
 # Disabled by default (can be started explicitly)
-DISABLED_BY_DEFAULT = {"mm", "demo", "entertainment"}
+DISABLED_BY_DEFAULT = {"mm", "demo", "entertainment", "beatrelease", "arb"}
 
 # Crash rate limiting
 MAX_CRASHES = 5

@@ -965,7 +965,8 @@ def quarter_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None,
                         fee_cents=fee_cents, return_details=True)
     contracts, _risk, details = result
     # Halve the half-Kelly position (= quarter-Kelly)
-    contracts = contracts // 2
+    # Use round() instead of // to avoid silently zeroing out 1-contract positions
+    contracts = max(1, round(contracts / 2)) if contracts >= 1 else 0
     details["kelly_fraction"] = details["kelly_fraction"] / 2
     # Hard-cap bracket exposure
     if contracts * price_cents > max_exposure_cents:
@@ -994,7 +995,8 @@ def quarter_kelly_sell(edge, sell_price_cents, max_cost_cents, bankroll_cents=No
                              fee_cents=fee_cents, return_details=True)
     contracts, _risk, details = result
     # Halve the half-Kelly position (= quarter-Kelly)
-    contracts = contracts // 2
+    # Use round() instead of // to avoid silently zeroing out 1-contract positions
+    contracts = max(1, round(contracts / 2)) if contracts >= 1 else 0
     details["kelly_fraction"] = details["kelly_fraction"] / 2
     # Hard-cap exposure (risk per contract = 100 - sell_price for sell side)
     risk_per = 100 - int(sell_price_cents)

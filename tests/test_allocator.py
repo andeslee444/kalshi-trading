@@ -198,18 +198,18 @@ class TestAbsoluteDailyLossCap:
     def test_cap_blocks_after_limit(self):
         """After exceeding effective cap in risk today, next request should be rejected.
 
-        With pct=0.10 and balance=$6000 (600000c), effective cap = max($500, $600) = $600.
-        Need to exceed $600 to trigger the block. Use multiple bots to avoid per-bot limits.
+        With pct=0.15 and balance=$6000 (600000c), effective cap = max($750, $900) = $900.
+        Need to exceed $900 to trigger the block. Use multiple bots to avoid per-bot limits.
         """
         alloc = self._make_allocator(balance=600000)
-        # Effective cap = max(50000, 600000*0.10) = max(50000, 60000) = 60000 cents ($600)
+        # Effective cap = max(75000, 600000*0.15) = max(75000, 90000) = 90000 cents ($900)
         # Spread across multiple bots to avoid per-bot daily limit.
         # Use varied ticker prefixes to avoid cluster limits.
-        for i in range(30):
+        for i in range(45):
             alloc.record_trade("source-monitor", f"SRCMON-A{i}", 1000, edge=0.10)
-        for i in range(31):
+        for i in range(46):
             alloc.record_trade("economics", f"KXCPI-B{i}", 1000, edge=0.10)
-        # Total risk = 61000 > 60000 effective cap
+        # Total risk = 91000 > 90000 effective cap
         budget = alloc.request_budget("weather", "KXHIGHNY-26FEB16-T40", edge=0.15)
         assert not budget.approved
         assert "absolute daily risk cap" in budget.reason
@@ -217,13 +217,13 @@ class TestAbsoluteDailyLossCap:
     def test_under_cap_allowed(self):
         """Under effective cap should still allow trading."""
         alloc = self._make_allocator(balance=600000)
-        # Effective cap = max(50000, 600000*0.10) = 60000 cents ($600).
-        # Record $590 of risk spread across bots. Use varied ticker prefixes to avoid cluster limits.
-        for i in range(29):
+        # Effective cap = max(75000, 600000*0.15) = 90000 cents ($900).
+        # Record $880 of risk spread across bots. Use varied ticker prefixes to avoid cluster limits.
+        for i in range(44):
             alloc.record_trade("source-monitor", f"SRCMON-A{i}", 1000, edge=0.10)
-        for i in range(29):
+        for i in range(44):
             alloc.record_trade("economics", f"KXCPI-B{i}", 1000, edge=0.10)
-        # Total risk = 58000 < 60000 effective cap
+        # Total risk = 88000 < 90000 effective cap
         budget = alloc.request_budget("weather", "KXHIGHNY-26FEB16-T40", edge=0.15)
         assert budget.approved
 
@@ -385,8 +385,8 @@ class TestConfigurableDailyLossCap:
     def test_load_absolute_cap_from_config(self):
         """_load_absolute_cap should read from bots-config.json."""
         cap = _load_absolute_cap()
-        # Our config has absoluteDailyLossCap: 500, so cap should be 50000 cents
-        assert cap == 50000
+        # Our config has absoluteDailyLossCap: 750, so cap should be 75000 cents
+        assert cap == 75000
 
     def test_no_safety_ceiling(self):
         """Cap should not be clamped — scales freely for large accounts."""
@@ -426,8 +426,8 @@ class TestAbsoluteCapPctLoading:
     def test_loads_from_config(self):
         """Should load absoluteDailyLossCapPct from config."""
         pct = _load_absolute_cap_pct()
-        # Our config has absoluteDailyLossCapPct: 0.10
-        assert pct == 0.10
+        # Our config has absoluteDailyLossCapPct: 0.15
+        assert pct == 0.15
 
     def test_safety_ceiling(self):
         """Pct should be clamped at 50% max."""

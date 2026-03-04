@@ -29,6 +29,7 @@
     }
   },
   "beatrelease": {
+    "enabled": false,
     "checkIntervalHours": 1,
     "maxTradeCents": 1500,
     "maxTradeAmountPct": 0.03,
@@ -122,6 +123,7 @@
     }
   },
   "cross_platform_arb": {
+    "enabled": false,
     "scanIntervalMinutes": 10,
     "minSpreadPct": 0.03,
     "executionEnabled": true,
@@ -143,9 +145,19 @@
     "trailingMinProfitCents": 10
   },
   "allocator": {
-    "maxConcurrentPositions": 20,
-    "absoluteDailyLossCap": 500,
-    "absoluteDailyLossCapPct": 0.10
+    "maxConcurrentPositions": 30,
+    "absoluteDailyLossCap": 750,
+    "absoluteDailyLossCapPct": 0.15,
+    "perBotDailyLimit": {
+      "weather": 200,
+      "economics": 300,
+      "crypto": 150,
+      "strategy": 150,
+      "monitor": 100,
+      "entertainment": 0,
+      "beatrelease": 0,
+      "arb": 0
+    }
   },
   "market_maker": {
     "enabled": false,

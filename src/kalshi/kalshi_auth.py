@@ -96,9 +96,11 @@ def setup_logging(name, log_file=None):
         "%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
+    # Only add StreamHandler if stdout is a real TTY (not redirected by supervisor)
+    if hasattr(sys.stdout, "isatty") and sys.stdout.isatty():
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        logger.addHandler(sh)
     # Auto file logging — derive path from bot name if not explicitly provided
     if log_file is None:
         log_file = str(PROJECT_DIR / "data" / "logs" / f"{name}.log")
@@ -328,12 +330,17 @@ class KalshiClient:
 
         if use_shared_cache and prefix and status == "open":
             try:
-                # Read existing cache, merge in new prefix data, write back
-                existing = read_market_cache(max_age=MARKET_CACHE_TTL * 10) or {}
-                if not isinstance(existing, dict):
-                    existing = {}
-                existing[prefix] = all_markets
-                write_market_cache(existing)
+                lock_path = MARKET_CACHE_PATH.with_suffix(".lock")
+                with open(lock_path, "w") as lock_fd:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                    try:
+                        existing = read_market_cache(max_age=MARKET_CACHE_TTL * 10) or {}
+                        if not isinstance(existing, dict):
+                            existing = {}
+                        existing[prefix] = all_markets
+                        write_market_cache(existing)
+                    finally:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
             except Exception as e:
                 _log.debug("Failed to write shared market cache: %s", e)
 
@@ -520,11 +527,23 @@ class RecentTradeTracker:
                 pass
 
     def is_recent(self, ticker):
-        """Return True if this ticker was traded within the cooldown window."""
+        """Return True if this ticker was traded within the cooldown window.
+
+        Lazily prunes expired entries to prevent unbounded memory growth
+        in long-running daemon sessions.
+        """
+        cutoff = datetime.datetime.now() - datetime.timedelta(hours=self.cooldown_hours)
+        # Prune expired entries every 100 calls (amortized O(1))
+        if not hasattr(self, "_prune_counter"):
+            self._prune_counter = 0
+        self._prune_counter += 1
+        if self._prune_counter >= 100:
+            self._prune_counter = 0
+            self._recent = {k: v for k, v in self._recent.items() if v > cutoff}
+
         ts = self._recent.get(ticker)
         if not ts:
             return False
-        cutoff = datetime.datetime.now() - datetime.timedelta(hours=self.cooldown_hours)
         return ts > cutoff
 
     def record(self, ticker):
