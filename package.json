@@ -30,6 +30,7 @@
     "reconcile": "python3 scripts/reconcile-trades.py",
     "supervisor": "python3 scripts/supervisor.py run",
     "supervisor:status": "python3 scripts/supervisor.py status",
+    "supervisor:reload": "bash scripts/reload-bots.sh",
     "sync:up": "bash scripts/s3-sync.sh upload",
     "sync:down": "bash scripts/s3-sync.sh download",
     "sync:setup": "bash scripts/s3-sync.sh setup",

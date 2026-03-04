@@ -16,6 +16,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 PORT = 3458
 WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "kalshi-deploy-2026")
 AUTO_PULL_SCRIPT = "/Users/andeslee/.openclaw/workspace/scripts/github-auto-pull.sh"
+RELOAD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reload-bots.sh")
 LOG = "/tmp/github-webhook.log"
 
 
@@ -71,9 +72,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
                 # Only trigger on main branch
                 if ref in ("refs/heads/main", "refs/heads/master"):
-                    log(f"Triggering auto-pull script...")
+                    log(f"Triggering auto-pull + bot reload...")
                     subprocess.Popen(
-                        ["/bin/bash", AUTO_PULL_SCRIPT],
+                        ["/bin/bash", "-c", f'"{AUTO_PULL_SCRIPT}" && /bin/bash "{RELOAD_SCRIPT}"'],
                         stdout=open("/tmp/github-auto-pull.log", "a"),
                         stderr=subprocess.STDOUT,
                     )

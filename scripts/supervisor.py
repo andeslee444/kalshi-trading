@@ -546,6 +546,13 @@ class Supervisor:
         signal.signal(signal.SIGTERM, _shutdown)
         signal.signal(signal.SIGINT, _shutdown)
 
+        def _reload(sig, frame):
+            log.info("Received SIGHUP — scheduling bot restart cycle")
+            self._reload_requested = True
+
+        signal.signal(signal.SIGHUP, _reload)
+
+        self._reload_requested = False
         self._acquire_lock()
         self._adopt_or_kill_orphans()
         self.start_bots()
@@ -577,6 +584,16 @@ class Supervisor:
                 continue
 
             if kill_switch_active:
+                continue
+
+            # SIGHUP reload — restart all bots with new code
+            if self._reload_requested:
+                log.info("Reloading: stopping all bots...")
+                self.stop_bots()
+                log.info("Reloading: starting all bots with new code...")
+                self.start_bots()
+                self._reload_requested = False
+                notify_webhook("Supervisor reload complete — all bots restarted", level="info")
                 continue
 
             # Per-bot halt checking
