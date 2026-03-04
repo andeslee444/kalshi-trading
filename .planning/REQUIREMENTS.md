@@ -3,9 +3,9 @@
 **Defined:** 2026-02-26
 **Core Value:** Every bot must produce consistent daily P&L — bots trading regularly on validated edges, exits protecting capital, and measurable model calibration proving the math works.
 
-## v1 Requirements
+## v1 Requirements — ALL COMPLETE
 
-Requirements for this milestone. Each maps to roadmap phases.
+All 35 v1 requirements delivered across GSD Phases 1-6, Consolidated Quant Desk tracks, and Phase 7.
 
 ### Feedback Loop
 
@@ -54,17 +54,17 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### New Strategies
 
-- [ ] **STRAT-01**: Box office trading bot scrapes The Numbers/Box Office Mojo weekend estimates and trades KXBOX/KXMOVIE markets
-- [ ] **STRAT-02**: Cross-platform arb execution enabled with $1-2 initial position sizes after monitoring validation
-- [ ] **STRAT-03**: Weather city coverage verified against actual Kalshi tickers and expanded where missing
+- [x] **STRAT-01**: Box office trading bot scrapes The Numbers/Box Office Mojo weekend estimates and trades KXBOX/KXMOVIE markets
+- [x] **STRAT-02**: Cross-platform arb execution enabled with $1-2 initial position sizes after monitoring validation
+- [x] **STRAT-03**: Weather city coverage verified against actual Kalshi tickers and expanded where missing
 
 ### Operational Hardening
 
-- [ ] **OPS-01**: Daily P&L report runs automatically and sends WhatsApp summary
-- [ ] **OPS-02**: Daily backtest runs automatically and alerts on >10% Brier drift
-- [ ] **OPS-03**: Settlement reconciliation runs daily as part of automated pipeline
-- [ ] **OPS-04**: Data source health monitoring detects and alerts on stale/failed sources within 2 scan cycles
-- [ ] **OPS-05**: HDD Sanity CMS endpoints re-enabled when functional (periodic health check)
+- [x] **OPS-01**: Daily P&L report runs automatically and sends WhatsApp summary
+- [x] **OPS-02**: Daily backtest runs automatically and alerts on >10% Brier drift
+- [x] **OPS-03**: Settlement reconciliation runs daily as part of automated pipeline
+- [x] **OPS-04**: Data source health monitoring detects and alerts on stale/failed sources within 2 scan cycles
+- [x] **OPS-05**: HDD Sanity CMS endpoints re-enabled when functional (periodic health check)
 
 ## v2 Requirements
 
@@ -81,11 +81,11 @@ Deferred to future milestone. Tracked but not in current roadmap.
 
 - **MODEL-01**: GARCH(1,1) volatility model for crypto replacing realized vol
 - **MODEL-02**: ML/DL models trained on 6+ months of labeled settlement data
-- **MODEL-03**: Correlation-aware position limits across related markets
+- **MODEL-03**: Correlation-aware position limits across related markets — DELIVERED in T2-P2 (correlation_engine.py)
 
 ### Scaling
 
-- **SCALE-01**: Market making (Avellaneda-Stoikov) enabled after 3+ months validated profitability
+- **SCALE-01**: Market making (Avellaneda-Stoikov) enabled after 3+ months validated profitability — MM calibration delivered in Phase 7
 - **SCALE-02**: Multi-exchange execution beyond Kalshi + Polymarket
 
 ## Out of Scope
@@ -97,14 +97,12 @@ Explicitly excluded. Documented to prevent scope creep.
 | High-frequency trading infrastructure | Kalshi API caches every 5 seconds; REST limits make HFT impractical |
 | Custom frontend / mobile app | Dashboard works; building UIs doesn't generate alpha |
 | ML/DL models | Zero labeled training data exists; ML before data = overfitting to noise |
-| WebSocket streaming (this milestone) | REST polling sufficient for 5-30 min event-driven strategies; measure latency cost first |
+| WebSocket streaming (this milestone) | REST polling sufficient for 5-30 min event-driven strategies |
 | Tax optimization / reporting | Zero priority until system is profitable for 3+ months |
 | Social / copy trading features | Product play, not trading edge play |
 | Auto-apply calibration without human review | One bad auto-tune can blow up the account |
 
 ## Traceability
-
-Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
@@ -135,20 +133,20 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CRYP-01 | Phase 6 | Complete |
 | CRYP-02 | Phase 6 | Complete |
 | CRYP-03 | Phase 6 | Complete |
-| STRAT-01 | Phase 7 | Pending |
-| STRAT-02 | Phase 7 | Pending |
-| STRAT-03 | Phase 7 | Pending |
-| OPS-01 | Phase 8 | Pending |
-| OPS-02 | Phase 8 | Pending |
-| OPS-03 | Phase 8 | Pending |
-| OPS-04 | Phase 8 | Pending |
-| OPS-05 | Phase 8 | Pending |
+| STRAT-01 | T1-P3 | Complete |
+| STRAT-02 | T1-P3 | Complete |
+| STRAT-03 | T1-P3 | Complete |
+| OPS-01 | T1-P3 | Complete |
+| OPS-02 | T1-P3 | Complete |
+| OPS-03 | T1-P3 | Complete |
+| OPS-04 | T1-P3 | Complete |
+| OPS-05 | T1-P3 | Complete |
 
 **Coverage:**
 - v1 requirements: 35 total
-- Mapped to phases: 35
-- Unmapped: 0
+- Completed: 35
+- Remaining: 0
 
 ---
 *Requirements defined: 2026-02-26*
-*Last updated: 2026-02-26 after roadmap creation*
+*Last updated: 2026-03-04 — all v1 requirements complete*

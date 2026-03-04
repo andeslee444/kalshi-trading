@@ -2,8 +2,8 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: unknown
-last_updated: "2026-02-28T10:08:46.036Z"
+status: complete
+last_updated: "2026-03-04"
 progress:
   total_phases: 6
   completed_phases: 6
@@ -15,121 +15,78 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-02-26)
+See: .planning/PROJECT.md (updated 2026-03-04)
 
 **Core value:** Every bot must produce consistent daily P&L -- bots trading regularly on validated edges, exits protecting capital, and measurable model calibration proving the math works.
-**Current focus:** Phase 6 complete (Crypto Validation). Model validated at Brier 0.0372, vol config confirmed near-optimal.
+**Current status:** All work complete. GSD Phases 1-6 delivered, Consolidated Quant Desk tracks T1/T2 (6 phases) merged, Phase 7 (Microstructure & Attribution) merged.
 
 ## Current Position
 
-Phase: 6 of 8 (Crypto Validation) -- COMPLETE
-Plan: 2 of 2 in current phase (2 complete)
-Status: Phase 06 complete. Both plans delivered: data pipeline + settlement audit (06-01), model backtest + vol sweep (06-02).
-Last activity: 2026-02-28 -- Completed 06-02 (Crypto Model Backtest and Vol Sweep)
+Phase: ALL COMPLETE
+Status: All GSD phases (1-6), consolidated quant desk tracks (T1-P1 through T2-P3), and Phase 7 (Microstructure & Attribution) are complete and merged to main.
+Last activity: 2026-03-04
 
-Progress: [██████████████████] 86%
+Progress: [████████████████████] 100%
+
+## Completed Work Summary
+
+### GSD Milestone v1.0 (Phases 1-6) — Complete
+| Phase | Name | Plans | Status | Verified |
+|-------|------|-------|--------|----------|
+| 1 | Feedback Loop | 5/5 | COMPLETE | 2026-02-27 |
+| 2 | Position Sizing | 2/2 | COMPLETE | 2026-02-27 |
+| 3 | Position Management | 2/2 | COMPLETE | 2026-02-28 |
+| 4 | Bot Activation | 4/4 | COMPLETE | 2026-02-27 |
+| 5 | Automated Calibration | 2/2 | COMPLETE | 2026-02-28 |
+| 6 | Crypto Validation | 2/2 | COMPLETE | 2026-02-28 |
+
+### Consolidated Quant Desk (Tracks T1/T2) — Complete
+| Phase | Name | Branch | Merged |
+|-------|------|--------|--------|
+| T1-P1 | Macro/Geopolitics Engine | track1/alpha-generation | main |
+| T1-P2 | Source Monitor Optimization | track1/alpha-generation | main (06fa019) |
+| T1-P3 | New Strategies + Ops Hardening | track1/alpha-generation | main |
+| T2-P1 | Particle Filter Engine | track2/quant-infrastructure | main |
+| T2-P2 | Correlation & Dependency Layer | track2/quant-infrastructure | main (a2ea2eb) |
+| T2-P3 | Advanced Simulation Engine | track2/quant-infrastructure | main (c60c113) |
+
+### Phase 7: Microstructure & Attribution — Complete
+| Component | Status |
+|-----------|--------|
+| P&L Attribution Engine (5-dimensional decomposition) | Merged |
+| Execution Quality Analytics (fill rate, slippage, shortfall) | Merged |
+| Edge Monitor (decay detection, competitor alerts) | Merged |
+| Agent-Based Orderbook Simulator | Merged |
+| MM Calibration Script | Merged |
+| Intelligence Dashboard Tab | Merged |
 
 ## Performance Metrics
 
-**Velocity:**
-- Total plans completed: 14
+**GSD Velocity:**
+- Total plans completed: 17
 - Average duration: 4 min
 - Total execution time: 1.0 hours
 
-**By Phase:**
-
-| Phase | Plans | Total | Avg/Plan |
-|-------|-------|-------|----------|
-| 01-feedback-loop | 5 | 30 min | 6 min |
-
-**Recent Trend:**
-- Last 5 plans: 2min, 2min, 2min, 4min, 6min
-- Trend: stable
-
-*Updated after each plan completion*
-| Phase 01 P04 | 15min | 2 tasks | 9 files |
-| Phase 01 P05 | 4min | 2 tasks | 8 files |
-| Phase 02 P01 | 2min | 1 tasks | 4 files |
-| Phase 02 P02 | 4min | 2 tasks | 8 files |
-| Phase 03 P01 | 7min | 2 tasks | 5 files |
-| Phase 03 P02 | 4min | 2 tasks | 4 files |
-| Phase 04 P01 | 2min | 2 tasks | 2 files |
-| Phase 04 P03 | 2min | 2 tasks | 1 files |
-| Phase 04 P04 | 2min | 2 tasks | 2 files |
-| Phase 04 P02 | 2min | 2 tasks | 2 files |
-| Phase 05 P01 | 4min | 2 tasks | 3 files |
-| Phase 05 P02 | 5min | 2 tasks | 2 files |
-| Phase 06 P01 | 6min | 2 tasks | 1 files |
-| Phase 06 P02 | 16min | 2 tasks | 2 files |
+**Consolidated Quant Desk:**
+- 6 track phases completed
+- New modules: macro_engine.py, particle_filter.py, correlation_engine.py, regime_detector.py, simulation.py
+- Phase 7: attribution.py, execution_quality.py, edge_monitor.py, orderbook_simulator.py
 
 ## Accumulated Context
 
-### Decisions
+### Key Decisions
 
-Decisions are logged in PROJECT.md Key Decisions table.
-Recent decisions affecting current work:
-
-- [Roadmap]: Fix feedback loop before anything else -- cannot optimize what you cannot measure
-- [Roadmap]: Phases 2 and 3 can run in parallel after Phase 1; Phase 6 can overlap with 2-5
-- [Roadmap]: 8-phase comprehensive depth matches 35 requirements across 8 natural categories
-- [01-01]: Used analyze-performance.py/dashboard.py 10-file list as canonical TRADE_FILES reference
-- [01-01]: Exported both TRADE_FILES (dicts) and ALL_TRADE_PATHS (Paths) for flexibility across scripts
-- [01-03]: Brier score as primary optimization target, P&L tiebreaker within 0.001 tolerance
-- [01-03]: Minimum 10 trades per city (up from 5) and 30 global for reliable calibration
-- [01-03]: Backup calibration.json before overwrite; skip save when no matched trades exist
-- [Phase 01-02]: Used 10-bin calibration default with fallback to 5 bins when sparse data
-- [Phase 01-02]: Chart.js via CDN for dashboard calibration curves and cumulative P&L chart
-- [01-04]: Kalshi revenue field is gross payout (cost + profit), not net profit -- must subtract cost for P&L
-- [01-04]: Kalshi API pagination limit is 100, not 1000
-- [01-04]: Chart.js canvas needs fixed-height container to prevent infinite growth on scroll
-- [01-05]: _reset_calibration() must set {} (not None) to prevent re-reading calibration.json during tests
-- [Phase 02]: Used simple alias for edge_after_fees deprecation (no warnings.warn) to avoid log clutter
-- [Phase 02]: quarter_kelly_sell delegates to half_kelly_sell then halves -- mirrors quarter_kelly pattern
-- [Phase 02-02]: Weather bot uses calibration gate: _load_calibration() per-city check to decide sizing tier
-- [Phase 02-02]: Bracket markets always use quarter-Kelly regardless of calibration status
-- [Phase 02-02]: Descriptive sizing labels include calibration status (e.g. "half-Kelly (calibrated)")
-- [Phase 03-01]: Market orders for stop-loss (urgent exit), limit orders for take-profit/model-shift (patient exit)
-- [Phase 03-01]: 50% partial exit for take-profit; remainder rides to settlement or trailing stop
-- [Phase 03-01]: Crypto gets tighter thresholds (85c TP, 25c SL, 15pp model-shift) due to higher vol
-- [Phase 03-01]: Entertainment/beatrelease model-shift deferred (no live data source to recompute)
-- [Phase 03-01]: Removed hardcoded info-arb skip logic; per-bot exit config handles naturally
-- [Phase 03-02]: Market orders for trailing stop exits (urgent, price-deteriorating scenario)
-- [Phase 03-02]: Illiquidity skip at bid=0 or spread>20c to avoid bad fills
-- [Phase 03-02]: Grace period prevents stale peak data from triggering exits on restart
-- [Phase 03-02]: Trailing state renamed to trailing-state.json with auto-migration
-- [Phase 04-01]: Confidence threshold 0.70 captures realistic 5-10% data exceedances from HDD while still requiring meaningful signal
-- [Phase 04-03]: Updated log header to say Top 10 to match the new longshot cap
-- [Phase 04-03]: Did not instrument find_near_settlement() -- display-only function, no trades placed
-- [Phase 04-04]: Peak hours 10am-4pm ET for NWS adaptive polling (running highs still developing)
-- [Phase 04-04]: Debug-level sigma logging for all evaluated markets, not just placed trades
-- [Phase 04-04]: is_calibrated added to trade records for downstream analysis
-- [Phase 04-02]: market_type classification moved before threshold parsing for richer decision logs in economics bot
-- [Phase 04-02]: Cleveland Fed parser logs page length and table count when both parsers fail
-- [Phase 05-01]: Continue on stage failure -- failed reconcile should not prevent backtest from running
-- [Phase 05-01]: Baselines only update on explicit --update-baseline flag, never auto-update on detection runs
-- [Phase 05-01]: Calibrate stage runs with --json only (no --save) to prevent auto-applying calibration in pipeline
-- [Phase 05-02]: 5% aggregate Brier improvement threshold for suggestion generation -- filters noise
-- [Phase 05-02]: Suggestion files use date-stamped names with -N suffix for same-day duplicates
-- [Phase 05-02]: apply_suggestion re-snapshots baselines after applying -- ensures drift detection reflects new calibration
-- [Phase 05-02]: Calibration sections use global_brier field matching calibrate-sigma.py output structure
-- [Phase 06-01]: estimate_time_to_settlement() validated as correct -- uses close_time - now dynamically, no hardcoded T=2456min
-- [Phase 06-01]: 15-minute markets (KXBTC15M) have different ticker format not handled by parse_crypto_ticker -- documented, not blocking
-- [Phase 06-01]: SOL DVOL unavailable on Deribit -- SOL backtest will use realized vol only
-- [Phase 06-02]: Crypto model Brier score 0.0372 -- well below 0.20 target, model validated
-- [Phase 06-02]: Vol sweep shows production config (IV=0.6, RV=24h) is near-optimal -- best config improves only 0.4%
-- [Phase 06-02]: RV-DVOL correlation is negative (BTC=-0.39, ETH=-0.60) -- RV and IV measure different things, blend still valuable
-- [Phase 06-02]: Bracket markets parsed using floor_strike and rules_primary regex for accurate range extraction
+See STATE decisions section in previous version for full history. All decisions resolved.
 
 ### Pending Todos
 
-None yet.
+None.
 
 ### Blockers/Concerns
 
-- HDD Sanity CMS endpoints may be broken (research gap)
+None active. All tracks merged.
 
 ## Session Continuity
 
-Last session: 2026-02-28
-Stopped at: Completed 06-02-PLAN.md (Crypto Model Backtest and Vol Sweep)
-Resume file: None
+Last session: 2026-03-04
+Status: All work complete. No resume needed.
