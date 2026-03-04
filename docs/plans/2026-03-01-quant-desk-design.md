@@ -1,5 +1,7 @@
 # Quant Desk Simulation Infrastructure — Design Document
 
+> **DEPRECATED**: This document is superseded by [Consolidated Quant Desk Design](2026-03-02-consolidated-quant-desk-design.md). Kept for historical reference only.
+
 **Date**: 2026-03-01
 **Goal**: Build institutional-grade simulation, correlation modeling, and competitive intelligence infrastructure to maximize profits while minimizing portfolio risk — designed to compete with quant desks as institutional trading arrives on Kalshi.
 **Bankroll**: $5,000+ live

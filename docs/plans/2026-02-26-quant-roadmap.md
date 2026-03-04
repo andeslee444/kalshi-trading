@@ -1,5 +1,7 @@
 # Quant Roadmap — February 2026
 
+> **DEPRECATED**: This document is superseded by [Consolidated Quant Desk Design](2026-03-02-consolidated-quant-desk-design.md). Kept for historical reference only.
+
 Prioritized action items from production log audit and system-wide analysis. Ordered by impact and dependency chain.
 
 ---

@@ -1,5 +1,7 @@
 # Phase 1: Unblock the Flow — Implementation Plan
 
+> **DEPRECATED**: This document is superseded by [Consolidated Quant Desk Design](2026-03-02-consolidated-quant-desk-design.md). Kept for historical reference only.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Increase trade volume from ~5% to ~15% of evaluated markets by removing overly conservative filters, scaling risk limits for $5K bankroll, building a skip audit tool for ongoing feedback, recovering crypto brackets, and enabling cross-platform arb execution.

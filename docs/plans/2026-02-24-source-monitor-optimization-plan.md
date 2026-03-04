@@ -1,5 +1,7 @@
 # Source Monitor Optimization Suite — Implementation Plan
 
+> **DEPRECATED**: This document is superseded by [Consolidated Quant Desk Design](2026-03-02-consolidated-quant-desk-design.md). Kept for historical reference only.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Implement 10 optimizations to the source-monitor bot: data freshness, time-decay sigma, retry logic, CI-based NWS thresholds, entertainment consolidation, cross-market consistency, high-confidence sizing, TMDb box office API, test suite, and settlement feedback loop.

@@ -1,5 +1,7 @@
 # Source Monitor Optimization Suite — Design Document
 
+> **DEPRECATED**: This document is superseded by [Consolidated Quant Desk Design](2026-03-02-consolidated-quant-desk-design.md). Kept for historical reference only.
+
 **Date**: 2026-02-24
 **Scope**: 10 optimizations across data quality, probability models, trade logic, testing, and settlement feedback
 **Environment**: Dual (demo dev + production Mac Mini) — all changes backward-compatible with safe defaults
