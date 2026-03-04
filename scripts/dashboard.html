@@ -37,7 +37,13 @@
     </div>
   </header>
 
-  <main class="p-4 grid gap-4 max-w-[1400px] mx-auto">
+  <nav class="border-b border-gray-800 px-6 flex gap-4">
+    <button class="tab-btn py-2 px-1 text-sm font-medium border-b-2 border-green-500 text-green-400" data-tab="dashboard">Dashboard</button>
+    <button class="tab-btn py-2 px-1 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-300" data-tab="intelligence">Intelligence</button>
+  </nav>
+
+  <main>
+  <div id="tab-dashboard" class="p-4 grid gap-4 max-w-[1400px] mx-auto">
 
     <!-- Row 1: Bot Status + Account + Risk -->
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -190,6 +196,67 @@
         </div>
       </div>
     </div>
+
+  </div>
+
+  <div id="tab-intelligence" class="p-4 grid gap-4 max-w-[1400px] mx-auto" style="display:none;">
+    <div class="card">
+      <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">P&L Attribution</h2>
+      <div id="attribution-summary" class="text-sm text-gray-500 mb-3">Loading...</div>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div>
+          <h3 class="text-xs font-semibold text-gray-500 mb-2">By Bot</h3>
+          <table id="attr-by-bot" class="w-full text-sm">
+            <thead><tr class="text-gray-500 text-left"><th class="pb-1">Bot</th><th>P&L</th><th>Trades</th><th>Win Rate</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div>
+          <h3 class="text-xs font-semibold text-gray-500 mb-2">By Edge Bucket</h3>
+          <table id="attr-by-edge" class="w-full text-sm">
+            <thead><tr class="text-gray-500 text-left"><th class="pb-1">Edge</th><th>P&L</th><th>Trades</th><th>Win Rate</th><th>Avg Edge</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
+        <div>
+          <h3 class="text-xs font-semibold text-gray-500 mb-2">By Market Type</h3>
+          <table id="attr-by-market" class="w-full text-sm">
+            <thead><tr class="text-gray-500 text-left"><th class="pb-1">Type</th><th>P&L</th><th>Trades</th><th>Win Rate</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div>
+          <h3 class="text-xs font-semibold text-gray-500 mb-2">By Sizing Method</h3>
+          <table id="attr-by-sizing" class="w-full text-sm">
+            <thead><tr class="text-gray-500 text-left"><th class="pb-1">Method</th><th>P&L</th><th>Trades</th><th>Win Rate</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <div class="card">
+        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Edge Decay Monitor</h2>
+        <div id="edge-decay-content" class="text-sm text-gray-500 mb-3">Loading...</div>
+        <table id="edge-decay-table" class="w-full text-sm">
+          <thead><tr class="text-gray-500 text-left"><th class="pb-1">Market Type</th><th>Win Rate</th><th>Trend</th><th>Half-Life</th><th>Competitor?</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Execution Quality</h2>
+        <div id="exec-quality-content" class="text-sm text-gray-500 mb-3">Loading...</div>
+        <table id="exec-quality-table" class="w-full text-sm">
+          <thead><tr class="text-gray-500 text-left"><th class="pb-1">Bot</th><th>Fill Rate</th><th>Slippage</th><th>Shortfall</th><th>Trades</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
 
   </main>
 
@@ -1012,6 +1079,85 @@ function startPolling() {
 
 document.getElementById('log-bot-select').addEventListener('change', loadLogs);
 startPolling();
+
+// Tab switching
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const tabId = btn.dataset.tab;
+    document.querySelectorAll('.tab-btn').forEach(b => {
+      b.classList.remove('border-green-500', 'text-green-400');
+      b.classList.add('border-transparent', 'text-gray-500');
+    });
+    btn.classList.remove('border-transparent', 'text-gray-500');
+    btn.classList.add('border-green-500', 'text-green-400');
+    document.getElementById('tab-dashboard').style.display = tabId === 'dashboard' ? '' : 'none';
+    document.getElementById('tab-intelligence').style.display = tabId === 'intelligence' ? '' : 'none';
+    if (tabId === 'intelligence') loadIntelligence();
+  });
+});
+
+async function loadIntelligence() {
+  try {
+    const attr = await fetch('/api/attribution').then(r => r.json());
+    if (attr.summary) {
+      const pnlClass = attr.summary.total_pnl_cents >= 0 ? 'text-green-400' : 'text-red-400';
+      document.getElementById('attribution-summary').innerHTML =
+        `<strong>Settled: ${attr.summary.total_trades_settled}</strong> trades | ` +
+        `Total P&L: <span class="${pnlClass}">$${(attr.summary.total_pnl_cents / 100).toFixed(2)}</span>`;
+    }
+    fillAttrTable('attr-by-bot', attr.by_bot);
+    fillAttrTable('attr-by-edge', attr.by_edge_bucket, true);
+    fillAttrTable('attr-by-market', attr.by_market_type);
+    fillAttrTable('attr-by-sizing', attr.by_sizing);
+  } catch(e) { console.error('Attribution load failed:', e); }
+
+  try {
+    const edge = await fetch('/api/edge-decay').then(r => r.json());
+    const tbody = document.querySelector('#edge-decay-table tbody');
+    tbody.innerHTML = '';
+    for (const [mt, d] of Object.entries(edge.market_types || {})) {
+      const hl = d.edge_half_life_days === Infinity ? '\u221E' : d.edge_half_life_days.toFixed(0);
+      tbody.innerHTML += `<tr class="border-t border-gray-800">
+        <td class="py-1">${mt}</td><td>${(d.realization_rate * 100).toFixed(1)}%</td>
+        <td>${d.efficiency_trend_slope.toFixed(5)}</td><td>${hl}d</td>
+        <td class="${d.competitor_detected ? 'text-yellow-400' : 'text-gray-500'}">${d.competitor_detected ? 'YES' : 'No'}</td></tr>`;
+    }
+    document.getElementById('edge-decay-content').innerHTML =
+      `${edge.total_observations || 0} observations tracked`;
+  } catch(e) { console.error('Edge decay load failed:', e); }
+
+  try {
+    const eq = await fetch('/api/execution-quality').then(r => r.json());
+    document.getElementById('exec-quality-content').innerHTML =
+      `Fill Rate: <strong>${(eq.fill_rate * 100).toFixed(1)}%</strong> | ` +
+      `Avg Slippage: ${eq.average_slippage_cents.toFixed(1)}c | ` +
+      `Shortfall: ${eq.implementation_shortfall_cents.toFixed(1)}c`;
+    const tbody = document.querySelector('#exec-quality-table tbody');
+    tbody.innerHTML = '';
+    for (const [bot, d] of Object.entries(eq.by_bot || {})) {
+      tbody.innerHTML += `<tr class="border-t border-gray-800">
+        <td class="py-1">${bot}</td>
+        <td>${(d.fill_rate * 100).toFixed(1)}%</td>
+        <td>${d.avg_slippage_cents.toFixed(1)}c</td>
+        <td>${d.impl_shortfall_cents.toFixed(1)}c</td>
+        <td>${d.trade_count}</td></tr>`;
+    }
+  } catch(e) { console.error('Exec quality load failed:', e); }
+}
+
+function fillAttrTable(tableId, data, hasAvgEdge) {
+  const tbody = document.querySelector(`#${tableId} tbody`);
+  if (!tbody || !data) return;
+  tbody.innerHTML = '';
+  for (const [key, d] of Object.entries(data)) {
+    const pnlClass = d.pnl_cents >= 0 ? 'text-green-400' : 'text-red-400';
+    let row = `<td class="py-1">${key}</td>
+      <td class="${pnlClass}">$${(d.pnl_cents / 100).toFixed(2)}</td>
+      <td>${d.trades}</td><td>${(d.win_rate * 100).toFixed(1)}%</td>`;
+    if (hasAvgEdge) row += `<td>${((d.avg_edge || 0) * 100).toFixed(1)}%</td>`;
+    tbody.innerHTML += `<tr class="border-t border-gray-800">${row}</tr>`;
+  }
+}
 </script>
 </body>
 </html>
