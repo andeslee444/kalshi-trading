@@ -58,7 +58,7 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxDailyTrades": MAX_DAILY_TRADES,
     "maxDailyLoss": MAX_DAILY_LOSS,
     "maxDailyLossPct": econ_config.get("maxDailyLossPct"),
-}, logger=log, order_monitor=order_monitor)
+}, logger=log, order_monitor=order_monitor, bot_name="economics")
 trim_trade_log(TRADES_PATH)
 
 def _classify_econ_market(ticker):

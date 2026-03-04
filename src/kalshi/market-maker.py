@@ -69,7 +69,7 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxDailyTrades": MAX_DAILY_TRADES,
     "maxDailyLoss": MAX_DAILY_LOSS,
     "maxDailyLossPct": mm_config.get("maxDailyLossPct"),
-}, logger=log, cooldown_hours=0)  # MM must re-quote every cycle
+}, logger=log, cooldown_hours=0, bot_name="mm")  # MM must re-quote every cycle
 trim_trade_log(TRADES_PATH)
 
 # === Inventory Tracking ===

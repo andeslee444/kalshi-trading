@@ -60,7 +60,7 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxDailyTrades": MAX_DAILY_TRADES,
     "maxDailyLoss": MAX_DAILY_LOSS,
     "maxDailyLossPct": arb_config.get("maxDailyLossPct"),
-}, logger=log)
+}, logger=log, bot_name="arb")
 trim_trade_log(TRADES_PATH)
 
 

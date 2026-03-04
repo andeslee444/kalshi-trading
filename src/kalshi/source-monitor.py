@@ -44,7 +44,7 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxDailyTrades": config["maxDailyTrades"],
     "maxDailyLoss": config["maxDailyLoss"],
     "maxDailyLossPct": config.get("maxDailyLossPct"),
-}, logger=log, order_monitor=order_monitor)
+}, logger=log, order_monitor=order_monitor, bot_name="source-monitor")
 trim_trade_log(TRADES_PATH)
 
 def save_snapshot(source_name, content, ext="html"):

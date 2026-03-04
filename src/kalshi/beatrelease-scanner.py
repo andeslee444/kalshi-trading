@@ -47,7 +47,7 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxDailyTrades": _bots_cfg.get("maxDailyTrades", 10),
     "maxDailyLoss": _bots_cfg.get("maxDailyLoss", 25),
     "maxDailyLossPct": _bots_cfg.get("maxDailyLossPct"),
-}, logger=log)
+}, logger=log, bot_name="beatrelease")
 allocator = PortfolioAllocator(client, logger=log)
 health = HealthCheckMonitor(logger=log)
 trim_trade_log(TRADES_PATH)

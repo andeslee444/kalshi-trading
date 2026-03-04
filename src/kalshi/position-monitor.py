@@ -154,7 +154,7 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": pm_config.get("maxTradeAmount", 50),  # exits can be larger
     "maxDailyTrades": MAX_DAILY_EXITS,
     "maxDailyLoss": pm_config.get("maxDailyLoss", 100),
-}, logger=log)
+}, logger=log, bot_name="positions")
 trim_trade_log(TRADES_PATH)
 
 # === Position Fetching ===

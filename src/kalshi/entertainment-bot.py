@@ -54,7 +54,7 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxDailyTrades": MAX_DAILY_TRADES,
     "maxDailyLoss": _bots_cfg.get("maxDailyLoss", 25),
     "maxDailyLossPct": _bots_cfg.get("maxDailyLossPct"),
-}, logger=log, order_monitor=order_monitor)
+}, logger=log, order_monitor=order_monitor, bot_name="entertainment")
 trim_trade_log(TRADES_PATH)
 
 # === Data Freshness ===

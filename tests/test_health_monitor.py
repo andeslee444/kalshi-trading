@@ -124,24 +124,32 @@ class TestAutoHalt:
         hm = self._make_monitor(tmp_path)
         assert hm.auto_halt is False
 
-    def test_auto_halt_creates_file_on_two_critical(self, tmp_path, monkeypatch):
-        """Auto-halt should trigger when 2+ critical issues exist."""
+    def test_auto_halt_creates_per_bot_halts_on_critical(self, tmp_path, monkeypatch):
+        """Auto-halt should create per-bot halt files (not global HALT_TRADING)."""
         import kalshi_auth
         halt_path = tmp_path / "data" / "HALT_TRADING"
         monkeypatch.setattr(kalshi_auth, "KILL_SWITCH_PATH", halt_path)
 
         hm = self._make_monitor(tmp_path, auto_halt=True, staleness_minutes=10)
 
-        # Create 2 critical issues: stale bot + failing source
+        # Create critical source failures for weather (NWS + OpenMeteo)
         old_time = (datetime.datetime.now() - datetime.timedelta(minutes=30)).isoformat()
         hm._state["bots"]["weather"] = {"last_heartbeat": old_time}
         for i in range(5):
-            hm.record_source_error("nws", f"err{i}")
+            hm.record_source_error("NWS", f"err{i}")
+            hm.record_source_error("OpenMeteo", f"err{i}")
+
+        # Redirect per-bot halt paths to tmp_path
+        monkeypatch.setattr(kalshi_auth, "per_bot_halt_path",
+                            lambda name: tmp_path / "data" / f"HALT_bot_{name}")
 
         issues = hm.check_health()
-        assert halt_path.exists()
-        halt_content = halt_path.read_text()
-        assert "stale" in halt_content or "failing" in halt_content
+        # Global halt should NOT be created
+        assert not halt_path.exists()
+        # Per-bot halt for weather should be created
+        assert (tmp_path / "data" / "HALT_bot_weather").exists()
+        # Issue list should mention per-bot halt
+        assert any("PER-BOT-HALT" in i for i in issues)
 
     def test_no_auto_halt_on_single_issue(self, tmp_path, monkeypatch):
         """Single issue should not trigger auto-halt."""

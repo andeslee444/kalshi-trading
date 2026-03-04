@@ -35,6 +35,15 @@ MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 1.0  # seconds
 
 KILL_SWITCH_PATH = PROJECT_DIR / "data" / "HALT_TRADING"
+PER_BOT_HALT_PREFIX = "HALT_bot_"
+BOT_SOURCE_MAP = {
+    "weather": ["NWS", "OpenMeteo"],
+    "crypto": ["Coinbase", "Deribit"],
+    "economics": ["ClevelandFed", "Truflation"],
+    "entertainment": ["HDD"],
+    "source-monitor": ["NWS", "HDD", "BoxOfficeMojo"],
+    "beatrelease": ["BeatRelease"],
+}
 SCAN_SUMMARIES_PATH = PROJECT_DIR / "data" / "scan-summaries.json"
 
 # Shared market cache — cross-process file cache for market data
@@ -559,6 +568,11 @@ def check_kill_switch(path=None):
     return p.exists()
 
 
+def per_bot_halt_path(bot_name):
+    """Return Path for a per-bot halt file: data/HALT_bot_{name}."""
+    return PROJECT_DIR / "data" / f"{PER_BOT_HALT_PREFIX}{bot_name}"
+
+
 # === Circuit breaker ===
 
 SHARED_BREAKER_PATH = PROJECT_DIR / "data" / "allocator-state.json"
@@ -961,13 +975,15 @@ class TradeManager:
 
     def __init__(self, client, trades_path, config, logger=None,
                  kill_switch_path=None, cooldown_hours=6, order_monitor=None,
-                 breaker_state_path=SHARED_BREAKER_PATH):
+                 breaker_state_path=SHARED_BREAKER_PATH, bot_name=None):
         validate_trade_config(config)
         self.client = client
         self.trades_path = Path(trades_path)
         self.config = config
         self.log = logger or _log
         self.kill_switch_path = kill_switch_path or KILL_SWITCH_PATH
+        self.bot_name = bot_name
+        self._per_bot_halt_path = per_bot_halt_path(bot_name) if bot_name else None
         self.tracker = RecentTradeTracker(self.trades_path, cooldown_hours=cooldown_hours)
         self.breaker = CircuitBreaker(state_path=breaker_state_path)
         self.order_monitor = order_monitor
@@ -1163,6 +1179,11 @@ class TradeManager:
         if check_kill_switch(self.kill_switch_path):
             self.log.warning("KILL SWITCH ACTIVE — refusing trade on %s", ticker)
             notify_webhook("Kill switch ACTIVE — trades blocked", level="critical")
+            return None
+
+        # 1b. Per-bot halt
+        if self._per_bot_halt_path and self._per_bot_halt_path.exists():
+            self.log.warning("PER-BOT HALT active for %s — refusing trade on %s", self.bot_name, ticker)
             return None
 
         # 2. Circuit breaker
@@ -1470,13 +1491,15 @@ class HealthCheckMonitor:
     """
 
     def __init__(self, state_path=None, staleness_minutes=60, auto_halt=False, logger=None,
-                 alert_cooldown_minutes=30):
+                 alert_cooldown_minutes=30, per_bot_halt_cooldown_seconds=600):
         self.state_path = Path(state_path) if state_path else HEALTH_STATE_PATH
         self.staleness_minutes = staleness_minutes
         self.auto_halt = auto_halt
         self.log = logger or _log
         self._alert_cooldown_minutes = alert_cooldown_minutes
         self._alerts_sent = {}  # key -> datetime of last alert
+        self._per_bot_halt_cooldown = per_bot_halt_cooldown_seconds
+        self._halt_transitions = {}  # bot_name -> timestamp of last halt/unhalt
         self._state = {
             "sources": {},      # source -> {"last_success": ts, "last_error": ts, "error_count": int}
             "bots": {},         # bot -> {"last_heartbeat": ts}
@@ -1631,18 +1654,65 @@ class HealthCheckMonitor:
                     level="warning",
                 )
 
-        # Auto-halt on critical failure
+        # Per-bot halts (replaces global auto-halt)
         if self.auto_halt and issues:
-            critical = [i for i in issues if "stale" in i or "failing" in i]
-            if len(critical) >= 2:
-                halt_path = KILL_SWITCH_PATH
-                if not halt_path.exists():
-                    halt_path.parent.mkdir(parents=True, exist_ok=True)
-                    halt_path.write_text(f"Auto-halted: {'; '.join(critical)}")
-                    self.log.warning("AUTO-HALT triggered: %s", "; ".join(critical))
-                    issues.append("AUTO-HALT: HALT_TRADING file created")
+            halt_status = self.check_per_bot_halts()
+            for bot_name, action in halt_status.items():
+                issues.append(f"PER-BOT-HALT: {bot_name} {action}")
 
         return issues
+
+    def check_per_bot_halts(self):
+        """Create/remove per-bot halt files based on source health.
+
+        For each bot in BOT_SOURCE_MAP:
+        - If ALL its sources have error_count >= 5 → create halt file
+        - If ALL its sources have error_count == 0 → remove halt file
+        - Respects cooldown between transitions (anti-flap)
+
+        Returns:
+            Dict of {bot_name: action} where action is "halted", "recovered", or "unchanged".
+        """
+        now = time.time()
+        status = {}
+        sources = self._state.get("sources", {})
+
+        for bot_name, required_sources in BOT_SOURCE_MAP.items():
+            halt_path = per_bot_halt_path(bot_name)
+            currently_halted = halt_path.exists()
+
+            # Check if all sources are failing (error_count >= 5)
+            all_failing = bool(required_sources) and all(
+                sources.get(s, {}).get("error_count", 0) >= 5
+                for s in required_sources
+            )
+
+            # Check if all sources have recovered (error_count == 0)
+            all_recovered = all(
+                sources.get(s, {}).get("error_count", 0) == 0
+                for s in required_sources
+            )
+
+            # Check cooldown
+            last_transition = self._halt_transitions.get(bot_name, 0)
+            cooldown_ok = (now - last_transition) >= self._per_bot_halt_cooldown
+
+            if all_failing and not currently_halted and cooldown_ok:
+                halt_path.parent.mkdir(parents=True, exist_ok=True)
+                failing_sources = [s for s in required_sources if sources.get(s, {}).get("error_count", 0) >= 5]
+                halt_path.write_text(f"Auto-halted: sources failing: {', '.join(failing_sources)}")
+                self._halt_transitions[bot_name] = now
+                self.log.warning("PER-BOT HALT created for %s (sources: %s)", bot_name, ", ".join(failing_sources))
+                status[bot_name] = "halted"
+            elif all_recovered and currently_halted and cooldown_ok:
+                halt_path.unlink(missing_ok=True)
+                self._halt_transitions[bot_name] = now
+                self.log.info("PER-BOT HALT removed for %s (sources recovered)", bot_name)
+                status[bot_name] = "recovered"
+            else:
+                status[bot_name] = "unchanged"
+
+        return status
 
 
 def notify_whatsapp(message, phone=None, logger=None):

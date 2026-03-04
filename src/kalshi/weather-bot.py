@@ -33,7 +33,7 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxDailyTrades": config.get("maxDailyTrades", 10),
     "maxDailyLoss": config.get("maxDailyLoss", 10),
     "maxDailyLossPct": config.get("maxDailyLossPct"),
-}, logger=log, order_monitor=order_monitor, cooldown_hours=12)
+}, logger=log, order_monitor=order_monitor, cooldown_hours=12, bot_name="weather")
 trim_trade_log(TRADES_PATH)
 
 # === Weather Forecast ===

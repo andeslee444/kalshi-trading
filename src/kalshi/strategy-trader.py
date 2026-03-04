@@ -37,7 +37,7 @@ trade_manager = TradeManager(client, TRADES_JSON_PATH, {
     "maxDailyTrades": _bots_cfg.get("maxDailyTrades", 20),
     "maxDailyLoss": _bots_cfg.get("maxDailyLoss", 50),
     "maxDailyLossPct": _bots_cfg.get("maxDailyLossPct"),
-}, logger=log, order_monitor=order_monitor)
+}, logger=log, order_monitor=order_monitor, bot_name="strategy")
 trim_trade_log(TRADES_JSON_PATH)
 
 def find_longshot_sells(markets, bankroll):

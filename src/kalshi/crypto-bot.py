@@ -69,7 +69,7 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxDailyTrades": MAX_DAILY_TRADES,
     "maxDailyLoss": MAX_DAILY_LOSS,
     "maxDailyLossPct": crypto_config.get("maxDailyLossPct"),
-}, logger=log, cooldown_hours=0.5, order_monitor=order_monitor)  # short cooldown for fast markets
+}, logger=log, cooldown_hours=0.5, order_monitor=order_monitor, bot_name="crypto")  # short cooldown for fast markets
 trim_trade_log(TRADES_PATH)
 
 # Particle filter for Bayesian belief tracking

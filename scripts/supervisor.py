@@ -26,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"))
 
-from kalshi_auth import setup_logging, check_kill_switch, notify_webhook
+from kalshi_auth import setup_logging, check_kill_switch, notify_webhook, per_bot_halt_path
 
 log = setup_logging("supervisor")
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -126,6 +126,7 @@ class BotProcess:
         self.started_at = None
         self.restart_count = 0
         self.recent_crashes = []  # timestamps
+        self.per_bot_halted = False
 
     def is_heartbeat_stale(self, health_data):
         """Check if bot's heartbeat is stale (indicates hung process).
@@ -578,11 +579,25 @@ class Supervisor:
             if kill_switch_active:
                 continue
 
+            # Per-bot halt checking
+            for name, bot in self.bots.items():
+                halt_file = per_bot_halt_path(name)
+                if halt_file.exists() and not bot.per_bot_halted:
+                    log.warning("Per-bot halt active for %s — stopping", name)
+                    bot.stop()
+                    bot.per_bot_halted = True
+                elif not halt_file.exists() and bot.per_bot_halted:
+                    log.info("Per-bot halt removed for %s — restarting", name)
+                    bot.per_bot_halted = False
+                    bot.start()
+
             # Auto-restart crashed or hung daemons
             health = self._load_health()
             any_restarted = False
             for name, bot in self.bots.items():
                 if name in DISABLED_BY_DEFAULT:
+                    continue
+                if bot.per_bot_halted:
                     continue
                 if bot.check_and_restart(health_data=health):
                     any_restarted = True
