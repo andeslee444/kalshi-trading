@@ -703,6 +703,14 @@ class PortfolioAllocator:
                          self._regime_detector.regime_confidence(),
                          regime_mult)
 
+        # 9. Floor: compound Kelly reductions (CI, tail risk, regime) can push
+        #    bankroll near zero. Enforce a $1 minimum so positions remain viable.
+        MIN_BANKROLL_CENTS = 100
+        if bankroll < MIN_BANKROLL_CENTS:
+            self.log.info("  Compound Kelly reductions pushed bankroll to $%.2f, applying $1 floor",
+                         bankroll / 100)
+            bankroll = MIN_BANKROLL_CENTS
+
         return BudgetResponse(
             approved=True,
             max_cost_cents=allocated,

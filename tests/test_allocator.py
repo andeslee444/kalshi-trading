@@ -653,3 +653,57 @@ class TestNwsSourceTypeRelaxedGate:
         assert result_default.approved
         assert result_nws.approved
         assert result_nws.max_cost_cents >= result_default.max_cost_cents
+
+
+# ===================================================================
+# Minimum Position Floor tests (Task 10)
+# ===================================================================
+
+class TestMinimumPositionFloor:
+    """Bankroll after compound Kelly reductions should not drop below $1 (100 cents)."""
+
+    def _make_allocator(self, balance=500000):
+        mock_client = MagicMock()
+        mock_client.get_balance.return_value = (balance, balance)
+        mock_client.get.return_value = {"market_positions": []}
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            json.dump({}, f)
+            state_path = f.name
+        alloc = PortfolioAllocator(client=mock_client, state_path=state_path)
+        alloc._daily_date = datetime.date.today().isoformat()
+        return alloc
+
+    @patch("capital_allocator.ABSOLUTE_DAILY_LOSS_CAP_CENTS", 100000000)
+    @patch("capital_allocator.ABSOLUTE_DAILY_LOSS_CAP_PCT", 0)
+    def test_minimum_position_floor(self):
+        """Bankroll after all reductions should not drop below $1 (100 cents).
+
+        With $2 balance, tail_risk=0.75, crisis regime=0.50:
+        bankroll = 200 * 0.75 * 0.50 = 75 cents -> floor to 100 cents.
+        """
+        alloc = self._make_allocator(balance=200)
+        # Force 100% crisis belief -> regime mult = 0.50
+        alloc._regime_detector.belief = [0.0, 0.0, 0.0, 1.0]
+        alloc._regime_detector.n_updates = 10
+        # Mock correlation engine to bypass cluster/VaR checks and apply tail risk
+        alloc._correlation_engine.check_cluster_limit = MagicMock(return_value=(True, ""))
+        alloc._correlation_engine.check_marginal_var = MagicMock(return_value=(True, ""))
+        alloc._correlation_engine.get_tail_risk_multiplier = MagicMock(return_value=0.75)
+        result = alloc.request_budget("crypto", "KXBTC-26MAR3-T95000",
+                                       edge=0.10, confidence=0.70,
+                                       bot_max_cost_cents=500)
+        assert result.approved
+        assert result.bankroll_cents >= 100  # $1 floor
+
+    @patch("capital_allocator.ABSOLUTE_DAILY_LOSS_CAP_CENTS", 100000000)
+    @patch("capital_allocator.ABSOLUTE_DAILY_LOSS_CAP_PCT", 0)
+    def test_floor_not_applied_above_minimum(self):
+        """Bankroll above $1 should not be changed by the floor."""
+        alloc = self._make_allocator(balance=500000)  # $5000
+        # Normal regime — no reductions
+        result = alloc.request_budget("crypto", "KXBTC-26MAR3-T95000",
+                                       edge=0.10, confidence=0.70,
+                                       bot_max_cost_cents=500)
+        assert result.approved
+        # Bankroll should be the full available balance (no regime/tail reductions)
+        assert result.bankroll_cents == 500000
