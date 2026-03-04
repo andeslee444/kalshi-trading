@@ -47,6 +47,20 @@ MAX_DAILY_TRADES = mm_config.get("maxDailyTrades", 50)
 MAX_DAILY_LOSS = mm_config.get("maxDailyLoss", 25)
 TARGET_MARKETS = mm_config.get("targetMarkets", ["KXHIGH"])
 
+# Load calibrated per-market params (from orderbook simulation)
+MM_CALIBRATION_PATH = PROJECT_DIR / "config" / "mm-calibration.json"
+
+def _load_mm_calibration():
+    """Load per-prefix calibrated MM params."""
+    try:
+        if MM_CALIBRATION_PATH.exists():
+            return json.loads(MM_CALIBRATION_PATH.read_text())
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return {}
+
+_mm_calibration = _load_mm_calibration()
+
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
@@ -289,12 +303,26 @@ def scan_and_quote():
             log.info(f"  {ticker}: inventory limit reached ({inventory}), skipping")
             continue
 
+        # Use calibrated params if available, else default
+        cal = None
+        for prefix in TARGET_MARKETS:
+            if ticker.startswith(prefix):
+                cal = _mm_calibration.get(prefix)
+                break
+
+        if cal and cal.get("activated"):
+            base_gamma = cal.get("gamma", GAMMA)
+            base_k = cal.get("k", K_PARAM)
+        else:
+            base_gamma = GAMMA
+            base_k = K_PARAM
+
         # Adaptive gamma: increase near settlement and with inventory
-        gamma = GAMMA * max(1.0, 24 / hours_to_settle) * (1 + abs(inventory) / MAX_INVENTORY)
+        gamma = base_gamma * max(1.0, 24 / hours_to_settle) * (1 + abs(inventory) / MAX_INVENTORY)
 
         # Compute reservation price and optimal spread
         reservation = compute_reservation_price(mid, inventory, sigma, hours_to_settle, gamma)
-        half_spread = compute_optimal_spread(sigma, hours_to_settle, gamma)
+        half_spread = compute_optimal_spread(sigma, hours_to_settle, gamma, base_k)
 
         bid_price = max(1, reservation - half_spread)
         ask_price = min(99, reservation + half_spread)

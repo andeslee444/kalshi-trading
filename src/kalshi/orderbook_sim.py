@@ -373,3 +373,21 @@ def kyle_lambda_estimate(price_history, order_flows):
     sum_xx = sum(x * x for x in xs)
 
     return sum_xy / sum_xx if sum_xx > 0 else 0.0
+
+
+def load_calibrated_params(config_path, ticker_prefix):
+    """Load calibrated MM params for a market prefix.
+
+    Returns dict with gamma, k if activated. Returns None if not
+    activated, not found, or config file missing.
+    """
+    import json
+    try:
+        with open(config_path) as f:
+            data = json.load(f)
+        params = data.get(ticker_prefix)
+        if params and params.get("activated"):
+            return {"gamma": params["gamma"], "k": params["k"]}
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        pass
+    return None
