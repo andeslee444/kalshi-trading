@@ -137,9 +137,34 @@ def compute_optimal_spread(sigma, time_to_settlement_hours, gamma=None, k=None):
     sigma_frac = sigma / 100.0  # convert cents to 0-1 fraction for A-S formula
     delta = gamma * (sigma_frac ** 2) * T + (2 / gamma) * math.log(1 + gamma / k)
 
-    # delta is in fraction space; convert back to cents
-    # Minimum spread of 2c (1c each side) to cover exchange fees
+    # delta is in fraction space; convert back to cents as half-spread
+    # Result is half-spread in cents: 1c minimum = 2c total spread (covers exchange fees)
     return max(1, round(delta * 100 / 2))
+
+
+def estimate_order_arrival_rate(market):
+    """Estimate order arrival rate from market volume and time.
+
+    Returns estimated orders per hour, or None if insufficient data.
+    Uses volume / hours_since_open as a rough proxy.
+    """
+    volume = market.get("volume", 0) or 0
+    if volume < 5:
+        return None
+
+    # Estimate hours the market has been active
+    open_time = market.get("open_time")
+    if open_time:
+        try:
+            open_dt = datetime.datetime.fromisoformat(open_time.replace("Z", "+00:00"))
+            now = datetime.datetime.now(datetime.timezone.utc)
+            hours_open = max(1, (now - open_dt).total_seconds() / 3600)
+            return volume / hours_open
+        except (ValueError, TypeError):
+            pass
+
+    # Fallback: assume 8 trading hours if no open_time
+    return volume / 8
 
 
 def estimate_market_sigma(market):
@@ -318,12 +343,28 @@ def scan_and_quote():
         # Adaptive gamma: increase near settlement and with inventory
         gamma = base_gamma * max(1.0, 24 / hours_to_settle) * (1 + abs(inventory) / MAX_INVENTORY)
 
+        # Dynamic k: use max of config value and fill-rate estimate
+        arrival_rate = estimate_order_arrival_rate(m)
+        if arrival_rate is not None:
+            estimated_k = max(base_k, arrival_rate * 0.8)
+            if estimated_k != base_k:
+                log.info(f"  {ticker}: dynamic k={estimated_k:.1f} (arrival={arrival_rate:.1f}/h, config={base_k:.1f})")
+            effective_k = estimated_k
+        else:
+            effective_k = base_k
+
         # Compute reservation price and optimal spread
         reservation = compute_reservation_price(mid, inventory, sigma, hours_to_settle, gamma)
-        half_spread = compute_optimal_spread(sigma, hours_to_settle, gamma, base_k)
+        half_spread = compute_optimal_spread(sigma, hours_to_settle, gamma, effective_k)
 
         bid_price = max(1, reservation - half_spread)
         ask_price = min(99, reservation + half_spread)
+
+        # Minimum spread: 2 cents total to prevent crossing
+        if ask_price - bid_price < 2:
+            mid_int = round(mid)
+            bid_price = max(1, mid_int - 1)
+            ask_price = min(99, mid_int + 1)
 
         # Only quote if our prices improve on existing bid/ask
         if bid_price >= yes_bid and ask_price <= yes_ask:

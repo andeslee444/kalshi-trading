@@ -378,9 +378,11 @@ class TestProcessGroupShutdown:
         def stubbed_kill(pid, sig):
             if sig == 0:
                 kill_zero_count[0] += 1
-                if kill_zero_count[0] > 20:
+                if kill_zero_count[0] > 60:
                     raise ProcessLookupError
                 return  # process still alive
+            if sig == signal.SIGUSR1:
+                return  # accept pre-shutdown signal
             raise ProcessLookupError
 
         with patch.object(bot, "_read_pid", return_value=12345), \

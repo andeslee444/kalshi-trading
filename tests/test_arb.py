@@ -232,6 +232,140 @@ class TestSpreadCalculation:
         assert 0.03 < fee_drag < 0.07
 
 
+class TestExtractDirection:
+    """Test _extract_direction() keyword parsing."""
+
+    def test_above_keyword(self, arb_mod):
+        assert arb_mod._extract_direction("Will BTC go above 70000?") == "above"
+
+    def test_below_keyword(self, arb_mod):
+        assert arb_mod._extract_direction("Will BTC fall below 60000?") == "below"
+
+    def test_exceed(self, arb_mod):
+        assert arb_mod._extract_direction("Will CPI exceed 3.5%?") == "above"
+
+    def test_at_least(self, arb_mod):
+        assert arb_mod._extract_direction("At least 200k jobs added") == "above"
+
+    def test_at_most(self, arb_mod):
+        assert arb_mod._extract_direction("At most 150k jobs added") == "below"
+
+    def test_higher_than(self, arb_mod):
+        assert arb_mod._extract_direction("Temperature higher than 90F") == "above"
+
+    def test_lower_than(self, arb_mod):
+        assert arb_mod._extract_direction("GDP lower than 2%") == "below"
+
+    def test_over(self, arb_mod):
+        assert arb_mod._extract_direction("Bitcoin over 100000") == "above"
+
+    def test_under(self, arb_mod):
+        assert arb_mod._extract_direction("Ethereum under 3000") == "below"
+
+    def test_more_than(self, arb_mod):
+        assert arb_mod._extract_direction("More than 500 units sold") == "above"
+
+    def test_less_than(self, arb_mod):
+        assert arb_mod._extract_direction("Less than 100 units sold") == "below"
+
+    def test_rise_above(self, arb_mod):
+        assert arb_mod._extract_direction("Will ETH rise above 4000?") == "above"
+
+    def test_drop_below(self, arb_mod):
+        assert arb_mod._extract_direction("Will BTC drop below 50000?") == "below"
+
+    def test_greater_than(self, arb_mod):
+        assert arb_mod._extract_direction("CPI greater than 3%") == "above"
+
+    def test_top(self, arb_mod):
+        assert arb_mod._extract_direction("Will it top 100?") == "above"
+
+    def test_no_direction(self, arb_mod):
+        assert arb_mod._extract_direction("Will it rain tomorrow?") is None
+
+    def test_no_direction_neutral(self, arb_mod):
+        assert arb_mod._extract_direction("Who will win the election?") is None
+
+    def test_case_insensitive(self, arb_mod):
+        assert arb_mod._extract_direction("ABOVE 70000") == "above"
+        assert arb_mod._extract_direction("BELOW 60000") == "below"
+
+
+class TestDirectionValidation:
+    """Test that validate_match rejects direction-conflicting pairs."""
+
+    def test_conflicting_directions_rejected(self, arb_mod):
+        """'above 70k' vs 'below 70k' should be rejected even with same numbers."""
+        assert not arb_mod.validate_match(
+            "Will BTC go above 70000",
+            "Will BTC fall below 70000",
+            score=0.85,
+        )
+
+    def test_same_directions_accepted(self, arb_mod):
+        """Both 'above' should pass."""
+        assert arb_mod.validate_match(
+            "Will BTC exceed 70000",
+            "Will Bitcoin go above 70000",
+            score=0.80,
+        )
+
+    def test_no_direction_both_passes(self, arb_mod):
+        """No direction in either text should not reject (backward compatible)."""
+        assert arb_mod.validate_match(
+            "Who wins the election",
+            "Who will win the election",
+            score=0.85,
+        )
+
+    def test_direction_in_only_one_passes(self, arb_mod):
+        """Direction in only one side should not reject."""
+        assert arb_mod.validate_match(
+            "Will BTC exceed 70000",
+            "BTC 70000 outcome",
+            score=0.80,
+        )
+
+    def test_above_vs_below_rejected(self, arb_mod):
+        """Explicit above vs below with high score still rejected."""
+        assert not arb_mod.validate_match(
+            "CPI above 3.5",
+            "CPI below 3.5",
+            score=0.90,
+        )
+
+
+class TestMatchMarketsDirection:
+    """Test that match_markets pipeline respects direction validation."""
+
+    def test_direction_conflict_filtered_out(self, arb_mod):
+        """Markets with conflicting directions should not match."""
+        kalshi = [{"title": "Will BTC go above 70000?", "subtitle": "", "ticker": "KXBTC-70K-UP"}]
+        poly = [{"question": "Will BTC fall below 70000?"}]
+        matches = arb_mod.match_markets(kalshi, poly)
+        assert len(matches) == 0
+
+    def test_same_direction_passes(self, arb_mod):
+        """Markets with same direction and matching numbers should match."""
+        kalshi = [{"title": "Will BTC exceed 70000?", "subtitle": "", "ticker": "KXBTC-70K"}]
+        poly = [{"question": "Will BTC exceed 70000?"}]
+        matches = arb_mod.match_markets(kalshi, poly)
+        assert len(matches) == 1
+        # Verify direction info is in the tuple
+        assert len(matches[0]) == 5  # (km, pm, score, k_dir, p_dir)
+        assert matches[0][3] == "above"  # k_dir
+        assert matches[0][4] == "above"  # p_dir
+
+    def test_no_direction_backward_compatible(self, arb_mod):
+        """Markets without direction keywords should still match."""
+        kalshi = [{"title": "Who wins the 2024 election?", "subtitle": "", "ticker": "KXPRES"}]
+        poly = [{"question": "Who wins the 2024 election?"}]
+        matches = arb_mod.match_markets(kalshi, poly)
+        assert len(matches) == 1
+        assert matches[0][3] is None  # k_dir
+        assert matches[0][4] is None  # p_dir
+
+
 class TestArbEdgeGating:
     """Test that arb requires minimum 3% net spread."""
 

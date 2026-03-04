@@ -22,8 +22,8 @@ from kalshi_auth import (
     load_trades, _atomic_write_json, ScanSummary,
     notify_whatsapp,
 )
-from probability import weather_probability, nws_probability, half_kelly, kalshi_fee_cents
-from ticker_utils import parse_weather_ticker as parse_temp_ticker
+from probability import weather_probability, nws_probability, half_kelly, kalshi_fee_cents, crypto_price_probability
+from ticker_utils import parse_weather_ticker as parse_temp_ticker, parse_crypto_ticker
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -418,18 +418,75 @@ def _compute_current_probability(ticker, source_bot, entry_side):
         return (prob if entry_side == "yes" else 1.0 - prob,
                 f"NWS {city} high {running_high}F, model prob={prob*100:.0f}%")
 
-    # Crypto: would need current price + vol + settlement time
-    # Complex data fetching -- defer to Phase 4 when crypto bot is active
+    # Crypto: fetch current spot price, compute model probability
     if source_bot == "crypto":
-        return None, None  # Skip for now
+        parsed = parse_crypto_ticker(ticker)
+        if not parsed:
+            return None, None
+        asset = parsed["asset"]
+        # Fetch current spot price from Coinbase (lightweight public API)
+        try:
+            url = f"https://api.coinbase.com/v2/prices/{asset}-USD/spot"
+            r = retry_request("GET", url, timeout=10)
+            price = float(r.json()["data"]["amount"])
+        except Exception as e:
+            log.error(f"  Crypto spot fetch failed for {asset}: {e}")
+            return None, None
+        # Estimate time to settlement
+        market_data = get_market_data(ticker)
+        if not market_data:
+            return None, None
+        close_time = market_data.get("close_time") or market_data.get("expected_expiration_time")
+        minutes_to_settle = 1440
+        if close_time:
+            try:
+                import datetime as dt_mod
+                close_dt = dt_mod.datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+                now = dt_mod.datetime.now(dt_mod.timezone.utc)
+                minutes_to_settle = max(1, int((close_dt - now).total_seconds() / 60))
+            except (ValueError, TypeError):
+                pass
+        prob = crypto_price_probability(
+            price, parsed["threshold"], "above",
+            time_horizon_minutes=minutes_to_settle,
+            realized_vol_pct=0.50,  # use conservative default vol
+        )
+        side_prob = prob if entry_side == "yes" else 1.0 - prob
+        return (side_prob,
+                f"Crypto {asset} spot ${price:,.0f}, model P(YES)={prob*100:.0f}%, T={minutes_to_settle}min")
 
     # Entertainment/beatrelease: no live data source to recompute
     if source_bot in ("entertainment", "beatrelease"):
         return None, None  # Hold to settlement
 
-    # Economics: would need current nowcast value
+    # Economics: read latest model probability from economics bot decision log
     if source_bot == "economics":
-        return None, None  # Skip for now
+        decisions_path = PROJECT_DIR / "data" / "economics-decisions.json"
+        try:
+            if not decisions_path.exists():
+                return None, None
+            decisions = json.loads(decisions_path.read_text())
+            # Find most recent decision for this ticker
+            for d in reversed(decisions):
+                if d.get("ticker") == ticker and d.get("model_prob") is not None:
+                    current_prob = d["model_prob"]
+                    side_prob = current_prob if entry_side == "yes" else 1.0 - current_prob
+                    age_min = 0
+                    ts = d.get("timestamp", "")
+                    if ts:
+                        try:
+                            d_dt = datetime.datetime.fromisoformat(ts)
+                            age_min = (datetime.datetime.now() - d_dt).total_seconds() / 60
+                        except (ValueError, TypeError):
+                            pass
+                    # Only use if decision is less than 12 hours old
+                    if age_min < 720:
+                        return (side_prob,
+                                f"Econ decision log: model_prob={current_prob*100:.0f}% (age={age_min:.0f}min)")
+                    break
+        except (json.JSONDecodeError, KeyError, OSError):
+            pass
+        return None, None
 
     return None, None  # Unknown bot
 

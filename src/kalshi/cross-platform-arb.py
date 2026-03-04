@@ -88,13 +88,37 @@ def fuzzy_match_score(text1, text2):
 MIN_MATCH_SCORE = 0.75
 
 
+def _extract_direction(text):
+    """Extract directional intent from market text.
+
+    Returns "above", "below", or None if no direction detected.
+    """
+    t = text.lower()
+    # Check "above" keywords (order: longer phrases first to avoid partial matches)
+    above_keywords = [
+        "rise above", "higher than", "greater than", "more than",
+        "at least", "above", "over", "exceed", "top",
+    ]
+    below_keywords = [
+        "fall below", "drop below", "lower than", "less than",
+        "at most", "below", "under",
+    ]
+    for kw in above_keywords:
+        if kw in t:
+            return "above"
+    for kw in below_keywords:
+        if kw in t:
+            return "below"
+    return None
+
+
 def _extract_numbers(text):
     """Extract all numbers from text for secondary validation."""
     return set(re.findall(r'\d+\.?\d*', text))
 
 
 def validate_match(k_text, p_text, score):
-    """Require fuzzy score >= 0.75 AND matching numerical thresholds."""
+    """Require fuzzy score >= 0.75, matching numerical thresholds, and compatible directions."""
     if score < MIN_MATCH_SCORE:
         return False
     k_nums = _extract_numbers(k_text)
@@ -102,14 +126,21 @@ def validate_match(k_text, p_text, score):
     # If both have numbers, at least one must overlap
     if k_nums and p_nums and not k_nums & p_nums:
         return False
+    # Direction check: reject if both have directions and they conflict
+    k_dir = _extract_direction(k_text)
+    p_dir = _extract_direction(p_text)
+    if k_dir and p_dir and k_dir != p_dir:
+        log.warning(f"Direction conflict: Kalshi='{k_dir}' vs Polymarket='{p_dir}' — "
+                     f"rejecting match (K: {k_text[:60]}, P: {p_text[:60]})")
+        return False
     return True
 
 
 def match_markets(kalshi_markets, polymarket_markets):
     """Find matching markets between Kalshi and Polymarket.
 
-    Returns list of (kalshi_market, polymarket_market, score) tuples
-    with score >= 0.75 AND matching numerical thresholds.
+    Returns list of (kalshi_market, polymarket_market, score, k_direction, p_direction)
+    tuples with score >= 0.75, matching numerical thresholds, and compatible directions.
     """
     matches = []
 
@@ -135,15 +166,20 @@ def match_markets(kalshi_markets, polymarket_markets):
                 best_match = pm
 
         if best_match:
-            matches.append((km, best_match, best_score))
+            k_dir = _extract_direction(k_text)
+            p_dir = _extract_direction(best_match.get("question", ""))
+            matches.append((km, best_match, best_score, k_dir, p_dir))
 
     return matches
 
 
 # === Spread Analysis ===
 
-def compute_spread(kalshi_market, pm_market):
+def compute_spread(kalshi_market, pm_market, k_direction=None, p_direction=None):
     """Compute the price spread between Kalshi and Polymarket.
+
+    If directions are inverted (one "above", one "below"), flips the Polymarket
+    price to account for the opposite framing.
 
     Returns dict with spread info, or None if prices unavailable.
     """
@@ -176,6 +212,16 @@ def compute_spread(kalshi_market, pm_market):
 
     if pm_yes_bid is None:
         return None
+
+    # Handle directional inversion: if one is "above" and the other is "below",
+    # the Polymarket YES price represents the opposite outcome, so flip it.
+    directions_inverted = (
+        k_direction and p_direction
+        and k_direction != p_direction
+    )
+    if directions_inverted:
+        log.info(f"  Direction inversion detected (K={k_direction}, P={p_direction}): flipping PM price {pm_yes_bid:.4f} -> {1 - pm_yes_bid:.4f}")
+        pm_yes_bid = 1 - pm_yes_bid
 
     k_yes_price = k_yes_ask / 100  # convert cents to decimal
 
@@ -274,11 +320,11 @@ def scan_spreads():
 
     # Analyze spreads
     tradeable = 0
-    for km, pm, score in matches:
+    for km, pm, score, k_dir, p_dir in matches:
         k_ticker = km.get("ticker", "")
         p_question = pm.get("question", "")
 
-        spread = compute_spread(km, pm)
+        spread = compute_spread(km, pm, k_direction=k_dir, p_direction=p_dir)
         if not spread:
             continue
 

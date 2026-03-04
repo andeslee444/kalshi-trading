@@ -9,7 +9,7 @@ import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, quarter_kelly, compute_limit_price, kalshi_fee_cents
-from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_threshold
+from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_threshold, configure_sanity
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -37,6 +37,12 @@ MAX_DAILY_TRADES = _bots_cfg["maxDailyTrades"]
 CONFIDENCE_THRESHOLD = _bots_cfg["confidenceThreshold"]
 SCAN_INTERVAL_MINUTES = _bots_cfg["scanIntervalMinutes"]
 ENTERTAINMENT_TICKERS = _bots_cfg["tickers"]
+
+# Configure Sanity CMS connection from config (defaults used if keys absent)
+configure_sanity(
+    project_id=_bots_cfg.get("sanityProject"),
+    api_version=_bots_cfg.get("sanityApiVersion"),
+)
 
 MIN_EDGE_CONFIRMED = 0.04  # 4% when sigma <= 5% (confirmed data)
 MIN_EDGE_UNCERTAIN = 0.10  # 10% when sigma > 5% (projections/articles)
@@ -210,6 +216,9 @@ def scrape_box_office():
                     box_data.append({"title": title, "gross": int(val), "source": "boxofficemojo-weekend"})
             except (ValueError, TypeError):
                 pass
+
+    if not box_data:
+        log.warning("Box office scraping returned zero results — source format may have changed")
 
     return box_data
 

@@ -31,11 +31,36 @@ SANITY_BASE = f"https://{SANITY_PROJECT}.api.sanity.io/v{SANITY_API_VERSION}/dat
 # SANITY CMS QUERIES
 # ============================================================
 
+def configure_sanity(project_id=None, api_version=None):
+    """Update Sanity CMS connection settings at runtime.
+
+    Called by bots to override defaults with values from bots-config.json.
+    """
+    global SANITY_PROJECT, SANITY_API_VERSION, SANITY_BASE
+    if project_id:
+        SANITY_PROJECT = project_id
+    if api_version:
+        SANITY_API_VERSION = api_version
+    SANITY_BASE = f"https://{SANITY_PROJECT}.api.sanity.io/v{SANITY_API_VERSION}/data/query/{SANITY_DATASET}"
+    _log.debug("Sanity config updated: project=%s, api_version=%s", SANITY_PROJECT, SANITY_API_VERSION)
+
+
 def sanity_query(groq_query):
-    """Execute a GROQ query against HDD's Sanity CMS."""
-    r = requests.get(SANITY_BASE, params={"query": groq_query}, timeout=20)
-    r.raise_for_status()
-    return r.json().get("result")
+    """Execute a GROQ query against HDD's Sanity CMS with retry."""
+    import time as _time
+    for attempt in range(3):
+        try:
+            r = requests.get(SANITY_BASE, params={"query": groq_query}, timeout=20)
+            r.raise_for_status()
+            return r.json().get("result")
+        except (requests.RequestException, requests.HTTPError) as e:
+            if attempt < 2:
+                wait = 2 ** attempt
+                _log.warning("Sanity query failed (attempt %d/3): %s, retrying in %ds", attempt + 1, e, wait)
+                _time.sleep(wait)
+            else:
+                _log.error("Sanity query failed after 3 attempts: %s", e)
+                raise
 
 
 def fetch_latest_chart(chart_slug):
@@ -71,6 +96,9 @@ def parse_chart_data(raw_data):
     entries = []
     if not raw_data:
         return entries
+
+    if raw_data and '|' not in raw_data:
+        _log.warning("Chart data missing expected '|' delimiter — format may have changed")
 
     lines = raw_data.strip().split('\n')
 
@@ -288,7 +316,11 @@ def get_album_sales(logger=None):
             for entry in entries:
                 artist = entry.get("artist", "")
                 # Kalshi settles on Albums column (pure sales), Activity is fallback
-                units = entry.get("albums", 0) or entry.get("activity", 0)
+                albums = entry.get("albums", 0)
+                activity = entry.get("activity", 0)
+                units = albums or activity
+                if albums == 0 and activity > 0:
+                    log.warning("Album sales column empty for %s, falling back to Activity (%d) — may not match Kalshi settlement", artist, activity)
                 if artist and units > 0:
                     key = artist.lower()
                     if key not in seen_artists:

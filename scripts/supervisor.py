@@ -229,12 +229,20 @@ class BotProcess:
             return False
 
     def stop(self):
-        """Stop the bot process (SIGTERM to process group, then SIGKILL after 10s)."""
+        """Stop the bot process (SIGUSR1 → SIGTERM → SIGKILL after 30s)."""
         pid = self._read_pid()
         if pid is None:
             return
 
         log.info(f"  Stopping {self.name} (PID {pid})...")
+
+        # Send SIGUSR1 first to signal "finish current cycle, don't start new one"
+        try:
+            os.kill(pid, signal.SIGUSR1)
+            time.sleep(1)  # Give bot a moment to set shutdown flag
+        except (ProcessLookupError, PermissionError):
+            pass
+
         try:
             # Kill entire process group (bots use start_new_session=True)
             os.killpg(os.getpgid(pid), signal.SIGTERM)
@@ -245,8 +253,8 @@ class BotProcess:
                 self._remove_pid()
                 return
 
-        # Wait up to 10s for graceful shutdown
-        for _ in range(20):
+        # Wait up to 30s for graceful shutdown (bots may be mid-API-call)
+        for _ in range(60):
             try:
                 os.kill(pid, 0)
                 time.sleep(0.5)

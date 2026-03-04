@@ -22,7 +22,8 @@ from kalshi_auth import (
     HealthCheckMonitor, OrderMonitor, _atomic_write_json, ScanSummary,
 )
 from probability import (
-    crypto_price_probability, quarter_kelly, half_kelly, compute_limit_price,
+    crypto_price_probability, crypto_price_probability_jd,
+    quarter_kelly, half_kelly, compute_limit_price,
     kalshi_fee_cents, is_market_liquid,
 )
 from ticker_utils import parse_crypto_ticker
@@ -53,6 +54,7 @@ SETTLEMENT_BUFFER_MINUTES = max(3, crypto_config.get("settlementBufferMinutes", 
 USE_OU = crypto_config.get("useOrnsteinUhlenbeck", False)
 OU_HALF_LIFE = crypto_config.get("ouHalfLifeMinutes", 120)
 DRIFT_PCT = crypto_config.get("driftPct", 0.0)
+USE_JD = crypto_config.get("useJumpDiffusion", False)
 MID_RANGE_EDGE_THRESHOLD = crypto_config.get("midRangeEdgeThreshold", 0.15)
 MID_RANGE_BAND = (
     crypto_config.get("midRangeLow", 0.25),
@@ -453,31 +455,48 @@ def scan_and_trade():
             vol_to_use = default_vol
 
         drift = drift_by_asset.get(asset, DRIFT_PCT)
+        prob_fn_args = dict(
+            current_price=current_price, threshold=threshold, direction="above",
+            time_horizon_minutes=minutes_to_settle,
+            realized_vol_pct=vol_to_use, iv_pct=None,
+            drift_pct=drift,
+        )
         if direction == "T":
-            prob = crypto_price_probability(
-                current_price, threshold, "above",
-                time_horizon_minutes=minutes_to_settle,
-                realized_vol_pct=vol_to_use, iv_pct=None,
-                use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
-                drift_pct=drift,
-            )
+            if USE_JD:
+                prob = crypto_price_probability_jd(**prob_fn_args)
+                gbm_prob = crypto_price_probability(
+                    **prob_fn_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
+                )
+                if abs(prob - gbm_prob) > 0.05:
+                    log.info(f"  {ticker}: JD={prob*100:.1f}% vs GBM={gbm_prob*100:.1f}% (diff={abs(prob-gbm_prob)*100:.1f}pp)")
+            else:
+                prob = crypto_price_probability(
+                    **prob_fn_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
+                )
         else:
             # Bracket: probability price lands in [threshold, threshold+range)
             range_size = _parse_bracket_range(ticker, asset, all_markets)
-            prob_above_low = crypto_price_probability(
-                current_price, threshold, "above",
-                time_horizon_minutes=minutes_to_settle,
-                realized_vol_pct=vol_to_use, iv_pct=None,
-                use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
-                drift_pct=drift,
-            )
-            prob_above_high = crypto_price_probability(
-                current_price, threshold + range_size, "above",
-                time_horizon_minutes=minutes_to_settle,
-                realized_vol_pct=vol_to_use, iv_pct=None,
-                use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
-                drift_pct=drift,
-            )
+            high_args = dict(prob_fn_args, threshold=threshold + range_size)
+            if USE_JD:
+                prob_above_low = crypto_price_probability_jd(**prob_fn_args)
+                prob_above_high = crypto_price_probability_jd(**high_args)
+                gbm_low = crypto_price_probability(
+                    **prob_fn_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
+                )
+                gbm_high = crypto_price_probability(
+                    **high_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
+                )
+                gbm_bracket = gbm_low - gbm_high
+                jd_bracket = prob_above_low - prob_above_high
+                if abs(jd_bracket - gbm_bracket) > 0.05:
+                    log.info(f"  {ticker}: JD bracket={jd_bracket*100:.1f}% vs GBM={gbm_bracket*100:.1f}% (diff={abs(jd_bracket-gbm_bracket)*100:.1f}pp)")
+            else:
+                prob_above_low = crypto_price_probability(
+                    **prob_fn_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
+                )
+                prob_above_high = crypto_price_probability(
+                    **high_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
+                )
             prob = prob_above_low - prob_above_high
 
         # Particle filter: update belief state and use filtered prob
@@ -545,6 +564,10 @@ def scan_and_trade():
     # Sort by edge
     opportunities.sort(key=lambda x: x["edge"], reverse=True)
     log.info(f"Found {len(opportunities)} opportunities with edge >= {EDGE_THRESHOLD*100:.0f}%")
+
+    # Clean up expired particle filters
+    active_tickers = {m.get("ticker", "") for m in all_markets}
+    filter_mgr.cleanup(active_tickers)
 
     for opp in opportunities:
         ticker = opp["ticker"]
