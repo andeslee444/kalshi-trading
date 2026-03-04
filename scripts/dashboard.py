@@ -21,6 +21,10 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR / "src" / "kalshi"))
 
+from pnl_attribution import PnLAttributor, _classify_market_type
+from edge_monitor import EdgeMonitor
+from execution_quality import ExecutionAnalyzer
+
 DASHBOARD_HTML = Path(__file__).resolve().parent / "dashboard.html"
 DATA_DIR = PROJECT_DIR / "data"
 PID_DIR = DATA_DIR / "pids"
@@ -949,6 +953,80 @@ async def api_exit_state():
         })
 
     return result
+
+
+# ─── Analytics endpoints ───
+
+# Build paths for analytics modules
+_ANALYTICS_TRADE_FILES = [
+    {"path": str(tf["path"]), "bot": tf["bot"]} for tf in TRADE_FILES
+]
+
+
+@app.get("/api/attribution")
+async def api_attribution():
+    """P&L attribution by bot, edge bucket, regime, sizing, market type."""
+    cached = cache.get("attribution")
+    if cached is not None:
+        return cached
+
+    attr = PnLAttributor(
+        trade_file_paths=_ANALYTICS_TRADE_FILES,
+        regime_state_path=str(PROJECT_DIR / "data" / "regime-state.json"),
+    )
+    attr.load_trades()
+    report = attr.full_report()
+    cache.set("attribution", report, ttl=120)
+    return report
+
+
+@app.get("/api/edge-decay")
+async def api_edge_decay():
+    """Edge decay metrics per market type."""
+    cached = cache.get("edge_decay")
+    if cached is not None:
+        return cached
+
+    em = EdgeMonitor(state_path=str(DATA_DIR / "edge-monitor-state.json"))
+    em.load_state()
+
+    # If no persisted state, build observations from settled trades
+    if not em._observations:
+        for tf in TRADE_FILES:
+            trades = load_trades_safe(tf["path"])
+            if not trades:
+                continue
+            for t in trades:
+                if t.get("settlement_result") is None:
+                    continue
+                ticker = t.get("ticker", "")
+                obs = {
+                    "timestamp": t.get("timestamp", ""),
+                    "market_type": _classify_market_type(ticker),
+                    "model_prob": t.get("model_prob", 0.5),
+                    "market_price_cents": t.get("best_ask") or t.get("price_cents", 50),
+                    "raw_edge": t.get("raw_edge", 0.0),
+                    "settled_won": t.get("settlement_result") in ("won", "yes", True, 1),
+                }
+                em._observations.append(obs)
+
+    report = em.json_report()
+    cache.set("edge_decay", report, ttl=300)
+    return report
+
+
+@app.get("/api/execution-quality")
+async def api_execution_quality():
+    """Execution quality metrics: fill rate, slippage, shortfall."""
+    cached = cache.get("exec_quality")
+    if cached is not None:
+        return cached
+
+    ea = ExecutionAnalyzer(trade_file_paths=_ANALYTICS_TRADE_FILES)
+    ea.load_trades()
+    report = ea.json_report()
+    cache.set("exec_quality", report, ttl=120)
+    return report
 
 
 # ─── Main ───
