@@ -588,13 +588,22 @@ def scan_and_trade():
     macro_signal = None
     try:
         macro_signal = macro.compute_signal(cleveland_nowcast=nowcast.get("cpi_yoy") if nowcast else None)
-        if macro_signal and macro_signal.confidence > 0.2 and nowcast:
-            if "cpi_yoy" in nowcast:
-                nowcast["cpi_yoy"] += macro_signal.cpi_bias
-                log.info(f"  Macro-adjusted CPI nowcast: {nowcast['cpi_yoy']:.3f}% "
-                         f"(bias={macro_signal.cpi_bias:+.3f}%, conf={macro_signal.confidence:.2f})")
     except Exception as e:
         log.warning(f"  Macro engine error (non-fatal): {e}")
+        # Fallback to cached signal
+        try:
+            macro_signal = macro.load_cached_signal()
+            if macro_signal:
+                log.info(f"  Using cached macro signal (bias={macro_signal.cpi_bias:+.3f}%)")
+        except Exception:
+            pass
+
+    if macro_signal and macro_signal.confidence > 0.2 and nowcast:
+        if "cpi_yoy" in nowcast:
+            adjusted_cpi = nowcast["cpi_yoy"] + macro_signal.cpi_bias
+            nowcast["cpi_yoy"] = adjusted_cpi
+            log.info(f"  Macro-adjusted CPI nowcast: {adjusted_cpi:.3f}% "
+                     f"(bias={macro_signal.cpi_bias:+.3f}%, conf={macro_signal.confidence:.2f})")
 
     if not nowcast and not gas_price:
         log.info("No data sources available (nowcast + gas), skipping scan.")
