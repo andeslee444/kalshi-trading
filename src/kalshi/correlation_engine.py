@@ -20,6 +20,9 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from scipy.stats import norm as _norm_dist
+from scipy.stats import t as _t_dist
+
 log = logging.getLogger("correlation-engine")
 
 
@@ -259,8 +262,7 @@ class CorrelationEngine:
         portfolio_std = math.sqrt(max(0.0, portfolio_variance))
 
         # z-score for confidence level
-        from scipy.stats import norm
-        z = norm.ppf(conf)
+        z = _norm_dist.ppf(conf)
 
         var = z * portfolio_std
         self._portfolio_var = var
@@ -283,10 +285,8 @@ class CorrelationEngine:
 
         nu = self.config.copula_df
 
-        from scipy.stats import t as t_dist
-
         arg = -math.sqrt((nu + 1) * (1 - rho) / (1 + rho))
-        lam = 2.0 * t_dist.cdf(arg, df=nu + 1)
+        lam = 2.0 * _t_dist.cdf(arg, df=nu + 1)
 
         return max(0.0, min(1.0, lam))
 
