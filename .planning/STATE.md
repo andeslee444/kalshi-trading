@@ -96,9 +96,10 @@ None active. All tracks merged.
 | 4 | Economics bot world-class redesign: Bayesian CPI fusion, 6-scenario mixture, uncertainty Kelly, EdgeScaler | 2026-03-05 | 0407aeb | [4-implement-economics-bot-world-class-rede](./quick/4-implement-economics-bot-world-class-rede/) |
 | 5 | Strategy bot bug fixes: reasoning string, dead code removal, NO-side limit pricing | 2026-03-05 | 0159c11 | [5-strategy-bot-fix-bugs-reasoning-string-d](./quick/5-strategy-bot-fix-bugs-reasoning-string-d/) |
 | 6 | Fix weather bot ticker parsing and purge stale calibration sigma overrides | 2026-03-05 | a813225 | [6-fix-weather-bot-ticker-parsing-regex-for](./quick/6-fix-weather-bot-ticker-parsing-regex-for/) |
+| 7 | Strategy bot Bayesian edge model, dual-tail longshot, copula sizing, confidence-scaled Kelly | 2026-03-05 | c6b0eed | [7-world-class-strategy-bot-bayesian-edge-m](./quick/7-world-class-strategy-bot-bayesian-edge-m/) |
 | 8 | Economics bot: dynamic sigma from cross-measure dispersion + nowcast age tracking | 2026-03-05 | 141cc57 | [8-implement-economics-bot-unfinished-impro](./quick/8-implement-economics-bot-unfinished-impro/) |
 
 ## Session Continuity
 
 Last session: 2026-03-05
-Status: All work complete. Quick task 8 (economics bot dynamic sigma + nowcast age tracking) finished.
+Status: All work complete. Quick task 7 (strategy bot Bayesian edge + dual-tail + copula sizing) finished.
