@@ -1178,6 +1178,95 @@ def crypto_price_probability_jd(current_price, threshold, direction="above",
     return prob_above
 
 
+def crypto_price_probability_heston(
+    current_price, threshold, direction="above",
+    time_horizon_minutes=1440,
+    v0=0.25, kappa=2.0, theta=0.25, xi=0.3, rho=-0.7,
+    drift_pct=0.0,
+):
+    """Heston stochastic volatility model for crypto binary options.
+
+    Uses the semi-closed-form characteristic function approach with numerical
+    integration (scipy.integrate.quad) to compute P(S_T > K).
+
+    Parameters:
+        current_price: Current spot price
+        threshold: Strike price
+        v0: Initial variance (e.g., 0.25 = 50% vol)
+        kappa: Mean-reversion speed of variance
+        theta: Long-run variance
+        xi: Vol-of-vol (volatility of variance process)
+        rho: Correlation between price and vol Brownian motions
+        drift_pct: Annualized drift (decimal)
+
+    Returns:
+        float: Probability in [0.001, 0.999]
+    """
+    import numpy as np
+    from scipy import integrate
+
+    T = time_horizon_minutes / (365.25 * 24 * 60)
+    if T <= 0:
+        if direction == "above":
+            return 0.999 if current_price > threshold else 0.001
+        return 0.999 if current_price < threshold else 0.001
+
+    S = current_price
+    K = threshold
+    mu = drift_pct
+    x = math.log(S / K)
+
+    def heston_cf(phi, j):
+        """Heston characteristic function for P1 (j=1) and P2 (j=2)."""
+        if j == 1:
+            u = 0.5
+            b = kappa - rho * xi
+        else:
+            u = -0.5
+            b = kappa
+
+        d = np.sqrt((rho * xi * 1j * phi - b) ** 2 - xi ** 2 * (2 * u * 1j * phi - phi ** 2))
+        g = (b - rho * xi * 1j * phi + d) / (b - rho * xi * 1j * phi - d)
+
+        if abs(g) > 1e10:
+            C = 0.0
+            D = 0.0
+        else:
+            exp_dT = np.exp(d * T)
+            C = mu * 1j * phi * T + (kappa * theta / xi ** 2) * (
+                (b - rho * xi * 1j * phi + d) * T - 2 * np.log((1 - g * exp_dT) / (1 - g))
+            )
+            D = ((b - rho * xi * 1j * phi + d) / xi ** 2) * (1 - exp_dT) / (1 - g * exp_dT)
+
+        return np.exp(C + D * v0 + 1j * phi * x)
+
+    def integrand_p(phi, j):
+        """Integrand for P_j = 0.5 + (1/pi) * integral."""
+        cf = heston_cf(phi, j)
+        return np.real(np.exp(-1j * phi * 0) * cf / (1j * phi))
+
+    # Numerical integration with error handling
+    try:
+        int1, _ = integrate.quad(lambda phi: integrand_p(phi, 1), 1e-8, 200, limit=100)
+        int2, _ = integrate.quad(lambda phi: integrand_p(phi, 2), 1e-8, 200, limit=100)
+        P1 = 0.5 + int1 / math.pi
+        P2 = 0.5 + int2 / math.pi
+    except Exception:
+        # Fallback to GBM if Heston integration fails
+        vol = math.sqrt(v0)
+        return crypto_price_probability(
+            current_price, threshold, direction,
+            time_horizon_minutes, realized_vol_pct=vol, drift_pct=drift_pct,
+        )
+
+    # For binary: P(S_T > K) = P2 (risk-neutral probability)
+    prob_above = max(0.001, min(0.999, P2))
+
+    if direction == "above":
+        return prob_above
+    return max(0.001, min(0.999, 1.0 - prob_above))
+
+
 # ─── Longshot bias model ───
 
 # Category-specific Becker (2025) parameters: (amplitude, decay_rate)
