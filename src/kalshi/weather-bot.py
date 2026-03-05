@@ -6,7 +6,7 @@ Scans KXHIGH temperature markets, compares to Open-Meteo forecasts, and places t
 import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary
+from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
 from probability import weather_probability, weather_sigma, ensemble_weather_probability, ensemble_spread_sigma_multiplier, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, _load_calibration
 from ticker_utils import parse_weather_ticker as parse_ticker
 from capital_allocator import PortfolioAllocator
@@ -190,28 +190,27 @@ def scan_and_trade():
             days_out = 0
 
         # Compute probability — ensemble or single-model
+        spread_mult = 1.0
         if ENSEMBLE_ENABLED and isinstance(forecast_data, dict):
             if not forecast_data:
                 ss.skip("empty_forecast")
                 continue
-            our_prob = ensemble_weather_probability(forecast_data, parsed["threshold"], parsed["direction"], days_out, city=city)
             valid_temps = [t for t in forecast_data.values() if t is not None]
             forecast_temp = sum(valid_temps) / len(valid_temps) if valid_temps else None  # mean for logging
             if forecast_temp is None:
                 ss.skip("null_forecast")
                 continue
+            # Compute spread multiplier once — widens sigma AND gates edge
+            if len(valid_temps) >= 2:
+                spread = max(valid_temps) - min(valid_temps)
+                spread_mult = ensemble_spread_sigma_multiplier(spread)
+                if spread_mult > 1.0:
+                    log.info(f"  {ticker}: ensemble spread {spread:.1f}F (sigma_mult={spread_mult:.2f})")
+            our_prob = ensemble_weather_probability(forecast_data, parsed["threshold"], parsed["direction"], days_out, city=city, sigma_multiplier=spread_mult)
             if our_prob is None:
                 # Ensemble failed (zero weight) — fall back to single-model
                 log.warning("Ensemble returned None for %s, falling back to single-model", ticker)
                 our_prob = compute_probability(forecast_temp, parsed["threshold"], parsed["direction"], days_out, city=city)
-            # Gate on ensemble spread — when models disagree, require extra edge
-            if len(valid_temps) >= 2:
-                spread = max(valid_temps) - min(valid_temps)
-                spread_mult = ensemble_spread_sigma_multiplier(spread)
-                if spread_mult > 1.5 and config["edgeThreshold"] > 0:
-                    # High model disagreement: require 2x edge threshold
-                    min_edge_for_spread = config["edgeThreshold"] * 2
-                    log.info(f"  {ticker}: ensemble spread {spread:.1f}F (mult={spread_mult:.2f}), min edge -> {min_edge_for_spread*100:.0f}%")
         else:
             if isinstance(forecast_data, dict):
                 if not forecast_data:
@@ -258,14 +257,10 @@ def scan_and_trade():
             ss.skip("no_price")
             continue
 
-        # Adjust edge threshold for high ensemble spread
+        # Adjust edge threshold for high ensemble spread (defense in depth)
         effective_edge_threshold = config["edgeThreshold"]
-        if ENSEMBLE_ENABLED and isinstance(forecast_data, dict) and len([t for t in forecast_data.values() if t is not None]) >= 2:
-            temps = [t for t in forecast_data.values() if t is not None]
-            spread = max(temps) - min(temps)
-            spread_mult = ensemble_spread_sigma_multiplier(spread)
-            if spread_mult > 1.5:
-                effective_edge_threshold = config["edgeThreshold"] * 2
+        if spread_mult > 1.5:
+            effective_edge_threshold = config["edgeThreshold"] * 2
 
         if edge_yes >= effective_edge_threshold:
             side = "yes" if our_prob > 0.5 else "no"
@@ -452,6 +447,9 @@ def main():
             import traceback; traceback.print_exc()
 
         interval = config["scanIntervalMinutes"]
+        if is_shutdown_requested():
+            log.info("Graceful shutdown requested, exiting.")
+            break
         log.info(f"\nNext scan in {interval} minutes...")
         time.sleep(interval * 60)
 

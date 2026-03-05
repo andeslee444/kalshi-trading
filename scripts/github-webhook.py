@@ -3,8 +3,13 @@
 
 Runs on port 3458, exposed via Cloudflare tunnel at deploy.andeslee.com.
 GitHub sends POST /webhook on every push, this script runs the auto-pull script.
+
+Usage:
+    python3 scripts/github-webhook.py                  # default (warn if no secret)
+    python3 scripts/github-webhook.py --require-secret  # exit if no secret set
 """
 
+import argparse
 import hashlib
 import hmac
 import json
@@ -14,13 +19,12 @@ import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 PORT = 3458
-WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
-if not WEBHOOK_SECRET:
-    print("WARNING: GITHUB_WEBHOOK_SECRET not set — webhook signature verification disabled")
-    print("Set GITHUB_WEBHOOK_SECRET env var for production security")
 AUTO_PULL_SCRIPT = "/Users/andeslee/.openclaw/workspace/scripts/github-auto-pull.sh"
 RELOAD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reload-bots.sh")
 LOG = "/tmp/github-webhook.log"
+
+# Module-level — set by main() after arg parsing
+WEBHOOK_SECRET = ""
 
 
 def log(msg):
@@ -112,7 +116,27 @@ class WebhookHandler(BaseHTTPRequestHandler):
         pass  # Suppress default HTTP logging
 
 
-if __name__ == "__main__":
+def main(args=None):
+    """Entry point. Parses args and starts the webhook server."""
+    global WEBHOOK_SECRET
+
+    parser = argparse.ArgumentParser(description="GitHub webhook listener")
+    parser.add_argument("--require-secret", action="store_true",
+                        help="Exit with error if GITHUB_WEBHOOK_SECRET is not set")
+    parsed = parser.parse_args(args)
+
+    WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+
+    if parsed.require_secret and not WEBHOOK_SECRET:
+        print("ERROR: --require-secret set but GITHUB_WEBHOOK_SECRET env var is empty.",
+              file=sys.stderr)
+        print("Set GITHUB_WEBHOOK_SECRET for production security.", file=sys.stderr)
+        sys.exit(1)
+
+    if not WEBHOOK_SECRET:
+        print("WARNING: GITHUB_WEBHOOK_SECRET not set — webhook signature verification disabled")
+        print("Set GITHUB_WEBHOOK_SECRET env var for production security")
+
     log(f"Starting webhook listener on port {PORT}")
     server = HTTPServer(("127.0.0.1", PORT), WebhookHandler)
     try:
@@ -120,3 +144,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log("Shutting down")
         server.server_close()
+
+
+if __name__ == "__main__":
+    main()

@@ -25,6 +25,7 @@ def _load_economics_bot():
     fake_auth.KalshiClient = lambda *a, **kw: MagicMock()
     fake_auth.setup_unbuffered = lambda: None
     fake_auth.setup_signal_handlers = lambda: None
+    fake_auth.is_shutdown_requested = lambda: False
     fake_auth.setup_logging = lambda *a, **kw: __import__("logging").getLogger("test")
     fake_auth.PROJECT_DIR = Path(__file__).resolve().parent.parent
     fake_auth.retry_request = lambda *a, **kw: MagicMock()

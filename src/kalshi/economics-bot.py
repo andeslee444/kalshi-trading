@@ -19,6 +19,7 @@ from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot,
     HealthCheckMonitor, OrderMonitor, ScanSummary,
+    is_shutdown_requested,
 )
 from probability import (
     econ_nowcast_probability, cpi_nowcast_sigma, quarter_kelly, compute_limit_price,
@@ -936,6 +937,9 @@ def main():
             log.error(f"Scan error: {e}")
             traceback.print_exc()
 
+        if is_shutdown_requested():
+            log.info("Graceful shutdown requested, exiting.")
+            break
         log.info(f"\nNext scan in {SCAN_INTERVAL} minutes...")
         time.sleep(SCAN_INTERVAL * 60)
 

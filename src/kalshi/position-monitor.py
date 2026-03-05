@@ -20,7 +20,7 @@ from kalshi_auth import (
     PROJECT_DIR, TradeManager, trim_trade_log, CITY_TIMEZONES, _local_today,
     round_half_up, retry_request, fetch_parallel, HealthCheckMonitor,
     load_trades, _atomic_write_json, ScanSummary,
-    notify_whatsapp,
+    notify_whatsapp, is_shutdown_requested,
 )
 from probability import weather_probability, nws_probability, half_kelly, kalshi_fee_cents, crypto_price_probability
 from ticker_utils import parse_weather_ticker as parse_temp_ticker, parse_crypto_ticker
@@ -395,6 +395,38 @@ def _fetch_nws_running_high(city_code):
     return None
 
 
+def _get_latest_crypto_vol(asset):
+    """Read the latest realized vol for an asset from crypto-bot's decision log.
+
+    Returns vol as a decimal (e.g. 0.55) or None if data is missing/stale (>4h).
+    """
+    decisions_path = PROJECT_DIR / "data" / "crypto-decisions.json"
+    try:
+        if not decisions_path.exists():
+            return None
+        decisions = json.loads(decisions_path.read_text())
+        # Find most recent decision for this asset with vol_used
+        for d in reversed(decisions[-100:]):  # check last 100 decisions
+            if d.get("asset", "").upper() == asset.upper() and "vol_used" in d:
+                # Check staleness
+                ts = d.get("timestamp") or d.get("time")
+                if ts:
+                    try:
+                        dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        age_hours = (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds() / 3600
+                        if age_hours > 4:
+                            log.debug(f"  Crypto vol for {asset} is {age_hours:.1f}h stale, ignoring")
+                            return None
+                    except (ValueError, TypeError):
+                        pass
+                vol = d["vol_used"]
+                if isinstance(vol, (int, float)) and 0 < vol < 5:
+                    return vol
+    except (json.JSONDecodeError, OSError, KeyError):
+        pass
+    return None
+
+
 def _compute_current_probability(ticker, source_bot, entry_side):
     """Recompute probability using the model that opened this position.
 
@@ -446,14 +478,16 @@ def _compute_current_probability(ticker, source_bot, entry_side):
                 minutes_to_settle = max(1, int((close_dt - now).total_seconds() / 60))
             except (ValueError, TypeError):
                 pass
+        # Use crypto-bot's latest realized vol if available and fresh
+        vol = _get_latest_crypto_vol(asset) or 0.50
         prob = crypto_price_probability(
             price, parsed["threshold"], "above",
             time_horizon_minutes=minutes_to_settle,
-            realized_vol_pct=0.50,  # use conservative default vol
+            realized_vol_pct=vol,
         )
         side_prob = prob if entry_side == "yes" else 1.0 - prob
         return (side_prob,
-                f"Crypto {asset} spot ${price:,.0f}, model P(YES)={prob*100:.0f}%, T={minutes_to_settle}min")
+                f"Crypto {asset} spot ${price:,.0f}, vol={vol*100:.0f}%, model P(YES)={prob*100:.0f}%, T={minutes_to_settle}min")
 
     # Entertainment/beatrelease: no live data source to recompute
     if source_bot in ("entertainment", "beatrelease"):
@@ -873,6 +907,9 @@ def main():
             log.error(f"Scan error: {e}")
             traceback.print_exc()
 
+        if is_shutdown_requested():
+            log.info("Graceful shutdown requested, exiting.")
+            break
         log.info(f"\nNext scan in {SCAN_INTERVAL} minutes...")
         time.sleep(SCAN_INTERVAL * 60)
 

@@ -12,7 +12,7 @@ Sources:
 import json, time, datetime, os, sys, re, hashlib, traceback
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary
+from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, quarter_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, nws_sigma_for_hour
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
 from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_threshold, check_sanity_health
@@ -1223,6 +1223,9 @@ def main():
             log.error(f"Main loop error: {e}")
             traceback.print_exc()
 
+        if is_shutdown_requested():
+            log.info("Graceful shutdown requested, exiting.")
+            break
         time.sleep(30)
 
 

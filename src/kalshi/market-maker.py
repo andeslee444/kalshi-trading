@@ -20,8 +20,9 @@ from pathlib import Path
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, TradeManager, trim_trade_log, build_market_snapshot,
+    is_shutdown_requested,
 )
-from probability import weather_probability, is_market_liquid
+from probability import weather_probability, is_market_liquid, _probit, _norm_pdf
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -167,12 +168,25 @@ def estimate_order_arrival_rate(market):
     return volume / 8
 
 
-def estimate_market_sigma(market):
+def estimate_market_sigma(market, mid_price=None):
     """Estimate price volatility independently of current spread.
 
     Uses weather model sigma for KXHIGH markets (converted to cents),
     fixed defaults for crypto/other. This avoids circular logic where
     sigma was derived FROM the spread and then used to compute the spread.
+
+    For KXHIGH markets with a valid mid_price, uses the CDF derivative
+    formula for nonlinear price-space conversion:
+        price_sigma = temp_sigma_F * phi(probit(mid/100)) * 100
+
+    This correctly captures that price sensitivity varies with mid:
+    - At mid=50c: max sensitivity (phi(0)=0.399)
+    - At mid=10c/90c: lower sensitivity (correct for deep OTM/ITM)
+
+    Args:
+        market: market dict from API.
+        mid_price: midpoint price in cents (0-100). Enables CDF derivative
+            conversion for KXHIGH markets.
 
     Returns sigma in cents.
     """
@@ -191,9 +205,16 @@ def estimate_market_sigma(market):
                 try:
                     market_date = datetime.date(2000 + yr, month, day)
                     days_out = max(0, (market_date - datetime.date.today()).days)
-                    # Weather sigma: intercept + slope * sqrt(days_out) (matching probability.py)
                     weather_sigma_f = 2.0 + 0.5 * math.sqrt(max(1, days_out))
-                    # Convert F uncertainty to price-cents uncertainty (~4 cents per degree F)
+
+                    # CDF derivative conversion when mid_price is available
+                    if mid_price is not None and 1 < mid_price < 99:
+                        p = mid_price / 100.0
+                        z = _probit(p)
+                        price_sigma = weather_sigma_f * _norm_pdf(z) * 100
+                        return max(2, round(price_sigma))
+
+                    # Fallback: linear approximation
                     return max(2, round(weather_sigma_f * 4))
                 except (ValueError, TypeError):
                     pass
@@ -314,7 +335,7 @@ def scan_and_quote():
 
         mid = (yes_bid + yes_ask) / 2
         inventory = get_current_inventory(ticker)
-        sigma = estimate_market_sigma(m)
+        sigma = estimate_market_sigma(m, mid_price=mid)
         hours_to_settle = estimate_hours_to_settlement(m)
 
         # Skip markets too close to settlement (spread widens, risk increases)
@@ -460,6 +481,9 @@ def main():
             log.error(f"Scan error: {e}")
             traceback.print_exc()
 
+        if is_shutdown_requested():
+            log.info("Graceful shutdown requested, exiting.")
+            break
         log.info(f"\nNext scan in {SCAN_INTERVAL} minutes...")
         time.sleep(SCAN_INTERVAL * 60)
 

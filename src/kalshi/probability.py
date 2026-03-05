@@ -18,6 +18,73 @@ def _norm_cdf(x):
     return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
 
+def _norm_pdf(x):
+    """Standard normal PDF. phi(x) = exp(-x^2/2) / sqrt(2*pi)."""
+    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+
+def _probit(p):
+    """Inverse normal CDF (probit function) via Acklam rational approximation.
+
+    Accurate to ~1e-4 for p in (0.001, 0.999). Returns z such that
+    _norm_cdf(z) ≈ p. Used for price-space sigma in market maker.
+
+    Args:
+        p: probability in (0, 1).
+
+    Returns:
+        z-score (float). Clamped for p outside (0.001, 0.999).
+    """
+    # Clamp to avoid numerical issues at extremes
+    p = max(0.001, min(0.999, p))
+
+    # Acklam rational approximation coefficients
+    a1 = -3.969683028665376e+01
+    a2 = 2.209460984245205e+02
+    a3 = -2.759285104469687e+02
+    a4 = 1.383577518672690e+02
+    a5 = -3.066479806614716e+01
+    a6 = 2.506628277459239e+00
+
+    b1 = -5.447609879822406e+01
+    b2 = 1.615858368580409e+02
+    b3 = -1.556989798598866e+02
+    b4 = 6.680131188771972e+01
+    b5 = -1.328068155288572e+01
+
+    c1 = -7.784894002430293e-03
+    c2 = -3.223964580411365e-01
+    c3 = -2.400758277161838e+00
+    c4 = -2.549732539343734e+00
+    c5 = 4.374664141464968e+00
+    c6 = 2.938163982698783e+00
+
+    d1 = 7.784695709041462e-03
+    d2 = 3.224671290700398e-01
+    d3 = 2.445134137142996e+00
+    d4 = 3.754408661907416e+00
+
+    p_low = 0.02425
+    p_high = 1 - p_low
+
+    if p < p_low:
+        # Rational approximation for lower region
+        q = math.sqrt(-2 * math.log(p))
+        return (((((c1*q + c2)*q + c3)*q + c4)*q + c5)*q + c6) / \
+               ((((d1*q + d2)*q + d3)*q + d4)*q + 1)
+    elif p <= p_high:
+        # Rational approximation for central region
+        q = p - 0.5
+        r = q * q
+        return (((((a1*r + a2)*r + a3)*r + a4)*r + a5)*r + a6) * q / \
+               (((((b1*r + b2)*r + b3)*r + b4)*r + b5)*r + 1)
+    else:
+        # Rational approximation for upper region (symmetry)
+        q = math.sqrt(-2 * math.log(1 - p))
+        return -(((((c1*q + c2)*q + c3)*q + c4)*q + c5)*q + c6) / \
+                ((((d1*q + d2)*q + d3)*q + d4)*q + 1)
+
+
 def _ln_gamma(x):
     """Log-gamma via Lanczos approximation (g=7, n=9). No scipy needed."""
     if x <= 0:
@@ -157,7 +224,8 @@ def _reset_calibration():
 
 # ─── Probability models ───
 
-def weather_probability(forecast_temp, threshold, direction, days_out=0, city=None):
+def weather_probability(forecast_temp, threshold, direction, days_out=0, city=None,
+                        sigma_override=None):
     """CDF-based probability for KXHIGH weather markets.
 
     sigma scales with forecast horizon: sigma = intercept + slope * sqrt(days_out)
@@ -166,6 +234,10 @@ def weather_probability(forecast_temp, threshold, direction, days_out=0, city=No
 
     If config/calibration.json exists with per-city or global sigma parameters,
     those override the defaults.
+
+    Args:
+        sigma_override: when set, replaces the computed sigma entirely.
+            Used by ensemble to pass spread-adjusted sigma.
 
     direction="T": P(actual > threshold) = 1 - Phi((threshold - forecast) / sigma)
     direction="B": P(threshold <= actual < threshold+1) = Phi((threshold+1 - forecast)/sigma) - Phi((threshold - forecast)/sigma)
@@ -187,6 +259,10 @@ def weather_probability(forecast_temp, threshold, direction, days_out=0, city=No
         slope = weather_cal.get("global_sigma_slope", slope)
 
     sigma = max(0.5, intercept + slope * math.sqrt(max(0, days_out)))
+
+    # Allow callers (e.g. ensemble) to override sigma entirely
+    if sigma_override is not None and sigma_override > 0:
+        sigma = sigma_override
 
     # Degrees of freedom for Student's t (fat tails for forecast errors)
     df = weather_cal.get("df", 6)
@@ -224,7 +300,28 @@ def weather_sigma(days_out=0, city=None):
     return max(0.5, intercept + slope * math.sqrt(max(0, days_out)))
 
 
-def ensemble_weather_probability(forecasts, threshold, direction, days_out=0, city=None):
+def _load_backtest_brier():
+    """Load per-model Brier scores from backtest results for BMA weighting.
+
+    Returns dict like {"gfs": 0.15, "ecmwf": 0.12, "icon": 0.18} or None
+    if data isn't available.
+    """
+    backtest_path = Path(__file__).resolve().parent.parent.parent / "data" / "backtest-results.json"
+    try:
+        if backtest_path.exists():
+            data = json.loads(backtest_path.read_text())
+            per_model = data.get("weather", {}).get("per_model_brier")
+            if per_model and isinstance(per_model, dict):
+                # Validate all values are positive numbers
+                if all(isinstance(v, (int, float)) and v > 0 for v in per_model.values()):
+                    return per_model
+    except (json.JSONDecodeError, OSError, KeyError):
+        pass
+    return None
+
+
+def ensemble_weather_probability(forecasts, threshold, direction, days_out=0, city=None,
+                                 sigma_multiplier=1.0):
     """Weighted ensemble averaging (linear opinion pool) for KXHIGH weather markets.
 
     Combines GFS, ECMWF, and ICON forecasts with calibrated weights.
@@ -238,6 +335,8 @@ def ensemble_weather_probability(forecasts, threshold, direction, days_out=0, ci
         direction: "T" (above threshold) or "B" (bracket).
         days_out: forecast horizon in days.
         city: city code for calibration lookup.
+        sigma_multiplier: multiplier applied to base sigma (default 1.0).
+            Values > 1 widen the distribution (more conservative).
 
     Returns:
         Weighted average probability (0-1).
@@ -245,16 +344,38 @@ def ensemble_weather_probability(forecasts, threshold, direction, days_out=0, ci
     cal = _load_calibration()
     ensemble_cal = cal.get("ensemble", {})
 
-    # Horizon-dependent default weights:
-    # GFS outperforms at day 0-1, ECMWF outperforms at day 3-7
-    if days_out <= 1:
-        default_weights = {"gfs": 0.50, "ecmwf": 0.35, "icon": 0.15}
-    elif days_out <= 3:
-        default_weights = {"gfs": 0.35, "ecmwf": 0.45, "icon": 0.20}
-    else:
-        default_weights = {"gfs": 0.30, "ecmwf": 0.45, "icon": 0.25}
-    # Calibration.json weights still override these defaults
-    weights = ensemble_cal.get("weights", default_weights)
+    # Try Brier-weighted BMA: weights proportional to 1/brier_score
+    brier_data = _load_backtest_brier()
+    if brier_data:
+        inv_brier = {}
+        for model_name in forecasts:
+            if model_name in brier_data:
+                inv_brier[model_name] = 1.0 / brier_data[model_name]
+        if len(inv_brier) >= 2:
+            total_inv = sum(inv_brier.values())
+            weights = {k: v / total_inv for k, v in inv_brier.items()}
+            _log.debug("BMA weights from Brier: %s", weights)
+        else:
+            # Not enough Brier data — fall back to static weights
+            brier_data = None
+
+    if not brier_data:
+        # Horizon-dependent default weights:
+        # GFS outperforms at day 0-1, ECMWF outperforms at day 3-7
+        if days_out <= 1:
+            default_weights = {"gfs": 0.50, "ecmwf": 0.35, "icon": 0.15}
+        elif days_out <= 3:
+            default_weights = {"gfs": 0.35, "ecmwf": 0.45, "icon": 0.20}
+        else:
+            default_weights = {"gfs": 0.30, "ecmwf": 0.45, "icon": 0.25}
+        # Calibration.json weights still override these defaults
+        weights = ensemble_cal.get("weights", default_weights)
+
+    # Compute sigma_override if multiplier != 1.0
+    sigma_kwarg = {}
+    if sigma_multiplier != 1.0 and sigma_multiplier > 0:
+        base_sigma = weather_sigma(days_out, city)
+        sigma_kwarg["sigma_override"] = base_sigma * sigma_multiplier
 
     total_weight = 0.0
     weighted_prob = 0.0
@@ -263,7 +384,7 @@ def ensemble_weather_probability(forecasts, threshold, direction, days_out=0, ci
         w = weights.get(model_name, 0.0)
         if w <= 0:
             continue
-        prob = weather_probability(temp, threshold, direction, days_out, city=city)
+        prob = weather_probability(temp, threshold, direction, days_out, city=city, **sigma_kwarg)
         if prob is None:
             continue
         weighted_prob += w * prob
@@ -426,11 +547,14 @@ def album_data_sigma(day_of_week, hours_since_publication=0, source=None):
     return base_sigma
 
 
-def econ_nowcast_probability(nowcast_value, nowcast_sigma, threshold, direction="above"):
+def econ_nowcast_probability(nowcast_value, nowcast_sigma, threshold, direction="above", df=None):
     """CDF-based probability for economics markets (CPI, GDP, Jobs).
 
     Uses nowcast point estimate and its uncertainty (sigma) to compute
     P(actual > threshold) or P(actual < threshold).
+
+    Uses Student-t distribution (default df=5) for fatter tails — CPI/GDP
+    surprise prints at 3+ sigma happen far more often than Gaussian predicts.
 
     Args:
         nowcast_value: nowcast point estimate (e.g. 3.2% for CPI).
@@ -438,6 +562,8 @@ def econ_nowcast_probability(nowcast_value, nowcast_sigma, threshold, direction=
         threshold: market threshold value.
         direction: "above" for P(actual > threshold),
                    "below" for P(actual < threshold).
+        df: degrees of freedom for Student-t (None = load from calibration, default 5).
+            Set df >= 500 for approximately Gaussian behavior.
 
     Returns:
         Probability (0-1).
@@ -446,7 +572,17 @@ def econ_nowcast_probability(nowcast_value, nowcast_sigma, threshold, direction=
         return 1.0 if nowcast_value > threshold else 0.0
 
     z = (threshold - nowcast_value) / nowcast_sigma
-    prob_above = 1.0 - _norm_cdf(z)
+
+    # Load df from calibration if not explicitly provided
+    if df is None:
+        cal = _load_calibration()
+        df = cal.get("economics", {}).get("df", 5)
+
+    # Validate df range
+    if not isinstance(df, (int, float)) or df < 2 or df > 500:
+        df = 5
+
+    prob_above = 1.0 - _student_t_cdf(z, df)
 
     if direction == "below":
         return 1.0 - prob_above
@@ -469,20 +605,31 @@ def cpi_nowcast_sigma(days_to_release):
         if key in cpi_cal:
             return cpi_cal[key]
 
-    # Fallback heuristic: step function matching documented behavior
-    # ~0.10% at 14d, ~0.06% at 7d, ~0.04% at 3d, 0.03% at 1d/release
-    if days_to_release <= 0:
-        return 0.03
-    elif days_to_release <= 1:
-        return 0.03
-    elif days_to_release <= 3:
-        return 0.04
-    elif days_to_release <= 7:
-        return 0.06
-    elif days_to_release <= 14:
-        return 0.10
-    else:
-        return 0.10
+    # Fallback: continuous exponential decay
+    # sigma = 0.03 + 0.07 * (1 - exp(-0.20 * d))
+    # d=0: 0.03, d=7: ~0.083, d=14: ~0.096, monotone increasing
+    d = max(0, days_to_release)
+    return 0.03 + 0.07 * (1 - math.exp(-0.20 * d))
+
+
+def gdp_nowcast_sigma(days_to_release):
+    """Exponential decay for GDP nowcast uncertainty based on time to release.
+
+    Returns sigma in percentage points. Wider range than CPI (GDP is noisier).
+    floor=0.05 at release, range=0.15, k=0.12.
+
+    sigma = 0.05 + 0.15 * (1 - exp(-0.12 * d))
+    d=0: 0.05, d=7: ~0.107, d=14: ~0.131, d=30: ~0.172
+    """
+    cal = _load_calibration()
+    gdp_cal = cal.get("gdp", {}).get("sigma_by_days", {})
+    if gdp_cal:
+        key = str(min(30, max(0, days_to_release)))
+        if key in gdp_cal:
+            return gdp_cal[key]
+
+    d = max(0, days_to_release)
+    return 0.05 + 0.15 * (1 - math.exp(-0.12 * d))
 
 
 def boxoffice_data_sigma(day_of_week, hours_since_publication=0):

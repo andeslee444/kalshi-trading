@@ -25,6 +25,7 @@ def _load_weather_bot():
     fake_auth.KalshiClient = lambda *a, **kw: None
     fake_auth.setup_unbuffered = lambda: None
     fake_auth.setup_signal_handlers = lambda: None
+    fake_auth.is_shutdown_requested = lambda: False
     fake_auth.setup_logging = lambda *a, **kw: __import__("logging").getLogger("test")
     fake_auth.PROJECT_DIR = Path("/tmp/fake_project")
     fake_auth.load_trades = lambda *a, **kw: []

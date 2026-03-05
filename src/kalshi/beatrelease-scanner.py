@@ -14,7 +14,7 @@ import requests
 from pathlib import Path
 from bs4 import BeautifulSoup
 
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, notify_whatsapp, _atomic_write_json, HealthCheckMonitor, ScanSummary, load_trades
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, notify_whatsapp, _atomic_write_json, HealthCheckMonitor, ScanSummary, load_trades, is_shutdown_requested
 from capital_allocator import PortfolioAllocator
 
 # Unbuffered output
@@ -650,7 +650,7 @@ def scan_cycle():
                     # Estimate confidence from how far the blog's limit price is from market
                     # A blog willing to pay 40c for a market at 30c implies 10c of conviction
                     price_edge = abs(limit_price - actual_price) / 100.0
-                    blog_confidence = min(0.95, max(0.55, 0.50 + price_edge * 2.0))
+                    blog_confidence = min(0.95, max(0.51, 0.50 + price_edge * 1.5))
                 edge = blog_confidence - actual_price / 100.0
             else:  # no
                 actual_price = no_ask if no_ask and no_ask > 0 else limit_price
@@ -669,7 +669,7 @@ def scan_cycle():
                     # Estimate confidence from how far the blog's limit price is from market
                     # A blog willing to pay 40c for a market at 30c implies 10c of conviction
                     price_edge = abs(limit_price - actual_price) / 100.0
-                    blog_confidence = min(0.95, max(0.55, 0.50 + price_edge * 2.0))
+                    blog_confidence = min(0.95, max(0.51, 0.50 + price_edge * 1.5))
                 edge = blog_confidence - actual_price / 100.0
 
             # Discount LLM-stated confidence — blog posts are systematically overconfident
@@ -781,6 +781,9 @@ def run_daemon():
             import traceback
             traceback.print_exc()
 
+        if is_shutdown_requested():
+            log.info("Graceful shutdown requested, exiting.")
+            break
         log.info(f"\nSleeping {CHECK_INTERVAL_HOURS}h until next check...")
         time.sleep(CHECK_INTERVAL_HOURS * 3600)
 

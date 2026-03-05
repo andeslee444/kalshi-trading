@@ -20,6 +20,7 @@ from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot,
     HealthCheckMonitor, OrderMonitor, _atomic_write_json, ScanSummary,
+    is_shutdown_requested,
 )
 from probability import (
     crypto_price_probability, crypto_price_probability_jd,
@@ -55,6 +56,13 @@ USE_OU = crypto_config.get("useOrnsteinUhlenbeck", False)
 OU_HALF_LIFE = crypto_config.get("ouHalfLifeMinutes", 120)
 DRIFT_PCT = crypto_config.get("driftPct", 0.0)
 USE_JD = crypto_config.get("useJumpDiffusion", False)
+JD_CONFIG = crypto_config.get("jumpDiffusion", {})
+JD_PARAMS = {
+    "jump_intensity": JD_CONFIG.get("jumpIntensity", 1.0),
+    "jump_mean": JD_CONFIG.get("jumpMean", -0.05),
+    "jump_std": JD_CONFIG.get("jumpStd", 0.10),
+    "max_jumps": JD_CONFIG.get("maxJumps", 10),
+}
 MID_RANGE_EDGE_THRESHOLD = crypto_config.get("midRangeEdgeThreshold", 0.15)
 MID_RANGE_BAND = (
     crypto_config.get("midRangeLow", 0.25),
@@ -303,6 +311,57 @@ def _parse_bracket_range(ticker, asset, markets):
     return 1000 if asset == "BTC" else 100  # fallback defaults
 
 
+def _compute_crypto_prob(prob_fn_args, direction, ticker, asset, all_markets):
+    """Compute crypto probability for T-direction or bracket, with optional JD comparison.
+
+    Returns (prob, debug_info_dict).
+    """
+    debug = {}
+    if direction == "T":
+        if USE_JD:
+            prob = crypto_price_probability_jd(**prob_fn_args, **JD_PARAMS)
+            gbm_prob = crypto_price_probability(
+                **prob_fn_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
+            )
+            debug["jd_prob"] = prob
+            debug["gbm_prob"] = gbm_prob
+            if abs(prob - gbm_prob) > 0.05:
+                log.info(f"  {ticker}: JD={prob*100:.1f}% vs GBM={gbm_prob*100:.1f}% (diff={abs(prob-gbm_prob)*100:.1f}pp)")
+        else:
+            prob = crypto_price_probability(
+                **prob_fn_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
+            )
+    else:
+        # Bracket: probability price lands in [threshold, threshold+range)
+        range_size = _parse_bracket_range(ticker, asset, all_markets)
+        high_args = dict(prob_fn_args, threshold=prob_fn_args["threshold"] + range_size)
+        if USE_JD:
+            prob_above_low = crypto_price_probability_jd(**prob_fn_args, **JD_PARAMS)
+            prob_above_high = crypto_price_probability_jd(**high_args, **JD_PARAMS)
+            gbm_low = crypto_price_probability(
+                **prob_fn_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
+            )
+            gbm_high = crypto_price_probability(
+                **high_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
+            )
+            gbm_bracket = gbm_low - gbm_high
+            jd_bracket = prob_above_low - prob_above_high
+            debug["jd_bracket"] = jd_bracket
+            debug["gbm_bracket"] = gbm_bracket
+            if abs(jd_bracket - gbm_bracket) > 0.05:
+                log.info(f"  {ticker}: JD bracket={jd_bracket*100:.1f}% vs GBM={gbm_bracket*100:.1f}% (diff={abs(jd_bracket-gbm_bracket)*100:.1f}pp)")
+        else:
+            prob_above_low = crypto_price_probability(
+                **prob_fn_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
+            )
+            prob_above_high = crypto_price_probability(
+                **high_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
+            )
+        prob = prob_above_low - prob_above_high
+
+    return prob, debug
+
+
 # === Scanning ===
 
 def scan_and_trade():
@@ -461,43 +520,7 @@ def scan_and_trade():
             realized_vol_pct=vol_to_use, iv_pct=None,
             drift_pct=drift,
         )
-        if direction == "T":
-            if USE_JD:
-                prob = crypto_price_probability_jd(**prob_fn_args)
-                gbm_prob = crypto_price_probability(
-                    **prob_fn_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
-                )
-                if abs(prob - gbm_prob) > 0.05:
-                    log.info(f"  {ticker}: JD={prob*100:.1f}% vs GBM={gbm_prob*100:.1f}% (diff={abs(prob-gbm_prob)*100:.1f}pp)")
-            else:
-                prob = crypto_price_probability(
-                    **prob_fn_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
-                )
-        else:
-            # Bracket: probability price lands in [threshold, threshold+range)
-            range_size = _parse_bracket_range(ticker, asset, all_markets)
-            high_args = dict(prob_fn_args, threshold=threshold + range_size)
-            if USE_JD:
-                prob_above_low = crypto_price_probability_jd(**prob_fn_args)
-                prob_above_high = crypto_price_probability_jd(**high_args)
-                gbm_low = crypto_price_probability(
-                    **prob_fn_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
-                )
-                gbm_high = crypto_price_probability(
-                    **high_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
-                )
-                gbm_bracket = gbm_low - gbm_high
-                jd_bracket = prob_above_low - prob_above_high
-                if abs(jd_bracket - gbm_bracket) > 0.05:
-                    log.info(f"  {ticker}: JD bracket={jd_bracket*100:.1f}% vs GBM={gbm_bracket*100:.1f}% (diff={abs(jd_bracket-gbm_bracket)*100:.1f}pp)")
-            else:
-                prob_above_low = crypto_price_probability(
-                    **prob_fn_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
-                )
-                prob_above_high = crypto_price_probability(
-                    **high_args, use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
-                )
-            prob = prob_above_low - prob_above_high
+        prob, _debug = _compute_crypto_prob(prob_fn_args, direction, ticker, asset, all_markets)
 
         # Particle filter: update belief state and use filtered prob
         pf = filter_mgr.get_filter(ticker)
@@ -705,6 +728,9 @@ def main():
             log.error(f"Scan error: {e}")
             traceback.print_exc()
 
+        if is_shutdown_requested():
+            log.info("Graceful shutdown requested, exiting.")
+            break
         log.info(f"\nNext scan in {SCAN_INTERVAL} minutes...")
         time.sleep(SCAN_INTERVAL * 60)
 

@@ -106,6 +106,7 @@ def _load_position_monitor():
     fake_auth.KalshiClient = lambda *a, **kw: fake_client
     fake_auth.setup_unbuffered = lambda: None
     fake_auth.setup_signal_handlers = lambda: None
+    fake_auth.is_shutdown_requested = lambda: False
     fake_auth.setup_logging = lambda *a, **kw: logging.getLogger("test")
     fake_auth.PROJECT_DIR = Path("/tmp/fake_posmon_exits")
     fake_auth.TradeManager = type("TradeManager", (), {
@@ -153,11 +154,13 @@ def _load_position_monitor():
     fake_prob.half_kelly = lambda *a, **kw: (0, 0)
     fake_prob.weather_probability = lambda *a, **kw: 0.5
     fake_prob.nws_probability = lambda *a, **kw: 0.5
+    fake_prob.crypto_price_probability = lambda *a, **kw: 0.5
     fake_prob.kalshi_fee_cents = lambda p: KALSHI_FEE_RATE * (p / 100) * (1 - p / 100) * 100
     sys.modules["probability"] = fake_prob
 
     fake_ticker = types.ModuleType("ticker_utils")
     fake_ticker.parse_weather_ticker = lambda ticker: None
+    fake_ticker.parse_crypto_ticker = lambda ticker: None
     sys.modules["ticker_utils"] = fake_ticker
 
     fake_alloc = types.ModuleType("capital_allocator")

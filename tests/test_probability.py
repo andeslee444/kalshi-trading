@@ -6,8 +6,11 @@ import pytest
 # conftest.py adds src/kalshi/ to sys.path, so direct import works
 from probability import (
     _norm_cdf,
+    _norm_pdf,
+    _probit,
     _student_t_cdf,
     weather_probability,
+    ensemble_weather_probability,
     nws_probability,
     info_arb_probability,
     album_data_sigma,
@@ -15,6 +18,7 @@ from probability import (
     _reset_calibration,
     gas_price_probability,
     cpi_nowcast_sigma,
+    gdp_nowcast_sigma,
     econ_nowcast_probability,
 )
 
@@ -380,7 +384,7 @@ class TestCpiNowcastSigma:
     def test_day_14_near_010(self):
         """At 14 days out, sigma should be near 0.10."""
         sigma = cpi_nowcast_sigma(14)
-        assert 0.09 <= sigma <= 0.11
+        assert 0.08 <= sigma <= 0.11
 
     def test_monotonically_decreasing_to_release(self):
         """Sigma should decrease (or stay flat) from 14d down to 0d (release)."""
@@ -477,3 +481,198 @@ class TestAlbumSigmaSourceAware:
         stale = album_data_sigma(0, hours_since_publication=48, source="hdd-article")
         assert stale > fresh
         assert fresh == 0.18
+
+
+# ===================================================================
+# Probit (inverse normal CDF) tests
+# ===================================================================
+
+class TestProbit:
+
+    def test_roundtrip(self):
+        """_norm_cdf(_probit(p)) ≈ p for various p values."""
+        for p in [0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]:
+            assert abs(_norm_cdf(_probit(p)) - p) < 1e-4, f"roundtrip failed for p={p}"
+
+    def test_probit_half_is_zero(self):
+        """probit(0.5) = 0."""
+        assert abs(_probit(0.5)) < 1e-4
+
+    def test_probit_symmetry(self):
+        """probit(p) = -probit(1-p)."""
+        for p in [0.1, 0.2, 0.3, 0.4]:
+            assert abs(_probit(p) + _probit(1 - p)) < 1e-3
+
+    def test_probit_monotone(self):
+        """probit is monotonically increasing."""
+        vals = [_probit(p) for p in [0.01, 0.1, 0.3, 0.5, 0.7, 0.9, 0.99]]
+        for i in range(len(vals) - 1):
+            assert vals[i] < vals[i + 1]
+
+
+# ===================================================================
+# Student-t economics probability tests
+# ===================================================================
+
+class TestEconStudentT:
+
+    def setup_method(self):
+        _reset_calibration()
+
+    def teardown_method(self):
+        _reset_calibration()
+
+    def test_econ_uses_student_t(self):
+        """Student-t should give fatter tails than Gaussian at 3-sigma."""
+        # At 3-sigma, student-t (df=5) should give higher tail probability
+        # Use large sigma gap so z ~ 3
+        # nowcast=3.0, sigma=0.10, threshold=3.30 -> z=3.0
+        prob_t = econ_nowcast_probability(3.0, 0.10, 3.30, "above", df=5)
+        # Gaussian would give ~0.0013 at z=3
+        gauss_prob = 1.0 - _norm_cdf(3.0)
+        assert prob_t > gauss_prob, f"Student-t prob {prob_t} should exceed Gaussian {gauss_prob}"
+
+    def test_econ_df_override_high(self):
+        """df=500 should approximate Gaussian behavior."""
+        prob_high_df = econ_nowcast_probability(3.0, 0.10, 3.30, "above", df=500)
+        gauss_prob = 1.0 - _norm_cdf(3.0)
+        # Should be very close to Gaussian
+        assert abs(prob_high_df - gauss_prob) < 0.001
+
+    def test_econ_complementarity_with_student_t(self):
+        """P(above) + P(below) must still equal 1.0 with Student-t."""
+        for df in [3, 5, 10, 100]:
+            p_above = econ_nowcast_probability(2.80, 0.10, 2.85, "above", df=df)
+            p_below = econ_nowcast_probability(2.80, 0.10, 2.85, "below", df=df)
+            assert abs(p_above + p_below - 1.0) < 1e-10, f"Complementarity failed for df={df}"
+
+
+# ===================================================================
+# CPI sigma smoothness tests
+# ===================================================================
+
+class TestCpiSigmaSmooth:
+
+    def setup_method(self):
+        _reset_calibration()
+
+    def teardown_method(self):
+        _reset_calibration()
+
+    def test_cpi_sigma_no_discontinuities(self):
+        """Adjacent days should not have large sigma jumps (exponential is smooth)."""
+        for d in range(0, 20):
+            s1 = cpi_nowcast_sigma(d)
+            s2 = cpi_nowcast_sigma(d + 1)
+            # Adjacent days should differ by at most ~0.01 (no step jumps)
+            assert abs(s2 - s1) < 0.015, f"Discontinuity at d={d}: {s1:.4f} -> {s2:.4f}"
+
+    def test_cpi_sigma_at_release(self):
+        """At release (d=0), sigma should be exactly 0.03 (floor)."""
+        assert cpi_nowcast_sigma(0) == 0.03
+
+
+# ===================================================================
+# GDP nowcast sigma tests
+# ===================================================================
+
+class TestGdpNowcastSigma:
+
+    def setup_method(self):
+        _reset_calibration()
+
+    def teardown_method(self):
+        _reset_calibration()
+
+    def test_release_day_floor(self):
+        """At release day (d=0), sigma should be 0.05."""
+        assert gdp_nowcast_sigma(0) == 0.05
+
+    def test_monotonically_increasing(self):
+        """Sigma should increase with days to release."""
+        sigmas = [gdp_nowcast_sigma(d) for d in range(0, 30)]
+        for i in range(len(sigmas) - 1):
+            assert sigmas[i] <= sigmas[i + 1]
+
+    def test_day_14_range(self):
+        """At 14 days out, sigma should be reasonable."""
+        sigma = gdp_nowcast_sigma(14)
+        assert 0.10 <= sigma <= 0.18
+
+    def test_negative_days_use_floor(self):
+        """Negative days should return the floor."""
+        assert gdp_nowcast_sigma(-1) == 0.05
+
+
+# ===================================================================
+# Ensemble sigma_multiplier tests
+# ===================================================================
+
+class TestEnsembleSigmaMultiplier:
+
+    def setup_method(self):
+        _reset_calibration()
+
+    def teardown_method(self):
+        _reset_calibration()
+
+    def test_sigma_multiplier_1_is_identity(self):
+        """sigma_multiplier=1.0 produces same output as default."""
+        forecasts = {"gfs": 90.0, "ecmwf": 89.0, "icon": 91.0}
+        prob_default = ensemble_weather_probability(forecasts, 86, "T", 0)
+        prob_mult1 = ensemble_weather_probability(forecasts, 86, "T", 0, sigma_multiplier=1.0)
+        assert abs(prob_default - prob_mult1) < 1e-10
+
+    def test_sigma_multiplier_widens_probability(self):
+        """sigma_multiplier > 1 should pull probability toward 0.5."""
+        forecasts = {"gfs": 92.0, "ecmwf": 91.0, "icon": 93.0}
+        prob_normal = ensemble_weather_probability(forecasts, 86, "T", 0, sigma_multiplier=1.0)
+        prob_wide = ensemble_weather_probability(forecasts, 86, "T", 0, sigma_multiplier=2.0)
+        # Wider sigma means less extreme probability (closer to 0.5)
+        assert prob_normal > prob_wide  # both > 0.5, so wider = less extreme
+        assert prob_wide > 0.5  # still above 0.5
+
+    def test_brier_weights_fall_back_when_no_data(self):
+        """Without backtest Brier data, ensemble uses static/calibration weights."""
+        # This just verifies it doesn't crash — no backtest-results.json in test env
+        forecasts = {"gfs": 88.0, "ecmwf": 87.0}
+        prob = ensemble_weather_probability(forecasts, 86, "T", 0)
+        assert 0.0 < prob < 1.0
+
+
+# ===================================================================
+# Binary sigma (CDF derivative) tests
+# ===================================================================
+
+class TestBinarySigma:
+    """Tests for the CDF-derivative price-space sigma formula:
+    price_sigma = temp_sigma * phi(probit(mid/100)) * 100
+    """
+
+    def test_sigma_at_mid50_higher_than_mid10(self):
+        """Maximum sensitivity should be at mid=50c (phi(0) is peak)."""
+        temp_sigma = 3.0
+        # At mid=50c
+        z50 = _probit(0.50)
+        sigma_50 = temp_sigma * _norm_pdf(z50) * 100
+        # At mid=10c
+        z10 = _probit(0.10)
+        sigma_10 = temp_sigma * _norm_pdf(z10) * 100
+        assert sigma_50 > sigma_10
+
+    def test_sigma_symmetric(self):
+        """10c and 90c should produce the same sigma (symmetry)."""
+        temp_sigma = 3.0
+        z10 = _probit(0.10)
+        z90 = _probit(0.90)
+        sigma_10 = temp_sigma * _norm_pdf(z10) * 100
+        sigma_90 = temp_sigma * _norm_pdf(z90) * 100
+        assert abs(sigma_10 - sigma_90) < 0.5  # within 0.5 cents
+
+    def test_sigma_reasonable_range(self):
+        """At mid=50c with temp_sigma=3.0, price_sigma should be ~120c."""
+        temp_sigma = 3.0
+        z = _probit(0.50)
+        sigma = temp_sigma * _norm_pdf(z) * 100
+        # phi(0) = 0.399, so 3.0 * 0.399 * 100 ≈ 120
+        assert 110 < sigma < 130

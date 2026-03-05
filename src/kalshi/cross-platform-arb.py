@@ -21,6 +21,7 @@ from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, TradeManager, trim_trade_log, build_market_snapshot,
     _atomic_write_json, HealthCheckMonitor, ScanSummary,
+    is_shutdown_requested,
 )
 from polymarket_client import PolymarketClient
 from capital_allocator import PortfolioAllocator
@@ -432,6 +433,9 @@ def main():
             log.error(f"Scan error: {e}")
             traceback.print_exc()
 
+        if is_shutdown_requested():
+            log.info("Graceful shutdown requested, exiting.")
+            break
         log.info(f"\nNext scan in {SCAN_INTERVAL} minutes...")
         time.sleep(SCAN_INTERVAL * 60)
 

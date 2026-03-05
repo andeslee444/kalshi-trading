@@ -25,6 +25,7 @@ def _load_arb_module():
     fake_auth.KalshiClient = lambda *a, **kw: MagicMock()
     fake_auth.setup_unbuffered = lambda: None
     fake_auth.setup_signal_handlers = lambda: None
+    fake_auth.is_shutdown_requested = lambda: False
     fake_auth.setup_logging = lambda *a, **kw: __import__("logging").getLogger("test")
     fake_auth.PROJECT_DIR = Path("/tmp/fake_arb")
     fake_auth.TradeManager = type("TradeManager", (), {

@@ -85,6 +85,12 @@
     "ouHalfLifeMinutes": 120,
     "enableBrackets": true,
     "useJumpDiffusion": true,
+    "jumpDiffusion": {
+      "jumpIntensity": 1.0,
+      "jumpMean": -0.05,
+      "jumpStd": 0.10,
+      "maxJumps": 10
+    },
     "pfProcessNoise": 0.02,
     "pfObservationNoise": 0.05,
     "pfParticles": 200,
@@ -167,7 +173,7 @@
     "scanIntervalMinutes": 5,
     "maxInventoryPerMarket": 20,
     "gamma": 0.3,
-    "kParam": 25.0,
+    "kParam": 8.0,
     "maxTradeAmount": 5,
     "maxTradeAmountPct": 0.01,
     "maxDailyTrades": 50,

@@ -121,13 +121,31 @@ def setup_logging(name, log_file=None):
     return logger
 
 
+_shutdown_requested = False
+
+
+def is_shutdown_requested():
+    """Check if a graceful shutdown has been requested via SIGUSR1.
+
+    Bots should check this after each scan cycle and break their main loop
+    to allow clean exit before SIGTERM arrives.
+    """
+    return _shutdown_requested
+
+
 def setup_signal_handlers():
-    """Install graceful shutdown handlers for SIGTERM and SIGINT."""
+    """Install graceful shutdown handlers for SIGTERM, SIGINT, and SIGUSR1."""
     def _handler(signum, frame):
         _log.info("Received signal %s, shutting down gracefully...", signum)
         sys.exit(0)
     signal.signal(signal.SIGTERM, _handler)
     signal.signal(signal.SIGINT, _handler)
+
+    def _sigusr1_handler(signum, frame):
+        global _shutdown_requested
+        _log.info("Received SIGUSR1, requesting graceful shutdown...")
+        _shutdown_requested = True
+    signal.signal(signal.SIGUSR1, _sigusr1_handler)
 
 
 class KalshiClient:
