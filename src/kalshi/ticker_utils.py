@@ -287,20 +287,143 @@ def format_ticker_human(ticker: str, city_names: dict | None = None) -> str:
                 return f"Album Sales · {month_str} {day}"
         return "Album Sales"
 
-    # 5. Generic KX ticker fallback — extract event name and make it readable
+    # 5. Economic stat tickers: KXECONSTATCPIYOY-26JUN-T2.0, KXECONSTATCORECPIYOY-26JUN-T2.3
+    m = re.match(r"KXECONSTAT(CORE)?(CPI|GDP|JOBS|PCE|PPI)(YOY|MOM)?-(\d{2})([A-Z]{3})(?:(\d{2}))?(?:-([TB])([\d.]+))?", ticker)
+    if m:
+        core = "Core " if m.group(1) else ""
+        stat = m.group(2)
+        freq = " YoY" if m.group(3) == "YOY" else " MoM" if m.group(3) == "MOM" else ""
+        yr = int(m.group(4))
+        mon = m.group(5)
+        day = m.group(6)
+        direction_code = m.group(7)
+        threshold = m.group(8)
+        month_num = MONTHS.get(mon)
+        month_str = MONTH_ABBR.get(month_num, mon) if month_num else mon
+        date_str = month_str
+        if day:
+            date_str += f" {int(day)}"
+        if direction_code and threshold:
+            direction = "Above" if direction_code == "T" else "Below"
+            return f"{core}{stat}{freq} {direction} {threshold}% · {date_str}"
+        return f"{core}{stat}{freq} · {date_str}"
+
+    # 6. Generic KX ticker fallback — extract event name and make it readable
     if ticker.upper().startswith("KX"):
         return _humanize_generic_ticker(ticker)
 
     return ticker
 
 
+# ─── Known event names for generic ticker humanization ───
+_EVENT_NAMES = {
+    "FACUPADVANCE": "FA Cup Advance",
+    "FACUP": "FA Cup",
+    "MARMAD1SEED": "March Madness #1 Seed",
+    "MARMAD": "March Madness",
+    "MARMADCHAMP": "March Madness Champion",
+    "MARMADFINAL4": "March Madness Final 4",
+    "MARMADELITE8": "March Madness Elite 8",
+    "MARMADSWEET16": "March Madness Sweet 16",
+    "NFLMVP": "NFL MVP",
+    "NFLPLAYOFFS": "NFL Playoffs",
+    "NFLSB": "Super Bowl",
+    "NBAMVP": "NBA MVP",
+    "NBACHAMP": "NBA Champion",
+    "NBA": "NBA",
+    "MLBWS": "World Series",
+    "MLB": "MLB",
+    "NHL": "NHL",
+    "NHLSC": "Stanley Cup",
+    "OSCARS": "Oscars",
+    "OSCAR": "Oscar",
+    "GRAMMY": "Grammy Awards",
+    "EMMYS": "Emmy Awards",
+    "POTUS": "Presidential Election",
+    "SENATE": "Senate Race",
+    "HOUSE": "House Race",
+    "FEDRATE": "Fed Rate Decision",
+    "FEDCUT": "Fed Rate Cut",
+    "SCOTUS": "Supreme Court",
+    "INX": "S&P 500",
+    "INXD": "S&P 500 Daily",
+    "NASDAQ": "Nasdaq",
+    "NDXD": "Nasdaq Daily",
+    "TIKTOKBAN": "TikTok Ban",
+    "TRUMPTARIFF": "Trump Tariff",
+    "GOVSHUTDOWN": "Gov't Shutdown",
+    "NASCARCUPSERIES": "NASCAR Cup Series",
+    "NASCAR": "NASCAR",
+    "PRESNOMD": "Pres. Nomination (D)",
+    "PRESNOMR": "Pres. Nomination (R)",
+    "PRESNOM": "Pres. Nomination",
+    "DEMSNOM": "Dem Nomination",
+    "GOPNOM": "GOP Nomination",
+    "F1WDC": "F1 World Championship",
+    "F1": "Formula 1",
+    "PGA": "PGA Tour",
+    "UFC": "UFC",
+    "BOXING": "Boxing",
+    "SOCCER": "Soccer",
+    "EPL": "Premier League",
+    "EPLRELEGATE": "Premier League Relegation",
+    "UCLCHAMP": "Champions League",
+    "LALIGA": "La Liga",
+    "SERIEA": "Serie A",
+    "MLS": "MLS",
+    "CFBCHAMP": "College Football Champion",
+    "HEISMAN": "Heisman Trophy",
+    "WORLDSERIES": "World Series",
+    "NBAALLSTAR": "NBA All-Star",
+    "NBAROY": "NBA Rookie of the Year",
+    "NBADPOY": "NBA DPOY",
+    "SUPERBOWL": "Super Bowl",
+}
+
+# School / team abbreviations for sports outcomes
+_TEAM_NAMES = {
+    # College basketball / football
+    "HOU": "Houston", "UVA": "Virginia", "ARIZ": "Arizona", "ISU": "Iowa St",
+    "CONN": "UConn", "DUK": "Duke", "UNC": "North Carolina", "KU": "Kansas",
+    "PUR": "Purdue", "BAYLOR": "Baylor", "GONZ": "Gonzaga", "AUB": "Auburn",
+    "TENN": "Tennessee", "FLA": "Florida", "MARQ": "Marquette", "WISC": "Wisconsin",
+    "MICH": "Michigan", "UK": "Kentucky", "STAN": "Stanford", "UCLA": "UCLA",
+    "MSU": "Michigan St", "OHST": "Ohio St", "TXTECH": "Texas Tech", "CREI": "Creighton",
+    "PROV": "Providence", "NOVA": "Villanova", "OREG": "Oregon", "ALA": "Alabama",
+    "MIZZ": "Missouri", "ARK": "Arkansas", "ILL": "Illinois", "IUPUI": "IUPUI",
+    "TXAM": "Texas A&M", "ND": "Notre Dame", "WAKE": "Wake Forest",
+    "CLEMSON": "Clemson", "VT": "Virginia Tech", "LOU": "Louisville",
+    # NBA
+    "LAL": "Lakers", "LAC": "Clippers", "BOS": "Celtics", "GSW": "Warriors",
+    "MIL": "Bucks", "PHI": "76ers", "DEN": "Nuggets", "PHX": "Suns",
+    "MIA": "Heat", "DAL": "Mavericks", "NYK": "Knicks", "BKN": "Nets",
+    "CLE": "Cavaliers", "MIN": "Timberwolves", "SAC": "Kings", "OKC": "Thunder",
+    "IND": "Pacers", "ATL": "Hawks", "CHI": "Bulls", "TOR": "Raptors",
+    "NOP": "Pelicans", "POR": "Trail Blazers", "SAS": "Spurs", "WAS": "Wizards",
+    "CHA": "Hornets", "DET": "Pistons", "ORL": "Magic", "MEM": "Grizzlies",
+    "UTA": "Jazz", "HOU2": "Rockets",
+    # Soccer / Premier League
+    "BRC": "Brentford", "ARS": "Arsenal", "MCI": "Man City", "MUN": "Man United",
+    "LIV": "Liverpool", "CHE": "Chelsea", "TOT": "Tottenham", "NEW": "Newcastle",
+    "EVE": "Everton", "WHU": "West Ham", "BHA": "Brighton", "AVL": "Aston Villa",
+    "FUL": "Fulham", "WOL": "Wolves", "BOU": "Bournemouth", "CRY": "Crystal Palace",
+    "NFO": "Nottm Forest", "LEI": "Leicester", "IPS": "Ipswich", "SOU": "Southampton",
+    # NASCAR
+    "TRED": "Toyota Racing", "CHEV": "Chevrolet", "FORD": "Ford",
+    # Politics (candidates)
+    "REMA": "Ramaswamy", "TRUMP": "Trump", "BIDEN": "Biden", "HARRIS": "Harris",
+    "DESANTIS": "DeSantis", "HALEY": "Haley", "NEWSOM": "Newsom",
+    "PENCE": "Pence", "SCOTT": "Tim Scott", "VANCE": "Vance",
+    "RFK": "RFK Jr", "KENNEDY": "Kennedy",
+}
+
+
 def _humanize_generic_ticker(ticker: str) -> str:
     """Best-effort humanization of unknown KX tickers.
 
-    KXFACUPADVANCE-26FEB14PVABRC-BRC → "FA Cup Advance"
-    KXNFLMVP-26FEB09-JALLEN → "NFL MVP"
+    KXFACUPADVANCE-26FEB14PVABRC-BRC → "FA Cup Advance · Brentford"
+    KXMARMAD1SEED-26-HOU             → "March Madness #1 Seed · Houston"
     """
-    # Split on first hyphen to get event prefix
     parts = ticker.split("-")
     event = parts[0]
 
@@ -308,45 +431,39 @@ def _humanize_generic_ticker(ticker: str) -> str:
     if event.upper().startswith("KX"):
         event = event[2:]
 
-    # Known event abbreviations
-    EVENT_NAMES = {
-        "FACUPADVANCE": "FA Cup Advance",
-        "FACUP": "FA Cup",
-        "NFLMVP": "NFL MVP",
-        "NFLPLAYOFFS": "NFL Playoffs",
-        "NFLSB": "Super Bowl",
-        "NBA": "NBA",
-        "NBAMVP": "NBA MVP",
-        "MLB": "MLB",
-        "NHL": "NHL",
-        "OSCARS": "Oscars",
-        "GRAMMY": "Grammy Awards",
-        "EMMYS": "Emmy Awards",
-        "POTUS": "Presidential Election",
-        "SENATE": "Senate Race",
-        "HOUSE": "House Race",
-        "FEDRATE": "Fed Rate Decision",
-        "SCOTUS": "Supreme Court",
-        "INX": "S&P 500",
-        "NASDAQ": "Nasdaq",
-    }
-
-    # Check exact match first
     event_upper = event.upper()
-    if event_upper in EVENT_NAMES:
-        return EVENT_NAMES[event_upper]
 
-    # Check prefix match
-    for prefix, name in EVENT_NAMES.items():
-        if event_upper.startswith(prefix):
-            remainder = event[len(prefix):]
-            if remainder:
-                return f"{name} · {remainder}"
-            return name
+    # Find the best matching event name (longest prefix match)
+    best_match = ""
+    best_name = ""
+    for prefix, name in _EVENT_NAMES.items():
+        if event_upper.startswith(prefix) and len(prefix) > len(best_match):
+            best_match = prefix
+            best_name = name
 
-    # Insert spaces before uppercase runs: "FACupAdvance" → "FA Cup Advance"
+    # Extract outcome from the last part (team/player name)
+    outcome = ""
+    if len(parts) >= 2:
+        last = parts[-1]
+        # Check if it's a known team
+        if last.upper() in _TEAM_NAMES:
+            outcome = _TEAM_NAMES[last.upper()]
+        elif last.upper() in CITY_NAMES:
+            outcome = CITY_NAMES[last.upper()]
+        elif re.match(r"^[A-Z]{2,}$", last) and not re.match(r"^\d", last):
+            # Unknown all-caps code, title-case it
+            outcome = last.title()
+
+    if best_name:
+        if outcome:
+            return f"{best_name} · {outcome}"
+        return best_name
+
+    # No known event match — insert spaces in camelCase and title-case
     spaced = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1 \2', event)
     spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', spaced)
-
-    # Title-case the result
-    return spaced.title() if spaced else ticker
+    spaced = re.sub(r'(\d+)', r' \1 ', spaced).strip()
+    result = spaced.title() if spaced else ticker
+    if outcome and outcome.lower() not in result.lower():
+        result += f" · {outcome}"
+    return result

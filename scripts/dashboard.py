@@ -24,6 +24,7 @@ sys.path.insert(0, str(PROJECT_DIR / "src" / "kalshi"))
 from pnl_attribution import PnLAttributor, _classify_market_type
 from edge_monitor import EdgeMonitor
 from execution_quality import ExecutionAnalyzer
+from ticker_utils import format_ticker_human
 
 DASHBOARD_HTML = Path(__file__).resolve().parent / "dashboard.html"
 DATA_DIR = PROJECT_DIR / "data"
@@ -35,6 +36,43 @@ KILL_SWITCH_PATH = DATA_DIR / "HALT_TRADING"
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
 WEATHER_CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-config.json"
 STARTING_BALANCE_CENTS = int(os.environ.get("STARTING_BALANCE_CENTS", "50000"))  # $500 default
+
+# ─── Strategy display names ───
+STRATEGY_DISPLAY = {
+    "weather": "Weather",
+    "entertainment": "Entertainment",
+    "crypto": "Crypto",
+    "economics": "Economics",
+    "positions": "Position Mgmt",
+    "monitor": "Data Monitor",
+    "strategy": "Opportunistic",
+    "hdd": "Data Scraper",
+    "arb": "Cross-Platform",
+    "mm": "Market Making",
+    "beatrelease": "Beat Release",
+}
+
+# ─── Human-readable decision skip reasons ───
+SKIP_REASON_MAP = [
+    (["edge", "threshold"], "Advantage too small"),
+    (["cooldown", "dedup", "recent"], "Recently traded"),
+    (["daily", "limit"], "Daily budget used"),
+    (["stale"], "Data too old"),
+    (["kill", "halt"], "Trading paused"),
+    (["balance", "cost"], "Insufficient funds"),
+]
+
+
+def _human_reason(raw_reason: str) -> str:
+    """Convert raw skip reason to human-readable text."""
+    if not raw_reason:
+        return ""
+    lower = raw_reason.lower()
+    for keywords, human in SKIP_REASON_MAP:
+        if any(k in lower for k in keywords):
+            return human
+    return raw_reason
+
 
 # ─── Config key mapping: bot name → bots-config.json key ───
 BOT_CONFIG_KEY = {
@@ -277,6 +315,7 @@ async def api_bots():
 
         result.append({
             "name": name,
+            "display_name": STRATEGY_DISPLAY.get(name, name),
             "status": status,
             "pid": pid if running else None,
             "last_heartbeat": last_heartbeat,
@@ -417,6 +456,8 @@ async def api_trades(
                         "bot": bot,
                         "bot_label": local.get("bot_label", ""),
                         "ticker": ticker,
+                        "human_ticker": format_ticker_human(ticker),
+                        "strategy": STRATEGY_DISPLAY.get(bot, bot),
                         "side": side,
                         "risk_cents": risk_cents,
                         "status": "filled",
@@ -443,10 +484,13 @@ async def api_trades(
             continue
         for t in trades:
             ts = extract_timestamp(t)
+            ticker = t.get("ticker", "")
             all_trades.append({
                 "bot": tf["bot"],
                 "bot_label": tf["label"],
-                "ticker": t.get("ticker", ""),
+                "ticker": ticker,
+                "human_ticker": format_ticker_human(ticker),
+                "strategy": STRATEGY_DISPLAY.get(tf["bot"], tf["bot"]),
                 "side": extract_side(t),
                 "risk_cents": extract_risk_cents(t),
                 "status": t.get("status", ""),
@@ -487,6 +531,13 @@ async def api_decisions(limit: int = Query(50, ge=1, le=500)):
             continue
         for d in data:
             d["bot"] = df["bot"]
+            d["strategy"] = STRATEGY_DISPLAY.get(df["bot"], df["bot"])
+            ticker = d.get("ticker", "")
+            if ticker:
+                d["human_ticker"] = format_ticker_human(ticker)
+            reason = d.get("reason", "") or d.get("skip_reason", "")
+            if reason:
+                d["human_reason"] = _human_reason(reason)
             all_decisions.append(d)
 
     all_decisions.sort(key=lambda x: x.get("timestamp", "") or "", reverse=True)
@@ -620,8 +671,12 @@ async def api_orders():
         orders = data.get("orders", [])
         result = []
         for o in orders:
+            ticker = o.get("ticker", "")
+            bot = _infer_bot_from_ticker(ticker)
             result.append({
-                "ticker": o.get("ticker", ""),
+                "ticker": ticker,
+                "human_ticker": format_ticker_human(ticker),
+                "strategy": STRATEGY_DISPLAY.get(bot, bot),
                 "side": o.get("side", ""),
                 "type": o.get("type", ""),
                 "price": o.get("yes_price") or o.get("no_price"),
@@ -703,6 +758,8 @@ async def api_settlements(limit: int = Query(50, ge=1, le=200)):
 
             result.append({
                 "ticker": ticker,
+                "human_ticker": format_ticker_human(ticker),
+                "strategy": STRATEGY_DISPLAY.get(bot, bot),
                 "revenue": revenue,
                 "cost": yes_cost + no_cost,
                 "profit": profit,
@@ -854,8 +911,11 @@ async def api_positions():
         for p in active:
             ticker = p.get("ticker", "")
             market = market_map.get(ticker)
+            bot = _infer_bot_from_ticker(ticker)
             entry = {
                 "ticker": ticker,
+                "human_ticker": format_ticker_human(ticker),
+                "strategy": STRATEGY_DISPLAY.get(bot, bot),
                 "position": p.get("position", 0),
                 "market_exposure": p.get("market_exposure", 0),
                 "realized_pnl": p.get("realized_pnl", 0),
@@ -938,6 +998,8 @@ async def api_exit_state():
 
         result.append({
             "ticker": ticker,
+            "human_ticker": format_ticker_human(ticker),
+            "strategy": STRATEGY_DISPLAY.get(source_bot, source_bot),
             "entry_price": entry_price,
             "peak_bid": peak_bid,
             "side": side,

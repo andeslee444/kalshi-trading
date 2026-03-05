@@ -4,1152 +4,973 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Kalshi Trading Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
-    body { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace; }
-    .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
-    .dot-green { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
-    .dot-red { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
+    * { font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace; }
+    body { background: #0a0e1a; color: #f1f5f9; }
+
+    .card {
+      background: #111827;
+      border: none;
+      border-radius: 12px;
+      padding: 24px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+    }
+    .section-label {
+      font-size: 0.6875rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: #64748b;
+      margin-bottom: 16px;
+    }
+
+    .tab-btn {
+      padding: 10px 16px;
+      font-size: 0.875rem;
+      font-weight: 500;
+      border-bottom: 2px solid transparent;
+      color: #64748b;
+      cursor: pointer;
+      transition: all 0.15s;
+      background: none;
+      border-top: none; border-left: none; border-right: none;
+    }
+    .tab-btn:hover { color: #94a3b8; }
+    .tab-btn.active { color: #f1f5f9; border-bottom-color: #3b82f6; }
+
+    .pill {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 9999px;
+      font-size: 0.6875rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    .pill-weather { background: #1e3a5f; color: #60a5fa; }
+    .pill-crypto { background: #3b1f54; color: #c084fc; }
+    .pill-economics { background: #1a3a2a; color: #34d399; }
+    .pill-entertainment { background: #3b2f1a; color: #fbbf24; }
+    .pill-strategy { background: #2d2d2d; color: #94a3b8; }
+    .pill-monitor { background: #1a2f3b; color: #67e8f9; }
+    .pill-positions { background: #2a1a1a; color: #fb923c; }
+    .pill-default { background: #1e293b; color: #94a3b8; }
+
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+    .dot-green { background: #10b981; box-shadow: 0 0 6px #10b981; }
+    .dot-red { background: #f43f5e; box-shadow: 0 0 6px #f43f5e; }
     .dot-yellow { background: #eab308; box-shadow: 0 0 6px #eab308; }
-    .dot-gray { background: #6b7280; }
-    .log-viewer { max-height: 320px; overflow-y: auto; }
-    .log-viewer::-webkit-scrollbar { width: 6px; }
-    .log-viewer::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
-    .progress-bar { height: 8px; border-radius: 4px; background: #374151; overflow: hidden; }
-    .progress-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
-    .card { background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 16px; }
-    .pulse { animation: pulse 2s infinite; }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    .dot-gray { background: #475569; }
+
+    .progress-bar { height: 6px; border-radius: 3px; background: #1e293b; overflow: hidden; }
+    .progress-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+
+    .log-viewer { max-height: 400px; overflow-y: auto; }
+    .log-viewer::-webkit-scrollbar { width: 5px; }
+    .log-viewer::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+
+    .kpi-value { font-size: 1.75rem; font-weight: 700; line-height: 1.2; }
+    .kpi-label { font-size: 0.75rem; color: #64748b; margin-top: 4px; }
+
+    .filter-btn {
+      padding: 4px 12px; border-radius: 6px; font-size: 0.75rem; font-weight: 500;
+      background: #1e293b; color: #94a3b8; border: none; cursor: pointer; transition: all 0.15s;
+    }
+    .filter-btn.active { background: #3b82f6; color: #fff; }
+    .filter-btn:hover:not(.active) { background: #334155; }
+
+    .position-card {
+      background: #0f172a; border-radius: 10px; padding: 16px;
+      border: 1px solid #1e293b; transition: border-color 0.15s;
+    }
+    .position-card:hover { border-color: #334155; }
+
+    .timeline-row {
+      display: grid; grid-template-columns: 80px 100px 1fr auto;
+      gap: 12px; align-items: center; padding: 8px 0;
+      border-bottom: 1px solid #1e293b;
+      font-size: 0.8125rem;
+    }
+    .timeline-row:last-child { border-bottom: none; }
   </style>
 </head>
-<body class="bg-gray-950 text-gray-100 min-h-screen">
+<body class="min-h-screen">
 
   <!-- Header -->
-  <header class="border-b border-gray-800 px-6 py-3 flex items-center justify-between">
-    <h1 class="text-lg font-bold text-gray-100">Kalshi Trading Dashboard</h1>
-    <div class="flex items-center gap-4 text-sm text-gray-400">
+  <header style="border-bottom: 1px solid #1e293b;" class="px-6 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <h1 class="text-base font-semibold text-slate-100">Kalshi Fund</h1>
+      <span id="system-badge" class="pill pill-default text-xs">Loading...</span>
+    </div>
+    <div class="flex items-center gap-4 text-xs text-slate-500">
       <span id="last-update"></span>
       <label class="flex items-center gap-2 cursor-pointer">
-        <input type="checkbox" id="auto-refresh" checked class="accent-green-500">
-        Auto-refresh
+        <input type="checkbox" id="auto-refresh" checked class="accent-blue-500">
+        Live
       </label>
     </div>
   </header>
 
-  <nav class="border-b border-gray-800 px-6 flex gap-4">
-    <button class="tab-btn py-2 px-1 text-sm font-medium border-b-2 border-green-500 text-green-400" data-tab="dashboard">Dashboard</button>
-    <button class="tab-btn py-2 px-1 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-300" data-tab="intelligence">Intelligence</button>
+  <!-- Tab Nav -->
+  <nav style="border-bottom: 1px solid #1e293b;" class="px-6 flex gap-1">
+    <button class="tab-btn active" data-tab="overview">Overview</button>
+    <button class="tab-btn" data-tab="positions">Positions</button>
+    <button class="tab-btn" data-tab="activity">Activity</button>
+    <button class="tab-btn" data-tab="system">System</button>
   </nav>
 
-  <main>
-  <div id="tab-dashboard" class="p-4 grid gap-4 max-w-[1400px] mx-auto">
+  <main class="max-w-[1440px] mx-auto p-6">
 
-    <!-- Row 1: Bot Status + Account + Risk -->
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+    <!-- ═══════════════════════════════════════════════ -->
+    <!-- TAB 1: OVERVIEW                                 -->
+    <!-- ═══════════════════════════════════════════════ -->
+    <div id="tab-overview" class="space-y-6">
 
-      <!-- Bot Status -->
-      <div class="card">
-        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Bot Status</h2>
-        <div id="bot-status" class="space-y-2 text-sm">
-          <div class="text-gray-500">Loading...</div>
+      <!-- Hero KPI Row -->
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <div class="card">
+          <div class="kpi-label">Account Value</div>
+          <div id="kpi-account" class="kpi-value mono">--</div>
+          <div id="kpi-account-detail" class="text-xs text-slate-500 mt-1"></div>
+        </div>
+        <div class="card">
+          <div class="kpi-label">Realized P&L</div>
+          <div id="kpi-pnl" class="kpi-value mono">--</div>
+          <div id="kpi-pnl-detail" class="text-xs text-slate-500 mt-1"></div>
+        </div>
+        <div class="card">
+          <div class="kpi-label">Hit Rate</div>
+          <div id="kpi-hitrate" class="kpi-value mono">--</div>
+          <div id="kpi-hitrate-detail" class="text-xs text-slate-500 mt-1"></div>
+        </div>
+        <div class="card">
+          <div class="kpi-label">Open Exposure</div>
+          <div id="kpi-exposure" class="kpi-value mono">--</div>
+          <div id="kpi-exposure-detail" class="text-xs text-slate-500 mt-1"></div>
         </div>
       </div>
 
-      <!-- Account Overview -->
+      <!-- Equity Curve -->
       <div class="card">
-        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Account</h2>
-        <div id="account-info">
-          <div class="text-gray-500 text-sm">Loading...</div>
+        <div class="section-label">Equity Curve</div>
+        <div style="height: 350px; position: relative;">
+          <canvas id="equity-chart"></canvas>
         </div>
       </div>
 
-      <!-- Risk & Safety -->
+      <!-- Strategy Performance + Daily Budget -->
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div class="card lg:col-span-2">
+          <div class="section-label">Strategy Performance</div>
+          <div id="strategy-table" class="text-sm">
+            <div class="text-slate-500">Loading...</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="section-label">Daily Budget</div>
+          <div id="daily-budget" class="space-y-3">
+            <div class="text-slate-500 text-sm">Loading...</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Forecast Accuracy -->
       <div class="card">
-        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Risk & Safety</h2>
-        <div id="risk-info">
-          <div class="text-gray-500 text-sm">Loading...</div>
+        <div class="section-label">Forecast Accuracy</div>
+        <div id="forecast-accuracy" class="space-y-3">
+          <div class="text-slate-500 text-sm">Loading...</div>
+        </div>
+        <div id="calibration-toggle" class="mt-4 hidden">
+          <button onclick="toggleCalibration()" class="filter-btn">Show Details</button>
+          <div id="calibration-detail" class="hidden mt-4">
+            <canvas id="calibration-chart" height="200"></canvas>
+          </div>
         </div>
       </div>
     </div>
 
-    <!-- Row 2: Risk Bars -->
-    <div class="card">
-      <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Daily Spend by Bot</h2>
-      <div id="risk-bars" class="space-y-2">
-        <div class="text-gray-500 text-sm">Loading...</div>
+    <!-- ═══════════════════════════════════════════════ -->
+    <!-- TAB 2: POSITIONS                                -->
+    <!-- ═══════════════════════════════════════════════ -->
+    <div id="tab-positions" class="space-y-6 hidden">
+
+      <!-- Open Positions -->
+      <div>
+        <div class="section-label">Open Positions</div>
+        <div id="positions-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div class="text-slate-500 text-sm">Loading...</div>
+        </div>
       </div>
-    </div>
 
-    <!-- Row 2.5: Settlements & P&L -->
-    <div class="card">
-      <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Settlements & P&L</h2>
-      <div id="settlements-summary" class="mb-3"></div>
-      <div id="settlements-list" class="text-sm space-y-1 max-h-64 overflow-y-auto">
-        <div class="text-gray-500">Loading...</div>
-      </div>
-    </div>
-
-    <!-- Row 3: Open Orders + Positions -->
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-
-      <!-- Open Orders -->
+      <!-- Pending Orders -->
       <div class="card">
-        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Open Orders (Resting)</h2>
-        <div id="open-orders" class="text-sm">
-          <div class="text-gray-500">Loading...</div>
+        <div class="section-label">Pending Orders</div>
+        <div id="pending-orders" class="text-sm">
+          <div class="text-slate-500">Loading...</div>
         </div>
       </div>
+    </div>
 
-      <!-- Positions -->
+    <!-- ═══════════════════════════════════════════════ -->
+    <!-- TAB 3: ACTIVITY                                 -->
+    <!-- ═══════════════════════════════════════════════ -->
+    <div id="tab-activity" class="space-y-6 hidden">
+
+      <!-- Summary Pills -->
+      <div id="activity-summary" class="flex gap-3 flex-wrap"></div>
+
+      <!-- Filter Buttons -->
+      <div class="flex gap-2">
+        <button class="filter-btn active" data-filter="all" onclick="filterActivity('all')">All</button>
+        <button class="filter-btn" data-filter="trades" onclick="filterActivity('trades')">Trades</button>
+        <button class="filter-btn" data-filter="settlements" onclick="filterActivity('settlements')">Settlements</button>
+      </div>
+
+      <!-- Unified Timeline -->
       <div class="card">
-        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Open Positions</h2>
-        <div id="positions" class="text-sm">
-          <div class="text-gray-500">Loading...</div>
+        <div id="activity-timeline" class="space-y-0">
+          <div class="text-slate-500 text-sm">Loading...</div>
         </div>
       </div>
-    </div>
 
-    <!-- Row 3.5: Active Exits -->
-    <div class="card" id="active-exits-card">
-      <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Active Exits</h2>
-      <div id="active-exits" class="text-sm">
-        <div class="text-gray-500">Loading...</div>
-      </div>
-    </div>
-
-    <!-- Row 4: Trades + Decisions -->
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-
-      <!-- Recent Trades -->
+      <!-- Strategy Decisions (collapsed) -->
       <div class="card">
-        <div class="flex items-center justify-between mb-3">
-          <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-wide">Recent Trades</h2>
-          <span id="trades-source" class="text-xs text-gray-600"></span>
-        </div>
-        <div id="recent-trades" class="text-sm space-y-1 max-h-80 overflow-y-auto">
-          <div class="text-gray-500">Loading...</div>
+        <button onclick="toggleDecisions()" class="flex items-center gap-2 text-sm text-slate-400 hover:text-slate-200 transition-colors w-full">
+          <svg id="decisions-chevron" class="w-4 h-4 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+          Strategy Decisions
+          <span id="decisions-count" class="text-slate-600 text-xs"></span>
+        </button>
+        <div id="decisions-list" class="hidden mt-4 space-y-1 max-h-80 overflow-y-auto">
+          <div class="text-slate-500 text-sm">Loading...</div>
         </div>
       </div>
+    </div>
 
-      <!-- Decision Feed -->
+    <!-- ═══════════════════════════════════════════════ -->
+    <!-- TAB 4: SYSTEM                                   -->
+    <!-- ═══════════════════════════════════════════════ -->
+    <div id="tab-system" class="space-y-6 hidden">
+
+      <!-- Status Banner -->
+      <div id="system-banner" class="card"></div>
+
+      <!-- Strategy Engines -->
       <div class="card">
-        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Decision Feed</h2>
-        <div id="decision-feed" class="text-sm space-y-1 max-h-80 overflow-y-auto">
-          <div class="text-gray-500">Loading...</div>
+        <div class="section-label">Strategy Engines</div>
+        <div id="strategy-engines" class="space-y-3">
+          <div class="text-slate-500 text-sm">Loading...</div>
         </div>
       </div>
-    </div>
 
-    <!-- Row 5: Model Quality -->
-    <div class="card">
-      <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Model Quality (Brier Scores)</h2>
-      <div id="brier-tables" class="mb-4">
-        <div class="text-gray-500 text-sm">Loading... (requires backtest data)</div>
-      </div>
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4" id="calibration-charts-container">
-      </div>
-    </div>
-
-    <!-- Row 6: P&L Analytics -->
-    <div class="card">
-      <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">P&L Analytics</h2>
-      <div id="pnl-table" class="mb-4">
-        <div class="text-gray-500 text-sm">Loading... (requires performance data)</div>
-      </div>
-      <div style="height: 300px; max-width: 100%;">
-        <canvas id="cumulative-pnl-chart"></canvas>
-      </div>
-    </div>
-
-    <!-- Row 7: Data Source Health + Log Viewer -->
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-
-      <!-- Data Source Health -->
+      <!-- Data Sources -->
       <div class="card">
-        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Data Source Health</h2>
-        <div id="source-health" class="text-sm">
-          <div class="text-gray-500">Loading...</div>
+        <div class="section-label">Data Sources</div>
+        <div id="data-sources" class="space-y-2">
+          <div class="text-slate-500 text-sm">Loading...</div>
         </div>
       </div>
 
-      <!-- Log Viewer -->
+      <!-- Logs (collapsed) -->
       <div class="card">
-        <div class="flex items-center justify-between mb-3">
-          <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-wide">Log Viewer</h2>
-          <select id="log-bot-select" class="bg-gray-800 text-gray-200 text-sm border border-gray-700 rounded px-2 py-1">
-            <option value="weather">weather</option>
-            <option value="entertainment">entertainment</option>
-            <option value="crypto">crypto</option>
-            <option value="economics">economics</option>
-            <option value="positions">positions</option>
-            <option value="monitor">monitor</option>
-            <option value="strategy">strategy</option>
-            <option value="hdd">hdd</option>
-            <option value="arb">arb</option>
-            <option value="mm">mm</option>
-            <option value="supervisor">supervisor</option>
-          </select>
-        </div>
-        <div id="log-viewer" class="log-viewer bg-gray-900 rounded p-3 text-xs text-gray-300 whitespace-pre-wrap font-mono">
-          Loading...
+        <button onclick="toggleLogs()" class="flex items-center gap-2 text-sm text-slate-400 hover:text-slate-200 transition-colors">
+          <svg id="logs-chevron" class="w-4 h-4 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+          View Logs
+        </button>
+        <div id="logs-panel" class="hidden mt-4">
+          <div class="flex items-center gap-3 mb-3">
+            <select id="log-bot-select" class="bg-[#0f172a] border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-300 focus:outline-none focus:border-blue-500">
+              <!-- Populated dynamically -->
+            </select>
+            <button onclick="loadLogs()" class="filter-btn active">Refresh</button>
+          </div>
+          <div id="log-content" class="log-viewer bg-[#0a0e1a] rounded-lg p-3 mono text-xs text-slate-400 whitespace-pre-wrap"></div>
         </div>
       </div>
     </div>
-
-  </div>
-
-  <div id="tab-intelligence" class="p-4 grid gap-4 max-w-[1400px] mx-auto" style="display:none;">
-    <div class="card">
-      <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">P&L Attribution</h2>
-      <div id="attribution-summary" class="text-sm text-gray-500 mb-3">Loading...</div>
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div>
-          <h3 class="text-xs font-semibold text-gray-500 mb-2">By Bot</h3>
-          <table id="attr-by-bot" class="w-full text-sm">
-            <thead><tr class="text-gray-500 text-left"><th class="pb-1">Bot</th><th>P&L</th><th>Trades</th><th>Win Rate</th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
-        <div>
-          <h3 class="text-xs font-semibold text-gray-500 mb-2">By Edge Bucket</h3>
-          <table id="attr-by-edge" class="w-full text-sm">
-            <thead><tr class="text-gray-500 text-left"><th class="pb-1">Edge</th><th>P&L</th><th>Trades</th><th>Win Rate</th><th>Avg Edge</th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
-      </div>
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
-        <div>
-          <h3 class="text-xs font-semibold text-gray-500 mb-2">By Market Type</h3>
-          <table id="attr-by-market" class="w-full text-sm">
-            <thead><tr class="text-gray-500 text-left"><th class="pb-1">Type</th><th>P&L</th><th>Trades</th><th>Win Rate</th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
-        <div>
-          <h3 class="text-xs font-semibold text-gray-500 mb-2">By Sizing Method</h3>
-          <table id="attr-by-sizing" class="w-full text-sm">
-            <thead><tr class="text-gray-500 text-left"><th class="pb-1">Method</th><th>P&L</th><th>Trades</th><th>Win Rate</th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-      <div class="card">
-        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Edge Decay Monitor</h2>
-        <div id="edge-decay-content" class="text-sm text-gray-500 mb-3">Loading...</div>
-        <table id="edge-decay-table" class="w-full text-sm">
-          <thead><tr class="text-gray-500 text-left"><th class="pb-1">Market Type</th><th>Win Rate</th><th>Trend</th><th>Half-Life</th><th>Competitor?</th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-
-      <div class="card">
-        <h2 class="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wide">Execution Quality</h2>
-        <div id="exec-quality-content" class="text-sm text-gray-500 mb-3">Loading...</div>
-        <table id="exec-quality-table" class="w-full text-sm">
-          <thead><tr class="text-gray-500 text-left"><th class="pb-1">Bot</th><th>Fill Rate</th><th>Slippage</th><th>Shortfall</th><th>Trades</th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
 
   </main>
 
 <script>
-const POLL_INTERVAL = 15000;
+// ─── State ───
 let refreshTimer = null;
-
-// ─── Utilities ───
-
-function timeAgo(isoStr) {
-  if (!isoStr) return '-';
-  try {
-    const d = new Date(isoStr);
-    if (isNaN(d.getTime())) return isoStr;
-    const s = Math.floor((Date.now() - d.getTime()) / 1000);
-    if (s < 0) return 'just now';
-    if (s < 60) return s + 's ago';
-    if (s < 3600) return Math.floor(s / 60) + 'm ago';
-    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
-    return Math.floor(s / 86400) + 'd ago';
-  } catch { return isoStr; }
-}
-
-function centsToUsd(cents) {
-  if (cents == null) return '-';
-  return '$' + (cents / 100).toFixed(2);
-}
-
-function shortTime(isoStr) {
-  if (!isoStr) return '';
-  try {
-    const d = new Date(isoStr);
-    if (isNaN(d.getTime())) return isoStr.substring(11, 16);
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  } catch { return ''; }
-}
-
-function escapeHtml(s) {
-  const div = document.createElement('div');
-  div.textContent = s;
-  return div.innerHTML;
-}
-
-function countdownStr(isoStr) {
-  if (!isoStr) return '';
-  try {
-    const d = new Date(isoStr);
-    if (isNaN(d.getTime())) return '';
-    const diff = d.getTime() - Date.now();
-    if (diff <= 0) return 'settled';
-    const mins = Math.floor(diff / 60000);
-    if (mins < 60) return mins + 'm';
-    const hrs = Math.floor(mins / 60);
-    const remMins = mins % 60;
-    if (hrs < 24) return hrs + 'h ' + remMins + 'm';
-    const days = Math.floor(hrs / 24);
-    const remHrs = hrs % 24;
-    return days + 'd ' + remHrs + 'h';
-  } catch { return ''; }
-}
-
-async function fetchJson(url) {
-  try {
-    const res = await fetch(url);
-    return await res.json();
-  } catch {
-    return null;
-  }
-}
-
-// ─── Bot Status ───
-
-async function loadBots() {
-  const data = await fetchJson('/api/bots');
-  const el = document.getElementById('bot-status');
-  if (!data || data.error) {
-    el.innerHTML = '<div class="text-gray-500">Unable to load</div>';
-    return;
-  }
-  el.innerHTML = data.map(b => {
-    let dotClass = 'dot-gray';
-    if (b.status === 'running') dotClass = 'dot-green';
-    else if (b.status === 'stale') dotClass = 'dot-yellow';
-    else if (b.status === 'stopped' && b.pid) dotClass = 'dot-red';
-
-    const hb = b.last_heartbeat ? timeAgo(b.last_heartbeat) : '-';
-    const interval = b.scan_interval_min ? `${b.scan_interval_min}m` : '';
-
-    return `<div class="flex items-center justify-between py-1">
-      <div class="flex items-center gap-2">
-        <span class="dot ${dotClass}"></span>
-        <span class="text-gray-200">${b.name}</span>
-      </div>
-      <div class="flex items-center gap-3 text-gray-500 text-xs">
-        ${interval ? `<span>${interval}</span>` : ''}
-        <span>${hb}</span>
-      </div>
-    </div>`;
-  }).join('');
-}
-
-// ─── Account ───
-
-async function loadAccount() {
-  const [account, risk] = await Promise.all([
-    fetchJson('/api/account'),
-    fetchJson('/api/risk'),
-  ]);
-
-  const el = document.getElementById('account-info');
-  if (!account || account.error) {
-    el.innerHTML = `<div class="text-gray-500 text-sm">API unavailable</div>`;
-  } else {
-    const pnl = account.pnl;
-    const pnlColor = v => v > 0 ? 'text-green-400' : v < 0 ? 'text-red-400' : 'text-gray-400';
-
-    el.innerHTML = `
-      <div class="mb-3">
-        <div class="text-xs text-gray-500">NAV</div>
-        <div class="text-2xl font-bold text-green-400">${pnl ? centsToUsd(pnl.nav_cents) : centsToUsd(account.total_value)}</div>
-      </div>
-      <div class="grid grid-cols-2 gap-4 mb-4">
-        <div>
-          <div class="text-xs text-gray-500">Cash</div>
-          <div class="text-lg font-semibold text-gray-200">${centsToUsd(account.balance)}</div>
-        </div>
-        <div>
-          <div class="text-xs text-gray-500">Open Positions</div>
-          <div class="text-lg font-semibold text-gray-200">${centsToUsd(account.portfolio_value)}</div>
-        </div>
-      </div>
-      ${pnl ? `<div class="grid grid-cols-2 gap-x-4 gap-y-2 border-t border-gray-800 pt-3 mb-3">
-        <div>
-          <div class="text-xs text-gray-500">Realized P&L</div>
-          <div class="text-lg font-bold ${pnlColor(pnl.realized_cents)}">${centsToUsd(pnl.realized_cents)}</div>
-        </div>
-        <div>
-          <div class="text-xs text-gray-500">Today's P&L</div>
-          <div class="text-lg font-bold ${pnlColor(pnl.today_pnl_cents)}">${centsToUsd(pnl.today_pnl_cents)}</div>
-        </div>
-        <div>
-          <div class="text-xs text-gray-500">Win Rate</div>
-          <div class="text-sm font-semibold text-gray-200">${pnl.win_rate}% <span class="text-xs text-gray-500">(${pnl.wins}W/${pnl.losses}L)</span></div>
-        </div>
-        <div>
-          <div class="text-xs text-gray-500">Fees Paid</div>
-          <div class="text-sm font-semibold text-gray-400">${centsToUsd(pnl.total_fees_cents)}</div>
-        </div>
-      </div>` : ''}`;
-  }
-
-  // Summary: today's trades across all bots
-  if (risk && risk.per_bot) {
-    const todayTrades = risk.per_bot.reduce((s, b) => s + b.today_trades, 0);
-    const todayRisk = risk.per_bot.reduce((s, b) => s + b.today_risk_cents, 0);
-    el.innerHTML += `
-      <div class="text-sm text-gray-400 border-t border-gray-800 pt-3">
-        Today: <span class="text-gray-200">${todayTrades} trades</span>,
-        <span class="text-gray-200">${centsToUsd(todayRisk)}</span> risked
-      </div>`;
-  }
-}
-
-// ─── Risk ───
-
-async function loadRisk() {
-  const data = await fetchJson('/api/risk');
-  const el = document.getElementById('risk-info');
-  const barsEl = document.getElementById('risk-bars');
-
-  if (!data) {
-    el.innerHTML = '<div class="text-gray-500 text-sm">Unable to load</div>';
-    barsEl.innerHTML = '';
-    return;
-  }
-
-  // Kill switch & circuit breaker
-  const ksColor = data.kill_switch ? 'text-red-400' : 'text-green-400';
-  const ksText = data.kill_switch ? 'ACTIVE' : 'OFF';
-  const cbColor = data.circuit_breaker_open ? 'text-red-400' : 'text-green-400';
-  const cbText = data.circuit_breaker_open ? 'OPEN' : 'CLOSED';
-
-  el.innerHTML = `
-    <div class="space-y-2">
-      <div class="flex justify-between">
-        <span class="text-gray-400">Kill Switch</span>
-        <span class="${ksColor} font-bold">${ksText}</span>
-      </div>
-      <div class="flex justify-between">
-        <span class="text-gray-400">Circuit Breaker</span>
-        <span class="${cbColor} font-bold">${cbText}</span>
-      </div>
-      ${data.circuit_breaker && data.circuit_breaker.failures ? `
-        <div class="flex justify-between text-xs">
-          <span class="text-gray-500">Failures</span>
-          <span class="text-gray-400">${data.circuit_breaker.failures} / ${data.circuit_breaker.max_failures}</span>
-        </div>` : ''}
-    </div>`;
-
-  // Risk bars
-  const bots = (data.per_bot || []).filter(b => b.today_trades > 0 || b.max_daily_loss);
-  if (bots.length === 0) {
-    barsEl.innerHTML = '<div class="text-gray-500 text-sm">No activity today</div>';
-    return;
-  }
-
-  barsEl.innerHTML = bots.map(b => {
-    const limitCents = (b.max_daily_loss || 50) * 100;
-    const pct = Math.min(100, Math.round((b.today_risk_cents / limitCents) * 100));
-    let barColor = 'bg-green-500';
-    if (pct > 80) barColor = 'bg-red-500';
-    else if (pct > 50) barColor = 'bg-yellow-500';
-
-    return `<div class="flex items-center gap-3 text-sm">
-      <span class="w-28 text-gray-300 truncate">${b.bot}</span>
-      <div class="progress-bar flex-1">
-        <div class="progress-fill ${barColor}" style="width:${pct}%"></div>
-      </div>
-      <span class="text-xs text-gray-400 w-24 text-right">${centsToUsd(b.today_risk_cents)} / ${centsToUsd(limitCents)}</span>
-      <span class="text-xs text-gray-500 w-8 text-right">${pct}%</span>
-    </div>`;
-  }).join('');
-}
-
-// ─── Open Orders ───
-
-async function loadOrders() {
-  const data = await fetchJson('/api/orders');
-  const el = document.getElementById('open-orders');
-
-  if (!data || data.error) {
-    el.innerHTML = '<div class="text-gray-500">API unavailable</div>';
-    return;
-  }
-  if (!Array.isArray(data) || data.length === 0) {
-    el.innerHTML = '<div class="text-gray-500">No resting orders</div>';
-    return;
-  }
-
-  el.innerHTML = `<div class="space-y-1">${data.map(o => {
-    const age = timeAgo(o.created_time);
-    return `<div class="flex justify-between py-1 border-b border-gray-800">
-      <div>
-        <span class="text-gray-200">${escapeHtml(o.ticker)}</span>
-        <span class="ml-2 ${o.side === 'yes' ? 'text-green-400' : 'text-red-400'}">${o.side?.toUpperCase()}</span>
-        <span class="text-gray-400 ml-1">@${o.price}c x${o.remaining_count}</span>
-      </div>
-      <span class="text-gray-500 text-xs">${age}</span>
-    </div>`;
-  }).join('')}</div>`;
-}
-
-// ─── Positions ───
-
-async function loadPositions() {
-  const data = await fetchJson('/api/positions');
-  const el = document.getElementById('positions');
-
-  if (!data || data.error) {
-    el.innerHTML = '<div class="text-gray-500">API unavailable</div>';
-    return;
-  }
-  if (!Array.isArray(data) || data.length === 0) {
-    el.innerHTML = '<div class="text-gray-500">No open positions</div>';
-    return;
-  }
-
-  el.innerHTML = `<div class="space-y-1">${data.map(p => {
-    const pnlColor = p.realized_pnl > 0 ? 'text-green-400' : p.realized_pnl < 0 ? 'text-red-400' : 'text-gray-400';
-    const countdown = p.close_time ? countdownStr(p.close_time) : '';
-    const spread = (p.yes_bid != null && p.yes_ask != null) ? `${p.yes_bid}-${p.yes_ask}c` : '';
-    return `<div class="flex justify-between py-1 border-b border-gray-800">
-      <div>
-        <span class="text-gray-200">${escapeHtml(p.ticker)}</span>
-        <span class="text-gray-400 ml-2">qty: ${p.position}</span>
-        ${countdown ? `<span class="text-yellow-400 text-xs ml-2">${countdown}</span>` : ''}
-      </div>
-      <div class="text-right">
-        ${spread ? `<span class="text-gray-500 text-xs">${spread}</span>` : ''}
-        <span class="text-gray-400 text-xs ml-2">exp: ${centsToUsd(p.market_exposure)}</span>
-        <span class="${pnlColor} text-xs ml-2">P&L: ${centsToUsd(p.realized_pnl)}</span>
-      </div>
-    </div>`;
-  }).join('')}</div>`;
-}
-
-// ─── Active Exits ───
-
-async function loadExitState() {
-  const data = await fetchJson('/api/exit-state');
-  const el = document.getElementById('active-exits');
-
-  if (!data || data.error) {
-    el.innerHTML = '<div class="text-gray-500">Unable to load exit state</div>';
-    return;
-  }
-  if (!Array.isArray(data) || data.length === 0) {
-    el.innerHTML = '<div class="text-gray-500">No active exits</div>';
-    return;
-  }
-
-  let html = `<div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="text-gray-500 text-xs">
-    <th class="text-left py-1">Ticker</th>
-    <th class="text-center py-1">Side</th>
-    <th class="text-right py-1">Entry</th>
-    <th class="text-right py-1">Peak</th>
-    <th class="text-right py-1">TP</th>
-    <th class="text-right py-1">SL</th>
-    <th class="text-right py-1">Trail</th>
-    <th class="text-left py-1">Nearest</th>
-    <th class="text-right py-1">Updated</th>
-  </tr></thead><tbody>`;
-
-  for (const ex of data) {
-    // Color-code rows
-    let rowClass = '';
-    const nearest = ex.nearest_threshold || 'hold';
-    if (nearest.startsWith('trailing')) {
-      rowClass = 'bg-yellow-900/20';
-    } else if (ex.peak_bid >= ex.take_profit_threshold) {
-      rowClass = 'bg-green-900/20';
-    } else if (ex.peak_bid > 0 && ex.peak_bid <= ex.stop_loss_threshold) {
-      rowClass = 'bg-red-900/20';
-    }
-
-    const sideColor = ex.side === 'yes' ? 'text-green-400' : 'text-red-400';
-    const updated = ex.last_updated ? timeAgo(ex.last_updated) : '-';
-
-    html += `<tr class="border-t border-gray-800 ${rowClass}">
-      <td class="py-1 text-gray-200">${escapeHtml(ex.ticker)}</td>
-      <td class="text-center ${sideColor}">${(ex.side || '').toUpperCase()}</td>
-      <td class="text-right text-gray-300">${ex.entry_price}c</td>
-      <td class="text-right text-gray-200 font-semibold">${ex.peak_bid}c</td>
-      <td class="text-right text-green-400">${ex.take_profit_threshold}c</td>
-      <td class="text-right text-red-400">${ex.stop_loss_threshold}c</td>
-      <td class="text-right text-yellow-400">${ex.trailing_drop}c</td>
-      <td class="text-left text-gray-300">${escapeHtml(nearest)}</td>
-      <td class="text-right text-gray-500 text-xs">${updated}</td>
-    </tr>`;
-  }
-
-  html += '</tbody></table></div>';
-  el.innerHTML = html;
-}
-
-// ─── Recent Trades ───
-
-async function loadTrades() {
-  const data = await fetchJson('/api/trades?limit=40');
-  const el = document.getElementById('recent-trades');
-  const srcEl = document.getElementById('trades-source');
-
-  if (!data || !Array.isArray(data) || data.length === 0) {
-    el.innerHTML = '<div class="text-gray-500">No trades</div>';
-    srcEl.textContent = '';
-    return;
-  }
-
-  const source = data[0]?.source || 'local';
-  srcEl.textContent = source === 'api' ? 'via Kalshi API' : 'local logs';
-
-  el.innerHTML = data.map(t => {
-    const time = shortTime(t.timestamp);
-    const dateStr = (t.timestamp || '').substring(0, 10);
-    const sideColor = t.side === 'YES' ? 'text-green-400' : t.side === 'NO' ? 'text-red-400' : 'text-gray-400';
-    const botLabel = t.bot || '?';
-    return `<div class="flex items-center gap-2 py-1 border-b border-gray-800/50">
-      <span class="text-gray-600 text-xs w-16 shrink-0">${dateStr.substring(5)} ${time}</span>
-      <span class="text-blue-400 text-xs w-20 truncate shrink-0">${botLabel}</span>
-      <span class="text-gray-200 flex-1 truncate">${escapeHtml(t.ticker)}</span>
-      <span class="${sideColor} w-8 shrink-0">${t.side}</span>
-      <span class="text-gray-400 text-xs shrink-0">x${t.count || '?'}</span>
-      <span class="text-gray-400 text-xs w-16 text-right shrink-0">${centsToUsd(t.risk_cents)}</span>
-    </div>`;
-  }).join('');
-}
-
-// ─── Decision Feed ───
-
-async function loadDecisions() {
-  const data = await fetchJson('/api/decisions?limit=30');
-  const el = document.getElementById('decision-feed');
-
-  if (!data || !Array.isArray(data) || data.length === 0) {
-    el.innerHTML = '<div class="text-gray-500">No decision logs available</div>';
-    return;
-  }
-
-  el.innerHTML = data.map(d => {
-    const time = shortTime(d.timestamp);
-    const reason = d.reason || d.skip_reason || '';
-    return `<div class="py-1 border-b border-gray-800/50">
-      <div class="flex items-center gap-2">
-        <span class="text-gray-500 text-xs w-12">${time}</span>
-        <span class="text-blue-400 text-xs">${d.bot || ''}</span>
-        <span class="text-gray-200 truncate">${escapeHtml(d.ticker || '')}</span>
-        <span class="text-yellow-400 text-xs">${d.action || 'skip'}</span>
-      </div>
-      ${reason ? `<div class="text-gray-500 text-xs ml-14 truncate">${escapeHtml(reason)}</div>` : ''}
-    </div>`;
-  }).join('');
-}
-
-// ─── Settlements & P&L ───
-
-async function loadSettlements() {
-  const data = await fetchJson('/api/settlements?limit=50');
-  const summaryEl = document.getElementById('settlements-summary');
-  const listEl = document.getElementById('settlements-list');
-
-  if (!data || data.error) {
-    summaryEl.innerHTML = '';
-    listEl.innerHTML = '<div class="text-gray-500">API unavailable</div>';
-    return;
-  }
-
-  const s = data.summary || {};
-  const pnlColor = s.total_pnl_cents > 0 ? 'text-green-400' : s.total_pnl_cents < 0 ? 'text-red-400' : 'text-gray-400';
-
-  summaryEl.innerHTML = `
-    <div class="flex items-center gap-6 text-sm">
-      <div>
-        <span class="text-gray-500">Realized P&L:</span>
-        <span class="font-bold ${pnlColor} ml-1">${centsToUsd(s.total_pnl_cents)}</span>
-      </div>
-      <div>
-        <span class="text-gray-500">Win Rate:</span>
-        <span class="text-gray-200 ml-1">${s.win_rate || 0}%</span>
-      </div>
-      <div>
-        <span class="text-gray-500">Record:</span>
-        <span class="text-green-400 ml-1">${s.wins || 0}W</span>
-        <span class="text-gray-500">/</span>
-        <span class="text-red-400">${s.losses || 0}L</span>
-      </div>
-      <div>
-        <span class="text-gray-500">Settled:</span>
-        <span class="text-gray-200 ml-1">${s.count || 0}</span>
-      </div>
-    </div>`;
-
-  const settlements = data.settlements || [];
-  if (settlements.length === 0) {
-    listEl.innerHTML = '<div class="text-gray-500">No settlements</div>';
-    return;
-  }
-
-  listEl.innerHTML = settlements.map(st => {
-    const profit = st.profit ?? (st.revenue || 0);
-    const isWin = profit > 0;
-    const isLoss = profit < 0;
-    const icon = isWin ? '<span class="text-green-400">W</span>' : isLoss ? '<span class="text-red-400">L</span>' : '<span class="text-gray-500">-</span>';
-    const profitColor = isWin ? 'text-green-400' : isLoss ? 'text-red-400' : 'text-gray-500';
-    const dateStr = (st.settled_time || '').substring(0, 10);
-    const timeStr = shortTime(st.settled_time);
-    return `<div class="flex items-center gap-2 py-1 border-b border-gray-800/50">
-      <span class="w-5 text-center font-bold">${icon}</span>
-      <span class="text-gray-600 text-xs w-20 shrink-0">${dateStr.substring(5)} ${timeStr}</span>
-      <span class="text-blue-400 text-xs w-20 truncate shrink-0">${st.bot || '?'}</span>
-      <span class="text-gray-200 flex-1 truncate">${escapeHtml(st.ticker)}</span>
-      <span class="${profitColor} text-xs w-16 text-right shrink-0">${profit >= 0 ? '+' : ''}${centsToUsd(profit)}</span>
-    </div>`;
-  }).join('');
-}
-
-// ─── Data Source Health ───
-
-async function loadHealth() {
-  const data = await fetchJson('/api/health');
-  const el = document.getElementById('source-health');
-
-  if (!data || (!data.sources && !data.bots)) {
-    el.innerHTML = '<div class="text-gray-500">No health data</div>';
-    return;
-  }
-
-  const sources = data.sources || {};
-  const keys = Object.keys(sources);
-  if (keys.length === 0) {
-    el.innerHTML = '<div class="text-gray-500">No data sources tracked</div>';
-    return;
-  }
-
-  el.innerHTML = keys.map(name => {
-    const s = sources[name];
-    const ok = s.status === 'ok' || !s.error_count;
-    const dotClass = ok ? 'dot-green' : (s.error_count > 3 ? 'dot-red' : 'dot-yellow');
-    const label = ok ? 'OK' : `${s.error_count} errors`;
-    const lastOk = s.last_success ? timeAgo(s.last_success) : '-';
-
-    return `<div class="flex items-center justify-between py-1">
-      <div class="flex items-center gap-2">
-        <span class="dot ${dotClass}"></span>
-        <span class="text-gray-200">${escapeHtml(name)}</span>
-      </div>
-      <div class="text-xs text-gray-500">
-        ${label} &middot; ${lastOk}
-      </div>
-    </div>`;
-  }).join('');
-}
-
-// ─── Log Viewer ───
-
-async function loadLogs() {
-  const bot = document.getElementById('log-bot-select').value;
-  const data = await fetchJson(`/api/logs?bot=${bot}&lines=100`);
-  const el = document.getElementById('log-viewer');
-
-  if (!data || data.error) {
-    el.textContent = data?.error || 'Unable to load logs';
-    return;
-  }
-  if (!data.lines || data.lines.length === 0) {
-    el.textContent = 'No log output';
-    return;
-  }
-
-  el.textContent = data.lines.join('\n');
-  // Auto-scroll to bottom
-  el.scrollTop = el.scrollHeight;
-}
-
-// ─── Model Quality (Brier Scores + Calibration Curves) ───
-
-let calibrationCharts = {};
-
-async function loadBacktest() {
-  const data = await fetchJson('/api/backtest');
-  const el = document.getElementById('brier-tables');
-  const chartsContainer = document.getElementById('calibration-charts-container');
-
-  if (!data || data.error) {
-    el.innerHTML = `<div class="text-gray-500 text-sm">${data?.error || 'No backtest data available'}</div>`;
-    chartsContainer.innerHTML = '';
-    return;
-  }
-
-  // Per-bot Brier table
-  const perBot = data.per_bot || {};
-  const perMT = data.per_market_type_brier || {};
-  const perCity = data.per_city_brier || {};
-
-  let html = '';
-
-  // Per-bot table
-  if (Object.keys(perBot).length > 0) {
-    html += `<div class="mb-3"><span class="text-xs text-gray-500 uppercase">Per Bot</span>
-      <table class="w-full text-sm mt-1"><thead><tr class="text-gray-500 text-xs">
-        <th class="text-left py-1">Bot</th><th class="text-right py-1">N</th><th class="text-right py-1">Brier</th><th class="text-right py-1">Win Rate</th>
-      </tr></thead><tbody>`;
-    for (const [bot, stats] of Object.entries(perBot)) {
-      const bs = stats.brier_score != null ? stats.brier_score.toFixed(4) : 'N/A';
-      const wr = stats.win_rate != null ? (stats.win_rate * 100).toFixed(1) + '%' : 'N/A';
-      const flag = stats.n_evaluated < 30 ? ' <span class="text-yellow-500 text-xs">(low sample)</span>' : '';
-      html += `<tr class="border-t border-gray-800"><td class="py-1 text-gray-200">${escapeHtml(bot)}</td>
-        <td class="text-right text-gray-400">${stats.n_evaluated}${flag}</td>
-        <td class="text-right text-gray-200">${bs}</td>
-        <td class="text-right text-gray-200">${wr}</td></tr>`;
-    }
-    html += `</tbody></table></div>`;
-  }
-
-  // Per-market-type table
-  if (Object.keys(perMT).length > 0) {
-    html += `<div class="mb-3"><span class="text-xs text-gray-500 uppercase">Per Market Type</span>
-      <table class="w-full text-sm mt-1"><thead><tr class="text-gray-500 text-xs">
-        <th class="text-left py-1">Type</th><th class="text-right py-1">N</th><th class="text-right py-1">Brier</th>
-      </tr></thead><tbody>`;
-    for (const [mtype, stats] of Object.entries(perMT)) {
-      const bs = stats.brier != null ? stats.brier.toFixed(4) : 'N/A';
-      const flag = stats.n < 30 ? ' <span class="text-yellow-500 text-xs">(low)</span>' : '';
-      html += `<tr class="border-t border-gray-800"><td class="py-1 text-gray-200">${escapeHtml(mtype)}</td>
-        <td class="text-right text-gray-400">${stats.n}${flag}</td>
-        <td class="text-right text-gray-200">${bs}</td></tr>`;
-    }
-    html += `</tbody></table></div>`;
-  }
-
-  // Per-city table (compact)
-  if (Object.keys(perCity).length > 0) {
-    html += `<div class="mb-3"><span class="text-xs text-gray-500 uppercase">Per City (Weather)</span>
-      <div class="flex flex-wrap gap-3 mt-1 text-sm">`;
-    for (const [city, stats] of Object.entries(perCity)) {
-      const bs = stats.brier != null ? stats.brier.toFixed(4) : 'N/A';
-      const flag = stats.n < 30 ? ' *' : '';
-      html += `<span class="text-gray-300">${city}: <span class="text-gray-100">${bs}</span> <span class="text-gray-500">(n=${stats.n}${flag})</span></span>`;
-    }
-    html += `</div></div>`;
-  }
-
-  // Aggregate
-  const aggBrier = data.aggregate_brier || data.brier_score;
-  if (aggBrier != null) {
-    html += `<div class="text-sm text-gray-400 mt-2">Aggregate Brier: <span class="text-gray-100 font-semibold">${aggBrier.toFixed(4)}</span> <span class="text-xs">(0=perfect, 0.25=random)</span></div>`;
-  }
-
-  el.innerHTML = html;
-
-  // Calibration curve charts
-  const curves = data.calibration_curves || {};
-  const mtypes = Object.keys(curves).filter(k => curves[k] && curves[k].length > 0);
-
-  if (mtypes.length === 0) {
-    chartsContainer.innerHTML = '<div class="text-gray-500 text-sm">No calibration data available</div>';
-    return;
-  }
-
-  // Create canvas elements for each market type
-  chartsContainer.innerHTML = mtypes.map(mtype =>
-    `<div><div class="text-xs text-gray-500 uppercase mb-1">${escapeHtml(mtype)} Calibration</div>
-     <div style="position:relative;height:250px"><canvas id="cal-chart-${mtype}"></canvas></div></div>`
-  ).join('');
-
-  // Render charts
-  for (const mtype of mtypes) {
-    const curve = curves[mtype];
-    const ctx = document.getElementById(`cal-chart-${mtype}`);
-    if (!ctx) continue;
-
-    // Destroy previous chart if exists
-    if (calibrationCharts[mtype]) {
-      calibrationCharts[mtype].destroy();
-    }
-
-    const labels = curve.map(r => r.bin);
-    const predicted = curve.map(r => r.predicted_avg);
-    const actual = curve.map(r => r.actual_avg);
-
-    calibrationCharts[mtype] = new Chart(ctx, {
-      type: 'scatter',
-      data: {
-        datasets: [
-          {
-            label: 'Actual',
-            data: predicted.map((p, i) => ({ x: p, y: actual[i] })),
-            backgroundColor: '#22c55e',
-            borderColor: '#22c55e',
-            pointRadius: 5,
-            showLine: true,
-            borderWidth: 2,
-          },
-          {
-            label: 'Perfect',
-            data: [{ x: 0, y: 0 }, { x: 1, y: 1 }],
-            borderColor: '#4b5563',
-            borderDash: [5, 5],
-            pointRadius: 0,
-            showLine: true,
-            borderWidth: 1,
-          },
-        ],
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {
-          legend: { labels: { color: '#9ca3af', font: { size: 10 } } },
-          tooltip: {
-            callbacks: {
-              label: function(ctx) {
-                const idx = ctx.dataIndex;
-                if (ctx.datasetIndex === 0) {
-                  const row = curve[idx];
-                  return `Pred: ${row.predicted_avg.toFixed(2)}, Actual: ${row.actual_avg.toFixed(2)} (n=${row.n})`;
-                }
-                return '';
-              }
-            }
-          }
-        },
-        scales: {
-          x: { title: { display: true, text: 'Predicted', color: '#6b7280' }, min: 0, max: 1, ticks: { color: '#6b7280' }, grid: { color: '#1f2937' } },
-          y: { title: { display: true, text: 'Actual', color: '#6b7280' }, min: 0, max: 1, ticks: { color: '#6b7280' }, grid: { color: '#1f2937' } },
-        },
-      },
-    });
-  }
-}
-
-// ─── P&L Analytics ───
-
-let cumulativePnlChart = null;
-
-async function loadPerformance() {
-  const data = await fetchJson('/api/performance');
-  const tableEl = document.getElementById('pnl-table');
-  const chartCanvas = document.getElementById('cumulative-pnl-chart');
-
-  if (!data || data.error) {
-    tableEl.innerHTML = `<div class="text-gray-500 text-sm">${data?.error || 'No performance data available'}</div>`;
-    return;
-  }
-
-  const perBot = data.per_bot || {};
-  const agg = data.aggregate || {};
-
-  // Per-bot P&L table
-  let html = `<table class="w-full text-sm"><thead><tr class="text-gray-500 text-xs">
-    <th class="text-left py-1">Bot</th><th class="text-right py-1">Gross</th><th class="text-right py-1">Net</th>
-    <th class="text-right py-1">Fees</th><th class="text-right py-1">WR</th><th class="text-right py-1">Sharpe</th><th class="text-right py-1">30d</th>
-  </tr></thead><tbody>`;
-
-  for (const [bot, stats] of Object.entries(perBot)) {
-    const gross = centsToUsd(stats.realized_pnl);
-    const net = centsToUsd(stats.net_pnl);
-    const fees = centsToUsd(stats.fee_cents);
-    const wr = stats.trade_count > 0 ? (stats.win_rate * 100).toFixed(1) + '%' : 'N/A';
-    const sharpe = stats.sharpe_all_time != null ? stats.sharpe_all_time.toFixed(2) : 'N/A';
-    const s30d = stats.sharpe_rolling_30d != null ? stats.sharpe_rolling_30d.toFixed(2) : 'N/A';
-    const grossColor = stats.realized_pnl > 0 ? 'text-green-400' : stats.realized_pnl < 0 ? 'text-red-400' : 'text-gray-400';
-    const netColor = stats.net_pnl > 0 ? 'text-green-400' : stats.net_pnl < 0 ? 'text-red-400' : 'text-gray-400';
-
-    html += `<tr class="border-t border-gray-800">
-      <td class="py-1 text-gray-200">${escapeHtml(bot)}</td>
-      <td class="text-right ${grossColor}">${gross}</td>
-      <td class="text-right ${netColor}">${net}</td>
-      <td class="text-right text-gray-400">${fees}</td>
-      <td class="text-right text-gray-200">${wr}</td>
-      <td class="text-right text-gray-200">${sharpe}</td>
-      <td class="text-right text-gray-200">${s30d}</td>
-    </tr>`;
-  }
-
-  // Aggregate row
-  if (agg.realized_pnl != null) {
-    const grossColor = agg.realized_pnl > 0 ? 'text-green-400' : agg.realized_pnl < 0 ? 'text-red-400' : 'text-gray-400';
-    const netColor = agg.net_pnl > 0 ? 'text-green-400' : agg.net_pnl < 0 ? 'text-red-400' : 'text-gray-400';
-    html += `<tr class="border-t-2 border-gray-600 font-semibold">
-      <td class="py-1 text-gray-100">TOTAL</td>
-      <td class="text-right ${grossColor}">${centsToUsd(agg.realized_pnl)}</td>
-      <td class="text-right ${netColor}">${centsToUsd(agg.net_pnl)}</td>
-      <td class="text-right text-gray-400">${centsToUsd(agg.fee_cents)}</td>
-      <td class="text-right text-gray-100">${agg.trade_count > 0 ? (agg.win_rate * 100).toFixed(1) + '%' : 'N/A'}</td>
-      <td class="text-right text-gray-100">${agg.sharpe_all_time != null ? agg.sharpe_all_time.toFixed(2) : 'N/A'}</td>
-      <td class="text-right text-gray-100">${agg.sharpe_rolling_30d != null ? agg.sharpe_rolling_30d.toFixed(2) : 'N/A'}</td>
-    </tr>`;
-  }
-
-  html += `</tbody></table>`;
-  tableEl.innerHTML = html;
-
-  // Cumulative P&L chart
-  const cumPnl = agg.cumulative_pnl || {};
-  const dates = Object.keys(cumPnl).sort();
-  if (dates.length > 0 && chartCanvas) {
-    const values = dates.map(d => cumPnl[d] / 100);  // Convert cents to dollars
-
-    if (cumulativePnlChart) {
-      cumulativePnlChart.destroy();
-    }
-
-    cumulativePnlChart = new Chart(chartCanvas, {
-      type: 'line',
-      data: {
-        labels: dates.map(d => d.substring(5)),  // MM-DD format
-        datasets: [{
-          label: 'Cumulative P&L ($)',
-          data: values,
-          borderColor: values[values.length - 1] >= 0 ? '#22c55e' : '#ef4444',
-          backgroundColor: 'rgba(34, 197, 94, 0.1)',
-          fill: true,
-          tension: 0.3,
-          pointRadius: dates.length > 30 ? 0 : 3,
-          borderWidth: 2,
-        }],
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {
-          legend: { labels: { color: '#9ca3af', font: { size: 10 } } },
-        },
-        scales: {
-          x: { ticks: { color: '#6b7280', maxTicksLimit: 15 }, grid: { color: '#1f2937' } },
-          y: { ticks: { color: '#6b7280', callback: v => '$' + v.toFixed(0) }, grid: { color: '#1f2937' } },
-        },
-      },
-    });
-  }
-}
-
-// ─── Polling ───
-
-async function refreshAll() {
-  await Promise.all([
-    loadBots(),
-    loadSettlements(),
-    loadAccount(),
-    loadRisk(),
-    loadOrders(),
-    loadPositions(),
-    loadExitState(),
-    loadTrades(),
-    loadDecisions(),
-    loadHealth(),
-    loadLogs(),
-    loadBacktest(),
-    loadPerformance(),
-  ]);
-  document.getElementById('last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
-}
-
-function startPolling() {
-  refreshAll();
-  refreshTimer = setInterval(() => {
-    if (document.getElementById('auto-refresh').checked) {
-      refreshAll();
-    }
-  }, POLL_INTERVAL);
-}
-
-document.getElementById('log-bot-select').addEventListener('change', loadLogs);
-startPolling();
-
-// Tab switching
+let equityChart = null;
+let calibrationChart = null;
+let cachedBots = [];
+let cachedSettlements = null;
+let activityFilter = 'all';
+
+// ─── Tab Navigation ───
 document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => {
-    const tabId = btn.dataset.tab;
-    document.querySelectorAll('.tab-btn').forEach(b => {
-      b.classList.remove('border-green-500', 'text-green-400');
-      b.classList.add('border-transparent', 'text-gray-500');
-    });
-    btn.classList.remove('border-transparent', 'text-gray-500');
-    btn.classList.add('border-green-500', 'text-green-400');
-    document.getElementById('tab-dashboard').style.display = tabId === 'dashboard' ? '' : 'none';
-    document.getElementById('tab-intelligence').style.display = tabId === 'intelligence' ? '' : 'none';
-    if (tabId === 'intelligence') loadIntelligence();
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const tab = btn.dataset.tab;
+    document.querySelectorAll('main > div[id^="tab-"]').forEach(el => el.classList.add('hidden'));
+    document.getElementById(`tab-${tab}`).classList.remove('hidden');
   });
 });
 
-async function loadIntelligence() {
-  try {
-    const attr = await fetch('/api/attribution').then(r => r.json());
-    if (attr.summary) {
-      const pnlClass = attr.summary.total_pnl_cents >= 0 ? 'text-green-400' : 'text-red-400';
-      document.getElementById('attribution-summary').innerHTML =
-        `<strong>Settled: ${attr.summary.total_trades_settled}</strong> trades | ` +
-        `Realized P&L: <span class="${pnlClass}">$${(attr.summary.total_pnl_cents / 100).toFixed(2)}</span>`;
-    }
-    fillAttrTable('attr-by-bot', attr.by_bot);
-    fillAttrTable('attr-by-edge', attr.by_edge_bucket, true);
-    fillAttrTable('attr-by-market', attr.by_market_type);
-    fillAttrTable('attr-by-sizing', attr.by_sizing);
-  } catch(e) { console.error('Attribution load failed:', e); }
-
-  try {
-    const edge = await fetch('/api/edge-decay').then(r => r.json());
-    const tbody = document.querySelector('#edge-decay-table tbody');
-    tbody.innerHTML = '';
-    for (const [mt, d] of Object.entries(edge.market_types || {})) {
-      const hl = d.edge_half_life_days === Infinity ? '\u221E' : d.edge_half_life_days.toFixed(0);
-      tbody.innerHTML += `<tr class="border-t border-gray-800">
-        <td class="py-1">${mt}</td><td>${(d.realization_rate * 100).toFixed(1)}%</td>
-        <td>${d.efficiency_trend_slope.toFixed(5)}</td><td>${hl}d</td>
-        <td class="${d.competitor_detected ? 'text-yellow-400' : 'text-gray-500'}">${d.competitor_detected ? 'YES' : 'No'}</td></tr>`;
-    }
-    document.getElementById('edge-decay-content').innerHTML =
-      `${edge.total_observations || 0} observations tracked`;
-  } catch(e) { console.error('Edge decay load failed:', e); }
-
-  try {
-    const eq = await fetch('/api/execution-quality').then(r => r.json());
-    document.getElementById('exec-quality-content').innerHTML =
-      `Fill Rate: <strong>${(eq.fill_rate * 100).toFixed(1)}%</strong> | ` +
-      `Avg Slippage: ${eq.average_slippage_cents.toFixed(1)}c | ` +
-      `Shortfall: ${eq.implementation_shortfall_cents.toFixed(1)}c`;
-    const tbody = document.querySelector('#exec-quality-table tbody');
-    tbody.innerHTML = '';
-    for (const [bot, d] of Object.entries(eq.by_bot || {})) {
-      tbody.innerHTML += `<tr class="border-t border-gray-800">
-        <td class="py-1">${bot}</td>
-        <td>${(d.fill_rate * 100).toFixed(1)}%</td>
-        <td>${d.avg_slippage_cents.toFixed(1)}c</td>
-        <td>${d.impl_shortfall_cents.toFixed(1)}c</td>
-        <td>${d.trade_count}</td></tr>`;
-    }
-  } catch(e) { console.error('Exec quality load failed:', e); }
+// ─── Formatting Helpers ───
+function cents(v) {
+  if (v == null) return '--';
+  const dollars = v / 100;
+  return dollars < 0 ? `-$${Math.abs(dollars).toFixed(2)}` : `$${dollars.toFixed(2)}`;
+}
+function pnlColor(v) { return v > 0 ? '#10b981' : v < 0 ? '#f43f5e' : '#94a3b8'; }
+function pnlSign(v) { return v > 0 ? '+' : ''; }
+function timeAgo(iso) {
+  if (!iso) return '';
+  const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s/60)}m ago`;
+  if (s < 86400) return `${Math.floor(s/3600)}h ago`;
+  return `${Math.floor(s/86400)}d ago`;
+}
+function formatTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+}
+function formatDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
-function fillAttrTable(tableId, data, hasAvgEdge) {
-  const tbody = document.querySelector(`#${tableId} tbody`);
-  if (!tbody || !data) return;
-  tbody.innerHTML = '';
-  for (const [key, d] of Object.entries(data)) {
-    const pnlClass = d.pnl_cents >= 0 ? 'text-green-400' : 'text-red-400';
-    let row = `<td class="py-1">${key}</td>
-      <td class="${pnlClass}">$${(d.pnl_cents / 100).toFixed(2)}</td>
-      <td>${d.trades}</td><td>${(d.win_rate * 100).toFixed(1)}%</td>`;
-    if (hasAvgEdge) row += `<td>${((d.avg_edge || 0) * 100).toFixed(1)}%</td>`;
-    tbody.innerHTML += `<tr class="border-t border-gray-800">${row}</tr>`;
+function pillClass(bot) {
+  const map = {
+    weather: 'pill-weather', crypto: 'pill-crypto', economics: 'pill-economics',
+    entertainment: 'pill-entertainment', beatrelease: 'pill-entertainment',
+    strategy: 'pill-strategy', monitor: 'pill-monitor', positions: 'pill-positions',
+    hdd: 'pill-monitor', arb: 'pill-strategy', mm: 'pill-strategy',
+  };
+  return map[bot] || 'pill-default';
+}
+
+function strategyPill(bot, strategy) {
+  return `<span class="pill ${pillClass(bot)}">${strategy || bot}</span>`;
+}
+
+// ─── Data Fetching ───
+async function fetchJSON(url) {
+  try {
+    const r = await fetch(url);
+    return await r.json();
+  } catch { return null; }
+}
+
+// ─── OVERVIEW TAB ───
+async function loadOverview() {
+  const [account, settlements, risk, positions, backtest, attribution] = await Promise.all([
+    fetchJSON('/api/account'),
+    fetchJSON('/api/settlements?limit=200'),
+    fetchJSON('/api/risk'),
+    fetchJSON('/api/positions'),
+    fetchJSON('/api/backtest'),
+    fetchJSON('/api/attribution'),
+  ]);
+
+  cachedSettlements = settlements;
+
+  // KPI: Account Value
+  if (account && !account.error) {
+    const total = account.total_value || 0;
+    document.getElementById('kpi-account').textContent = cents(total);
+    document.getElementById('kpi-account-detail').textContent =
+      `${cents(account.balance)} cash · ${cents(account.portfolio_value)} positions`;
+  }
+
+  // KPI: Realized P&L
+  if (account?.pnl) {
+    const p = account.pnl;
+    const el = document.getElementById('kpi-pnl');
+    el.textContent = `${pnlSign(p.realized_cents)}${cents(p.realized_cents)}`;
+    el.style.color = pnlColor(p.realized_cents);
+    document.getElementById('kpi-pnl-detail').innerHTML =
+      `Today: <span style="color:${pnlColor(p.today_pnl_cents)}">${pnlSign(p.today_pnl_cents)}${cents(p.today_pnl_cents)}</span>`;
+  }
+
+  // KPI: Hit Rate
+  if (account?.pnl) {
+    const p = account.pnl;
+    const el = document.getElementById('kpi-hitrate');
+    el.textContent = `${p.win_rate}%`;
+    el.style.color = p.win_rate >= 50 ? '#10b981' : '#f43f5e';
+    document.getElementById('kpi-hitrate-detail').innerHTML =
+      `<span style="color:#10b981">${p.wins}W</span> · <span style="color:#f43f5e">${p.losses}L</span>`;
+  }
+
+  // KPI: Open Exposure
+  if (Array.isArray(positions)) {
+    const exposure = positions.reduce((s, p) => s + Math.abs(p.market_exposure || 0), 0);
+    document.getElementById('kpi-exposure').textContent = cents(exposure);
+    document.getElementById('kpi-exposure-detail').textContent = `${positions.length} open positions`;
+  }
+
+  // Equity Curve
+  if (settlements?.settlements) {
+    renderEquityCurve(settlements.settlements);
+  }
+
+  // Strategy Performance Table
+  if (settlements?.settlements) {
+    renderStrategyTable(settlements.settlements);
+  }
+
+  // Daily Budget
+  if (risk && !risk.error) {
+    renderDailyBudget(risk);
+  }
+
+  // Forecast Accuracy
+  if (backtest && !backtest.error) {
+    renderForecastAccuracy(backtest);
   }
 }
+
+function renderEquityCurve(settlements) {
+  // Sort chronologically
+  const sorted = [...settlements].sort((a, b) => (a.settled_time || '').localeCompare(b.settled_time || ''));
+  let cumulative = 0;
+  const data = sorted.map(s => {
+    cumulative += (s.profit || 0);
+    return { x: s.settled_time, y: cumulative / 100 };
+  });
+
+  const ctx = document.getElementById('equity-chart').getContext('2d');
+  if (equityChart) equityChart.destroy();
+
+  const gradient = ctx.createLinearGradient(0, 0, 0, 350);
+  const lastVal = data.length ? data[data.length-1].y : 0;
+  if (lastVal >= 0) {
+    gradient.addColorStop(0, 'rgba(16, 185, 129, 0.3)');
+    gradient.addColorStop(1, 'rgba(16, 185, 129, 0)');
+  } else {
+    gradient.addColorStop(0, 'rgba(244, 63, 94, 0.3)');
+    gradient.addColorStop(1, 'rgba(244, 63, 94, 0)');
+  }
+
+  equityChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: data.map(d => d.x),
+      datasets: [{
+        data: data.map(d => d.y),
+        borderColor: lastVal >= 0 ? '#10b981' : '#f43f5e',
+        backgroundColor: gradient,
+        fill: true,
+        tension: 0.3,
+        pointRadius: 0,
+        borderWidth: 2,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: {
+          display: true,
+          ticks: {
+            color: '#475569', font: { size: 10 },
+            maxTicksLimit: 8,
+            callback: function(val, idx) {
+              const label = this.getLabelForValue(val);
+              if (!label) return '';
+              return formatDate(label);
+            }
+          },
+          grid: { color: '#1e293b' }
+        },
+        y: {
+          ticks: {
+            color: '#475569', font: { size: 10, family: 'ui-monospace, monospace' },
+            callback: v => `$${v.toFixed(2)}`
+          },
+          grid: { color: '#1e293b' }
+        }
+      },
+      interaction: { intersect: false, mode: 'index' },
+    }
+  });
+}
+
+function renderStrategyTable(settlements) {
+  // Group by strategy
+  const byStrategy = {};
+  for (const s of settlements) {
+    const key = s.strategy || s.bot || 'Unknown';
+    if (!byStrategy[key]) byStrategy[key] = { pnl: 0, wins: 0, losses: 0, trades: 0, bot: s.bot };
+    byStrategy[key].pnl += (s.profit || 0);
+    byStrategy[key].trades++;
+    if (s.profit > 0) byStrategy[key].wins++;
+    else if (s.profit < 0) byStrategy[key].losses++;
+  }
+
+  const rows = Object.entries(byStrategy)
+    .map(([strategy, d]) => ({
+      strategy, ...d,
+      hitRate: d.trades > 0 ? Math.round(d.wins / d.trades * 100) : 0,
+      avgReturn: d.trades > 0 ? d.pnl / d.trades : 0,
+    }))
+    .sort((a, b) => b.pnl - a.pnl);
+
+  let html = `<table class="w-full"><thead>
+    <tr class="text-xs text-slate-500 border-b border-slate-800">
+      <th class="text-left py-2 font-medium">Strategy</th>
+      <th class="text-right py-2 font-medium">Settled P&L</th>
+      <th class="text-right py-2 font-medium">Hit Rate</th>
+      <th class="text-right py-2 font-medium">Trades</th>
+      <th class="text-right py-2 font-medium">Avg Return</th>
+    </tr></thead><tbody>`;
+
+  for (const r of rows) {
+    const bgTint = r.pnl > 0 ? 'rgba(16,185,129,0.04)' : r.pnl < 0 ? 'rgba(244,63,94,0.04)' : '';
+    html += `<tr style="background:${bgTint}" class="border-b border-slate-800/50">
+      <td class="py-2.5">${strategyPill(r.bot, r.strategy)}</td>
+      <td class="text-right py-2.5 mono" style="color:${pnlColor(r.pnl)}">${pnlSign(r.pnl)}${cents(r.pnl)}</td>
+      <td class="text-right py-2.5 mono" style="color:${r.hitRate >= 50 ? '#10b981' : '#f43f5e'}">${r.hitRate}%</td>
+      <td class="text-right py-2.5 mono text-slate-400">${r.trades}</td>
+      <td class="text-right py-2.5 mono" style="color:${pnlColor(r.avgReturn)}">${pnlSign(r.avgReturn)}${cents(r.avgReturn)}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  document.getElementById('strategy-table').innerHTML = html;
+}
+
+function renderDailyBudget(risk) {
+  const bots = risk.per_bot || [];
+  let html = '';
+  for (const b of bots) {
+    const maxLoss = b.max_daily_loss || 0;
+    if (!maxLoss && !b.today_risk_cents) continue;
+    const pct = maxLoss > 0 ? Math.min(100, (b.today_risk_cents / maxLoss) * 100) : 0;
+    const color = pct > 80 ? '#f43f5e' : pct > 50 ? '#eab308' : '#10b981';
+    const displayName = cachedBots.find(x => x.name === b.bot)?.display_name || b.label || b.bot;
+    html += `<div>
+      <div class="flex justify-between text-xs mb-1">
+        <span class="text-slate-300">${displayName}</span>
+        <span class="mono text-slate-500">${cents(b.today_risk_cents)} / ${cents(maxLoss)}</span>
+      </div>
+      <div class="progress-bar"><div class="progress-fill" style="width:${pct}%;background:${color}"></div></div>
+    </div>`;
+  }
+  document.getElementById('daily-budget').innerHTML = html || '<div class="text-slate-500 text-sm">No trading activity today</div>';
+}
+
+function renderForecastAccuracy(backtest) {
+  const results = backtest.results || backtest.bot_results || {};
+  let html = '';
+  for (const [bot, data] of Object.entries(results)) {
+    const brier = data.brier_score ?? data.brier;
+    if (brier == null) continue;
+    const accuracy = Math.max(0, Math.min(100, (1 - brier / 0.25) * 100));
+    const count = data.n_predictions || data.count || 0;
+    const displayName = cachedBots.find(x => x.name === bot)?.display_name || bot;
+    const color = accuracy >= 80 ? '#10b981' : accuracy >= 60 ? '#eab308' : '#f43f5e';
+    html += `<div>
+      <div class="flex justify-between text-xs mb-1">
+        <span class="text-slate-300">${displayName}: <span class="mono" style="color:${color}">${accuracy.toFixed(0)}%</span></span>
+        <span class="text-slate-600">${count} predictions</span>
+      </div>
+      <div class="progress-bar"><div class="progress-fill" style="width:${accuracy}%;background:${color}"></div></div>
+    </div>`;
+  }
+  if (html) {
+    document.getElementById('calibration-toggle').classList.remove('hidden');
+  }
+  document.getElementById('forecast-accuracy').innerHTML = html || '<div class="text-slate-500 text-sm">No backtest data available</div>';
+}
+
+function toggleCalibration() {
+  const detail = document.getElementById('calibration-detail');
+  detail.classList.toggle('hidden');
+}
+
+// ─── POSITIONS TAB ───
+async function loadPositions() {
+  const [positions, exitState, orders] = await Promise.all([
+    fetchJSON('/api/positions'),
+    fetchJSON('/api/exit-state'),
+    fetchJSON('/api/orders'),
+  ]);
+
+  // Build exit state lookup
+  const exitMap = {};
+  if (Array.isArray(exitState)) {
+    for (const e of exitState) exitMap[e.ticker] = e;
+  }
+
+  // Position Cards
+  if (Array.isArray(positions) && positions.length > 0) {
+    // Sort by close_time (soonest first)
+    positions.sort((a, b) => (a.close_time || '').localeCompare(b.close_time || ''));
+
+    let html = '';
+    for (const p of positions) {
+      const exit = exitMap[p.ticker] || {};
+      const pos = p.position || 0;
+      const side = pos > 0 ? 'Bought YES' : 'Bought NO';
+      const sideColor = pos > 0 ? '#10b981' : '#f43f5e';
+      const contracts = Math.abs(pos);
+      const bidAsk = p.yes_bid != null && p.yes_ask != null ? `${p.yes_bid}¢ / ${p.yes_ask}¢` : '--';
+
+      // Settlement countdown
+      let settlesIn = '';
+      let settlePct = 0;
+      if (p.close_time) {
+        const now = Date.now();
+        const close = new Date(p.close_time).getTime();
+        const remaining = close - now;
+        if (remaining > 0) {
+          if (remaining < 3600000) settlesIn = `${Math.floor(remaining/60000)}m`;
+          else if (remaining < 86400000) settlesIn = `${Math.floor(remaining/3600000)}h ${Math.floor((remaining%3600000)/60000)}m`;
+          else settlesIn = `${Math.floor(remaining/86400000)}d ${Math.floor((remaining%86400000)/3600000)}h`;
+          // Assume 7 days as max for progress bar
+          settlePct = Math.max(0, Math.min(100, 100 - (remaining / (7*86400000)) * 100));
+        } else {
+          settlesIn = 'Settling...';
+          settlePct = 100;
+        }
+      }
+
+      // Exit rules
+      let exitHtml = '';
+      if (exit.take_profit_threshold || exit.stop_loss_threshold) {
+        exitHtml = `<div class="mt-3 pt-3 border-t border-slate-800 text-xs text-slate-500 space-y-1">`;
+        if (exit.take_profit_threshold) exitHtml += `<div>Auto-Sell Target: <span class="mono text-slate-400">${exit.take_profit_threshold}¢</span></div>`;
+        if (exit.stop_loss_threshold) exitHtml += `<div>Downside Limit: <span class="mono text-slate-400">${exit.stop_loss_threshold}¢</span></div>`;
+        if (exit.trailing_drop) exitHtml += `<div>Trailing Stop: <span class="mono text-slate-400">${exit.nearest_threshold === 'hold' ? 'inactive' : exit.nearest_threshold}</span></div>`;
+        exitHtml += `</div>`;
+      }
+
+      html += `<div class="position-card">
+        <div class="flex items-start justify-between mb-2">
+          <div class="font-medium text-sm text-slate-200">${p.human_ticker || p.ticker}</div>
+          ${strategyPill(p.strategy?.toLowerCase() || '', p.strategy)}
+        </div>
+        <div class="grid grid-cols-2 gap-y-2 text-xs mt-3">
+          <div><span class="text-slate-500">Side</span><div style="color:${sideColor}" class="font-medium">${side}</div></div>
+          <div><span class="text-slate-500">Contracts</span><div class="mono text-slate-200">${contracts}</div></div>
+          <div><span class="text-slate-500">Market</span><div class="mono text-slate-300">${bidAsk}</div></div>
+          <div><span class="text-slate-500">Exposure</span><div class="mono text-slate-300">${cents(Math.abs(p.market_exposure))}</div></div>
+        </div>
+        ${settlesIn ? `<div class="mt-3">
+          <div class="flex justify-between text-xs mb-1">
+            <span class="text-slate-500">Settles in</span>
+            <span class="mono text-slate-400">${settlesIn}</span>
+          </div>
+          <div class="progress-bar"><div class="progress-fill" style="width:${settlePct}%;background:#3b82f6"></div></div>
+        </div>` : ''}
+        ${exitHtml}
+      </div>`;
+    }
+    document.getElementById('positions-grid').innerHTML = html;
+  } else if (Array.isArray(positions)) {
+    document.getElementById('positions-grid').innerHTML = '<div class="text-slate-500 text-sm">No open positions</div>';
+  }
+
+  // Pending Orders
+  if (Array.isArray(orders) && orders.length > 0) {
+    let html = `<table class="w-full"><thead>
+      <tr class="text-xs text-slate-500 border-b border-slate-800">
+        <th class="text-left py-2 font-medium">Market</th>
+        <th class="text-left py-2 font-medium">Side</th>
+        <th class="text-right py-2 font-medium">Price</th>
+        <th class="text-right py-2 font-medium">Qty</th>
+        <th class="text-right py-2 font-medium">Placed</th>
+      </tr></thead><tbody>`;
+    for (const o of orders) {
+      html += `<tr class="border-b border-slate-800/50">
+        <td class="py-2 text-slate-300">${o.human_ticker || o.ticker}</td>
+        <td class="py-2">${o.side}</td>
+        <td class="text-right py-2 mono text-slate-300">${o.price}¢</td>
+        <td class="text-right py-2 mono text-slate-400">${o.remaining_count}</td>
+        <td class="text-right py-2 text-slate-500">${timeAgo(o.created_time)}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    document.getElementById('pending-orders').innerHTML = html;
+  } else if (Array.isArray(orders)) {
+    document.getElementById('pending-orders').innerHTML = '<div class="text-slate-500">No pending orders</div>';
+  }
+}
+
+// ─── ACTIVITY TAB ───
+async function loadActivity() {
+  const [trades, settlements, decisions] = await Promise.all([
+    fetchJSON('/api/trades?limit=100'),
+    cachedSettlements || fetchJSON('/api/settlements?limit=200'),
+    fetchJSON('/api/decisions?limit=30'),
+  ]);
+
+  // Summary pills
+  if (Array.isArray(trades)) {
+    const today = new Date().toISOString().slice(0, 10);
+    const todayTrades = trades.filter(t => (t.timestamp || '').startsWith(today));
+    const todaySettled = (settlements?.settlements || []).filter(s => (s.settled_time || '').startsWith(today));
+    const todayPnl = todaySettled.reduce((s, t) => s + (t.profit || 0), 0);
+    const todayWins = todaySettled.filter(s => s.profit > 0).length;
+    const todayHitRate = todaySettled.length > 0 ? Math.round(todayWins / todaySettled.length * 100) : 0;
+
+    document.getElementById('activity-summary').innerHTML = `
+      <div class="pill pill-default">Today: ${todayTrades.length} trades</div>
+      <div class="pill pill-default" style="color:${pnlColor(todayPnl)}">${pnlSign(todayPnl)}${cents(todayPnl)} settled</div>
+      ${todaySettled.length > 0 ? `<div class="pill pill-default">${todayHitRate}% hit rate</div>` : ''}
+    `;
+  }
+
+  // Unified timeline: merge trades + settlements
+  const timeline = [];
+
+  if (Array.isArray(trades)) {
+    for (const t of trades) {
+      timeline.push({
+        type: 'trade',
+        time: t.timestamp,
+        bot: t.bot,
+        strategy: t.strategy || t.bot,
+        market: t.human_ticker || t.ticker,
+        action: `Bought ${t.side}`,
+        amount: t.risk_cents,
+        amountColor: '#94a3b8',
+      });
+    }
+  }
+
+  if (settlements?.settlements) {
+    for (const s of settlements.settlements) {
+      const won = s.profit > 0;
+      timeline.push({
+        type: 'settlement',
+        time: s.settled_time,
+        bot: s.bot,
+        strategy: s.strategy || s.bot,
+        market: s.human_ticker || s.ticker,
+        action: won ? 'Won' : 'Lost',
+        amount: s.profit,
+        amountColor: pnlColor(s.profit),
+      });
+    }
+  }
+
+  timeline.sort((a, b) => (b.time || '').localeCompare(a.time || ''));
+
+  // Render
+  renderTimeline(timeline);
+
+  // Decisions
+  if (Array.isArray(decisions) && decisions.length > 0) {
+    document.getElementById('decisions-count').textContent = `(${decisions.length})`;
+    let html = '';
+    for (const d of decisions) {
+      const action = d.action === 'trade' ? `<span style="color:#10b981">Traded</span>` :
+                     `<span class="text-slate-600">Skipped</span>`;
+      const reason = d.human_reason || d.reason || d.skip_reason || '';
+      html += `<div class="text-xs text-slate-500 py-1">
+        <span class="text-slate-600">${formatTime(d.timestamp)}</span> ·
+        ${strategyPill(d.bot, d.strategy)} ·
+        <span class="text-slate-400">${d.human_ticker || d.ticker || ''}</span> ·
+        ${action}${reason ? ` — ${reason}` : ''}
+      </div>`;
+    }
+    document.getElementById('decisions-list').innerHTML = html;
+  }
+}
+
+function renderTimeline(timeline) {
+  const filtered = activityFilter === 'all' ? timeline :
+    timeline.filter(t => activityFilter === 'trades' ? t.type === 'trade' : t.type === 'settlement');
+
+  if (filtered.length === 0) {
+    document.getElementById('activity-timeline').innerHTML = '<div class="text-slate-500 text-sm py-4">No activity</div>';
+    return;
+  }
+
+  let html = '';
+  for (const t of filtered.slice(0, 100)) {
+    html += `<div class="timeline-row">
+      <span class="text-slate-600 text-xs">${formatTime(t.time)}<br><span class="text-slate-700">${formatDate(t.time)}</span></span>
+      ${strategyPill(t.bot, t.strategy)}
+      <span class="text-slate-300 truncate">${t.market}</span>
+      <span class="mono text-right" style="color:${t.amountColor}">
+        ${t.action} ${t.type === 'settlement' ? `${pnlSign(t.amount)}${cents(t.amount)}` : cents(t.amount)}
+      </span>
+    </div>`;
+  }
+  document.getElementById('activity-timeline').innerHTML = html;
+
+  // Store for filtering
+  window._timeline = timeline;
+}
+
+function filterActivity(filter) {
+  activityFilter = filter;
+  document.querySelectorAll('[data-filter]').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.filter === filter);
+  });
+  if (window._timeline) renderTimeline(window._timeline);
+}
+
+function toggleDecisions() {
+  const list = document.getElementById('decisions-list');
+  const chevron = document.getElementById('decisions-chevron');
+  list.classList.toggle('hidden');
+  chevron.style.transform = list.classList.contains('hidden') ? '' : 'rotate(90deg)';
+}
+
+// ─── SYSTEM TAB ───
+async function loadSystem() {
+  const [bots, health, risk] = await Promise.all([
+    fetchJSON('/api/bots'),
+    fetchJSON('/api/health'),
+    fetchJSON('/api/risk'),
+  ]);
+
+  cachedBots = bots || [];
+
+  // Status Banner
+  if (risk && !risk.error) {
+    const killSwitch = risk.kill_switch;
+    const cbOpen = risk.circuit_breaker_open;
+    const staleBots = (bots || []).filter(b => b.status === 'stale');
+    const stoppedBots = (bots || []).filter(b => b.status === 'stopped');
+    const runningBots = (bots || []).filter(b => b.status === 'running');
+
+    let bannerHtml, bannerBg;
+    if (killSwitch) {
+      bannerBg = 'rgba(244,63,94,0.1)'; bannerHtml = `<div class="flex items-center gap-3"><span class="dot dot-red"></span><span class="font-medium text-rose-400">Trading Paused — Emergency Stop Active</span></div>`;
+    } else if (cbOpen) {
+      bannerBg = 'rgba(234,179,8,0.1)'; bannerHtml = `<div class="flex items-center gap-3"><span class="dot dot-yellow"></span><span class="font-medium text-yellow-400">Circuit Breaker Open — API Errors Detected</span></div>`;
+    } else if (staleBots.length > 0) {
+      bannerBg = 'rgba(234,179,8,0.1)'; bannerHtml = `<div class="flex items-center gap-3"><span class="dot dot-yellow"></span><span class="font-medium text-yellow-400">${staleBots.length} Strategy Delayed</span></div>`;
+    } else if (runningBots.length > 0) {
+      bannerBg = 'rgba(16,185,129,0.08)'; bannerHtml = `<div class="flex items-center gap-3"><span class="dot dot-green"></span><span class="font-medium text-emerald-400">All Systems Running</span></div>`;
+    } else {
+      bannerBg = 'rgba(100,116,139,0.1)'; bannerHtml = `<div class="flex items-center gap-3"><span class="dot dot-gray"></span><span class="font-medium text-slate-400">No Bots Running</span></div>`;
+    }
+    document.getElementById('system-banner').style.background = bannerBg;
+    document.getElementById('system-banner').innerHTML = bannerHtml;
+
+    // Update header badge
+    const badge = document.getElementById('system-badge');
+    if (killSwitch) { badge.textContent = 'Paused'; badge.className = 'pill'; badge.style.cssText = 'background:rgba(244,63,94,0.15);color:#f43f5e;font-size:0.6875rem;padding:2px 10px;border-radius:9999px;font-weight:600;'; }
+    else if (staleBots.length > 0 || cbOpen) { badge.textContent = 'Warning'; badge.className = 'pill'; badge.style.cssText = 'background:rgba(234,179,8,0.15);color:#eab308;font-size:0.6875rem;padding:2px 10px;border-radius:9999px;font-weight:600;'; }
+    else if (runningBots.length > 0) { badge.textContent = 'Live'; badge.className = 'pill'; badge.style.cssText = 'background:rgba(16,185,129,0.15);color:#10b981;font-size:0.6875rem;padding:2px 10px;border-radius:9999px;font-weight:600;'; }
+    else { badge.textContent = 'Offline'; badge.className = 'pill pill-default'; badge.style.cssText = ''; }
+  }
+
+  // Strategy Engines
+  if (Array.isArray(bots)) {
+    let html = '';
+    for (const b of bots) {
+      const dotClass = b.status === 'running' ? 'dot-green' : b.status === 'stale' ? 'dot-yellow' : 'dot-gray';
+      const statusText = b.status === 'running' ? `Active ${timeAgo(b.last_heartbeat)}` :
+                         b.status === 'stale' ? `Stale ${timeAgo(b.last_heartbeat)}` : 'Stopped';
+      const interval = b.scan_interval_min ? `Every ${b.scan_interval_min}m` : '';
+      html += `<div class="flex items-center justify-between py-2 border-b border-slate-800/50 last:border-0">
+        <div class="flex items-center gap-3">
+          <span class="dot ${dotClass}"></span>
+          <span class="text-sm text-slate-200">${b.display_name || b.name}</span>
+        </div>
+        <div class="flex items-center gap-4 text-xs">
+          <span class="text-slate-500">${interval}</span>
+          <span class="text-slate-400">${statusText}</span>
+          ${b.error_count > 0 ? `<span class="text-rose-400">${b.error_count} errors</span>` : ''}
+        </div>
+      </div>`;
+    }
+    document.getElementById('strategy-engines').innerHTML = html;
+
+    // Populate log dropdown dynamically
+    const select = document.getElementById('log-bot-select');
+    select.innerHTML = '';
+    for (const b of bots) {
+      const opt = document.createElement('option');
+      opt.value = b.name;
+      opt.textContent = b.display_name || b.name;
+      select.appendChild(opt);
+    }
+  }
+
+  // Data Sources
+  if (health && health.sources) {
+    let html = '';
+    const sources = health.sources;
+    for (const [name, info] of Object.entries(sources)) {
+      const lastUpdate = info.last_update || info.last_check || '';
+      const fresh = info.fresh !== false;
+      const dotClass = fresh ? 'dot-green' : 'dot-yellow';
+      const displayName = name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+      html += `<div class="flex items-center justify-between py-1.5">
+        <div class="flex items-center gap-2">
+          <span class="dot ${dotClass}"></span>
+          <span class="text-sm text-slate-300">${displayName}</span>
+        </div>
+        <span class="text-xs text-slate-500">${lastUpdate ? timeAgo(lastUpdate) : 'Unknown'}</span>
+      </div>`;
+    }
+    document.getElementById('data-sources').innerHTML = html || '<div class="text-slate-500 text-sm">No source data</div>';
+  }
+}
+
+function toggleLogs() {
+  const panel = document.getElementById('logs-panel');
+  const chevron = document.getElementById('logs-chevron');
+  panel.classList.toggle('hidden');
+  chevron.style.transform = panel.classList.contains('hidden') ? '' : 'rotate(90deg)';
+  if (!panel.classList.contains('hidden')) loadLogs();
+}
+
+async function loadLogs() {
+  const bot = document.getElementById('log-bot-select').value;
+  const data = await fetchJSON(`/api/logs?bot=${bot}&lines=200`);
+  const el = document.getElementById('log-content');
+  if (data?.lines?.length) {
+    el.textContent = data.lines.join('\n');
+    el.scrollTop = el.scrollHeight;
+  } else {
+    el.textContent = data?.error || 'No logs available';
+  }
+}
+
+// ─── Refresh Loop ───
+async function refreshAll() {
+  const activeTab = document.querySelector('.tab-btn.active')?.dataset.tab || 'overview';
+  document.getElementById('last-update').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+
+  // Always load system for header badge
+  await loadSystem();
+
+  if (activeTab === 'overview') await loadOverview();
+  else if (activeTab === 'positions') await loadPositions();
+  else if (activeTab === 'activity') await loadActivity();
+  // System already loaded above
+}
+
+function startRefresh() {
+  refreshAll();
+  refreshTimer = setInterval(() => {
+    if (document.getElementById('auto-refresh').checked) refreshAll();
+  }, 15000);
+}
+
+// Tab switch triggers data load
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const tab = btn.dataset.tab;
+    if (tab === 'overview') loadOverview();
+    else if (tab === 'positions') loadPositions();
+    else if (tab === 'activity') loadActivity();
+    // System is always loaded via refreshAll
+  });
+});
+
+startRefresh();
 </script>
 </body>
 </html>
