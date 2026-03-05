@@ -800,6 +800,27 @@ def scan_and_trade():
 
     if nowcast:
         ss.source_ok("cleveland-fed")
+        # Record nowcast snapshot for empirical sigma calibration
+        try:
+            from nowcast_tracker import NowcastTracker
+            tracker = NowcastTracker()
+            if nowcast.get("cpi_yoy") is not None:
+                for prefix in ["KXCPI", "KXECON"]:
+                    try:
+                        markets = client.get_all_markets(prefix=prefix, cache_ttl=300)
+                        for nm in markets[:1]:
+                            days = estimate_days_to_release(nm)
+                            tracker.record_snapshot(
+                                nowcast["cpi_yoy"], "cpi_yoy",
+                                nm.get("close_time", "")[:7],  # YYYY-MM
+                                days,
+                            )
+                            break
+                        break
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.debug(f"  Nowcast tracking error (non-fatal): {e}")
     else:
         ss.source_fail("cleveland-fed", "no data")
     if gas_price:
