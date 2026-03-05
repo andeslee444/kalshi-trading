@@ -346,3 +346,57 @@ class TestCrossMeasureDispersion:
         nowcast = {"cpi_yoy": 2.83, "core_cpi_yoy": 3.14, "pce_yoy": 2.51}
         _econ._compute_cross_measure_dispersion(nowcast)
         assert "cross_measure_dispersion" in nowcast
+
+
+# ===================================================================
+# Nowcast source info tests
+# ===================================================================
+
+class TestNowcastSourceInfo:
+
+    def test_nowcast_source_info_returns_age(self, tmp_path):
+        """Mock cache file with known timestamp, verify age calculation."""
+        cache_file = tmp_path / "econ-nowcast-cache.json"
+        # Cache saved 2 hours ago
+        cached_at = time.time() - 7200
+        cache_data = {"cached_at": cached_at, "data": {"cpi_yoy": 2.8}}
+        cache_file.write_text(json.dumps(cache_data))
+
+        orig_path = _econ.NOWCAST_CACHE_PATH
+        _econ.NOWCAST_CACHE_PATH = cache_file
+        try:
+            info = _econ._nowcast_source_info()
+            assert "nowcast_age_hours" in info
+            assert abs(info["nowcast_age_hours"] - 2.0) < 0.1
+        finally:
+            _econ.NOWCAST_CACHE_PATH = orig_path
+
+    def test_nowcast_source_info_returns_iso_timestamp(self, tmp_path):
+        """Verify ISO 8601 format in data_source_timestamp."""
+        cache_file = tmp_path / "econ-nowcast-cache.json"
+        cached_at = 1709640000.0  # 2024-03-05T12:00:00Z
+        cache_data = {"cached_at": cached_at, "data": {"cpi_yoy": 2.8}}
+        cache_file.write_text(json.dumps(cache_data))
+
+        orig_path = _econ.NOWCAST_CACHE_PATH
+        _econ.NOWCAST_CACHE_PATH = cache_file
+        try:
+            info = _econ._nowcast_source_info()
+            assert "data_source_timestamp" in info
+            # Should be an ISO 8601 string ending in Z
+            ts = info["data_source_timestamp"]
+            assert ts.endswith("Z")
+            assert "T" in ts
+        finally:
+            _econ.NOWCAST_CACHE_PATH = orig_path
+
+    def test_nowcast_source_info_missing_cache(self, tmp_path):
+        """Missing cache returns age 0.0 and current timestamp."""
+        orig_path = _econ.NOWCAST_CACHE_PATH
+        _econ.NOWCAST_CACHE_PATH = tmp_path / "nonexistent.json"
+        try:
+            info = _econ._nowcast_source_info()
+            assert info["nowcast_age_hours"] == 0.0
+            assert info["data_source_timestamp"].endswith("Z")
+        finally:
+            _econ.NOWCAST_CACHE_PATH = orig_path
