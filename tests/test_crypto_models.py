@@ -326,6 +326,37 @@ class TestHestonFellerFallback:
         assert not math.isnan(prob)
 
 
+class TestParticleFilterSmoothing:
+    """Verify filter provides actual smoothing with reduced process noise."""
+
+    def test_low_noise_smooths_outliers(self):
+        from particle_filter import ParticleFilter, FilterConfig
+        config = FilterConfig(n_particles=200, process_noise=0.005, observation_noise=0.05)
+        pf = ParticleFilter(config=config)
+        # Feed stable 0.70 observations
+        for _ in range(10):
+            pf.update(0.70)
+        stable_est = pf.estimate()
+        # Now feed a single outlier
+        pf.update(0.40)
+        outlier_est = pf.estimate()
+        # With low process noise, the filter should resist the outlier
+        # Estimate should still be closer to 0.70 than to 0.40
+        assert outlier_est.prob > 0.55, f"Filter should smooth outlier, got {outlier_est.prob}"
+
+    def test_high_noise_does_not_smooth(self):
+        from particle_filter import ParticleFilter, FilterConfig
+        config = FilterConfig(n_particles=200, process_noise=0.02, observation_noise=0.05)
+        pf = ParticleFilter(config=config)
+        for _ in range(10):
+            pf.update(0.70)
+        pf.update(0.40)
+        outlier_est = pf.estimate()
+        # With high process noise, the filter barely resists
+        # This test documents the current behavior (less smoothing)
+        assert outlier_est.prob < 0.65  # Much more influenced by outlier
+
+
 class TestDCCWarmup:
     """DCC should not report ready before actual warmup."""
 
