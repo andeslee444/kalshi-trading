@@ -155,3 +155,61 @@ class TestHestonEdgeCases:
             v0=2.0, kappa=10.0, theta=2.0, xi=2.0, rho=-0.99,
         )
         assert 0.001 <= prob <= 0.999
+
+
+class TestHestonNumericalStability:
+    """Formulation 2 stability — these would fail with Formulation 1."""
+
+    def test_high_xi_no_nan(self):
+        """High vol-of-vol should not produce NaN."""
+        for xi in [0.5, 1.0, 2.0, 3.0]:
+            prob = crypto_price_probability_heston(
+                current_price=80000, threshold=82000, direction="above",
+                time_horizon_minutes=1440,
+                v0=0.25, kappa=2.0, theta=0.25, xi=xi, rho=-0.7,
+            )
+            assert 0.001 <= prob <= 0.999, f"xi={xi} gave {prob}"
+
+    def test_extreme_rho_stable(self):
+        """Extreme rho should not cause overflow."""
+        for rho in [-0.99, -0.5, 0.0, 0.5, 0.99]:
+            prob = crypto_price_probability_heston(
+                current_price=80000, threshold=82000, direction="above",
+                time_horizon_minutes=1440,
+                v0=0.25, kappa=2.0, theta=0.25, xi=0.5, rho=rho,
+            )
+            assert 0.001 <= prob <= 0.999, f"rho={rho} gave {prob}"
+
+    def test_feller_violated_still_works(self):
+        """When 2*kappa*theta < xi^2, should still produce valid result."""
+        # 2*1.0*0.1 = 0.2 < 1.0 = xi^2 -> Feller violated
+        prob = crypto_price_probability_heston(
+            current_price=80000, threshold=82000, direction="above",
+            time_horizon_minutes=1440,
+            v0=0.10, kappa=1.0, theta=0.10, xi=1.0, rho=-0.7,
+        )
+        assert 0.001 <= prob <= 0.999
+
+    def test_large_phi_T_product(self):
+        """Long horizon + high vol should not overflow."""
+        prob = crypto_price_probability_heston(
+            current_price=80000, threshold=85000, direction="above",
+            time_horizon_minutes=10080,  # 1 week
+            v0=1.0, kappa=2.0, theta=0.5, xi=0.8, rho=-0.8,
+        )
+        assert 0.001 <= prob <= 0.999
+
+    def test_complement_with_extreme_params(self):
+        """P(above) + P(below) = 1 even with extreme params."""
+        for xi, rho in [(1.5, -0.95), (0.1, 0.9), (2.0, -0.5)]:
+            above = crypto_price_probability_heston(
+                current_price=80000, threshold=83000, direction="above",
+                time_horizon_minutes=1440,
+                v0=0.30, kappa=2.0, theta=0.25, xi=xi, rho=rho,
+            )
+            below = crypto_price_probability_heston(
+                current_price=80000, threshold=83000, direction="below",
+                time_horizon_minutes=1440,
+                v0=0.30, kappa=2.0, theta=0.25, xi=xi, rho=rho,
+            )
+            assert abs(above + below - 1.0) < 0.02, f"xi={xi}, rho={rho}: {above}+{below}={above+below}"
