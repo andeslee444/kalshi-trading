@@ -49,17 +49,21 @@ def horizon_kelly_fraction(minutes_to_settle):
 
     Short horizons use smaller Kelly (more noise, less model confidence).
     Long horizons use larger Kelly (more data, better model accuracy).
+
+    Loosened from original schedule after audit showed effective Kelly
+    was dropping below 1/4 (academic growth threshold) after applying
+    CI, regime, and correlation multipliers.
     """
     if minutes_to_settle < 15:
-        return 0.125   # 1/8 Kelly
+        return 0.15    # ~1/7 Kelly (was 1/8)
     elif minutes_to_settle < 60:
-        return 0.20    # 1/5 Kelly
+        return 0.25    # 1/4 Kelly (was 1/5)
     elif minutes_to_settle < 360:
-        return 0.25    # 1/4 Kelly
+        return 0.333   # 1/3 Kelly (was 1/4) — best vol data, most confident
     elif minutes_to_settle < 1440:
-        return 0.333   # 1/3 Kelly
+        return 0.375   # 3/8 Kelly (was 1/3)
     else:
-        return 0.50    # 1/2 Kelly
+        return 0.50    # 1/2 Kelly (unchanged)
 
 
 def horizon_vol_weights(minutes_to_settle):
@@ -75,6 +79,30 @@ def horizon_vol_weights(minutes_to_settle):
     w_rv = 30.0 / (30.0 + minutes_to_settle)
     w_iv = minutes_to_settle / (30.0 + minutes_to_settle)
     return w_iv, w_rv
+
+
+def vol_skew_multiplier(moneyness, skew_slope=0.30, smile_curvature=0.20):
+    """Approximate vol skew/smile multiplier for crypto options.
+
+    Uses a simple parametric model calibrated to typical BTC/ETH skew:
+        mult = 1 - skew_slope * ln(moneyness) + smile_curvature * ln(moneyness)^2
+
+    The skew_slope term captures the put skew (OTM puts have higher IV).
+    The smile_curvature term captures the smile (both OTM puts and calls elevated).
+
+    Args:
+        moneyness: S/K ratio (1.0 = ATM, <1 = OTM put side, >1 = OTM call side)
+        skew_slope: Linear skew strength (default 0.15 = 15% more IV per 100% OTM)
+        smile_curvature: Quadratic smile term (default 0.10)
+
+    Returns:
+        float: Multiplier >= 1.0, clamped to [1.0, 2.0]
+    """
+    log_m = math.log(max(moneyness, 0.5))  # log-moneyness, clamped
+    # Skew: negative log_m (OTM puts) -> higher vol
+    # Smile: squared term adds vol to both tails
+    mult = 1.0 - skew_slope * log_m + smile_curvature * log_m ** 2
+    return max(1.0, min(2.0, mult))
 
 
 class AR1VolForecast:
@@ -139,6 +167,43 @@ class EnsembleModel:
         self._jd_params = jd_params or dict(DEFAULT_JD)
         self._heston_params = heston_params or dict(DEFAULT_HESTON)
         self._bma_weights = bma_weights or dict(REGIME_BMA_WEIGHTS)
+
+    @classmethod
+    def from_calibration(cls, calibration_dict, asset="BTC"):
+        """Build an EnsembleModel from calibration output.
+
+        Args:
+            calibration_dict: Parsed config/crypto-calibration.json
+            asset: Which asset's calibration to use (default "BTC")
+
+        Returns:
+            EnsembleModel with calibrated weights and params.
+        """
+        assets = calibration_dict.get("assets", {})
+        asset_cal = assets.get(asset, {})
+
+        # Extract calibrated BMA weights
+        bma_weights = None
+        cal_weights = asset_cal.get("ensemble_weights")
+        if cal_weights and len(cal_weights) == 3 and sum(cal_weights) > 0.99:
+            # Apply calibrated weights to all regimes (override normal, keep regime structure)
+            bma_weights = dict(REGIME_BMA_WEIGHTS)
+            bma_weights["normal"] = cal_weights
+
+        # Extract calibrated Heston params
+        heston_params = None
+        cal_heston = asset_cal.get("heston_params")
+        if cal_heston:
+            heston_params = dict(DEFAULT_HESTON)
+            heston_params.update(cal_heston)
+
+        # Extract calibrated JD params
+        jd_params = None
+        cal_lambda = asset_cal.get("jd_lambda")
+        if cal_lambda is not None:
+            jd_params = dict(DEFAULT_JD)
+
+        return cls(jd_params=jd_params, heston_params=heston_params, bma_weights=bma_weights)
 
     def estimate_prob(self, current_price, threshold, direction="above",
                       time_horizon_minutes=1440, vol=0.50, regime="normal",

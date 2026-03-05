@@ -103,7 +103,7 @@
       "jumpStd": 0.10,
       "maxJumps": 10
     },
-    "pfProcessNoise": 0.02,
+    "pfProcessNoise": 0.005,
     "pfObservationNoise": 0.05,
     "pfParticles": 200,
     "pfStalenessHours": 24,

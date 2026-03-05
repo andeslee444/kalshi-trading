@@ -30,7 +30,7 @@ from ticker_utils import parse_crypto_ticker
 from capital_allocator import PortfolioAllocator
 from particle_filter import FilterManager, FilterConfig, ci_kelly_multiplier
 from regime_detector import RegimeDetector, regime_kelly_multiplier
-from crypto_models import EnsembleModel, smooth_edge_threshold, horizon_kelly_fraction, horizon_vol_weights, AR1VolForecast
+from crypto_models import EnsembleModel, smooth_edge_threshold, horizon_kelly_fraction, horizon_vol_weights, AR1VolForecast, vol_skew_multiplier
 from vol_forecaster import GARCHForecaster, DCCCorrelation, intraday_vol_multiplier, correct_bid_ask_bounce
 
 setup_unbuffered()
@@ -94,7 +94,13 @@ if _calibration_path.exists():
         _calibration = json.loads(_calibration_path.read_text())
     except (json.JSONDecodeError, OSError):
         pass
-ensemble_model = EnsembleModel()
+
+if _calibration.get("assets"):
+    # Use BTC calibration as the primary (most liquid, best data)
+    ensemble_model = EnsembleModel.from_calibration(_calibration, asset="BTC")
+    log.info("Loaded calibrated ensemble model from crypto-calibration.json")
+else:
+    ensemble_model = EnsembleModel()
 
 # Default Heston parameters
 DEFAULT_HESTON_PARAMS = {"v0": 0.25, "kappa": 2.0, "theta": 0.25, "xi": 0.3, "rho": -0.7}
@@ -390,10 +396,12 @@ def scan_and_trade():
         history = _price_history.get(asset, [])
         if len(history) >= 2:
             prev_price = history[-2][1]
+            prev_time = history[-2][0]
             if prev_price > 0:
                 log_ret = math.log(price / prev_price)
+                interval_sec = time.time() - prev_time
                 if asset in garch_forecasters:
-                    garch_forecasters[asset].update(log_ret)
+                    garch_forecasters[asset].update(log_ret, interval_seconds=interval_sec)
 
     # Update AR(1) vol forecasters
     for asset in spot_prices:
@@ -515,7 +523,7 @@ def scan_and_trade():
 
         # GARCH forecast (if available)
         garch_vol = garch_forecasters.get(asset)
-        garch_forecast = garch_vol.forecast_vol(annualize_factor=365.25*24*12) if garch_vol else None
+        garch_forecast = garch_vol.forecast_vol(use_actual_interval=True) if garch_vol else None
 
         # Use best available vol estimate
         if iv is not None and rv is not None:
@@ -533,6 +541,11 @@ def scan_and_trade():
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         season_mult = intraday_vol_multiplier(now_utc.hour, now_utc.weekday())
         vol_to_use *= season_mult
+
+        # Vol skew adjustment: OTM options have higher IV than ATM DVOL
+        moneyness = current_price / threshold if threshold > 0 else 1.0
+        skew_mult = vol_skew_multiplier(moneyness)
+        vol_to_use *= skew_mult
 
         drift = drift_by_asset.get(asset, DRIFT_PCT)
         # Drift is negligible for sub-daily horizons and introduces noise
@@ -603,12 +616,14 @@ def scan_and_trade():
 
         ss.markets_evaluated += 1
 
-        # Determine trade direction and edge (raw edge, fees handled in Kelly)
-        # Use market_price (with fallback) for edge computation
+        # Determine trade direction and edge
+        # Compare FEE-ADJUSTED edge against threshold to avoid entering with negative net edge
         if prob > 0.5:
             eff_threshold = smooth_edge_threshold(prob, base=EDGE_THRESHOLD)
             edge = prob - market_price / 100
-            if edge > eff_threshold:
+            fee_pp = kalshi_fee_cents(market_price) / 100  # fee as probability points
+            net_edge = edge - fee_pp
+            if net_edge > eff_threshold:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "yes",
                     "prob": prob, "edge": edge, "asset": asset,
@@ -619,10 +634,11 @@ def scan_and_trade():
                     "raw_prob": raw_prob, "filtered_est": filtered_est,
                 })
             else:
-                reason = "edge below mid-range threshold" if eff_threshold > EDGE_THRESHOLD else "edge below threshold"
+                reason = "net edge below threshold" if net_edge <= eff_threshold else "edge below threshold"
                 trade_manager.log_decision(
                     ticker, "yes", "skipped", reason,
-                    edge=edge, price_cents=market_price, asset=asset, vol_used=round(vol_to_use, 4),
+                    edge=edge, net_edge=round(net_edge, 4), fee_pp=round(fee_pp, 4),
+                    price_cents=market_price, asset=asset, vol_used=round(vol_to_use, 4),
                 )
         elif prob <= 0.5:
             no_prob = 1.0 - prob
@@ -630,7 +646,9 @@ def scan_and_trade():
             # Use no_ask directly if available, else derive from market_price
             no_price = no_ask if no_ask else (100 - market_price)
             edge = no_prob - no_price / 100
-            if edge > eff_threshold:
+            fee_pp = kalshi_fee_cents(no_price) / 100
+            net_edge = edge - fee_pp
+            if net_edge > eff_threshold:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "no",
                     "prob": prob, "edge": edge, "asset": asset,
@@ -641,10 +659,11 @@ def scan_and_trade():
                     "raw_prob": raw_prob, "filtered_est": filtered_est,
                 })
             else:
-                reason = "edge below mid-range threshold" if eff_threshold > EDGE_THRESHOLD else "edge below threshold"
+                reason = "net edge below threshold" if net_edge <= eff_threshold else "edge below threshold"
                 trade_manager.log_decision(
                     ticker, "no", "skipped", reason,
-                    edge=edge, price_cents=no_ask, asset=asset, vol_used=round(vol_to_use, 4),
+                    edge=edge, net_edge=round(net_edge, 4), fee_pp=round(fee_pp, 4),
+                    price_cents=no_ask, asset=asset, vol_used=round(vol_to_use, 4),
                 )
 
     # Sort by edge
@@ -781,6 +800,20 @@ def scan_and_trade():
     ss.finalize()
 
 
+def _check_short_horizon_markets():
+    """Check if any active crypto markets settle within 2 hours."""
+    try:
+        for prefix in CRYPTO_PREFIXES:
+            markets = client.get_all_markets(prefix=prefix, cache_ttl=60)
+            for m in markets:
+                mins = estimate_time_to_settlement(m)
+                if SETTLEMENT_BUFFER_MINUTES < mins < 120:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 # === Entry Point ===
 
 def main():
@@ -823,8 +856,15 @@ def main():
         if is_shutdown_requested():
             log.info("Graceful shutdown requested, exiting.")
             break
-        log.info(f"\nNext scan in {SCAN_INTERVAL} minutes...")
-        time.sleep(SCAN_INTERVAL * 60)
+
+        # Adaptive interval: faster when short-horizon markets exist
+        has_short_horizon = _check_short_horizon_markets()
+        if has_short_horizon:
+            interval = max(1, SCAN_INTERVAL // 3)  # ~1.5 min for default 5-min
+        else:
+            interval = SCAN_INTERVAL
+        log.info(f"\nNext scan in {interval} minutes{'  (short-horizon mode)' if has_short_horizon else ''}...")
+        time.sleep(interval * 60)
 
 
 if __name__ == "__main__":

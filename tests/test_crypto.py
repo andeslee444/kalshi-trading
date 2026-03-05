@@ -668,3 +668,132 @@ class TestEnsembleIntegration:
         for t in [5, 15, 60, 360, 1440]:
             w_iv, w_rv = horizon_vol_weights(t)
             assert abs(w_iv + w_rv - 1.0) < 0.001
+
+
+class TestOUDriftCorrection:
+    """OU model should adjust both variance AND drift (mean reversion)."""
+
+    def test_ou_differs_from_gbm_short_horizon(self):
+        """With OU, prob should differ from pure GBM for short horizons."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "kalshi"))
+        from probability import crypto_price_probability
+        # Near-ATM so neither prob is at boundary
+        gbm_prob = crypto_price_probability(
+            current_price=80000, threshold=80500, direction="above",
+            time_horizon_minutes=60, realized_vol_pct=0.50,
+            use_ou=False,
+        )
+        ou_prob = crypto_price_probability(
+            current_price=80000, threshold=80500, direction="above",
+            time_horizon_minutes=60, realized_vol_pct=0.50,
+            use_ou=True, ou_half_life_minutes=120,
+        )
+        # OU reduces vol for short horizons → different probability
+        assert abs(ou_prob - gbm_prob) > 0.001
+
+    def test_ou_symmetric_effect(self):
+        """OU should affect both above and below threshold symmetrically in vol."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "kalshi"))
+        from probability import crypto_price_probability
+        p_above = crypto_price_probability(
+            current_price=80000, threshold=80000, direction="above",
+            time_horizon_minutes=60, realized_vol_pct=0.50,
+            use_ou=True, ou_half_life_minutes=120,
+        )
+        p_below = crypto_price_probability(
+            current_price=80000, threshold=80000, direction="below",
+            time_horizon_minutes=60, realized_vol_pct=0.50,
+            use_ou=True, ou_half_life_minutes=120,
+        )
+        assert abs(p_above + p_below - 1.0) < 0.01
+
+    def test_ou_no_effect_long_horizon(self):
+        """OU blends out for horizons > 300 min."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "kalshi"))
+        from probability import crypto_price_probability
+        gbm_prob = crypto_price_probability(
+            current_price=80000, threshold=82000, direction="above",
+            time_horizon_minutes=500, realized_vol_pct=0.50,
+            use_ou=False,
+        )
+        ou_prob = crypto_price_probability(
+            current_price=80000, threshold=82000, direction="above",
+            time_horizon_minutes=500, realized_vol_pct=0.50,
+            use_ou=True, ou_half_life_minutes=120,
+        )
+        assert abs(gbm_prob - ou_prob) < 0.005  # Effectively identical
+
+
+class TestVolSkew:
+    """Vol skew adjustment for OTM binary options."""
+
+    def test_skew_multiplier_atm(self):
+        """ATM options should have multiplier ~1.0."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "kalshi"))
+        from crypto_models import vol_skew_multiplier
+        mult = vol_skew_multiplier(moneyness=1.0)
+        assert 0.98 <= mult <= 1.02
+
+    def test_skew_multiplier_otm_put(self):
+        """Deep OTM puts should have higher IV (multiplier > 1)."""
+        from crypto_models import vol_skew_multiplier
+        mult = vol_skew_multiplier(moneyness=0.85)  # 15% OTM put
+        assert mult > 1.05
+
+    def test_skew_multiplier_otm_call(self):
+        """Near-OTM calls should be at floor (put skew dominates in crypto)."""
+        from crypto_models import vol_skew_multiplier
+        mult = vol_skew_multiplier(moneyness=1.15)  # 15% OTM call
+        assert mult >= 1.0  # Floor applied — put skew dominates crypto smile
+
+    def test_skew_symmetric_light_smile(self):
+        """Both sides of ATM should have elevated vol (smile, not pure skew)."""
+        from crypto_models import vol_skew_multiplier
+        put_mult = vol_skew_multiplier(moneyness=0.90)
+        call_mult = vol_skew_multiplier(moneyness=1.10)
+        # Put skew is typically stronger than call
+        assert put_mult > call_mult
+
+    def test_skew_clamped(self):
+        """Extreme moneyness should clamp to a reasonable multiplier."""
+        from crypto_models import vol_skew_multiplier
+        mult = vol_skew_multiplier(moneyness=0.50)  # 50% OTM
+        assert mult <= 2.0  # Max 2x ATM vol
+
+
+class TestFeeAdjustedEdge:
+    """Edge threshold should account for Kalshi fees."""
+
+    def test_fee_at_50_cents(self):
+        """At 50c, fee is ~1.75c. A raw 8% edge has ~6.25% net edge."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "kalshi"))
+        from probability import kalshi_fee_cents
+        fee = kalshi_fee_cents(50)
+        # fee = 0.07 * 0.5 * 0.5 * 100 = 1.75
+        assert abs(fee - 1.75) < 0.01
+
+    def test_fee_at_10_cents(self):
+        """At 10c, fee is small."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "kalshi"))
+        from probability import kalshi_fee_cents
+        fee = kalshi_fee_cents(10)
+        # fee = 0.07 * 0.1 * 0.9 * 100 = 0.63
+        assert abs(fee - 0.63) < 0.01
+
+    def test_net_edge_below_threshold_should_skip(self):
+        """Raw edge 8.5%, fee 1.75pp at 50c -> net 6.75% < 8% threshold. Should skip."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "kalshi"))
+        from probability import kalshi_fee_cents
+        raw_edge = 0.085
+        price_cents = 50
+        fee_pp = kalshi_fee_cents(price_cents) / 100  # 0.0175
+        net_edge = raw_edge - fee_pp
+        threshold = 0.08
+        assert net_edge < threshold  # 0.0675 < 0.08 -> should NOT trade

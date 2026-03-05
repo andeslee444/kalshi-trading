@@ -94,12 +94,20 @@ class GARCHForecaster:
         self._beta = beta
         self._min_obs = min_observations
         self._returns = []
+        self._intervals = []  # observation intervals in seconds
         self._sigma2 = None  # Current conditional variance
         self._sigma2_history = []  # For vol-of-vol computation
 
-    def update(self, log_return):
-        """Update with a new log return observation."""
+    def update(self, log_return, interval_seconds=None):
+        """Update with a new log return observation.
+
+        Args:
+            log_return: Log return since last observation.
+            interval_seconds: Actual time since last observation. If None, not tracked.
+        """
         self._returns.append(log_return)
+        if interval_seconds is not None:
+            self._intervals.append(interval_seconds)
         if len(self._returns) < self._min_obs:
             return
 
@@ -121,12 +129,22 @@ class GARCHForecaster:
         if len(self._sigma2_history) > 500:
             self._sigma2_history = self._sigma2_history[-500:]
 
-    def forecast_vol(self, annualize_factor=None):
+    def _median_interval_seconds(self):
+        """Return median observation interval, or None if not tracked."""
+        if not self._intervals:
+            return None
+        sorted_intervals = sorted(self._intervals)
+        return sorted_intervals[len(sorted_intervals) // 2]
+
+    def forecast_vol(self, annualize_factor=None, use_actual_interval=False):
         """Forecast next-period volatility.
 
         Args:
-            annualize_factor: If provided, multiply by sqrt(factor). If None,
-                returns per-observation vol (caller annualizes based on interval).
+            annualize_factor: If provided, multiply by sqrt(factor). If None and
+                use_actual_interval is False, returns per-observation vol.
+            use_actual_interval: If True, compute annualize_factor from tracked
+                observation intervals. Falls back to annualize_factor if no
+                intervals tracked.
 
         Returns:
             float (annualized vol) or None if insufficient data.
@@ -134,8 +152,17 @@ class GARCHForecaster:
         if self._sigma2 is None:
             return None
         vol = math.sqrt(self._sigma2)
-        if annualize_factor is not None:
+
+        if use_actual_interval:
+            median_dt = self._median_interval_seconds()
+            if median_dt and median_dt > 0:
+                intervals_per_year = 365.25 * 86400 / median_dt
+                vol *= math.sqrt(intervals_per_year)
+            elif annualize_factor is not None:
+                vol *= math.sqrt(annualize_factor)
+        elif annualize_factor is not None:
             vol *= math.sqrt(annualize_factor)
+
         return vol
 
     def vol_of_vol(self):
@@ -192,8 +219,7 @@ class DCCCorrelation:
             for a in self._assets if a in self._garch
         )
         if not all_warmed:
-            self._count += 1
-            return
+            return  # Don't count as DCC update — Q matrix not being updated
 
         # Build standardized residuals
         eps = np.zeros(self._n)
