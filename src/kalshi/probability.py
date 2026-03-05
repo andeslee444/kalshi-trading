@@ -229,7 +229,7 @@ def weather_probability(forecast_temp, threshold, direction, days_out=0, city=No
     """CDF-based probability for KXHIGH weather markets.
 
     sigma scales with forecast horizon: sigma = intercept + slope * sqrt(days_out)
-    Default: sigma = 2.0 + 0.5 * sqrt(days_out)
+    Default: sigma = 1.5 + 0.5 * sqrt(days_out)
     Sublinear (sqrt) scaling matches random-walk forecast error growth.
 
     If config/calibration.json exists with per-city or global sigma parameters,
@@ -246,7 +246,7 @@ def weather_probability(forecast_temp, threshold, direction, days_out=0, city=No
         return None
 
     cal = _load_calibration()
-    intercept = 2.0  # NWS MAE data shows day-0 error ~2.0°F (was 2.5)
+    intercept = 1.5  # NWS MAE data shows day-0 error ~1.5°F (was 2.0; Brier 0.321 showed sigma too large)
     slope = 0.5
 
     weather_cal = cal.get("weather", {})
@@ -287,7 +287,7 @@ def weather_sigma(days_out=0, city=None):
     Useful for logging sigma_used in trade records for calibration.
     """
     cal = _load_calibration()
-    intercept = 2.0
+    intercept = 1.5
     slope = 0.5
     weather_cal = cal.get("weather", {})
     if city and city in weather_cal.get("per_city", {}):
@@ -1210,7 +1210,7 @@ def high_conviction_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None
 # ─── Market filters ───
 
 # Minimum spread to consider a market liquid enough to trade
-MIN_LIQUIDITY_VOLUME = 50
+MIN_LIQUIDITY_VOLUME = 10
 MAX_SPREAD_FOR_ENTRY = 20  # cents
 
 
@@ -1222,7 +1222,7 @@ def is_market_liquid(market, min_volume=None, max_spread=None):
 
     Args:
         market: Market dict with yes_bid, yes_ask, volume fields.
-        min_volume: Override minimum volume (default: MIN_LIQUIDITY_VOLUME=50).
+        min_volume: Override minimum volume (default: MIN_LIQUIDITY_VOLUME=10).
         max_spread: Override max spread in cents (default: MAX_SPREAD_FOR_ENTRY=20).
     """
     vol_threshold = min_volume if min_volume is not None else MIN_LIQUIDITY_VOLUME

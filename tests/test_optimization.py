@@ -623,8 +623,8 @@ class TestIsMarketLiquid:
         assert is_market_liquid(market) is False
 
     def test_low_volume(self):
-        """Volume < 50 should be illiquid."""
-        market = {"yes_bid": 40, "yes_ask": 45, "volume": 10}
+        """Volume < 10 should be illiquid."""
+        market = {"yes_bid": 40, "yes_ask": 45, "volume": 5}
         assert is_market_liquid(market) is False
 
     def test_zero_volume(self):

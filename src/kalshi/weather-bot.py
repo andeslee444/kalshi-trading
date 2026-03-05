@@ -169,6 +169,7 @@ def scan_and_trade():
         ticker = m.get("ticker", "")
         parsed = parse_ticker(ticker)
         if not parsed:
+            log.warning("Unparseable KXHIGH ticker: %s", ticker)
             ss.skip("no_parse")
             continue
 
@@ -239,7 +240,13 @@ def scan_and_trade():
         no_ask = m.get("no_ask", 0)
         last = m.get("last_price", 0)
 
-        if not is_market_liquid(m):
+        # Relaxed liquidity for near-settlement markets (0-1 days out)
+        # where forecast accuracy is best and trading interest highest
+        if days_out is not None and days_out <= 1:
+            liquid = is_market_liquid(m, min_volume=5)
+        else:
+            liquid = is_market_liquid(m)
+        if not liquid:
             ss.skip("illiquid")
             continue
 
@@ -255,6 +262,15 @@ def scan_and_trade():
             edge_yes = (1 - our_prob) - (no_ask / 100.0)  # positive = NO signal
         else:
             ss.skip("no_price")
+            continue
+
+        # Guard: never trade on negative edge (model says we'd lose money)
+        if edge_yes < 0:
+            ss.skip("negative_edge")
+            trade_manager.log_decision(ticker, "yes" if our_prob > 0.5 else "no",
+                                       "skipped", "negative_edge",
+                                       edge=edge_yes,
+                                       price_cents=yes_ask if our_prob > 0.5 else no_ask)
             continue
 
         # Adjust edge threshold for high ensemble spread (defense in depth)
