@@ -77,6 +77,57 @@ def _classify_econ_market(ticker):
         return "FED"
     return "other"
 
+# === Concentration Limits ===
+FAMILY_EXPOSURE_PCT = 0.15   # 15% of bankroll per ticker family
+RELEASE_EXPOSURE_PCT = 0.25  # 25% per release date
+TOTAL_ECON_PCT = 0.40        # 40% total economics exposure
+
+def _ticker_family(ticker):
+    """Extract ticker family (everything before -T/-B threshold suffix)."""
+    m = re.match(r'^(.*?)-[TB][\d.]+$', ticker)
+    return m.group(1) if m else ticker
+
+def _compute_exposure(trades, match_value, match_mode="family"):
+    """Sum cost_cents across trades matching a ticker family or prefix."""
+    total = 0
+    for t in trades:
+        t_ticker = t.get("ticker", "")
+        if match_mode == "family":
+            if _ticker_family(t_ticker) == match_value:
+                total += t.get("cost_cents", 0)
+        elif match_mode == "prefix":
+            if t_ticker.startswith(match_value):
+                total += t.get("cost_cents", 0)
+    return total
+
+def _check_concentration(ticker, bankroll_cents, trades):
+    """Check concentration limits. Returns (allowed, reason) tuple."""
+    family = _ticker_family(ticker)
+
+    # Level 2: Per-ticker-family (15%)
+    family_cap = int(bankroll_cents * FAMILY_EXPOSURE_PCT)
+    family_exposure = _compute_exposure(trades, family, "family")
+    if family_exposure >= family_cap:
+        return False, f"family_cap: ${family_exposure/100:.0f} >= ${family_cap/100:.0f} (15%)"
+
+    # Level 3: Per-release-date (25%) — same as family for econ markets
+    release_cap = int(bankroll_cents * RELEASE_EXPOSURE_PCT)
+    if family_exposure >= release_cap:
+        return False, f"release_cap: ${family_exposure/100:.0f} >= ${release_cap/100:.0f} (25%)"
+
+    # Level 4: Total econ exposure (40%)
+    total_cap = int(bankroll_cents * TOTAL_ECON_PCT)
+    total_exposure = _compute_exposure(trades, "KXECON", "prefix")
+    total_exposure += _compute_exposure(trades, "KXCPI", "prefix")
+    total_exposure += _compute_exposure(trades, "KXGDP", "prefix")
+    total_exposure += _compute_exposure(trades, "KXJOBS", "prefix")
+    total_exposure += _compute_exposure(trades, "KXGAS", "prefix")
+    total_exposure += _compute_exposure(trades, "KXINFLATION", "prefix")
+    if total_exposure >= total_cap:
+        return False, f"total_econ_cap: ${total_exposure/100:.0f} >= ${total_cap/100:.0f} (40%)"
+
+    return True, ""
+
 # === Market ticker prefixes ===
 # Note: KXFED removed — CME FedWatch is a JavaScript SPA, HTML scraper returns garbage.
 # Re-enable when a proper FedWatch data source (JSON API or FRED SOFR futures) is wired up.
@@ -848,6 +899,16 @@ def scan_and_trade():
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             ss.skip("allocator_denied")
             trade_manager.log_decision(ticker, side, "skipped", f"allocator denied: {budget.reason}",
+                                       edge=edge, price_cents=yes_ask if side == "yes" else no_ask)
+            continue
+
+        # Concentration check
+        existing_trades = trade_manager.load_trades()
+        allowed, conc_reason = _check_concentration(ticker, budget.bankroll_cents, existing_trades)
+        if not allowed:
+            log.info(f"  Concentration limit hit for {ticker}: {conc_reason}")
+            ss.skip("concentration_limit")
+            trade_manager.log_decision(ticker, side, "skipped", f"concentration: {conc_reason}",
                                        edge=edge, price_cents=yes_ask if side == "yes" else no_ask)
             continue
 
