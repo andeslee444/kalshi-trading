@@ -323,44 +323,85 @@ class TestComputeRealizedVol:
 
 
 class TestBracketLiquidityGate:
-    """Test bracket-specific liquidity requirements (relaxed vs standard)."""
+    """Test bracket-specific liquidity requirements (relaxed: checks both YES and NO sides)."""
 
-    def _bracket_eligible(self, market, max_spread=15, min_volume=10):
-        """Simulate bracket eligibility: spread < 15c AND volume > 10."""
-        yes_bid = market.get("yes_bid", 0)
-        yes_ask = market.get("yes_ask", 0)
+    def _bracket_eligible(self, market, max_spread=15, min_volume=5):
+        """Simulate relaxed bracket eligibility: EITHER side has tight spread, min volume 5.
+
+        Also accepts markets with recent trades (last_price set) and volume >= 10
+        even if the order book is empty.
+        """
+        yes_bid = market.get("yes_bid", 0) or 0
+        yes_ask = market.get("yes_ask", 0) or 0
+        no_bid = market.get("no_bid", 0) or 0
+        no_ask = market.get("no_ask", 0) or 0
         volume = market.get("volume", 0) or 0
-        if not yes_ask:
+
+        # Check YES-side spread
+        yes_spread = (yes_ask - yes_bid) if (yes_bid and yes_ask) else 999
+        # Check NO-side spread
+        no_spread = (no_ask - no_bid) if (no_bid and no_ask) else 999
+        # Market is liquid if EITHER side has a tight spread
+        b_spread = min(yes_spread, no_spread)
+
+        # Also accept if market has recent trades even with empty book
+        has_recent_trade = bool(market.get("last_price"))
+        if b_spread > max_spread and not (has_recent_trade and volume >= 10):
             return False
-        spread = (yes_ask - yes_bid) if yes_bid else 999
-        return spread <= max_spread and volume >= min_volume
+        if volume < min_volume:
+            return False
+        return True
 
     def test_tight_spread_high_volume_eligible(self):
         market = {"yes_bid": 40, "yes_ask": 50, "volume": 25}
         assert self._bracket_eligible(market)
 
-    def test_wide_spread_rejected(self):
-        """Spread > 15c rejects bracket."""
-        market = {"yes_bid": 30, "yes_ask": 50, "volume": 25}
+    def test_wide_yes_spread_but_tight_no_spread_eligible(self):
+        """NO side has tight spread even though YES side is wide -- should pass."""
+        market = {"yes_bid": 0, "yes_ask": 50, "no_bid": 45, "no_ask": 55, "volume": 15}
+        assert self._bracket_eligible(market)
+
+    def test_no_side_only_liquidity_eligible(self):
+        """Market with no YES bid but valid NO ask/bid should pass."""
+        market = {"yes_bid": 0, "yes_ask": 0, "no_bid": 40, "no_ask": 50, "volume": 20}
+        assert self._bracket_eligible(market)
+
+    def test_last_price_fallback_eligible(self):
+        """Market with no bid/ask on either side but recent trades should pass."""
+        market = {"yes_bid": 0, "yes_ask": 0, "no_bid": 0, "no_ask": 0,
+                  "volume": 15, "last_price": 45}
+        assert self._bracket_eligible(market)
+
+    def test_last_price_but_low_volume_rejected(self):
+        """Last price set but volume < 10 should be rejected for last_price fallback."""
+        market = {"yes_bid": 0, "yes_ask": 0, "no_bid": 0, "no_ask": 0,
+                  "volume": 8, "last_price": 45}
         assert not self._bracket_eligible(market)
 
-    def test_low_volume_rejected(self):
-        """Volume < 10 rejects bracket."""
-        market = {"yes_bid": 40, "yes_ask": 50, "volume": 5}
-        assert not self._bracket_eligible(market)
-
-    def test_ask_only_rejected(self):
-        """Ask-only market (no bid) has spread=999, rejected."""
-        market = {"yes_bid": 0, "yes_ask": 50, "volume": 25}
+    def test_wide_both_spreads_no_last_price_rejected(self):
+        """Both sides have wide spreads and no last_price -- rejected."""
+        market = {"yes_bid": 10, "yes_ask": 50, "no_bid": 10, "no_ask": 50, "volume": 25}
         assert not self._bracket_eligible(market)
 
     def test_boundary_spread_15_eligible(self):
         market = {"yes_bid": 35, "yes_ask": 50, "volume": 15}
         assert self._bracket_eligible(market)
 
-    def test_boundary_volume_10_eligible(self):
-        market = {"yes_bid": 40, "yes_ask": 50, "volume": 10}
+    def test_very_low_volume_rejected(self):
+        """Volume < 5 rejects bracket even with tight spread."""
+        market = {"yes_bid": 40, "yes_ask": 50, "volume": 3}
+        assert not self._bracket_eligible(market)
+
+    def test_boundary_volume_5_eligible(self):
+        """Volume exactly 5 should pass (lowered from 10)."""
+        market = {"yes_bid": 40, "yes_ask": 50, "volume": 5}
         assert self._bracket_eligible(market)
+
+    def test_truly_illiquid_rejected(self):
+        """No liquidity anywhere: no spreads, no volume, no last_price."""
+        market = {"yes_bid": 0, "yes_ask": 0, "no_bid": 0, "no_ask": 0,
+                  "volume": 0, "last_price": 0}
+        assert not self._bracket_eligible(market)
 
 
 class TestBracketLimitPricing:
@@ -494,3 +535,113 @@ class TestJumpDiffusionCrypto:
             time_horizon_minutes=5, realized_vol_pct=0.60,
         )
         assert prob < 0.10  # Very unlikely in 5 minutes
+
+
+class TestPriceFallback:
+    """Test price fallback logic: yes_ask -> no_ask -> last_price."""
+
+    def _get_market_price(self, market):
+        """Simulate price fallback logic from crypto-bot.
+
+        Returns the market price to use for edge computation, or None if no price.
+        yes_ask values of 99+ are not useful (near-certain outcomes have no edge).
+        """
+        yes_ask = market.get("yes_ask", 0) or 0
+        no_ask = market.get("no_ask", 0) or 0
+        last_price = market.get("last_price", 0) or 0
+
+        if yes_ask and 1 <= yes_ask < 99:
+            return yes_ask
+        elif no_ask and 1 <= no_ask < 99:
+            return 100 - no_ask  # implied yes price from NO side
+        elif last_price and 1 <= last_price < 99:
+            return last_price
+        else:
+            return None
+
+    def test_yes_ask_available(self):
+        """When yes_ask is available, use it directly."""
+        market = {"yes_ask": 45, "no_ask": 55, "last_price": 40}
+        assert self._get_market_price(market) == 45
+
+    def test_no_ask_fallback(self):
+        """When yes_ask=0 but no_ask=55, implied price is 100-55=45."""
+        market = {"yes_ask": 0, "no_ask": 55, "last_price": 40}
+        assert self._get_market_price(market) == 45  # 100 - 55
+
+    def test_last_price_fallback(self):
+        """When yes_ask=0, no_ask=0, use last_price."""
+        market = {"yes_ask": 0, "no_ask": 0, "last_price": 45}
+        assert self._get_market_price(market) == 45
+
+    def test_no_price_at_all(self):
+        """When nothing available, return None (skip market)."""
+        market = {"yes_ask": 0, "no_ask": 0, "last_price": 0}
+        assert self._get_market_price(market) is None
+
+    def test_yes_ask_too_high_uses_fallback(self):
+        """yes_ask >= 99 is not useful, fall back."""
+        market = {"yes_ask": 99, "no_ask": 55, "last_price": 40}
+        assert self._get_market_price(market) == 45  # 100 - 55
+
+    def test_yes_ask_zero_with_no_ask(self):
+        """yes_ask=0 with valid no_ask should compute implied price."""
+        market = {"yes_ask": 0, "no_ask": 30}
+        assert self._get_market_price(market) == 70  # 100 - 30
+
+    def test_no_ask_out_of_range(self):
+        """no_ask=0 or no_ask>=100 should not be used."""
+        market = {"yes_ask": 0, "no_ask": 0, "last_price": 50}
+        assert self._get_market_price(market) == 50
+
+    def test_none_values_handled(self):
+        """None values in market dict should be handled gracefully."""
+        market = {"yes_ask": None, "no_ask": None, "last_price": 42}
+        assert self._get_market_price(market) == 42
+
+
+class TestDriftZeroShortHorizon:
+    """Test that drift is zeroed for sub-daily (< 1440 minute) markets."""
+
+    def _apply_drift(self, drift, minutes_to_settle):
+        """Simulate drift zeroing logic from crypto-bot."""
+        if minutes_to_settle < 1440:
+            return 0.0
+        return drift
+
+    def test_15min_market_zeros_drift(self):
+        """15-minute bracket should have drift = 0."""
+        assert self._apply_drift(0.5, 15) == 0.0
+
+    def test_1hour_market_zeros_drift(self):
+        """1-hour market should have drift = 0."""
+        assert self._apply_drift(1.5, 60) == 0.0
+
+    def test_6hour_market_zeros_drift(self):
+        """6-hour market should have drift = 0."""
+        assert self._apply_drift(2.0, 360) == 0.0
+
+    def test_23hour_market_zeros_drift(self):
+        """23-hour market (sub-daily) should have drift = 0."""
+        assert self._apply_drift(1.0, 1380) == 0.0
+
+    def test_24hour_market_uses_drift(self):
+        """Exactly 1440 minutes (24h) should use actual drift."""
+        assert self._apply_drift(0.5, 1440) == 0.5
+
+    def test_weekly_market_uses_drift(self):
+        """Weekly market (10080 min) should use actual drift."""
+        assert self._apply_drift(-1.2, 10080) == -1.2
+
+    def test_monthly_market_uses_drift(self):
+        """Monthly market should use actual drift."""
+        assert self._apply_drift(0.8, 43200) == 0.8
+
+    def test_zero_drift_stays_zero(self):
+        """Zero drift stays zero regardless of horizon."""
+        assert self._apply_drift(0.0, 15) == 0.0
+        assert self._apply_drift(0.0, 1440) == 0.0
+
+    def test_negative_drift_zeroed_short_horizon(self):
+        """Negative drift also zeroed for short horizons."""
+        assert self._apply_drift(-2.0, 120) == 0.0
