@@ -1424,6 +1424,58 @@ def quarter_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None,
     return (contracts, risk)
 
 
+def uncertainty_kelly(edge, price_cents, max_cost_cents, bankroll_cents,
+                      scenario_agreement, posterior_sigma, fee_cents=0):
+    """Kelly sizing scaled by model confidence.
+
+    Wraps quarter_kelly() with two confidence multipliers:
+    1. scenario_agreement (0-1): do all scenarios agree on the direction?
+    2. posterior_sigma: how tight is the Bayesian posterior?
+
+    Combined via geometric mean to avoid double-counting.
+
+    Args:
+        edge: model_prob - implied_prob
+        price_cents: limit price (1-99)
+        max_cost_cents: max spend per trade
+        bankroll_cents: total balance
+        scenario_agreement: from ScenarioResult.agreement (0-1)
+        posterior_sigma: from CPIBeliefFilter.posterior sigma
+        fee_cents: per-contract fee
+
+    Returns:
+        (contracts, risk_cents, details_dict)
+    """
+    base_count, risk, details = quarter_kelly(
+        edge, price_cents, max_cost_cents, bankroll_cents,
+        fee_cents=fee_cents, return_details=True,
+    )
+
+    if base_count <= 0:
+        return 0, 0, {**details, "confidence": 0, "agreement_mult": 0, "sigma_mult": 0}
+
+    # Scenario agreement: 1.0 -> full size, 0.5 -> ~35%, 0.0 -> 10%
+    agreement_mult = 0.1 + 0.9 * max(0, min(1, scenario_agreement)) ** 2
+
+    # Sigma confidence: tight posterior -> full size, wide -> reduced
+    # Calibrated: 0.10pp -> mult=1.0, 0.40pp -> mult=0.25
+    sigma_mult = min(1.0, 0.10 / max(posterior_sigma, 0.01))
+
+    # Geometric mean avoids double-counting correlated signals
+    confidence = math.sqrt(agreement_mult * sigma_mult)
+    confidence = max(0.0, min(1.0, confidence))
+
+    adjusted_count = max(1, int(base_count * confidence))
+    adjusted_risk = risk * confidence
+
+    return adjusted_count, adjusted_risk, {
+        **details,
+        "confidence": round(confidence, 4),
+        "agreement_mult": round(agreement_mult, 4),
+        "sigma_mult": round(sigma_mult, 4),
+    }
+
+
 def quarter_kelly_sell(edge, sell_price_cents, max_cost_cents, bankroll_cents=None,
                        max_exposure_cents=None, fee_cents=0, return_details=False):
     """Quarter-Kelly for sell-side trades (higher model uncertainty).
