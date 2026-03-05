@@ -904,9 +904,11 @@ def scan_and_trade():
         # Bayesian belief fusion
         belief = CPIBeliefFilter(nowcast_value, sigma)
         if truflation_cpi is not None:
-            belief.update(truflation_cpi, obs_sigma=0.15)
+            # Truflation tracks different basket than BLS CPI. Historical RMSE ~0.30pp.
+            belief.update(truflation_cpi, obs_sigma=0.30)
         if tips_breakeven is not None:
-            belief.update(tips_breakeven, obs_sigma=0.25)
+            # TIPS 10Y breakeven is a long-term measure. Mapping to 1-month CPI has ~0.60pp noise.
+            belief.update(tips_breakeven, obs_sigma=0.60)
         fused_nowcast, posterior_sigma = belief.posterior
 
         # Compute probability using scenario-weighted mixture
