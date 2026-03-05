@@ -540,6 +540,32 @@ def fetch_gas_prices():
         return None
 
 
+def fetch_gdpnow():
+    """Fetch Atlanta Fed GDPNow estimate from FRED.
+
+    Returns GDP growth estimate as percentage (e.g. 2.3), or None on failure.
+    """
+    try:
+        params = {
+            "series_id": "GDPNOW",
+            "sort_order": "desc",
+            "limit": "1",
+            "file_type": "json",
+        }
+        resp = retry_request("GET", "https://api.stlouisfed.org/fred/series/observations",
+                             params=params, timeout=15)
+        obs = resp.json().get("observations", [])
+        if obs and obs[0].get("value", ".") != ".":
+            val = float(obs[0]["value"])
+            log.info(f"  GDPNow: {val:.2f}%")
+            health.record_source_success("gdpnow")
+            return val
+    except Exception as e:
+        log.error(f"  GDPNow fetch failed: {e}")
+        health.record_source_error("gdpnow", str(e))
+    return None
+
+
 # === Market Matching ===
 
 def parse_econ_threshold(market):
@@ -745,6 +771,10 @@ def scan_and_trade():
     if gas_price:
         health.record_source_success("aaa-gas")
 
+    gdpnow_value = fetch_gdpnow()
+    if gdpnow_value:
+        ss.source_ok("gdpnow")
+
     nowcast_stale = nowcast.pop("_stale", False) if nowcast else False
     if nowcast_stale:
         log.warning("Nowcast data is stale (>24h) — skipping CPI/GDP/Jobs trading this cycle")
@@ -903,11 +933,12 @@ def scan_and_trade():
         if "CPI" in ticker.upper() or "INFLATION" in ticker.upper():
             nowcast_value = nowcast.get("cpi_yoy") or nowcast.get("core_cpi_yoy")
         elif "GDP" in ticker.upper():
-            # Primary: Cleveland Fed GDP nowcast. Fallback: Atlanta Fed GDPNow via macro engine
-            nowcast_value = nowcast.get("gdp_growth")
+            # Primary: direct GDPNow fetch. Fallback: Cleveland Fed, then macro engine
+            nowcast_value = gdpnow_value or nowcast.get("gdp_growth")
             if nowcast_value is None and macro_signal and hasattr(macro_signal, 'gdpnow') and macro_signal.gdpnow:
                 nowcast_value = macro_signal.gdpnow
-                log.info(f"  Using GDPNow from macro engine for {ticker}: {nowcast_value:.2f}%")
+            if nowcast_value is not None:
+                log.info(f"  GDP nowcast for {ticker}: {nowcast_value:.2f}%")
         elif "JOBS" in ticker.upper() or "EMPLOYMENT" in ticker.upper():
             # Jobs nowcast not yet available — skip with clear log message
             log.info(f"  Skipping {ticker}: no Jobs/NFP nowcast data source connected")

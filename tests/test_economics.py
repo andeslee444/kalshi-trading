@@ -468,3 +468,18 @@ class TestLiquidityFilter:
         from probability import is_market_liquid
         m = {"yes_bid": 45, "yes_ask": 50, "volume": 100}
         assert is_market_liquid(m)
+
+
+# ===================================================================
+# GDP nowcast classification tests
+# ===================================================================
+
+class TestGdpNowcast:
+
+    def test_classify_gdp_market(self):
+        """GDP ticker should classify as GDP."""
+        assert _econ._classify_econ_market("KXGDP-26Q1-T2.0") == "GDP"
+
+    def test_classify_jobs_market(self):
+        """Jobs ticker should classify as JOBS."""
+        assert _econ._classify_econ_market("KXJOBS-26MAR-T200") == "JOBS"
