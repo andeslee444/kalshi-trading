@@ -172,7 +172,7 @@ class TestConfigValidation:
 class TestBankrollProportionalLimits:
 
     def test_effective_max_trade_uses_pct(self, tmp_path):
-        """When pct is set, effective max trade should scale with bankroll."""
+        """When pct is set, effective max trade is min(static, dynamic) — static is ceiling."""
         mgr, client, _ = _make_manager(tmp_path, {
             "maxTradeAmount": 5, "maxDailyTrades": 100, "maxDailyLoss": 100,
             "maxTradeAmountPct": 0.02,  # 2% of bankroll
@@ -181,10 +181,11 @@ class TestBankrollProportionalLimits:
         client.get_balance.return_value = (500000, 500000)
         effective = mgr._effective_max_trade_cents()
         # 2% of 500000 = 10000 cents ($100), vs static $5 = 500 cents
-        assert effective == 10000
+        # min(500, 10000) = 500 — static ceiling caps it
+        assert effective == 500
 
-    def test_effective_max_trade_static_floor(self, tmp_path):
-        """When bankroll is tiny, static value should be the floor."""
+    def test_effective_max_trade_dynamic_when_smaller(self, tmp_path):
+        """When bankroll is small, dynamic pct is smaller than static — dynamic wins."""
         mgr, client, _ = _make_manager(tmp_path, {
             "maxTradeAmount": 5, "maxDailyTrades": 100, "maxDailyLoss": 100,
             "maxTradeAmountPct": 0.02,
@@ -192,7 +193,8 @@ class TestBankrollProportionalLimits:
         # Mock balance: $10 = 1000 cents; 2% = 20 cents, less than static $5 = 500 cents
         client.get_balance.return_value = (1000, 1000)
         effective = mgr._effective_max_trade_cents()
-        assert effective == 500  # static floor wins
+        # min(500, 20) = 20 — dynamic scales down with small bankroll
+        assert effective == 20
 
     def test_effective_max_trade_no_pct(self, tmp_path):
         """Without pct key, should use static value."""
@@ -204,7 +206,7 @@ class TestBankrollProportionalLimits:
         assert effective == 500  # static only
 
     def test_effective_max_daily_loss_uses_pct(self, tmp_path):
-        """When pct is set, effective max daily loss should scale with bankroll."""
+        """When pct is set, effective max daily loss is min(static, dynamic) — static is ceiling."""
         mgr, client, _ = _make_manager(tmp_path, {
             "maxTradeAmount": 5, "maxDailyTrades": 100, "maxDailyLoss": 25,
             "maxDailyLossPct": 0.05,  # 5% of bankroll
@@ -212,22 +214,21 @@ class TestBankrollProportionalLimits:
         client.get_balance.return_value = (500000, 500000)
         effective = mgr._effective_max_daily_loss_cents()
         # 5% of 500000 = 25000 cents ($250), vs static $25 = 2500 cents
-        assert effective == 25000
+        # min(2500, 25000) = 2500 — static ceiling caps it
+        assert effective == 2500
 
-    def test_cost_cap_scales_with_bankroll(self, tmp_path):
-        """place_order should allow larger trades when pct scaling is active."""
+    def test_cost_cap_respects_static_ceiling(self, tmp_path):
+        """place_order respects static ceiling even with large bankroll."""
         mgr, client, _ = _make_manager(tmp_path, {
             "maxTradeAmount": 5, "maxDailyTrades": 100, "maxDailyLoss": 500,
-            "maxTradeAmountPct": 0.02,  # 2% of $5000 = $100
+            "maxTradeAmountPct": 0.02,  # 2% of $5000 = $100, but static = $5
             "maxDailyLossPct": 0.10,
         })
         client.get_balance.return_value = (500000, 500000)
-        # Place 10 contracts at 50c each = $5 total cost
-        # Without pct: max_cost = $5 = 500 cents, 500/50 = 10 contracts max
-        # With pct: max_cost = $100 = 10000 cents, 10000/50 = 200 contracts max
+        # Static $5 = 500 cents is ceiling; 500/50 = 10 contracts max
         mgr.place_order("T1", "yes", 50, 20, "r1")
         call_body = client.post.call_args[1]["body"]
-        assert call_body["count"] == 20  # allowed because pct scaling
+        assert call_body["count"] == 10  # capped by static ceiling
 
 
 # ===================================================================

@@ -226,7 +226,7 @@ def _nowcast_source_info():
     except Exception:
         pass
     return {
-        "nowcast_age_hours": 0.0,
+        "nowcast_age_hours": None,
         "data_source_timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
@@ -260,7 +260,8 @@ def _compute_cross_measure_dispersion(nowcast):
         # 2 values: use abs(diff)/2 as rough dispersion
         dispersion = abs(values[0] - values[1]) / 2
 
-    ci_width = dispersion * 1.645  # 1-sigma to 90% CI approximation
+    # Net effect: dynamic_sigma = dispersion * 1.645 / 3.29 ≈ dispersion / 2
+    ci_width = dispersion * 1.645
     nowcast["cross_measure_dispersion"] = ci_width
     return ci_width
 
@@ -894,7 +895,7 @@ def scan_and_trade():
             # Fed markets handled via FedWatch path
             continue
         else:
-            sigma = cpi_nowcast_sigma(days_to_release, fed_ci_width=dispersion_ci)  # default fallback
+            sigma = cpi_nowcast_sigma(days_to_release)  # unknown market type — don't apply CPI dispersion
 
         # Macro-adjusted sigma tightening
         if macro is not None and macro_signal and macro_signal.confidence > 0.3:

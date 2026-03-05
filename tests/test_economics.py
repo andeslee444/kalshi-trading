@@ -391,12 +391,12 @@ class TestNowcastSourceInfo:
             _econ.NOWCAST_CACHE_PATH = orig_path
 
     def test_nowcast_source_info_missing_cache(self, tmp_path):
-        """Missing cache returns age 0.0 and current timestamp."""
+        """Missing cache returns age None and current timestamp."""
         orig_path = _econ.NOWCAST_CACHE_PATH
         _econ.NOWCAST_CACHE_PATH = tmp_path / "nonexistent.json"
         try:
             info = _econ._nowcast_source_info()
-            assert info["nowcast_age_hours"] == 0.0
+            assert info["nowcast_age_hours"] is None
             assert info["data_source_timestamp"].endswith("Z")
         finally:
             _econ.NOWCAST_CACHE_PATH = orig_path
