@@ -354,6 +354,9 @@ def ensemble_weather_probability(forecasts, threshold, direction, days_out=0, ci
         if len(inv_brier) >= 2:
             total_inv = sum(inv_brier.values())
             weights = {k: v / total_inv for k, v in inv_brier.items()}
+            dropped = [m for m in forecasts if m not in inv_brier]
+            if dropped:
+                _log.warning("BMA: dropping models with no Brier data: %s (weight=0)", dropped)
             _log.debug("BMA weights from Brier: %s", weights)
         else:
             # Not enough Brier data — fall back to static weights

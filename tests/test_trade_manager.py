@@ -740,9 +740,11 @@ def _load_position_monitor():
     fake_prob.nws_probability = MagicMock(return_value=0.5)
     fake_prob.half_kelly = MagicMock(return_value=(1, 50))
     fake_prob.kalshi_fee_cents = MagicMock(return_value=0)
+    fake_prob.crypto_price_probability = MagicMock(return_value=0.5)
 
     fake_ticker = types.ModuleType("ticker_utils")
     fake_ticker.parse_weather_ticker = MagicMock(return_value=None)
+    fake_ticker.parse_crypto_ticker = MagicMock(return_value=None)
 
     fake_alloc = types.ModuleType("capital_allocator")
     fake_alloc.PortfolioAllocator = MagicMock()

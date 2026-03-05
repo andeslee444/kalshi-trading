@@ -1123,14 +1123,14 @@ class TestCpiNowcastSigma:
         assert cpi_nowcast_sigma(0) == 0.03
 
     def test_one_day_out(self):
-        """Smooth exponential: day 1 hits the 0.03 floor."""
+        """Smooth exponential: day 1 is above floor (no longer step function)."""
         sigma = cpi_nowcast_sigma(1)
-        assert sigma == 0.03
+        assert 0.03 < sigma < 0.06
 
     def test_one_week_out(self):
-        """Smooth exponential: day 7 should be around 0.06."""
+        """Smooth exponential: day 7 should be around 0.08."""
         sigma = cpi_nowcast_sigma(7)
-        assert 0.04 < sigma < 0.08
+        assert 0.06 < sigma < 0.10
 
     def test_two_weeks_out(self):
         """Smooth exponential: day 14 should be around 0.10."""
@@ -1928,6 +1928,7 @@ class TestSettlementAwareCleanup:
         fake_prob.nws_probability = lambda *a, **kw: 0.5
         fake_prob.edge_after_fees = lambda *a, **kw: 0.0
         fake_prob.kalshi_fee_cents = lambda p: 0.07 * (p / 100) * (1 - p / 100) * 100
+        fake_prob.crypto_price_probability = lambda *a, **kw: 0.5
         sys.modules["probability"] = fake_prob
 
         fake_alloc = types.ModuleType("capital_allocator")

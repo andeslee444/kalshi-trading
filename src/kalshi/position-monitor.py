@@ -400,7 +400,7 @@ def _get_latest_crypto_vol(asset):
 
     Returns vol as a decimal (e.g. 0.55) or None if data is missing/stale (>4h).
     """
-    decisions_path = PROJECT_DIR / "data" / "crypto-decisions.json"
+    decisions_path = PROJECT_DIR / "data" / "kalshi-crypto-trades-decisions.json"
     try:
         if not decisions_path.exists():
             return None

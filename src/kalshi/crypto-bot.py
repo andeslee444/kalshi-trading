@@ -477,7 +477,7 @@ def scan_and_trade():
             if b_spread > 15 or b_volume < 10:
                 ss.skip("bracket_illiquid")
                 trade_manager.log_decision(ticker, "yes", "skipped", "bracket_illiquid",
-                                           spread=b_spread, volume=b_volume)
+                                           spread=b_spread, volume=b_volume, asset=asset)
                 continue
 
         # Estimate time to settlement
@@ -561,7 +561,7 @@ def scan_and_trade():
                 reason = "edge below mid-range threshold" if eff_threshold > EDGE_THRESHOLD else "edge below threshold"
                 trade_manager.log_decision(
                     ticker, "yes", "skipped", reason,
-                    edge=edge, price_cents=yes_ask,
+                    edge=edge, price_cents=yes_ask, asset=asset, vol_used=round(vol_to_use, 4),
                 )
         elif prob <= 0.5 and no_ask:
             no_prob = 1.0 - prob
@@ -581,7 +581,7 @@ def scan_and_trade():
                 reason = "edge below mid-range threshold" if eff_threshold > EDGE_THRESHOLD else "edge below threshold"
                 trade_manager.log_decision(
                     ticker, "no", "skipped", reason,
-                    edge=edge, price_cents=no_ask,
+                    edge=edge, price_cents=no_ask, asset=asset, vol_used=round(vol_to_use, 4),
                 )
 
     # Sort by edge
@@ -608,7 +608,8 @@ def scan_and_trade():
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             ss.skip("allocator_denied")
             trade_manager.log_decision(ticker, side, "skipped", f"allocator denied: {budget.reason}",
-                                       edge=edge, price_cents=yes_ask if side == "yes" else no_ask)
+                                       edge=edge, price_cents=yes_ask if side == "yes" else no_ask,
+                                       asset=opp["asset"], vol_used=round(opp["vol_used"], 4))
             continue
 
         if opp.get("is_bracket"):
@@ -633,7 +634,8 @@ def scan_and_trade():
         if count <= 0:
             ss.skip("kelly_zero")
             trade_manager.log_decision(ticker, side, "skipped", "kelly_zero: edge too small for price",
-                                       edge=edge, price_cents=price)
+                                       edge=edge, price_cents=price,
+                                       asset=opp["asset"], vol_used=round(opp["vol_used"], 4))
             continue
 
         # Determine vol_source for trade record
