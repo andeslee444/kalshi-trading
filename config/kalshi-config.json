@@ -35,5 +35,12 @@
     "enabled": true,
     "models": ["gfs", "ecmwf", "icon"],
     "weights": { "gfs": 0.40, "ecmwf": 0.40, "icon": 0.20 }
+  },
+  "verification": {
+    "enabled": true,
+    "lookback_days": 30,
+    "min_samples_for_adaptive": 10,
+    "disagreement_edge_multiplier": 2.0,
+    "max_api_calls_per_scan": 5
   }
 }

@@ -7,9 +7,10 @@ import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
-from probability import weather_probability, weather_sigma, ensemble_weather_probability, ensemble_spread_sigma_multiplier, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, _load_calibration
+from probability import weather_probability, weather_sigma, ensemble_weather_probability, ensemble_spread_sigma_multiplier, ensemble_weather_probability_v2, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, _load_calibration
 from ticker_utils import parse_weather_ticker as parse_ticker
 from capital_allocator import PortfolioAllocator
+from forecast_verifier import ForecastVerifier
 
 setup_unbuffered()
 log = setup_logging("weather")
@@ -45,6 +46,13 @@ ENSEMBLE_MODELS = {
     "icon": "icon_seamless",
 }
 ENSEMBLE_ENABLED = config.get("ensemble", {}).get("enabled", False)
+
+# === Forecast Verification ===
+VERIFICATION_ENABLED = config.get("verification", {}).get("enabled", True)
+VERIFICATION_CONFIG = config.get("verification", {})
+verifier = ForecastVerifier(PROJECT_DIR / "data" / "weather-verification.json", logger=log) if VERIFICATION_ENABLED else None
+if verifier:
+    verifier.load()
 
 
 def get_forecast(lat, lon):
@@ -163,6 +171,42 @@ def scan_and_trade():
             log.error(f"Forecast error for {info['name']}: {e}")
             health.record_source_error("open-meteo", str(e))
 
+    # Forecast verification: verify past forecasts and record new ones
+    if verifier:
+        try:
+            city_coords = {code: {"lat": info["lat"], "lon": info["lon"]}
+                          for code, info in CITIES.items()}
+            verifier.verify_past_forecasts(city_coords)
+        except Exception as e:
+            log.warning("Verification check failed (non-blocking): %s", e)
+
+        # Record current forecasts for later verification
+        for code, info in CITIES.items():
+            if code in forecasts:
+                city_forecast = forecasts[code]
+                for date_str, model_data in city_forecast.items():
+                    if isinstance(model_data, dict):
+                        verifier.record_forecast(code, date_str, model_data)
+
+    # Get adaptive ensemble data from verification (if available)
+    verification_summary = None
+    city_bias = {}
+    if verifier:
+        try:
+            lookback = VERIFICATION_CONFIG.get("lookback_days", 30)
+            verification_summary = verifier.get_verification_summary(lookback)
+            city_bias = verifier.get_city_bias(lookback)
+            if verification_summary:
+                log.info("Adaptive weights available from %d models",
+                        len(verification_summary))
+            if city_bias:
+                log.info("City bias available for %d cities", len(city_bias))
+        except Exception as e:
+            log.warning("Verification summary failed (non-blocking): %s", e)
+
+    # Current hour for intra-day sigma (day-0 markets only)
+    current_hour = now.hour
+
     # Analyze markets
     opportunities = []
     for m in markets:
@@ -192,6 +236,7 @@ def scan_and_trade():
 
         # Compute probability — ensemble or single-model
         spread_mult = 1.0
+        disagreement_score = 0.0
         if ENSEMBLE_ENABLED and isinstance(forecast_data, dict):
             if not forecast_data:
                 ss.skip("empty_forecast")
@@ -207,8 +252,26 @@ def scan_and_trade():
                 spread_mult = ensemble_spread_sigma_multiplier(spread)
                 if spread_mult > 1.0:
                     log.info(f"  {ticker}: ensemble spread {spread:.1f}F (sigma_mult={spread_mult:.2f})")
-            our_prob = ensemble_weather_probability(forecast_data, parsed["threshold"], parsed["direction"], days_out, city=city, sigma_multiplier=spread_mult)
-            if our_prob is None:
+
+            # Use v2 ensemble with adaptive weights, hour-aware sigma, disagreement scoring
+            # Get city-specific skew from verification bias data
+            city_skew = city_bias.get(city, {}).get("skew_alpha", 0.0) if city_bias else 0.0
+            hour_for_sigma = current_hour if days_out == 0 else None
+
+            result = ensemble_weather_probability_v2(
+                forecast_data, parsed["threshold"], parsed["direction"],
+                days_out, city=city, sigma_multiplier=spread_mult,
+                hour_of_day=hour_for_sigma,
+                verification_data=verification_summary if verification_summary else None,
+                return_details=True,
+            )
+
+            if result[0] is not None:
+                our_prob, ensemble_details = result
+                disagreement_score = ensemble_details.get("disagreement_score", 0.0)
+                if disagreement_score > 0.3:
+                    log.info(f"  {ticker}: high ensemble disagreement ({disagreement_score:.2f}), doubling edge threshold")
+            else:
                 # Ensemble failed (zero weight) — fall back to single-model
                 log.warning("Ensemble returned None for %s, falling back to single-model", ticker)
                 our_prob = compute_probability(forecast_temp, parsed["threshold"], parsed["direction"], days_out, city=city)
@@ -273,9 +336,12 @@ def scan_and_trade():
                                        price_cents=yes_ask if our_prob > 0.5 else no_ask)
             continue
 
-        # Adjust edge threshold for high ensemble spread (defense in depth)
+        # Adjust edge threshold for high ensemble spread or disagreement (defense in depth)
         effective_edge_threshold = config["edgeThreshold"]
-        if spread_mult > 1.5:
+        disagree_mult = VERIFICATION_CONFIG.get("disagreement_edge_multiplier", 2.0)
+        if disagreement_score > 0.3:
+            effective_edge_threshold = config["edgeThreshold"] * disagree_mult
+        elif spread_mult > 1.5:
             effective_edge_threshold = config["edgeThreshold"] * 2
 
         if edge_yes >= effective_edge_threshold:
@@ -431,6 +497,14 @@ def scan_and_trade():
         if result:
             ss.trades_placed += 1
             allocator.record_trade("weather", ticker, risk, edge=edge)
+
+    # Save verification state
+    if verifier:
+        try:
+            verifier.cleanup()
+            verifier.save()
+        except Exception as e:
+            log.warning("Verification save failed (non-blocking): %s", e)
 
     ss.finalize()
 
