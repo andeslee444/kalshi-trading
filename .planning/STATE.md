@@ -3,7 +3,7 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: complete
-last_updated: "2026-03-04"
+last_updated: "2026-03-05"
 progress:
   total_phases: 6
   completed_phases: 6
@@ -24,7 +24,7 @@ See: .planning/PROJECT.md (updated 2026-03-04)
 
 Phase: ALL COMPLETE
 Status: All GSD phases (1-6), consolidated quant desk tracks (T1-P1 through T2-P3), and Phase 7 (Microstructure & Attribution) are complete and merged to main.
-Last activity: 2026-03-05 - Completed quick task 1: Fix crypto bot opportunity access: bracket liquidity, ticker parsing, price fallback, drift cap
+Last activity: 2026-03-05 - Completed quick task 2: Fix weather bot bugs: tighten sigma, relax liquidity, add edge guard
 
 Progress: [████████████████████] 100%
 
@@ -91,8 +91,9 @@ None active. All tracks merged.
 | # | Description | Date | Commit | Directory |
 |---|-------------|------|--------|-----------|
 | 1 | Fix crypto bot opportunity access: bracket liquidity, ticker parsing, price fallback, drift cap | 2026-03-05 | 492372f | [1-fix-crypto-bot-opportunity-access-bracke](./quick/1-fix-crypto-bot-opportunity-access-bracke/) |
+| 2 | Fix weather bot bugs: tighten sigma, relax liquidity, add edge guard | 2026-03-05 | c2033dd | [2-fix-weather-bot-bugs-calibration-ticker-](./quick/2-fix-weather-bot-bugs-calibration-ticker-/) |
 
 ## Session Continuity
 
-Last session: 2026-03-04
-Status: All work complete. No resume needed.
+Last session: 2026-03-05
+Status: All work complete. Quick task 2 (weather bot bugs) finished.
