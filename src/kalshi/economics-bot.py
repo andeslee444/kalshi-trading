@@ -791,11 +791,43 @@ def scan_and_trade():
     if macro is not None:
         try:
             fred_all = macro._fred.fetch_all() if hasattr(macro, '_fred') else {}
+            crude_oil = fred_all.get("crude_oil")
+
+            # Compute 90-day MA from FRED (fetch last 90 observations of daily WTI)
+            crude_oil_90d_ma = None
+            if hasattr(macro, '_fred') and crude_oil is not None:
+                try:
+                    import datetime as _dt
+                    start = (_dt.date.today() - _dt.timedelta(days=120)).isoformat()
+                    params = {
+                        "series_id": "DCOILWTICO",
+                        "observation_start": start,
+                        "file_type": "json",
+                    }
+                    if macro._fred.api_key:
+                        params["api_key"] = macro._fred.api_key
+                    resp = retry_request("GET", macro._fred.BASE_URL, params=params, timeout=15)
+                    obs = resp.json().get("observations", [])
+                    vals = [float(o["value"]) for o in obs if o.get("value", ".") != "."]
+                    if len(vals) >= 30:
+                        crude_oil_90d_ma = sum(vals[-90:]) / len(vals[-90:])
+                        log.info(f"  Crude oil 90d MA: ${crude_oil_90d_ma:.2f} (current: ${crude_oil:.2f})")
+                except Exception as e:
+                    log.warning(f"  Crude oil 90d MA calc failed (non-fatal): {e}")
+
+            # TIPS 5Y-10Y spread for stagflation signal
+            tips_5y = fred_all.get("tips_breakeven_5y")
+            tips_10y = fred_all.get("tips_breakeven_10y")
+            tips_5y_minus_10y = None
+            if tips_5y is not None and tips_10y is not None:
+                tips_5y_minus_10y = tips_5y - tips_10y
+
             fred_scenario_data = {
-                "crude_oil": fred_all.get("crude_oil"),
-                "crude_oil_90d_ma": fred_all.get("crude_oil"),  # TODO: compute actual 90d MA
+                "crude_oil": crude_oil,
+                "crude_oil_90d_ma": crude_oil_90d_ma,
                 "T10Y2Y": fred_all.get("yield_curve"),
                 "gdpnow": fred_all.get("gdpnow"),
+                "tips_5y_minus_10y": tips_5y_minus_10y,
             }
         except Exception as e:
             log.warning(f"  FRED scenario data fetch failed (non-fatal): {e}")
