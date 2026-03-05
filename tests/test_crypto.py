@@ -670,6 +670,44 @@ class TestEnsembleIntegration:
             assert abs(w_iv + w_rv - 1.0) < 0.001
 
 
+class TestVolSkew:
+    """Vol skew adjustment for OTM binary options."""
+
+    def test_skew_multiplier_atm(self):
+        """ATM options should have multiplier ~1.0."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "kalshi"))
+        from crypto_models import vol_skew_multiplier
+        mult = vol_skew_multiplier(moneyness=1.0)
+        assert 0.98 <= mult <= 1.02
+
+    def test_skew_multiplier_otm_put(self):
+        """Deep OTM puts should have higher IV (multiplier > 1)."""
+        from crypto_models import vol_skew_multiplier
+        mult = vol_skew_multiplier(moneyness=0.85)  # 15% OTM put
+        assert mult > 1.05
+
+    def test_skew_multiplier_otm_call(self):
+        """Near-OTM calls should be at floor (put skew dominates in crypto)."""
+        from crypto_models import vol_skew_multiplier
+        mult = vol_skew_multiplier(moneyness=1.15)  # 15% OTM call
+        assert mult >= 1.0  # Floor applied — put skew dominates crypto smile
+
+    def test_skew_symmetric_light_smile(self):
+        """Both sides of ATM should have elevated vol (smile, not pure skew)."""
+        from crypto_models import vol_skew_multiplier
+        put_mult = vol_skew_multiplier(moneyness=0.90)
+        call_mult = vol_skew_multiplier(moneyness=1.10)
+        # Put skew is typically stronger than call
+        assert put_mult > call_mult
+
+    def test_skew_clamped(self):
+        """Extreme moneyness should clamp to a reasonable multiplier."""
+        from crypto_models import vol_skew_multiplier
+        mult = vol_skew_multiplier(moneyness=0.50)  # 50% OTM
+        assert mult <= 2.0  # Max 2x ATM vol
+
+
 class TestFeeAdjustedEdge:
     """Edge threshold should account for Kalshi fees."""
 

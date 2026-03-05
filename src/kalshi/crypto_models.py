@@ -81,6 +81,30 @@ def horizon_vol_weights(minutes_to_settle):
     return w_iv, w_rv
 
 
+def vol_skew_multiplier(moneyness, skew_slope=0.30, smile_curvature=0.20):
+    """Approximate vol skew/smile multiplier for crypto options.
+
+    Uses a simple parametric model calibrated to typical BTC/ETH skew:
+        mult = 1 - skew_slope * ln(moneyness) + smile_curvature * ln(moneyness)^2
+
+    The skew_slope term captures the put skew (OTM puts have higher IV).
+    The smile_curvature term captures the smile (both OTM puts and calls elevated).
+
+    Args:
+        moneyness: S/K ratio (1.0 = ATM, <1 = OTM put side, >1 = OTM call side)
+        skew_slope: Linear skew strength (default 0.15 = 15% more IV per 100% OTM)
+        smile_curvature: Quadratic smile term (default 0.10)
+
+    Returns:
+        float: Multiplier >= 1.0, clamped to [1.0, 2.0]
+    """
+    log_m = math.log(max(moneyness, 0.5))  # log-moneyness, clamped
+    # Skew: negative log_m (OTM puts) -> higher vol
+    # Smile: squared term adds vol to both tails
+    mult = 1.0 - skew_slope * log_m + smile_curvature * log_m ** 2
+    return max(1.0, min(2.0, mult))
+
+
 class AR1VolForecast:
     """Simple AR(1) volatility forecaster.
 

@@ -30,7 +30,7 @@ from ticker_utils import parse_crypto_ticker
 from capital_allocator import PortfolioAllocator
 from particle_filter import FilterManager, FilterConfig, ci_kelly_multiplier
 from regime_detector import RegimeDetector, regime_kelly_multiplier
-from crypto_models import EnsembleModel, smooth_edge_threshold, horizon_kelly_fraction, horizon_vol_weights, AR1VolForecast
+from crypto_models import EnsembleModel, smooth_edge_threshold, horizon_kelly_fraction, horizon_vol_weights, AR1VolForecast, vol_skew_multiplier
 from vol_forecaster import GARCHForecaster, DCCCorrelation, intraday_vol_multiplier, correct_bid_ask_bounce
 
 setup_unbuffered()
@@ -539,6 +539,11 @@ def scan_and_trade():
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         season_mult = intraday_vol_multiplier(now_utc.hour, now_utc.weekday())
         vol_to_use *= season_mult
+
+        # Vol skew adjustment: OTM options have higher IV than ATM DVOL
+        moneyness = current_price / threshold if threshold > 0 else 1.0
+        skew_mult = vol_skew_multiplier(moneyness)
+        vol_to_use *= skew_mult
 
         drift = drift_by_asset.get(asset, DRIFT_PCT)
         # Drift is negligible for sub-daily horizons and introduces noise
