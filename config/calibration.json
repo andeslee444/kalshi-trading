@@ -3,42 +3,9 @@
   "n_settlements": 116,
   "n_trades": 188,
   "weather": {
-    "global_sigma_intercept": 5.5,
-    "global_sigma_slope": 0.2,
-    "df": 30,
     "global_brier": 0.309726,
     "global_log_loss": 0.937282,
     "global_pnl_cents": 36643,
-    "per_city": {
-      "DEN": {
-        "sigma_intercept": 4.15,
-        "sigma_slope": 0.2,
-        "df": 7,
-        "n": 11,
-        "shrinkage_weight": 0.423
-      },
-      "AUS": {
-        "sigma_intercept": 4.86,
-        "sigma_slope": 0.2,
-        "df": 5,
-        "n": 10,
-        "shrinkage_weight": 0.4
-      },
-      "CHI": {
-        "sigma_intercept": 4.82,
-        "sigma_slope": 0.92,
-        "df": 5,
-        "n": 11,
-        "shrinkage_weight": 0.423
-      },
-      "NY": {
-        "sigma_intercept": 3.62,
-        "sigma_slope": 0.2,
-        "df": 8,
-        "n": 14,
-        "shrinkage_weight": 0.483
-      }
-    },
     "n": 69
   },
   "nws": {
