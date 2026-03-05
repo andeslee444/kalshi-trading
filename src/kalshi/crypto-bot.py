@@ -609,12 +609,14 @@ def scan_and_trade():
 
         ss.markets_evaluated += 1
 
-        # Determine trade direction and edge (raw edge, fees handled in Kelly)
-        # Use market_price (with fallback) for edge computation
+        # Determine trade direction and edge
+        # Compare FEE-ADJUSTED edge against threshold to avoid entering with negative net edge
         if prob > 0.5:
             eff_threshold = smooth_edge_threshold(prob, base=EDGE_THRESHOLD)
             edge = prob - market_price / 100
-            if edge > eff_threshold:
+            fee_pp = kalshi_fee_cents(market_price) / 100  # fee as probability points
+            net_edge = edge - fee_pp
+            if net_edge > eff_threshold:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "yes",
                     "prob": prob, "edge": edge, "asset": asset,
@@ -625,10 +627,11 @@ def scan_and_trade():
                     "raw_prob": raw_prob, "filtered_est": filtered_est,
                 })
             else:
-                reason = "edge below mid-range threshold" if eff_threshold > EDGE_THRESHOLD else "edge below threshold"
+                reason = "net edge below threshold" if net_edge <= eff_threshold else "edge below threshold"
                 trade_manager.log_decision(
                     ticker, "yes", "skipped", reason,
-                    edge=edge, price_cents=market_price, asset=asset, vol_used=round(vol_to_use, 4),
+                    edge=edge, net_edge=round(net_edge, 4), fee_pp=round(fee_pp, 4),
+                    price_cents=market_price, asset=asset, vol_used=round(vol_to_use, 4),
                 )
         elif prob <= 0.5:
             no_prob = 1.0 - prob
@@ -636,7 +639,9 @@ def scan_and_trade():
             # Use no_ask directly if available, else derive from market_price
             no_price = no_ask if no_ask else (100 - market_price)
             edge = no_prob - no_price / 100
-            if edge > eff_threshold:
+            fee_pp = kalshi_fee_cents(no_price) / 100
+            net_edge = edge - fee_pp
+            if net_edge > eff_threshold:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "no",
                     "prob": prob, "edge": edge, "asset": asset,
@@ -647,10 +652,11 @@ def scan_and_trade():
                     "raw_prob": raw_prob, "filtered_est": filtered_est,
                 })
             else:
-                reason = "edge below mid-range threshold" if eff_threshold > EDGE_THRESHOLD else "edge below threshold"
+                reason = "net edge below threshold" if net_edge <= eff_threshold else "edge below threshold"
                 trade_manager.log_decision(
                     ticker, "no", "skipped", reason,
-                    edge=edge, price_cents=no_ask, asset=asset, vol_used=round(vol_to_use, 4),
+                    edge=edge, net_edge=round(net_edge, 4), fee_pp=round(fee_pp, 4),
+                    price_cents=no_ask, asset=asset, vol_used=round(vol_to_use, 4),
                 )
 
     # Sort by edge

@@ -668,3 +668,37 @@ class TestEnsembleIntegration:
         for t in [5, 15, 60, 360, 1440]:
             w_iv, w_rv = horizon_vol_weights(t)
             assert abs(w_iv + w_rv - 1.0) < 0.001
+
+
+class TestFeeAdjustedEdge:
+    """Edge threshold should account for Kalshi fees."""
+
+    def test_fee_at_50_cents(self):
+        """At 50c, fee is ~1.75c. A raw 8% edge has ~6.25% net edge."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "kalshi"))
+        from probability import kalshi_fee_cents
+        fee = kalshi_fee_cents(50)
+        # fee = 0.07 * 0.5 * 0.5 * 100 = 1.75
+        assert abs(fee - 1.75) < 0.01
+
+    def test_fee_at_10_cents(self):
+        """At 10c, fee is small."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "kalshi"))
+        from probability import kalshi_fee_cents
+        fee = kalshi_fee_cents(10)
+        # fee = 0.07 * 0.1 * 0.9 * 100 = 0.63
+        assert abs(fee - 0.63) < 0.01
+
+    def test_net_edge_below_threshold_should_skip(self):
+        """Raw edge 8.5%, fee 1.75pp at 50c -> net 6.75% < 8% threshold. Should skip."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "kalshi"))
+        from probability import kalshi_fee_cents
+        raw_edge = 0.085
+        price_cents = 50
+        fee_pp = kalshi_fee_cents(price_cents) / 100  # 0.0175
+        net_edge = raw_edge - fee_pp
+        threshold = 0.08
+        assert net_edge < threshold  # 0.0675 < 0.08 -> should NOT trade
