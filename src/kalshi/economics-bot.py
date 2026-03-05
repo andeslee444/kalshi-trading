@@ -946,6 +946,7 @@ def scan_and_trade():
         log.info(f"  Placing: {count}x {side} @ {price}c on {ticker}")
 
         result = trade_manager.place_order(ticker, side, price, count, reasoning,
+                                            edge=round(edge, 4),
                                             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                             model_prob=round(opp["prob"], 4), raw_edge=round(edge, 4),
                                             fee_cents=round(kalshi_fee_cents(price), 2), sizing_method="quarter_kelly",
