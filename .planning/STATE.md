@@ -24,7 +24,7 @@ See: .planning/PROJECT.md (updated 2026-03-04)
 
 Phase: ALL COMPLETE
 Status: All GSD phases (1-6), consolidated quant desk tracks (T1-P1 through T2-P3), and Phase 7 (Microstructure & Attribution) are complete and merged to main.
-Last activity: 2026-03-05 - Completed quick task 4: Economics bot world-class redesign (Bayesian fusion, scenarios, uncertainty Kelly)
+Last activity: 2026-03-05 - Completed quick task 6: Fix weather bot ticker parsing and purge stale calibration sigma overrides
 
 Progress: [████████████████████] 100%
 
@@ -95,8 +95,9 @@ None active. All tracks merged.
 | 3 | World-class weather bot: skew-normal, hour-aware sigma, adaptive ensemble, forecast verifier | 2026-03-05 | b11330a | [3-world-class-weather-bot-advanced-probabi](./quick/3-world-class-weather-bot-advanced-probabi/) |
 | 4 | Economics bot world-class redesign: Bayesian CPI fusion, 6-scenario mixture, uncertainty Kelly, EdgeScaler | 2026-03-05 | 0407aeb | [4-implement-economics-bot-world-class-rede](./quick/4-implement-economics-bot-world-class-rede/) |
 | 5 | Strategy bot bug fixes: reasoning string, dead code removal, NO-side limit pricing | 2026-03-05 | 0159c11 | [5-strategy-bot-fix-bugs-reasoning-string-d](./quick/5-strategy-bot-fix-bugs-reasoning-string-d/) |
+| 6 | Fix weather bot ticker parsing and purge stale calibration sigma overrides | 2026-03-05 | a813225 | [6-fix-weather-bot-ticker-parsing-regex-for](./quick/6-fix-weather-bot-ticker-parsing-regex-for/) |
 
 ## Session Continuity
 
 Last session: 2026-03-05
-Status: All work complete. Quick task 4 (economics bot world-class redesign) finished.
+Status: All work complete. Quick task 6 (weather ticker filter + calibration purge) finished.
