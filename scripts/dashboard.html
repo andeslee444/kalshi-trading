@@ -375,35 +375,27 @@ async function loadAccount() {
 
     el.innerHTML = `
       <div class="mb-3">
-        <div class="text-xs text-gray-500">Total Value</div>
-        <div class="text-2xl font-bold text-green-400">${centsToUsd(account.total_value)}</div>
+        <div class="text-xs text-gray-500">NAV</div>
+        <div class="text-2xl font-bold text-green-400">${pnl ? centsToUsd(pnl.nav_cents) : centsToUsd(account.total_value)}</div>
       </div>
       <div class="grid grid-cols-2 gap-4 mb-4">
         <div>
-          <div class="text-xs text-gray-500">Cash Balance</div>
+          <div class="text-xs text-gray-500">Cash</div>
           <div class="text-lg font-semibold text-gray-200">${centsToUsd(account.balance)}</div>
         </div>
         <div>
-          <div class="text-xs text-gray-500">Portfolio Value</div>
+          <div class="text-xs text-gray-500">Open Positions</div>
           <div class="text-lg font-semibold text-gray-200">${centsToUsd(account.portfolio_value)}</div>
         </div>
       </div>
       ${pnl ? `<div class="grid grid-cols-2 gap-x-4 gap-y-2 border-t border-gray-800 pt-3 mb-3">
         <div>
-          <div class="text-xs text-gray-500">Total P&L</div>
-          <div class="text-lg font-bold ${pnlColor(pnl.total_pnl_cents)}">${centsToUsd(pnl.total_pnl_cents)}</div>
+          <div class="text-xs text-gray-500">Realized P&L</div>
+          <div class="text-lg font-bold ${pnlColor(pnl.realized_cents)}">${centsToUsd(pnl.realized_cents)}</div>
         </div>
         <div>
           <div class="text-xs text-gray-500">Today's P&L</div>
           <div class="text-lg font-bold ${pnlColor(pnl.today_pnl_cents)}">${centsToUsd(pnl.today_pnl_cents)}</div>
-        </div>
-        <div>
-          <div class="text-xs text-gray-500">Realized</div>
-          <div class="text-sm font-semibold ${pnlColor(pnl.realized_cents)}">${centsToUsd(pnl.realized_cents)}</div>
-        </div>
-        <div>
-          <div class="text-xs text-gray-500">Unrealized</div>
-          <div class="text-sm font-semibold ${pnlColor(pnl.unrealized_cents)}">${centsToUsd(pnl.unrealized_cents)}</div>
         </div>
         <div>
           <div class="text-xs text-gray-500">Win Rate</div>
@@ -687,7 +679,7 @@ async function loadSettlements() {
   summaryEl.innerHTML = `
     <div class="flex items-center gap-6 text-sm">
       <div>
-        <span class="text-gray-500">Total P&L:</span>
+        <span class="text-gray-500">Realized P&L:</span>
         <span class="font-bold ${pnlColor} ml-1">${centsToUsd(s.total_pnl_cents)}</span>
       </div>
       <div>
@@ -1103,7 +1095,7 @@ async function loadIntelligence() {
       const pnlClass = attr.summary.total_pnl_cents >= 0 ? 'text-green-400' : 'text-red-400';
       document.getElementById('attribution-summary').innerHTML =
         `<strong>Settled: ${attr.summary.total_trades_settled}</strong> trades | ` +
-        `Total P&L: <span class="${pnlClass}">$${(attr.summary.total_pnl_cents / 100).toFixed(2)}</span>`;
+        `Realized P&L: <span class="${pnlClass}">$${(attr.summary.total_pnl_cents / 100).toFixed(2)}</span>`;
     }
     fillAttrTable('attr-by-bot', attr.by_bot);
     fillAttrTable('attr-by-edge', attr.by_edge_bucket, true);

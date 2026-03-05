@@ -317,14 +317,12 @@ async def api_account():
 
             if settlement_data and "summary" in settlement_data:
                 s = settlement_data["summary"]
-                realized = s["total_pnl_cents"]
-                total_pnl = (balance + portfolio_value) - STARTING_BALANCE_CENTS
-                unrealized = total_pnl - realized
+                nav = balance + portfolio_value
 
                 result["pnl"] = {
-                    "realized_cents": realized,
-                    "unrealized_cents": unrealized,
-                    "total_pnl_cents": total_pnl,
+                    "nav_cents": nav,
+                    "realized_cents": s["total_pnl_cents"],
+                    "open_position_cents": portfolio_value,
                     "today_pnl_cents": s["today_pnl_cents"],
                     "total_fees_cents": s.get("total_fees_cents", 0),
                     "wins": s["wins"],
