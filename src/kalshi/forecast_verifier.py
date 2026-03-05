@@ -12,6 +12,30 @@ from pathlib import Path
 
 _log = logging.getLogger("forecast_verifier")
 
+# Canonical mapping of Kalshi city codes to IEM ASOS station IDs
+DEFAULT_STATION_MAP = {
+    "MIA": "KMIA",
+    "LAX": "KLAX",
+    "PHIL": "KPHL",
+    "NY": "KNYC",
+    "CHI": "KMDW",
+    "AUS": "KAUS",
+    "DEN": "KDEN",
+    "HOU": "KHOU",
+    "ATL": "KATL",
+    "BOS": "KBOS",
+    "SFO": "KSFO",
+    "SEA": "KSEA",
+    "LV": "KLAS",
+    "DAL": "KDFW",
+    "MIN": "KMSP",
+    "PHX": "KPHX",
+    "DC": "KDCA",
+    "NOLA": "KMSY",
+    "OKC": "KOKC",
+    "SATX": "KSAT",
+}
+
 
 class ForecastVerifier:
     """Tracks forecast accuracy and provides adaptive calibration data.
@@ -75,19 +99,28 @@ class ForecastVerifier:
 
         self.state["pending"].append(record)
 
-    def verify_past_forecasts(self, city_coords=None):
+    def verify_past_forecasts(self, city_coords=None, station_map=None):
         """Check forecasts from 2+ days ago against actual temperatures.
 
-        Fetches actual high from Open-Meteo historical API. Rate-limits
-        to max 5 API calls per scan to avoid hammering the archive API.
+        Fetches actual high from IEM ASOS station data. Rate-limits
+        to max 5 API calls per scan to avoid hammering the API.
 
         Args:
-            city_coords: dict of {city_code: {"lat": float, "lon": float}}
-                Required to look up coordinates for API calls.
-                If None, skips verification silently.
+            station_map: dict of {city_code: station_id} (e.g. {"NY": "KNYC"}).
+                Preferred parameter. Uses IEM ASOS for actual temps.
+            city_coords: DEPRECATED. dict of {city_code: {"lat": float, "lon": float}}.
+                If station_map is not provided and city_coords is given, logs a
+                deprecation warning and skips verification.
         """
-        if not city_coords:
-            self.log.debug("No city_coords provided, skipping verification")
+        if station_map is None and city_coords is not None:
+            self.log.warning(
+                "verify_past_forecasts(city_coords=...) is deprecated. "
+                "Pass station_map={city: station_id} instead. Skipping verification."
+            )
+            return
+
+        if station_map is None:
+            self.log.debug("No station_map provided, skipping verification")
             return
 
         today = datetime.date.today()
@@ -122,19 +155,13 @@ class ForecastVerifier:
                 continue
 
             city = record["city"]
-            if city not in city_coords:
-                self.log.debug("No coordinates for city %s, skipping verification", city)
+            if city not in station_map:
+                self.log.debug("No station mapping for city %s, skipping verification", city)
                 remaining.append(record)
                 continue
 
-            coords = city_coords[city]
-            lat = coords.get("lat")
-            lon = coords.get("lon")
-            if lat is None or lon is None:
-                remaining.append(record)
-                continue
-
-            actual_high = self._fetch_actual_high(lat, lon, record["date"])
+            station_id = station_map[city]
+            actual_high = self._fetch_actual_high(station_id, record["date"])
             api_calls += 1
 
             if actual_high is None:
@@ -172,11 +199,19 @@ class ForecastVerifier:
             self.log.info("Verified %d forecasts (total: %d)",
                          len(verified_this_scan), len(self.state["verified"]))
 
-    def _fetch_actual_high(self, lat, lon, date_str):
-        """Fetch actual high temperature from Open-Meteo historical API.
+    def _fetch_actual_high(self, station_id, date_str):
+        """Fetch actual high temperature from IEM ASOS station data.
 
-        Returns temperature in Fahrenheit, or None on failure.
-        Non-blocking: logs warning and returns None on any error.
+        Uses Iowa Environmental Mesonet (IEM) for official ASOS observations,
+        which match how Kalshi settles weather markets.
+
+        Args:
+            station_id: IEM ASOS station ID (e.g. "KNYC", "KMIA").
+            date_str: date in YYYY-MM-DD format.
+
+        Returns:
+            Temperature in Fahrenheit (float), or None on failure.
+            Non-blocking: logs warning and returns None on any error.
         """
         try:
             from kalshi_auth import retry_request
@@ -184,28 +219,52 @@ class ForecastVerifier:
             self.log.warning("Cannot import retry_request, skipping verification")
             return None
 
+        try:
+            parts = date_str.split("-")
+            year, month, day = parts[0], parts[1], parts[2]
+        except (IndexError, ValueError):
+            self.log.warning("Invalid date format: %s", date_str)
+            return None
+
         url = (
-            f"https://archive-api.open-meteo.com/v1/archive?"
-            f"latitude={lat}&longitude={lon}"
-            f"&start_date={date_str}&end_date={date_str}"
-            f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
-            f"&timezone=America%2FNew_York"
+            f"https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?"
+            f"station={station_id}&data=max_tmpf&tz=America/New_York"
+            f"&format=comma&year1={year}&month1={month}&day1={day}"
+            f"&year2={year}&month2={month}&day2={day}"
         )
 
         try:
             resp = retry_request("GET", url, timeout=10, max_retries=2)
             if resp is None or resp.status_code != 200:
-                self.log.warning("Archive API returned status %s for %s",
-                                getattr(resp, 'status_code', 'None'), date_str)
+                self.log.warning("IEM ASOS returned status %s for %s/%s",
+                                getattr(resp, 'status_code', 'None'),
+                                station_id, date_str)
                 return None
 
-            data = resp.json()
-            temps = data.get("daily", {}).get("temperature_2m_max", [])
-            if temps and temps[0] is not None:
-                return temps[0]
-            return None
+            # Parse CSV response: skip comment lines starting with #
+            lines = resp.text.strip().split("\n")
+            for line in lines:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # Header line (station,valid,max_tmpf) -- skip it
+                if "station" in line.lower() and "max_tmpf" in line.lower():
+                    continue
+                # Data row
+                parts = line.split(",")
+                if len(parts) >= 3:
+                    max_tmpf = parts[2].strip()
+                    if max_tmpf == "M" or max_tmpf == "":
+                        return None  # Missing data
+                    try:
+                        return float(max_tmpf)
+                    except ValueError:
+                        self.log.warning("IEM ASOS non-numeric max_tmpf: %s", max_tmpf)
+                        return None
+
+            return None  # No data rows found
         except Exception as e:
-            self.log.warning("Archive API error for %s: %s", date_str, e)
+            self.log.warning("IEM ASOS error for %s/%s: %s", station_id, date_str, e)
             return None
 
     def get_verification_summary(self, lookback_days=30):

@@ -10,7 +10,7 @@ from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered,
 from probability import weather_probability, weather_sigma, ensemble_weather_probability, ensemble_spread_sigma_multiplier, ensemble_weather_probability_v2, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, _load_calibration
 from ticker_utils import parse_weather_ticker as parse_ticker
 from capital_allocator import PortfolioAllocator
-from forecast_verifier import ForecastVerifier
+from forecast_verifier import ForecastVerifier, DEFAULT_STATION_MAP
 
 setup_unbuffered()
 log = setup_logging("weather")
@@ -174,9 +174,7 @@ def scan_and_trade():
     # Forecast verification: verify past forecasts and record new ones
     if verifier:
         try:
-            city_coords = {code: {"lat": info["lat"], "lon": info["lon"]}
-                          for code, info in CITIES.items()}
-            verifier.verify_past_forecasts(city_coords)
+            verifier.verify_past_forecasts(station_map=DEFAULT_STATION_MAP)
         except Exception as e:
             log.warning("Verification check failed (non-blocking): %s", e)
 
@@ -291,8 +289,8 @@ def scan_and_trade():
                 continue
             our_prob = compute_probability(forecast_temp, parsed["threshold"], parsed["direction"], days_out, city=city)
 
-        # Skip near-threshold coinflips (|forecast - threshold| < 2°F)
-        MIN_FORECAST_DISTANCE_F = 2.0
+        # Skip near-threshold coinflips (|forecast - threshold| < 4°F)
+        MIN_FORECAST_DISTANCE_F = 4.0
         distance = abs(forecast_temp - parsed["threshold"])
         if distance < MIN_FORECAST_DISTANCE_F:
             ss.skip("near_threshold")

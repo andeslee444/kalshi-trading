@@ -1,5 +1,5 @@
 {
-  "_comment": "City coordinates are NWS airport weather station locations (not city centers). Kalshi settles against these stations. NY uses KJFK (JFK Int'l), not KNYC (Central Park).",
+  "_comment": "City coordinates are NWS airport weather station locations (not city centers). Kalshi settles against these stations. NY uses KNYC (Central Park).",
   "mode": "demo",
   "maxTradeAmount": 30,
   "maxTradeAmountPct": 0.03,
@@ -12,7 +12,7 @@
     "MIA": { "lat": 25.7959, "lon": -80.2870, "name": "Miami" },
     "LAX": { "lat": 33.9425, "lon": -118.4081, "name": "Los Angeles" },
     "PHIL": { "lat": 39.8721, "lon": -75.2411, "name": "Philadelphia" },
-    "NY": { "lat": 40.6413, "lon": -73.7781, "name": "New York" },
+    "NY": { "lat": 40.7829, "lon": -73.9654, "name": "New York" },
     "CHI": { "lat": 41.7868, "lon": -87.7522, "name": "Chicago" },
     "AUS": { "lat": 30.1945, "lon": -97.6699, "name": "Austin" },
     "DEN": { "lat": 39.8561, "lon": -104.6737, "name": "Denver" },
