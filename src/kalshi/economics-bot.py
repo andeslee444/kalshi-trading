@@ -26,7 +26,10 @@ from probability import (
     compute_limit_price, kalshi_fee_cents, gas_price_probability,
 )
 from capital_allocator import PortfolioAllocator
-from macro_engine import MacroEngine
+try:
+    from macro_engine import MacroEngine
+except ImportError:
+    MacroEngine = None
 
 setup_unbuffered()
 log = setup_logging("economics")
@@ -51,7 +54,7 @@ GAS_EDGE_THRESHOLD = econ_config.get("gasEdgeThreshold", 0.04)
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
 health = HealthCheckMonitor(logger=log)
-macro = MacroEngine(config=econ_config.get("macro", {}))
+macro = MacroEngine(config=econ_config.get("macro", {})) if MacroEngine else None
 order_monitor = OrderMonitor(client, log=log)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": MAX_TRADE,
@@ -646,17 +649,18 @@ def scan_and_trade():
 
     # Macro adjustment (if available)
     macro_signal = None
-    try:
-        macro_signal = macro.compute_signal(cleveland_nowcast=nowcast.get("cpi_yoy") if nowcast else None)
-    except Exception as e:
-        log.warning(f"  Macro engine error (non-fatal): {e}")
-        # Fallback to cached signal
+    if macro is not None:
         try:
-            macro_signal = macro.load_cached_signal()
-            if macro_signal:
-                log.info(f"  Using cached macro signal (bias={macro_signal.cpi_bias:+.3f}%)")
-        except Exception:
-            pass
+            macro_signal = macro.compute_signal(cleveland_nowcast=nowcast.get("cpi_yoy") if nowcast else None)
+        except Exception as e:
+            log.warning(f"  Macro engine error (non-fatal): {e}")
+            # Fallback to cached signal
+            try:
+                macro_signal = macro.load_cached_signal()
+                if macro_signal:
+                    log.info(f"  Using cached macro signal (bias={macro_signal.cpi_bias:+.3f}%)")
+            except Exception:
+                pass
 
     if macro_signal and macro_signal.confidence > 0.2 and nowcast:
         if "cpi_yoy" in nowcast:
@@ -749,7 +753,7 @@ def scan_and_trade():
             sigma = cpi_nowcast_sigma(days_to_release)  # default fallback
 
         # Macro-adjusted sigma tightening
-        if macro_signal and macro_signal.confidence > 0.3:
+        if macro is not None and macro_signal and macro_signal.confidence > 0.3:
             sigma *= macro.compute_sigma_multiplier(macro_signal.confidence)
 
         # Compute probability
