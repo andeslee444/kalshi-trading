@@ -98,8 +98,9 @@ None active. All tracks merged.
 | 6 | Fix weather bot ticker parsing and purge stale calibration sigma overrides | 2026-03-05 | a813225 | [6-fix-weather-bot-ticker-parsing-regex-for](./quick/6-fix-weather-bot-ticker-parsing-regex-for/) |
 | 7 | Strategy bot Bayesian edge model, dual-tail longshot, copula sizing, confidence-scaled Kelly | 2026-03-05 | c6b0eed | [7-world-class-strategy-bot-bayesian-edge-m](./quick/7-world-class-strategy-bot-bayesian-edge-m/) |
 | 8 | Economics bot: dynamic sigma from cross-measure dispersion + nowcast age tracking | 2026-03-05 | 141cc57 | [8-implement-economics-bot-unfinished-impro](./quick/8-implement-economics-bot-unfinished-impro/) |
+| 9 | Strategy bot intraday wave scheduling, settlement source info-arb, fill probability model | 2026-03-05 | f63d815 | [9-strategy-bot-intraday-wave-scheduling-se](./quick/9-strategy-bot-intraday-wave-scheduling-se/) |
 
 ## Session Continuity
 
 Last session: 2026-03-05
-Status: All work complete. Quick task 7 (strategy bot Bayesian edge + dual-tail + copula sizing) finished.
+Status: Quick task 9 (strategy bot wave scheduling + settlement sources + fill model) complete.
