@@ -22,7 +22,7 @@ from kalshi_auth import (
     PROJECT_DIR, TradeManager, trim_trade_log, build_market_snapshot,
     is_shutdown_requested,
 )
-from probability import weather_probability, is_market_liquid, _probit, _norm_pdf
+from probability import weather_probability, weather_sigma, is_market_liquid, _probit, _norm_pdf
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
@@ -205,7 +205,7 @@ def estimate_market_sigma(market, mid_price=None):
                 try:
                     market_date = datetime.date(2000 + yr, month, day)
                     days_out = max(0, (market_date - datetime.date.today()).days)
-                    weather_sigma_f = 2.0 + 0.5 * math.sqrt(max(1, days_out))
+                    weather_sigma_f = weather_sigma(days_out, city=city)
 
                     # CDF derivative conversion when mid_price is available
                     if mid_price is not None and 1 < mid_price < 99:

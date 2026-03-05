@@ -54,6 +54,7 @@ def _load_economics_bot():
     fake_prob = types.ModuleType("probability")
     fake_prob.econ_nowcast_probability = lambda *a, **kw: 0.5
     fake_prob.cpi_nowcast_sigma = lambda *a, **kw: 0.05
+    fake_prob.gdp_nowcast_sigma = lambda *a, **kw: 0.10
     fake_prob.quarter_kelly = lambda *a, **kw: (0, 0)
     fake_prob.compute_limit_price = lambda *a, **kw: 50
     fake_prob.kalshi_fee_cents = lambda *a, **kw: 1.0

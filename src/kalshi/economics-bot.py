@@ -22,8 +22,8 @@ from kalshi_auth import (
     is_shutdown_requested,
 )
 from probability import (
-    econ_nowcast_probability, cpi_nowcast_sigma, quarter_kelly, compute_limit_price,
-    kalshi_fee_cents, gas_price_probability,
+    econ_nowcast_probability, cpi_nowcast_sigma, gdp_nowcast_sigma, quarter_kelly,
+    compute_limit_price, kalshi_fee_cents, gas_price_probability,
 )
 from capital_allocator import PortfolioAllocator
 from macro_engine import MacroEngine
@@ -689,8 +689,8 @@ def scan_and_trade():
             # Gas handled separately via gas_price_probability path
             continue
         elif "GDP" in ticker_upper or "JOBS" in ticker_upper or "NFP" in ticker_upper:
-            # GDP/Jobs: much wider sigma than CPI
-            sigma = max(0.5, 1.0 * math.exp(-0.08 * (14 - min(14, days_to_release))))
+            # GDP/Jobs: use calibrated GDP sigma (wider than CPI)
+            sigma = gdp_nowcast_sigma(days_to_release)
         elif "FED" in ticker_upper or "FOMC" in ticker_upper:
             # Fed markets handled via FedWatch path
             continue
