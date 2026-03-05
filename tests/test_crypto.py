@@ -670,6 +670,63 @@ class TestEnsembleIntegration:
             assert abs(w_iv + w_rv - 1.0) < 0.001
 
 
+class TestOUDriftCorrection:
+    """OU model should adjust both variance AND drift (mean reversion)."""
+
+    def test_ou_differs_from_gbm_short_horizon(self):
+        """With OU, prob should differ from pure GBM for short horizons."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "kalshi"))
+        from probability import crypto_price_probability
+        # Near-ATM so neither prob is at boundary
+        gbm_prob = crypto_price_probability(
+            current_price=80000, threshold=80500, direction="above",
+            time_horizon_minutes=60, realized_vol_pct=0.50,
+            use_ou=False,
+        )
+        ou_prob = crypto_price_probability(
+            current_price=80000, threshold=80500, direction="above",
+            time_horizon_minutes=60, realized_vol_pct=0.50,
+            use_ou=True, ou_half_life_minutes=120,
+        )
+        # OU reduces vol for short horizons → different probability
+        assert abs(ou_prob - gbm_prob) > 0.001
+
+    def test_ou_symmetric_effect(self):
+        """OU should affect both above and below threshold symmetrically in vol."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "kalshi"))
+        from probability import crypto_price_probability
+        p_above = crypto_price_probability(
+            current_price=80000, threshold=80000, direction="above",
+            time_horizon_minutes=60, realized_vol_pct=0.50,
+            use_ou=True, ou_half_life_minutes=120,
+        )
+        p_below = crypto_price_probability(
+            current_price=80000, threshold=80000, direction="below",
+            time_horizon_minutes=60, realized_vol_pct=0.50,
+            use_ou=True, ou_half_life_minutes=120,
+        )
+        assert abs(p_above + p_below - 1.0) < 0.01
+
+    def test_ou_no_effect_long_horizon(self):
+        """OU blends out for horizons > 300 min."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "kalshi"))
+        from probability import crypto_price_probability
+        gbm_prob = crypto_price_probability(
+            current_price=80000, threshold=82000, direction="above",
+            time_horizon_minutes=500, realized_vol_pct=0.50,
+            use_ou=False,
+        )
+        ou_prob = crypto_price_probability(
+            current_price=80000, threshold=82000, direction="above",
+            time_horizon_minutes=500, realized_vol_pct=0.50,
+            use_ou=True, ou_half_life_minutes=120,
+        )
+        assert abs(gbm_prob - ou_prob) < 0.005  # Effectively identical
+
+
 class TestVolSkew:
     """Vol skew adjustment for OTM binary options."""
 

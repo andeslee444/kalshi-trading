@@ -1075,16 +1075,26 @@ def crypto_price_probability(current_price, threshold, direction="above",
         return 1.0 if current_price > threshold else 0.0
 
     # Ornstein-Uhlenbeck mean-reversion adjustment with smooth blend
+    ou_drift_adj = 0.0  # Additional drift from mean-reversion
     if use_ou:
         half_life = ou_half_life_minutes or 120  # default 2-hour half-life
-        theta_per_min = math.log(2) / max(1, half_life)
-        two_theta_T = 2 * theta_per_min * time_horizon_minutes
+        theta_ou = math.log(2) / max(1, half_life)  # mean-reversion speed (per minute)
+        two_theta_T = 2 * theta_ou * time_horizon_minutes
         if two_theta_T > 1e-10:
+            # OU variance adjustment: Var[X_T] = sigma^2 * (1-e^{-2*theta*T}) / (2*theta*T)
             ou_factor = math.sqrt((1 - math.exp(-two_theta_T)) / two_theta_T)
+
+            # OU drift correction: mean-reversion pull toward long-run mean
+            # For log-price OU: E[X_T] = X_0 * e^{-theta*T} + mu * (1 - e^{-theta*T})
+            # The correction reduces effective drift for deviations from mean
+            theta_T_min = theta_ou * time_horizon_minutes
+            ou_drift_adj = -(1 - math.exp(-theta_T_min)) * math.log(current_price / threshold)
+
             # Smooth blend: full OU below 180 min, linear taper to 1.0 at 300 min
             if time_horizon_minutes > 180:
                 blend = max(0.0, (300 - time_horizon_minutes) / 120)
                 ou_factor = blend * ou_factor + (1 - blend) * 1.0
+                ou_drift_adj *= blend
             sigma = sigma * ou_factor
 
     sqrt_T = math.sqrt(T)
@@ -1093,8 +1103,8 @@ def crypto_price_probability(current_price, threshold, direction="above",
     if sigma_sqrt_T <= 0:
         return 1.0 if current_price > threshold else 0.0
 
-    # d2 with configurable drift (default 0.0 = risk-neutral)
-    d2 = (math.log(current_price / threshold) + (drift_pct - 0.5 * sigma**2) * T) / sigma_sqrt_T
+    # d2 with configurable drift + OU drift correction
+    d2 = (math.log(current_price / threshold) + (drift_pct - 0.5 * sigma**2) * T + ou_drift_adj) / sigma_sqrt_T
     prob_above = _norm_cdf(d2)
 
     if direction == "below":
