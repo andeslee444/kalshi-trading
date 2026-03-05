@@ -104,8 +104,11 @@ class GARCHForecaster:
             return
 
         if self._sigma2 is None:
-            # Initialize with sample variance
+            # Initialize with sample variance — do NOT apply recursion yet
             self._sigma2 = sum(r ** 2 for r in self._returns) / len(self._returns)
+            self._sigma2 = max(1e-10, self._sigma2)
+            self._sigma2_history.append(self._sigma2)
+            return
 
         # GARCH(1,1) recursion
         self._sigma2 = (
@@ -183,6 +186,15 @@ class DCCCorrelation:
             if asset in self._garch:
                 self._garch[asset].update(ret)
 
+        # Skip DCC update until all GARCH forecasters are warmed up
+        all_warmed = all(
+            self._garch[a].forecast_vol() is not None
+            for a in self._assets if a in self._garch
+        )
+        if not all_warmed:
+            self._count += 1
+            return
+
         # Build standardized residuals
         eps = np.zeros(self._n)
         for asset, ret in returns_dict.items():
@@ -192,7 +204,7 @@ class DCCCorrelation:
                 if vol and vol > 0:
                     eps[idx] = ret / vol
                 else:
-                    eps[idx] = ret / 0.02  # fallback
+                    eps[idx] = 0.0
 
         self._count += 1
         # Exponentially weighted update

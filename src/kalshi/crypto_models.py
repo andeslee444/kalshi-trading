@@ -112,7 +112,7 @@ class AR1VolForecast:
         obs = self._observations
         if self._alpha is not None and self._beta is not None:
             # Use provided parameters
-            return self._alpha + self._beta * obs[-1]
+            return max(0.01, self._alpha + self._beta * obs[-1])
 
         # Estimate AR(1) via OLS: sigma_t = alpha + beta * sigma_{t-1}
         x = obs[:-1]  # sigma_{t-1}
@@ -127,7 +127,7 @@ class AR1VolForecast:
         alpha = y_mean - beta * x_mean
         # Clamp beta to [0, 0.999] for stationarity
         beta = max(0.0, min(0.999, beta))
-        return alpha + beta * obs[-1]
+        return max(0.01, alpha + beta * obs[-1])
 
 
 class EnsembleModel:

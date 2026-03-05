@@ -212,3 +212,26 @@ class TestHorizonVolWeight:
         for t in [5, 15, 60, 360, 1440, 10080]:
             w_iv, w_rv = horizon_vol_weights(t)
             assert abs(w_iv + w_rv - 1.0) < 0.001
+
+
+class TestAR1NegativeVol:
+    """AR1 should never return negative vol."""
+
+    def test_floor_at_positive_value(self):
+        from crypto_models import AR1VolForecast
+        ar1 = AR1VolForecast()
+        # Feed decreasing vols toward zero
+        for v in [0.5, 0.3, 0.1, 0.01, 0.001]:
+            ar1.update(v)
+        forecast = ar1.forecast()
+        assert forecast is not None
+        assert forecast >= 0.01
+
+    def test_constant_zero_vol_returns_long_run(self):
+        from crypto_models import AR1VolForecast
+        ar1 = AR1VolForecast()
+        for _ in range(10):
+            ar1.update(0.0)
+        forecast = ar1.forecast()
+        # Should return long_run (0.50) since all identical -> den=0
+        assert forecast == 0.50

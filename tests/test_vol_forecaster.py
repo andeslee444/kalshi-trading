@@ -166,3 +166,52 @@ class TestBidAskBounce:
         from vol_forecaster import correct_bid_ask_bounce
         corrected = correct_bid_ask_bounce(0.01, spread_cents=50, n_observations=5)
         assert corrected >= 0
+
+
+class TestGARCHInitialization:
+    """GARCH should not double-count the initializing return."""
+
+    def test_first_forecast_not_biased_by_last_return(self):
+        from vol_forecaster import GARCHForecaster
+        garch = GARCHForecaster(min_observations=5)
+        # Feed 4 calm returns, then 1 huge return
+        for _ in range(4):
+            garch.update(0.001)
+        # 5th return triggers init — should NOT immediately apply GARCH recursion
+        garch.update(0.001)
+        vol_after_init = garch.forecast_vol()
+        # Now feed a shock
+        garch.update(0.15)
+        vol_after_shock = garch.forecast_vol()
+        # The shock should increase vol (not be double-counted with init)
+        assert vol_after_shock > vol_after_init
+        # And init vol should be based on sample variance of the 5 calm returns
+        assert vol_after_init < 0.01  # sqrt(~0.001^2) is tiny
+
+
+class TestDCCWarmup:
+    """DCC should skip updates until GARCH is warmed up."""
+
+    def test_early_updates_dont_corrupt_q_matrix(self):
+        from vol_forecaster import DCCCorrelation
+        import numpy as np
+        dcc = DCCCorrelation(assets=["BTC", "ETH"], min_observations=20)
+        # Feed 5 returns (GARCH needs 10 to warm up)
+        for i in range(5):
+            dcc.update({"BTC": 0.01, "ETH": 0.012})
+        # Q matrix should still be identity (no real updates applied)
+        assert np.allclose(dcc._Q, np.eye(2), atol=0.1)
+
+    def test_produces_valid_corr_after_full_warmup(self):
+        from vol_forecaster import DCCCorrelation
+        import random
+        random.seed(42)
+        dcc = DCCCorrelation(assets=["BTC", "ETH"], min_observations=20)
+        # Feed 50 correlated returns (enough for both GARCH + DCC warmup)
+        for _ in range(50):
+            base = random.gauss(0, 0.02)
+            dcc.update({"BTC": base + random.gauss(0, 0.005),
+                        "ETH": base * 0.8 + random.gauss(0, 0.008)})
+        corr = dcc.correlation_matrix()
+        assert corr is not None
+        assert corr[0, 1] > 0.2  # should detect positive correlation
