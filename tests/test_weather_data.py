@@ -270,3 +270,260 @@ KMIA,2026-03-03,84.0
         fetcher = IEMFetcher()
         result = fetcher.fetch_daily_high("KNYC", "invalid-date")
         assert result is None
+
+
+# ===================================================================
+# HRRRFetcher tests (with mocked HTTP)
+# ===================================================================
+
+from weather_data import HRRRFetcher
+
+
+class TestHRRRFetcher:
+
+    def _make_mock_response(self, json_data, status_code=200):
+        mock_resp = MagicMock()
+        mock_resp.status_code = status_code
+        mock_resp.json.return_value = json_data
+        return mock_resp
+
+    @patch("weather_data._retry_request")
+    def test_fetch_hrrr_parses_hourly_to_daily_max(self, mock_retry):
+        """HRRR returns hourly data; fetcher should compute daily max."""
+        json_data = {
+            "hourly": {
+                "time": [
+                    "2026-03-05T00:00", "2026-03-05T06:00",
+                    "2026-03-05T12:00", "2026-03-05T18:00",
+                    "2026-03-06T00:00", "2026-03-06T06:00",
+                    "2026-03-06T12:00", "2026-03-06T18:00",
+                ],
+                "temperature_2m": [55.0, 58.0, 72.0, 68.0, 52.0, 56.0, 70.0, 66.0],
+            }
+        }
+        mock_retry.return_value = self._make_mock_response(json_data)
+
+        fetcher = HRRRFetcher()
+        result = fetcher.fetch_hrrr(25.7, -80.2)
+
+        assert result is not None
+        assert "2026-03-05" in result
+        assert "2026-03-06" in result
+        assert result["2026-03-05"] == 72.0  # max of 55, 58, 72, 68
+        assert result["2026-03-06"] == 70.0  # max of 52, 56, 70, 66
+
+    @patch("weather_data._retry_request")
+    def test_fetch_hrrr_returns_none_on_failure(self, mock_retry):
+        mock_retry.return_value = None
+        fetcher = HRRRFetcher()
+        result = fetcher.fetch_hrrr(25.7, -80.2)
+        assert result is None
+
+    @patch("weather_data._retry_request")
+    def test_fetch_hrrr_returns_none_on_bad_status(self, mock_retry):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_retry.return_value = mock_resp
+        fetcher = HRRRFetcher()
+        result = fetcher.fetch_hrrr(25.7, -80.2)
+        assert result is None
+
+    @patch("weather_data._retry_request")
+    def test_fetch_hrrr_skips_none_values(self, mock_retry):
+        json_data = {
+            "hourly": {
+                "time": [
+                    "2026-03-05T00:00", "2026-03-05T06:00",
+                    "2026-03-05T12:00", "2026-03-05T18:00",
+                ],
+                "temperature_2m": [55.0, None, 72.0, None],
+            }
+        }
+        mock_retry.return_value = self._make_mock_response(json_data)
+
+        fetcher = HRRRFetcher()
+        result = fetcher.fetch_hrrr(25.7, -80.2)
+
+        assert result is not None
+        assert result["2026-03-05"] == 72.0  # max of non-None values
+
+    @patch("weather_data._retry_request")
+    def test_fetch_hrrr_handles_empty_hourly(self, mock_retry):
+        json_data = {"hourly": {"time": [], "temperature_2m": []}}
+        mock_retry.return_value = self._make_mock_response(json_data)
+
+        fetcher = HRRRFetcher()
+        result = fetcher.fetch_hrrr(25.7, -80.2)
+        assert result is None
+
+    @patch("weather_data._retry_request")
+    def test_fetch_hrrr_url_uses_hrrr_conus(self, mock_retry):
+        """Verify the URL uses the hrrr_conus model."""
+        mock_retry.return_value = self._make_mock_response(
+            {"hourly": {"time": ["2026-03-05T00:00"], "temperature_2m": [72.0]}}
+        )
+        fetcher = HRRRFetcher()
+        fetcher.fetch_hrrr(25.7, -80.2)
+
+        call_args = mock_retry.call_args
+        url = call_args[0][1]  # second positional arg is the URL
+        assert "models=hrrr_conus" in url
+        assert "hourly=temperature_2m" in url
+        assert "temperature_unit=fahrenheit" in url
+
+
+# ===================================================================
+# OrderBookDepth tests (with mocked client)
+# ===================================================================
+
+from weather_data import OrderBookDepth
+
+
+class TestOrderBookDepth:
+
+    def test_fetch_depth_parses_orderbook(self):
+        """Test parsing of Kalshi orderbook API response."""
+        mock_client = MagicMock()
+        mock_client.get.return_value = {
+            "orderbook": {
+                "yes": [[85, 10], [84, 20], [83, 15]],
+                "no": [[18, 5], [17, 12], [16, 8]],
+            }
+        }
+
+        ob = OrderBookDepth()
+        result = ob.fetch_depth(mock_client, "KXHIGHMIA-26MAR05-T86")
+
+        assert result is not None
+        # YES bids sorted descending by price
+        assert result["yes_bids"] == [(85, 10), (84, 20), (83, 15)]
+        # NO bids become YES asks at 100-price, sorted ascending
+        assert result["yes_asks"][0][0] < result["yes_asks"][-1][0]
+        assert result["total_bid_depth"] == 45  # 10 + 20 + 15
+        assert result["total_ask_depth"] == 25  # 5 + 12 + 8
+
+    def test_fetch_depth_returns_none_on_error(self):
+        """Test that API errors return None gracefully."""
+        mock_client = MagicMock()
+        mock_client.get.side_effect = Exception("API error")
+
+        ob = OrderBookDepth()
+        result = ob.fetch_depth(mock_client, "KXHIGHMIA-26MAR05-T86")
+        assert result is None
+
+    def test_fetch_depth_handles_empty_book(self):
+        """Test with empty orderbook."""
+        mock_client = MagicMock()
+        mock_client.get.return_value = {
+            "orderbook": {"yes": [], "no": []}
+        }
+
+        ob = OrderBookDepth()
+        result = ob.fetch_depth(mock_client, "KXHIGHMIA-26MAR05-T86")
+        assert result is not None
+        assert result["total_bid_depth"] == 0
+        assert result["total_ask_depth"] == 0
+
+    def test_estimate_fill_price_buy(self):
+        """Test estimated fill price for a buy order walking the ask book."""
+        depth = {
+            "yes_bids": [(85, 10), (84, 20)],
+            "yes_asks": [(82, 5), (83, 10), (84, 20)],
+            "total_bid_depth": 30,
+            "total_ask_depth": 35,
+        }
+        ob = OrderBookDepth()
+        # Buy 10 contracts: 5 at 82 + 5 at 83 = (82*5 + 83*5) / 10 = 82.5
+        price = ob.estimate_fill_price(depth, "yes", 10)
+        assert price == pytest.approx(82.5, abs=0.01)
+
+    def test_estimate_fill_price_sell(self):
+        """Test estimated fill price for a sell order walking the bid book."""
+        depth = {
+            "yes_bids": [(85, 10), (84, 20)],
+            "yes_asks": [(82, 5), (83, 10)],
+            "total_bid_depth": 30,
+            "total_ask_depth": 15,
+        }
+        ob = OrderBookDepth()
+        # Sell 15 contracts: 10 at 85 + 5 at 84 = (85*10 + 84*5) / 15 = 84.67
+        price = ob.estimate_fill_price(depth, "no", 15)
+        assert price == pytest.approx(84.667, abs=0.01)
+
+    def test_estimate_fill_price_insufficient_liquidity(self):
+        """Return None if insufficient depth for requested quantity."""
+        depth = {
+            "yes_bids": [(85, 5)],
+            "yes_asks": [(82, 3)],
+            "total_bid_depth": 5,
+            "total_ask_depth": 3,
+        }
+        ob = OrderBookDepth()
+        result = ob.estimate_fill_price(depth, "yes", 10)  # need 10 but only 3 available
+        assert result is None
+
+
+# ===================================================================
+# MODEL_RUN_SCHEDULE and next_model_run tests
+# ===================================================================
+
+import datetime
+from weather_data import MODEL_RUN_SCHEDULE, next_model_run
+
+
+class TestModelRunSchedule:
+
+    def test_schedule_has_expected_models(self):
+        assert "gfs" in MODEL_RUN_SCHEDULE
+        assert "ecmwf" in MODEL_RUN_SCHEDULE
+        assert "hrrr" in MODEL_RUN_SCHEDULE
+
+    def test_hrrr_runs_hourly(self):
+        assert len(MODEL_RUN_SCHEDULE["hrrr"]["hours_utc"]) == 24
+
+    def test_gfs_runs_4_times(self):
+        assert MODEL_RUN_SCHEDULE["gfs"]["hours_utc"] == [0, 6, 12, 18]
+
+    def test_ecmwf_runs_2_times(self):
+        assert MODEL_RUN_SCHEDULE["ecmwf"]["hours_utc"] == [0, 12]
+
+    def test_next_model_run_returns_tuple(self):
+        """next_model_run should return (model_name, minutes_until_available)."""
+        result = next_model_run()
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        model_name, minutes = result
+        assert model_name in MODEL_RUN_SCHEDULE
+        assert isinstance(minutes, (int, float))
+        assert minutes >= 0
+
+    def test_next_model_run_with_specific_time(self):
+        """HRRR runs hourly with 45-min delay. At 00:30 UTC, HRRR 00Z run
+        should be available at 00:45, so 15 minutes away."""
+        now = datetime.datetime(2026, 3, 5, 0, 30, 0)
+        model, minutes = next_model_run(now)
+        # HRRR 00Z output available at 00:45 = 15 min from now
+        # That should be the soonest
+        assert minutes <= 15
+        assert minutes >= 0
+
+    def test_next_model_run_available_now(self):
+        """If a model run output is already available, minutes should be 0."""
+        # HRRR 00Z available at 00:45. If we check at 01:00, the 00Z run
+        # was available 15 min ago. Return 0 for "available now".
+        now = datetime.datetime(2026, 3, 5, 1, 0, 0)
+        model, minutes = next_model_run(now)
+        # At 01:00, HRRR 00Z was at 00:45 (15min ago, avail now)
+        # HRRR 01Z will be at 01:45 (45min away)
+        # So something should be available now (0 min)
+        assert minutes == 0
+
+    def test_next_model_run_prefers_soonest(self):
+        """Should return the model run that becomes available soonest."""
+        # At 05:00 UTC:
+        # GFS 00Z: available at 03:30 (already past) -> 0
+        # HRRR 04Z: available at 04:45 (already past) -> 0
+        # Either could be returned, both are "available now"
+        now = datetime.datetime(2026, 3, 5, 5, 0, 0)
+        model, minutes = next_model_run(now)
+        assert minutes == 0

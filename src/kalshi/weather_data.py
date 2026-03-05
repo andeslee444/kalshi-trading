@@ -3,12 +3,17 @@
 Provides:
 - STATION_MAP: Kalshi city code -> IEM ASOS station ID mapping
 - EnsembleCollector: Fetches raw ensemble member temperatures from Open-Meteo
+- HRRRFetcher: Fetches HRRR deterministic forecast data from Open-Meteo
 - IEMFetcher: Fetches actual daily high temperatures from Iowa Environmental Mesonet
+- OrderBookDepth: Fetches and analyzes Kalshi order book depth
+- MODEL_RUN_SCHEDULE / next_model_run(): Model run timing awareness
 - TrainingStore: SQLite storage for forecast-vs-actual training pairs
 """
 
+import datetime
 import logging
 import sqlite3
+from collections import defaultdict
 
 _log = logging.getLogger("weather_data")
 
@@ -270,6 +275,250 @@ class IEMFetcher:
                 except ValueError:
                     continue
         return result
+
+
+class HRRRFetcher:
+    """Fetches HRRR deterministic forecast from Open-Meteo (hrrr_conus model).
+
+    HRRR (High-Resolution Rapid Refresh) provides 3km resolution hourly forecasts
+    updated every hour, with ~45 minute processing delay. Dramatically improves
+    day-0 and day-1 temperature forecasts.
+    """
+
+    def __init__(self, logger=None):
+        self.log = logger or _log
+
+    def fetch_hrrr(self, lat, lon):
+        """Fetch HRRR hourly temps and compute daily max temperatures.
+
+        HRRR only provides hourly data (not daily max), so we fetch hourly
+        temperature_2m and group by calendar day to find daily maxima.
+
+        Args:
+            lat: latitude
+            lon: longitude
+
+        Returns:
+            dict of {date_str: max_temp_f} for the next ~48 hours (2-3 calendar days),
+            or None on API failure.
+        """
+        if _retry_request is None:
+            self.log.warning("retry_request not available")
+            return None
+
+        url = (
+            f"https://api.open-meteo.com/v1/forecast?"
+            f"latitude={lat}&longitude={lon}"
+            f"&hourly=temperature_2m&temperature_unit=fahrenheit"
+            f"&timezone=America%2FNew_York&forecast_days=2"
+            f"&models=hrrr_conus"
+        )
+
+        try:
+            resp = _retry_request("GET", url, timeout=15, max_retries=2)
+            if resp is None or resp.status_code != 200:
+                self.log.warning(
+                    "HRRR API returned status %s",
+                    getattr(resp, "status_code", "None"),
+                )
+                return None
+
+            data = resp.json()
+            hourly = data.get("hourly", {})
+            times = hourly.get("time", [])
+            temps = hourly.get("temperature_2m", [])
+
+            if not times or not temps:
+                self.log.warning("HRRR API returned no hourly data")
+                return None
+
+            # Group hourly temps by calendar day and compute daily max
+            day_temps = defaultdict(list)
+            for i, time_str in enumerate(times):
+                if i < len(temps) and temps[i] is not None:
+                    # Extract date from "2026-03-05T14:00" format
+                    date_str = time_str[:10]
+                    day_temps[date_str].append(temps[i])
+
+            if not day_temps:
+                self.log.warning("HRRR: no valid temperature data after filtering nulls")
+                return None
+
+            result = {date: max(t_list) for date, t_list in day_temps.items()}
+
+            self.log.debug(
+                "HRRR: %d hours fetched, %d dates computed (max temps: %s)",
+                len(times), len(result),
+                {d: f"{t:.1f}F" for d, t in result.items()},
+            )
+            return result
+
+        except Exception as e:
+            self.log.warning("HRRR API error: %s", e)
+            return None
+
+
+class OrderBookDepth:
+    """Fetches and analyzes Kalshi order book depth for improved limit pricing.
+
+    Provides depth analysis to:
+    1. Skip trades into thin books (insufficient liquidity)
+    2. Estimate realistic fill prices considering book depth
+    """
+
+    def __init__(self, logger=None):
+        self.log = logger or _log
+
+    def fetch_depth(self, client, ticker):
+        """Fetch order book depth for a given ticker.
+
+        Args:
+            client: KalshiClient instance
+            ticker: market ticker string
+
+        Returns:
+            dict with keys: yes_bids, yes_asks, total_bid_depth, total_ask_depth
+            or None on failure.
+
+            yes_bids: list of (price, qty) sorted descending by price
+            yes_asks: list of (price, qty) sorted ascending by price
+            (NO bids are converted to YES asks at 100-price)
+        """
+        try:
+            data = client.get(f"/markets/{ticker}/orderbook")
+            orderbook = data.get("orderbook", {})
+            yes_entries = orderbook.get("yes", [])
+            no_entries = orderbook.get("no", [])
+
+            # YES bids sorted descending by price
+            yes_bids = sorted(
+                [(price, qty) for price, qty in yes_entries],
+                key=lambda x: x[0], reverse=True,
+            )
+
+            # NO bids become YES asks at 100-price, sorted ascending
+            yes_asks = sorted(
+                [(100 - price, qty) for price, qty in no_entries],
+                key=lambda x: x[0],
+            )
+
+            total_bid = sum(qty for _, qty in yes_bids)
+            total_ask = sum(qty for _, qty in yes_asks)
+
+            return {
+                "yes_bids": yes_bids,
+                "yes_asks": yes_asks,
+                "total_bid_depth": total_bid,
+                "total_ask_depth": total_ask,
+            }
+        except Exception as e:
+            self.log.warning("Orderbook fetch failed for %s: %s", ticker, e)
+            return None
+
+    def estimate_fill_price(self, depth, side, quantity):
+        """Estimate volume-weighted average fill price for a given quantity.
+
+        Args:
+            depth: dict from fetch_depth()
+            side: "yes" (buy, walk asks) or "no" (sell, walk bids)
+            quantity: number of contracts
+
+        Returns:
+            Estimated average fill price in cents, or None if insufficient liquidity.
+        """
+        if side == "yes":
+            book = depth.get("yes_asks", [])
+        else:
+            book = depth.get("yes_bids", [])
+
+        if not book:
+            return None
+
+        total_filled = 0
+        total_cost = 0
+
+        for price, qty in book:
+            fill = min(qty, quantity - total_filled)
+            total_cost += price * fill
+            total_filled += fill
+            if total_filled >= quantity:
+                break
+
+        if total_filled < quantity:
+            return None
+
+        return total_cost / total_filled
+
+
+# === Model Run Timing ===
+
+MODEL_RUN_SCHEDULE = {
+    "gfs": {"hours_utc": [0, 6, 12, 18], "delay_minutes": 210},      # ~3.5h processing
+    "ecmwf": {"hours_utc": [0, 12], "delay_minutes": 360},            # ~6h processing
+    "hrrr": {"hours_utc": list(range(24)), "delay_minutes": 45},      # hourly, ~45min delay
+}
+
+
+def next_model_run(now_utc=None):
+    """Find the model run that will become available soonest.
+
+    Args:
+        now_utc: datetime.datetime in UTC. If None, uses datetime.datetime.utcnow().
+
+    Returns:
+        Tuple of (model_name, minutes_until_available).
+        If a run is already available (minutes <= 0), returns (model_name, 0).
+    """
+    if now_utc is None:
+        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+    best_model = None
+    best_minutes = float("inf")
+
+    now_minutes = now_utc.hour * 60 + now_utc.minute
+
+    for model_name, schedule in MODEL_RUN_SCHEDULE.items():
+        delay = schedule["delay_minutes"]
+        for run_hour in schedule["hours_utc"]:
+            # Output available at: run_hour * 60 + delay minutes from midnight
+            available_at = run_hour * 60 + delay
+            minutes_until = available_at - now_minutes
+
+            # If available_at is in the past (today), it's available now
+            if minutes_until <= 0:
+                # This run is already available — check if it's "recent"
+                # (within the last cycle period for this model)
+                if minutes_until >= -60:  # available within last hour
+                    return (model_name, 0)
+                continue
+
+            if minutes_until < best_minutes:
+                best_minutes = minutes_until
+                best_model = model_name
+
+    # If nothing found in future, check wrap-around (next day's first run)
+    if best_model is None:
+        # Everything was in the past — find earliest tomorrow
+        for model_name, schedule in MODEL_RUN_SCHEDULE.items():
+            delay = schedule["delay_minutes"]
+            first_hour = schedule["hours_utc"][0]
+            available_at = first_hour * 60 + delay + 1440  # tomorrow
+            minutes_until = available_at - now_minutes
+            if minutes_until < best_minutes:
+                best_minutes = minutes_until
+                best_model = model_name
+
+    # Check if any run from the current cycle is already available
+    # (this handles the case where recent runs exist)
+    for model_name, schedule in MODEL_RUN_SCHEDULE.items():
+        delay = schedule["delay_minutes"]
+        for run_hour in schedule["hours_utc"]:
+            available_at = run_hour * 60 + delay
+            minutes_until = available_at - now_minutes
+            if minutes_until <= 0 and minutes_until >= -120:
+                return (model_name, 0)
+
+    return (best_model, max(0, best_minutes))
 
 
 class TrainingStore:
