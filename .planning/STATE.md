@@ -99,8 +99,9 @@ None active. All tracks merged.
 | 7 | Strategy bot Bayesian edge model, dual-tail longshot, copula sizing, confidence-scaled Kelly | 2026-03-05 | c6b0eed | [7-world-class-strategy-bot-bayesian-edge-m](./quick/7-world-class-strategy-bot-bayesian-edge-m/) |
 | 8 | Economics bot: dynamic sigma from cross-measure dispersion + nowcast age tracking | 2026-03-05 | 141cc57 | [8-implement-economics-bot-unfinished-impro](./quick/8-implement-economics-bot-unfinished-impro/) |
 | 9 | Strategy bot intraday wave scheduling, settlement source info-arb, fill probability model | 2026-03-05 | f63d815 | [9-strategy-bot-intraday-wave-scheduling-se](./quick/9-strategy-bot-intraday-wave-scheduling-se/) |
+| 11 | Weather bot v2: NY coordinates fix, IEM ASOS verification, empirical ensemble CDF model | 2026-03-05 | f1feba5 | [11-world-class-weather-bot-v2-critical-fixe](./quick/11-world-class-weather-bot-v2-critical-fixe/) |
 
 ## Session Continuity
 
 Last session: 2026-03-05
-Status: Quick task 9 (strategy bot wave scheduling + settlement sources + fill model) complete.
+Status: Quick task 11 (weather bot v2 critical fixes + empirical ensemble CDF) complete.
