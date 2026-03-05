@@ -211,6 +211,51 @@ class TestHorizonVolWeight:
             assert abs(w_iv + w_rv - 1.0) < 0.001
 
 
+class TestHestonFellerFallback:
+    """Heston should fall back to GBM when Feller condition is violated."""
+
+    def test_feller_violated_returns_valid_prob(self):
+        """When xi is too high for Feller, should still return a sane probability."""
+        from probability import crypto_price_probability_heston, crypto_price_probability
+        # Feller violated: 2*2*0.25=1.0 < 2.0^2=4.0
+        prob = crypto_price_probability_heston(
+            current_price=80000, threshold=82000, direction="above",
+            time_horizon_minutes=1440, v0=0.25, kappa=2.0, theta=0.25, xi=2.0, rho=-0.7,
+        )
+        # Should match GBM fallback (vol=sqrt(v0)=0.5)
+        gbm_prob = crypto_price_probability(
+            current_price=80000, threshold=82000, direction="above",
+            time_horizon_minutes=1440, realized_vol_pct=0.5,
+        )
+        assert 0.001 <= prob <= 0.999
+        assert abs(prob - gbm_prob) < 0.01  # Should be close to GBM fallback
+
+    def test_feller_satisfied_does_not_fallback(self):
+        """When Feller is satisfied, Heston and GBM should differ."""
+        from probability import crypto_price_probability_heston, crypto_price_probability
+        # Feller OK: 2*2*0.25=1.0 >= 0.3^2=0.09
+        prob_heston = crypto_price_probability_heston(
+            current_price=80000, threshold=84000, direction="above",
+            time_horizon_minutes=1440, v0=0.25, kappa=2.0, theta=0.25, xi=0.3, rho=-0.7,
+        )
+        prob_gbm = crypto_price_probability(
+            current_price=80000, threshold=84000, direction="above",
+            time_horizon_minutes=1440, realized_vol_pct=0.5,
+        )
+        # Heston and GBM should give different results (stoch vol effect)
+        assert abs(prob_heston - prob_gbm) > 0.0005
+
+    def test_extreme_xi_from_garch(self):
+        """Simulate GARCH-driven xi=2.0 with low kappa — must not crash or return NaN."""
+        from probability import crypto_price_probability_heston
+        prob = crypto_price_probability_heston(
+            current_price=80000, threshold=85000, direction="above",
+            time_horizon_minutes=1440, v0=0.5, kappa=1.0, theta=0.25, xi=2.0, rho=-0.9,
+        )
+        assert 0.001 <= prob <= 0.999
+        assert not math.isnan(prob)
+
+
 class TestAR1NegativeVol:
     """AR1 should never return negative vol."""
 

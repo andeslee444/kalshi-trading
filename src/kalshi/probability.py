@@ -1226,9 +1226,17 @@ def crypto_price_probability_heston(
             return 0.999 if current_price > threshold else 0.001
         return 0.999 if current_price < threshold else 0.001
 
+    # Feller condition: 2*kappa*theta >= xi^2 ensures variance stays positive.
+    # When violated (e.g., GARCH-driven xi), the Fourier inversion becomes
+    # unreliable. Fall back to GBM with vol=sqrt(v0) for safety.
     if 2 * kappa * theta < xi ** 2:
-        _log.debug("Heston Feller condition violated: 2*kappa*theta=%.3f < xi^2=%.3f",
-                   2 * kappa * theta, xi ** 2)
+        _log.warning("Heston Feller violated (2κθ=%.3f < ξ²=%.3f), falling back to GBM",
+                     2 * kappa * theta, xi ** 2)
+        vol = math.sqrt(max(v0, 1e-10))
+        return crypto_price_probability(
+            current_price, threshold, direction,
+            time_horizon_minutes, realized_vol_pct=vol, drift_pct=drift_pct,
+        )
 
     S = current_price
     K = threshold
