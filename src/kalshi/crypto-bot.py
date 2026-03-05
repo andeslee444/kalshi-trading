@@ -162,7 +162,10 @@ def compute_trailing_drift(asset):
         return 0.0
     log_return = math.log(newest_price / oldest_price)
     annualized = log_return * (365.25 * 86400 / dt_seconds)
-    return max(-2.0, min(2.0, annualized))
+    capped = max(-2.0, min(2.0, annualized))
+    if abs(annualized) > 2.0:
+        log.debug(f"  Drift capped: raw={annualized*100:.0f}% -> {capped*100:.0f}%")
+    return capped
 
 
 # === Data Sources ===
@@ -467,14 +470,32 @@ def scan_and_trade():
         threshold = parsed["threshold"]
         direction = parsed.get("direction", "T")
 
-        # Bracket markets: gate on tighter liquidity (spread < 15c, volume > 10)
+        # Bracket markets: gate on liquidity (checks BOTH yes and no sides)
         if direction == "B":
             if not crypto_config.get("enableBrackets", True):
                 ss.skip("brackets_disabled")
                 continue
-            b_spread = (m.get("yes_ask", 0) - m.get("yes_bid", 0)) if m.get("yes_bid") else 999
+            yes_bid_b = m.get("yes_bid", 0) or 0
+            yes_ask_b = m.get("yes_ask", 0) or 0
+            no_bid_b = m.get("no_bid", 0) or 0
+            no_ask_b = m.get("no_ask", 0) or 0
             b_volume = m.get("volume", 0) or 0
-            if b_spread > 15 or b_volume < 10:
+
+            # Check YES-side spread
+            yes_spread = (yes_ask_b - yes_bid_b) if (yes_bid_b and yes_ask_b) else 999
+            # Check NO-side spread
+            no_spread = (no_ask_b - no_bid_b) if (no_bid_b and no_ask_b) else 999
+            # Market is liquid if EITHER side has a tight spread
+            b_spread = min(yes_spread, no_spread)
+
+            # Also accept if market has recent trades even with empty book
+            has_recent_trade = bool(m.get("last_price"))
+            if b_spread > 15 and not (has_recent_trade and b_volume >= 10):
+                ss.skip("bracket_illiquid")
+                trade_manager.log_decision(ticker, "yes", "skipped", "bracket_illiquid",
+                                           spread=b_spread, volume=b_volume, asset=asset)
+                continue
+            if b_volume < 5:  # Lower volume floor (was 10) since we have spread confirmation
                 ss.skip("bracket_illiquid")
                 trade_manager.log_decision(ticker, "yes", "skipped", "bracket_illiquid",
                                            spread=b_spread, volume=b_volume, asset=asset)
@@ -514,6 +535,9 @@ def scan_and_trade():
             vol_to_use = default_vol
 
         drift = drift_by_asset.get(asset, DRIFT_PCT)
+        # Drift is negligible for sub-daily horizons and introduces noise
+        if minutes_to_settle < 1440:
+            drift = 0.0
         prob_fn_args = dict(
             current_price=current_price, threshold=threshold, direction="above",
             time_horizon_minutes=minutes_to_settle,
@@ -529,11 +553,21 @@ def scan_and_trade():
         raw_prob = prob
         prob = filtered_est.prob  # use filtered probability for edge computation
 
-        yes_ask = m.get("yes_ask", 0)
-        no_ask = m.get("no_ask", 0)
-        yes_bid = m.get("yes_bid", 0)
+        yes_ask = m.get("yes_ask", 0) or 0
+        no_ask = m.get("no_ask", 0) or 0
+        yes_bid = m.get("yes_bid", 0) or 0
+        last_price = m.get("last_price", 0) or 0
 
-        if not yes_ask or yes_ask >= 99:
+        # Primary: use yes_ask if available and reasonable
+        # Fallback 1: compute from no_ask (yes_ask ~ 100 - no_ask)
+        # Fallback 2: use last_price as stale reference
+        if yes_ask and 1 <= yes_ask < 99:
+            market_price = yes_ask
+        elif no_ask and 1 <= no_ask < 99:
+            market_price = 100 - no_ask  # implied yes price from NO side
+        elif last_price and 1 <= last_price < 99:
+            market_price = last_price
+        else:
             ss.skip("no_price")
             continue
 
@@ -544,9 +578,10 @@ def scan_and_trade():
         ss.markets_evaluated += 1
 
         # Determine trade direction and edge (raw edge, fees handled in Kelly)
-        if prob > 0.5 and yes_ask:
+        # Use market_price (with fallback) for edge computation
+        if prob > 0.5:
             eff_threshold = _effective_edge_threshold(prob)
-            edge = prob - yes_ask / 100
+            edge = prob - market_price / 100
             if edge > eff_threshold:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "yes",
@@ -561,12 +596,14 @@ def scan_and_trade():
                 reason = "edge below mid-range threshold" if eff_threshold > EDGE_THRESHOLD else "edge below threshold"
                 trade_manager.log_decision(
                     ticker, "yes", "skipped", reason,
-                    edge=edge, price_cents=yes_ask, asset=asset, vol_used=round(vol_to_use, 4),
+                    edge=edge, price_cents=market_price, asset=asset, vol_used=round(vol_to_use, 4),
                 )
-        elif prob <= 0.5 and no_ask:
+        elif prob <= 0.5:
             no_prob = 1.0 - prob
             eff_threshold = _effective_edge_threshold(no_prob)
-            edge = no_prob - no_ask / 100
+            # Use no_ask directly if available, else derive from market_price
+            no_price = no_ask if no_ask else (100 - market_price)
+            edge = no_prob - no_price / 100
             if edge > eff_threshold:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "no",
