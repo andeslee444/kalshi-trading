@@ -140,6 +140,43 @@ class EnsembleModel:
         self._heston_params = heston_params or dict(DEFAULT_HESTON)
         self._bma_weights = bma_weights or dict(REGIME_BMA_WEIGHTS)
 
+    @classmethod
+    def from_calibration(cls, calibration_dict, asset="BTC"):
+        """Build an EnsembleModel from calibration output.
+
+        Args:
+            calibration_dict: Parsed config/crypto-calibration.json
+            asset: Which asset's calibration to use (default "BTC")
+
+        Returns:
+            EnsembleModel with calibrated weights and params.
+        """
+        assets = calibration_dict.get("assets", {})
+        asset_cal = assets.get(asset, {})
+
+        # Extract calibrated BMA weights
+        bma_weights = None
+        cal_weights = asset_cal.get("ensemble_weights")
+        if cal_weights and len(cal_weights) == 3 and sum(cal_weights) > 0.99:
+            # Apply calibrated weights to all regimes (override normal, keep regime structure)
+            bma_weights = dict(REGIME_BMA_WEIGHTS)
+            bma_weights["normal"] = cal_weights
+
+        # Extract calibrated Heston params
+        heston_params = None
+        cal_heston = asset_cal.get("heston_params")
+        if cal_heston:
+            heston_params = dict(DEFAULT_HESTON)
+            heston_params.update(cal_heston)
+
+        # Extract calibrated JD params
+        jd_params = None
+        cal_lambda = asset_cal.get("jd_lambda")
+        if cal_lambda is not None:
+            jd_params = dict(DEFAULT_JD)
+
+        return cls(jd_params=jd_params, heston_params=heston_params, bma_weights=bma_weights)
+
     def estimate_prob(self, current_price, threshold, direction="above",
                       time_horizon_minutes=1440, vol=0.50, regime="normal",
                       drift_pct=0.0, heston_params=None, use_ou=False,

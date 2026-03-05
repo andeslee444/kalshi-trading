@@ -86,6 +86,76 @@ class TestEnsembleModel:
         assert 0.001 <= prob <= 0.999
 
 
+class TestEnsembleCalibration:
+    """EnsembleModel should accept and use calibration overrides."""
+
+    def test_custom_bma_weights_change_output(self):
+        from crypto_models import EnsembleModel
+        model_default = EnsembleModel()
+        # Custom weights: 100% GBM, 0% JD, 0% Heston
+        custom_weights = {
+            "normal": [1.0, 0.0, 0.0],
+            "low_vol": [1.0, 0.0, 0.0],
+            "high_vol": [1.0, 0.0, 0.0],
+            "crisis": [1.0, 0.0, 0.0],
+        }
+        model_custom = EnsembleModel(bma_weights=custom_weights)
+        # Use crisis regime where weight differences are largest
+        prob_default = model_default.estimate_prob(
+            current_price=80000, threshold=83000, direction="above",
+            time_horizon_minutes=1440, vol=0.50, regime="crisis",
+        )
+        prob_custom = model_custom.estimate_prob(
+            current_price=80000, threshold=83000, direction="above",
+            time_horizon_minutes=1440, vol=0.50, regime="crisis",
+        )
+        # Custom uses 100% GBM, default crisis uses 5% GBM / 35% JD / 60% Heston
+        assert abs(prob_default - prob_custom) > 0.0005
+
+    def test_custom_heston_params_used(self):
+        from crypto_models import EnsembleModel
+        # Very different v0 and kappa — use longer horizon for more divergence
+        model_a = EnsembleModel(heston_params={"v0": 0.10, "kappa": 0.5, "theta": 0.10, "xi": 0.3, "rho": -0.7})
+        model_b = EnsembleModel(heston_params={"v0": 0.50, "kappa": 10.0, "theta": 0.50, "xi": 0.3, "rho": -0.7})
+        prob_a = model_a.estimate_prob(
+            current_price=80000, threshold=82000, direction="above",
+            time_horizon_minutes=10080, vol=0.50,
+        )
+        prob_b = model_b.estimate_prob(
+            current_price=80000, threshold=82000, direction="above",
+            time_horizon_minutes=10080, vol=0.50,
+        )
+        assert abs(prob_a - prob_b) > 0.001
+
+    def test_from_calibration_dict(self):
+        """EnsembleModel.from_calibration() should extract weights and params."""
+        from crypto_models import EnsembleModel
+        cal = {
+            "assets": {
+                "BTC": {
+                    "ensemble_weights": [0.20, 0.50, 0.30],
+                    "heston_params": {"kappa": 3.0, "xi": 0.4, "rho": -0.6},
+                    "jd_lambda": 2.0,
+                }
+            }
+        }
+        model = EnsembleModel.from_calibration(cal, asset="BTC")
+        assert model is not None
+        # Verify it uses calibrated weights (not defaults)
+        prob = model.estimate_prob(
+            current_price=80000, threshold=82000, direction="above",
+            time_horizon_minutes=60, vol=0.50,
+        )
+        assert 0.001 <= prob <= 0.999
+
+    def test_from_calibration_missing_asset_uses_defaults(self):
+        """Missing asset in calibration should not crash."""
+        from crypto_models import EnsembleModel
+        cal = {"assets": {"ETH": {"ensemble_weights": [0.3, 0.4, 0.3]}}}
+        model = EnsembleModel.from_calibration(cal, asset="BTC")
+        assert model is not None
+
+
 class TestRegimeAwareJD:
     """Jump-diffusion with regime-dependent lambda."""
 

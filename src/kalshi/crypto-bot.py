@@ -94,7 +94,13 @@ if _calibration_path.exists():
         _calibration = json.loads(_calibration_path.read_text())
     except (json.JSONDecodeError, OSError):
         pass
-ensemble_model = EnsembleModel()
+
+if _calibration.get("assets"):
+    # Use BTC calibration as the primary (most liquid, best data)
+    ensemble_model = EnsembleModel.from_calibration(_calibration, asset="BTC")
+    log.info("Loaded calibrated ensemble model from crypto-calibration.json")
+else:
+    ensemble_model = EnsembleModel()
 
 # Default Heston parameters
 DEFAULT_HESTON_PARAMS = {"v0": 0.25, "kappa": 2.0, "theta": 0.25, "xi": 0.3, "rho": -0.7}
