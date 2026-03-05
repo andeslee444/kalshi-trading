@@ -36,20 +36,24 @@ class TestSkewNormalCdf:
                 f"Failed at x={x}: skew_normal={_skew_normal_cdf(x, alpha=0)}, norm={_norm_cdf(x)}"
 
     def test_positive_skew_shifts_mass_right(self):
-        """skew_normal_cdf(x, alpha=3) > norm_cdf(x) for positive x."""
+        """skew_normal_cdf(x, alpha=3) < norm_cdf(x) for positive x.
+        Positive alpha means more mass in the right tail, so CDF is lower
+        (less mass accumulated to the left of x)."""
         for x in [0.5, 1.0, 1.5, 2.0]:
             sn = _skew_normal_cdf(x, alpha=3)
             n = _norm_cdf(x)
-            assert sn > n, \
-                f"Positive skew should shift mass right at x={x}: sn={sn}, n={n}"
+            assert sn < n, \
+                f"Positive skew should lower CDF at positive x={x}: sn={sn}, n={n}"
 
     def test_negative_skew_shifts_mass_left(self):
-        """skew_normal_cdf(x, alpha=-3) < norm_cdf(x) for positive x."""
+        """skew_normal_cdf(x, alpha=-3) > norm_cdf(x) for positive x.
+        Negative alpha means more mass in the left tail, so CDF is higher
+        (more mass accumulated to the left of x)."""
         for x in [0.5, 1.0, 1.5, 2.0]:
             sn = _skew_normal_cdf(x, alpha=-3)
             n = _norm_cdf(x)
-            assert sn < n, \
-                f"Negative skew should shift mass left at x={x}: sn={sn}, n={n}"
+            assert sn > n, \
+                f"Negative skew should raise CDF at positive x={x}: sn={sn}, n={n}"
 
     def test_skew_normal_bounded_0_1(self):
         """CDF values should be in [0, 1]."""
@@ -59,11 +63,12 @@ class TestSkewNormalCdf:
                 assert 0 <= val <= 1, f"Out of bounds: sn_cdf({x}, alpha={alpha}) = {val}"
 
     def test_skew_normal_monotonic(self):
-        """CDF should be monotonically increasing in x."""
+        """CDF should be monotonically increasing in x (within numerical tolerance)."""
         for alpha in [-3, 0, 3]:
             vals = [_skew_normal_cdf(x, alpha=alpha) for x in [-3, -2, -1, 0, 1, 2, 3]]
             for i in range(len(vals) - 1):
-                assert vals[i] <= vals[i + 1], \
+                # Allow 1e-7 tolerance for quadrature numerical precision at extremes
+                assert vals[i] <= vals[i + 1] + 1e-7, \
                     f"Not monotonic at alpha={alpha}: {vals}"
 
 

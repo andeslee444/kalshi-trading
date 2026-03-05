@@ -70,7 +70,9 @@ def _skew_normal_cdf(x, alpha=0.0):
     Uses the closed-form: Phi_SN(x) = Phi(x) - 2*T(x, alpha)
     where T(x, alpha) is Owen's T function.
     """
-    return _norm_cdf(x) - 2.0 * _owens_t(x, alpha)
+    result = _norm_cdf(x) - 2.0 * _owens_t(x, alpha)
+    # Clamp to [0, 1] to handle minor numerical precision issues from quadrature
+    return max(0.0, min(1.0, result))
 
 
 def _probit(p):
@@ -275,7 +277,7 @@ def _reset_calibration():
 # ─── Probability models ───
 
 def weather_probability(forecast_temp, threshold, direction, days_out=0, city=None,
-                        sigma_override=None):
+                        sigma_override=None, hour_of_day=None, skew=0.0):
     """CDF-based probability for KXHIGH weather markets.
 
     sigma scales with forecast horizon: sigma = intercept + slope * sqrt(days_out)
@@ -288,6 +290,12 @@ def weather_probability(forecast_temp, threshold, direction, days_out=0, city=No
     Args:
         sigma_override: when set, replaces the computed sigma entirely.
             Used by ensemble to pass spread-adjusted sigma.
+        hour_of_day: hour (0-23) for intra-day sigma decay on day-0 markets.
+            Only used when days_out == 0. None = use standard sigma.
+        skew: skew-normal alpha parameter (default 0.0 = symmetric).
+            Positive = right skew (warm bias), negative = left skew (cold bias).
+            Read from calibration.json weather.skew or weather.per_city.{city}.skew
+            if not explicitly provided (i.e., if 0.0).
 
     direction="T": P(actual > threshold) = 1 - Phi((threshold - forecast) / sigma)
     direction="B": P(threshold <= actual < threshold+1) = Phi((threshold+1 - forecast)/sigma) - Phi((threshold - forecast)/sigma)
@@ -310,9 +318,20 @@ def weather_probability(forecast_temp, threshold, direction, days_out=0, city=No
 
     sigma = max(0.5, intercept + slope * math.sqrt(max(0, days_out)))
 
+    # Hour-of-day sigma adjustment for day-0 markets
+    if hour_of_day is not None and days_out == 0 and sigma_override is None:
+        sigma = weather_sigma_hourly(days_out=0, city=city, hour_of_day=hour_of_day)
+
     # Allow callers (e.g. ensemble) to override sigma entirely
     if sigma_override is not None and sigma_override > 0:
         sigma = sigma_override
+
+    # Resolve skew parameter: explicit > per-city calibration > global calibration > 0.0
+    if skew == 0.0:
+        if city and city in weather_cal.get("per_city", {}):
+            skew = weather_cal["per_city"][city].get("skew", 0.0)
+        else:
+            skew = weather_cal.get("skew", 0.0)
 
     # Degrees of freedom for Student's t (fat tails for forecast errors)
     df = weather_cal.get("df", 6)
@@ -323,12 +342,39 @@ def weather_probability(forecast_temp, threshold, direction, days_out=0, city=No
     if direction == "T":
         # P(actual > threshold)
         z = (threshold - forecast_temp) / sigma
-        return 1.0 - _student_t_cdf(z, df)
+        base_prob = 1.0 - _student_t_cdf(z, df)
+
+        # Skew correction: use skew-normal CDF to compute the asymmetric
+        # correction, then apply as an additive delta to the Student-t result.
+        # This preserves fat tails from Student-t while adding asymmetry.
+        # skew_normal_cdf(z, alpha) < norm_cdf(z) when alpha > 0 (right skew)
+        # => 1 - skew_normal_cdf > 1 - norm_cdf => P(above) increases with positive skew
+        if abs(skew) > 1e-10:
+            normal_prob = 1.0 - _norm_cdf(z)
+            skew_prob = 1.0 - _skew_normal_cdf(z, alpha=skew)
+            # Additive correction: difference between skew-normal and normal
+            skew_correction = skew_prob - normal_prob
+            base_prob = max(0.001, min(0.999, base_prob + skew_correction))
+
+        return base_prob
     else:
         # B = bracket: P(threshold <= actual < threshold + 1)
         z_low = (threshold - forecast_temp) / sigma
         z_high = (threshold + 1 - forecast_temp) / sigma
-        return _student_t_cdf(z_high, df) - _student_t_cdf(z_low, df)
+        base_prob = _student_t_cdf(z_high, df) - _student_t_cdf(z_low, df)
+
+        # Skew correction for brackets (apply to both bounds)
+        if abs(skew) > 1e-10:
+            sn_high = _skew_normal_cdf(z_high, alpha=skew)
+            sn_low = _skew_normal_cdf(z_low, alpha=skew)
+            normal_diff = _norm_cdf(z_high) - _norm_cdf(z_low)
+            skew_diff = sn_high - sn_low
+            if abs(normal_diff) > 1e-10:
+                # Scale the Student-t bracket probability by the skew ratio
+                ratio = skew_diff / normal_diff
+                base_prob = max(0.0, base_prob * ratio)
+
+        return base_prob
 
 
 def weather_sigma(days_out=0, city=None):
@@ -494,6 +540,180 @@ def ensemble_spread_sigma_multiplier(spread_f):
     # Linear ramp: spread 2→10°F maps to multiplier 1.0→2.0
     raw = 1.0 + (spread_f - 2.0) * 0.125
     return min(raw, 2.5)  # Cap at 2.5x
+
+
+def compute_adaptive_ensemble_weights(verification_data, default_weights=None):
+    """Compute model weights from recent forecast verification data.
+
+    Uses inverse-Brier weighting: models with lower Brier scores (more accurate)
+    get higher weight. Falls back to default_weights if verification data is
+    insufficient (< 20 samples per model) or None.
+
+    Args:
+        verification_data: dict of {model_name: {"brier_predictions": [(pred_prob, actual_outcome), ...]}}
+            or None. Each brier_predictions entry is a list of (predicted_probability, 0_or_1) tuples.
+        default_weights: fallback weights dict {model_name: weight}. Returned when
+            verification data is insufficient.
+
+    Returns:
+        dict of {model_name: weight} summing to 1.0.
+    """
+    if default_weights is None:
+        default_weights = {"gfs": 0.40, "ecmwf": 0.40, "icon": 0.20}
+
+    if not verification_data:
+        return default_weights
+
+    # Compute Brier score per model
+    model_briers = {}
+    min_samples = 20
+
+    for model_name, data in verification_data.items():
+        preds = data.get("brier_predictions", [])
+        if len(preds) < min_samples:
+            continue
+        # Brier score = mean((predicted - actual)^2)
+        brier = sum((p - a) ** 2 for p, a in preds) / len(preds)
+        if brier > 0:
+            model_briers[model_name] = brier
+
+    if len(model_briers) < 2:
+        return default_weights
+
+    # Inverse-Brier weighting
+    inv_brier = {m: 1.0 / b for m, b in model_briers.items()}
+    total = sum(inv_brier.values())
+    return {m: w / total for m, w in inv_brier.items()}
+
+
+def ensemble_disagreement_score(model_probs):
+    """Compute disagreement between ensemble model probabilities.
+
+    Uses coefficient of variation (std/mean) of probabilities, normalized
+    to [0, 1]. When score > 0.3, signals regime uncertainty and the bot
+    should require higher edge threshold or skip the trade.
+
+    Args:
+        model_probs: dict of {model_name: probability} (values in [0, 1]).
+
+    Returns:
+        float in [0, 1] where 0 = perfect agreement, 1 = maximum disagreement.
+    """
+    if not model_probs or len(model_probs) < 2:
+        return 0.0
+
+    probs = list(model_probs.values())
+    mean_p = sum(probs) / len(probs)
+
+    if mean_p <= 0:
+        return 0.0
+
+    # Standard deviation
+    variance = sum((p - mean_p) ** 2 for p in probs) / len(probs)
+    std_dev = math.sqrt(variance)
+
+    # Coefficient of variation, capped at 1.0
+    # Normalize by theoretical max CV for [0,1] bounded values
+    # Max CV occurs when half are 0 and half are 1 -> CV = 1/sqrt(n) * n/sqrt(n) ~ 1
+    cv = std_dev / mean_p if mean_p > 0 else 0.0
+    return min(1.0, cv)
+
+
+def ensemble_weather_probability_v2(forecasts, threshold, direction, days_out=0, city=None,
+                                     sigma_multiplier=1.0, hour_of_day=None,
+                                     verification_data=None, return_details=False):
+    """Enhanced ensemble with adaptive weights, hour-aware sigma, and disagreement scoring.
+
+    Builds on ensemble_weather_probability with three additions:
+    1. Hour-of-day-aware sigma for day-0 markets
+    2. Adaptive weights from verification data (inverse-Brier weighting)
+    3. Disagreement score measuring ensemble model divergence
+
+    Args:
+        forecasts: dict mapping model name to forecast temperature (F).
+        threshold: market threshold temperature (F).
+        direction: "T" (above threshold) or "B" (bracket).
+        days_out: forecast horizon in days.
+        city: city code for calibration lookup.
+        sigma_multiplier: multiplier applied to base sigma (default 1.0).
+        hour_of_day: hour (0-23) for intra-day sigma decay on day-0 markets.
+        verification_data: dict for adaptive ensemble weights (from ForecastVerifier).
+        return_details: if True, return (prob, details_dict) with disagreement_score,
+            weights_used, per_model_probs. If False, return just prob (backward compatible).
+
+    Returns:
+        float probability, or (float, dict) if return_details=True.
+    """
+    cal = _load_calibration()
+    ensemble_cal = cal.get("ensemble", {})
+
+    # Determine weights: adaptive > backtest Brier > static
+    if verification_data:
+        weights = compute_adaptive_ensemble_weights(verification_data)
+    else:
+        brier_data = _load_backtest_brier()
+        if brier_data:
+            inv_brier = {}
+            for model_name in forecasts:
+                if model_name in brier_data:
+                    inv_brier[model_name] = 1.0 / brier_data[model_name]
+            if len(inv_brier) >= 2:
+                total_inv = sum(inv_brier.values())
+                weights = {k: v / total_inv for k, v in inv_brier.items()}
+            else:
+                brier_data = None
+
+        if not verification_data and not brier_data:
+            if days_out <= 1:
+                default_weights = {"gfs": 0.50, "ecmwf": 0.35, "icon": 0.15}
+            elif days_out <= 3:
+                default_weights = {"gfs": 0.35, "ecmwf": 0.45, "icon": 0.20}
+            else:
+                default_weights = {"gfs": 0.30, "ecmwf": 0.45, "icon": 0.25}
+            weights = ensemble_cal.get("weights", default_weights)
+
+    # Compute sigma_override if multiplier != 1.0
+    sigma_kwarg = {}
+    if sigma_multiplier != 1.0 and sigma_multiplier > 0:
+        base_sigma = weather_sigma(days_out, city)
+        sigma_kwarg["sigma_override"] = base_sigma * sigma_multiplier
+
+    # Pass hour_of_day for day-0 intra-day sigma (only when no sigma_override)
+    hour_kwarg = {}
+    if hour_of_day is not None and days_out == 0 and "sigma_override" not in sigma_kwarg:
+        hour_kwarg["hour_of_day"] = hour_of_day
+
+    total_weight = 0.0
+    weighted_prob = 0.0
+    per_model_probs = {}
+
+    for model_name, temp in forecasts.items():
+        w = weights.get(model_name, 0.0)
+        if w <= 0:
+            continue
+        prob = weather_probability(temp, threshold, direction, days_out, city=city,
+                                   **sigma_kwarg, **hour_kwarg)
+        if prob is None:
+            continue
+        per_model_probs[model_name] = prob
+        weighted_prob += w * prob
+        total_weight += w
+
+    if total_weight <= 0:
+        if return_details:
+            return (None, {"disagreement_score": 0.0, "weights_used": weights, "per_model_probs": {}})
+        return None
+
+    final_prob = weighted_prob / total_weight
+    disagreement = ensemble_disagreement_score(per_model_probs)
+
+    if return_details:
+        return (final_prob, {
+            "disagreement_score": disagreement,
+            "weights_used": {k: v for k, v in weights.items() if k in per_model_probs},
+            "per_model_probs": per_model_probs,
+        })
+    return final_prob
 
 
 def nws_sigma_for_hour(hour_of_day):
