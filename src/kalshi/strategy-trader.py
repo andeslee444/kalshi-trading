@@ -176,11 +176,14 @@ def find_longshot_sells(markets, bankroll):
         copula_scale = 1.0
         if _bayesian_edge_enabled:
             edge_est = edge_estimator.estimate_edge(sell_price, category, hours)
-            kelly_mult = bayesian_kelly_multiplier(edge_est.confidence_ratio)
+            # Design doc: "With <10 trades per category: use Becker priors directly"
+            if edge_est.n_observations >= 10:
+                kelly_mult = bayesian_kelly_multiplier(edge_est.confidence_ratio)
+            else:
+                kelly_mult = 1.0  # trust Becker prior at full quarter-Kelly
             n_same = category_counts.get(category, 0) + 1
-            copula_scale = correlation_sizer.kelly_scale(
-                n_same, correlation_sizer.get_intra_category_rho(category)
-            )
+            # Only apply copula scaling when we have empirical correlation data
+            copula_scale = 1.0  # TODO: replace with empirical rho when data exists
 
         # Check category cap before sizing
         if not correlation_sizer.check_category_cap(category, no_price * 1):
@@ -322,11 +325,14 @@ def find_longshot_buys(markets, bankroll):
         if _bayesian_edge_enabled:
             no_price = 100 - yes_bid
             edge_est = edge_estimator.estimate_edge(no_price, category, hours)
-            kelly_mult = bayesian_kelly_multiplier(edge_est.confidence_ratio)
+            # Design doc: "With <10 trades per category: use Becker priors directly"
+            if edge_est.n_observations >= 10:
+                kelly_mult = bayesian_kelly_multiplier(edge_est.confidence_ratio)
+            else:
+                kelly_mult = 1.0  # trust Becker prior at full quarter-Kelly
             n_same = category_counts.get(category, 0) + 1
-            copula_scale = correlation_sizer.kelly_scale(
-                n_same, correlation_sizer.get_intra_category_rho(category)
-            )
+            # Only apply copula scaling when we have empirical correlation data
+            copula_scale = 1.0  # TODO: replace with empirical rho when data exists
 
         # Category cap check
         if not correlation_sizer.check_category_cap(category, buy_price):
@@ -792,25 +798,11 @@ def main():
 
             if scheduler and _wave_scheduling_enabled:
                 wave = scheduler.current_wave()
-                if wave and scheduler.should_scan():
+                if wave:
                     log.info(f"Wave {wave} scan (budget remaining: ${scheduler.remaining_budget()/100:.2f})")
-                    run_scan()
-                elif not wave:
-                    next_t = scheduler.next_scan_time()
-                    if next_t:
-                        wait_secs = max(60, (next_t - datetime.datetime.now(datetime.timezone.utc)).total_seconds())
-                        wait_secs = min(wait_secs, SCAN_INTERVAL * 60)
-                        log.info(f"Between waves. Next wave at {next_t.strftime('%H:%M ET')}. Sleeping {wait_secs/60:.0f}m")
-                        time.sleep(wait_secs)
-                        continue
-                    else:
-                        log.info("No more waves today. Sleeping until tomorrow.")
-                        time.sleep(SCAN_INTERVAL * 60)
-                        continue
                 else:
-                    log.info(f"Wave budget exhausted. Sleeping {SCAN_INTERVAL}m...")
-                    time.sleep(SCAN_INTERVAL * 60)
-                    continue
+                    log.info("Off-wave scan (no budget tracking)")
+                run_scan()
             else:
                 run_scan()
         except Exception as e:

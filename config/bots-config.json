@@ -67,7 +67,7 @@
     "bayesianEdge": true,
     "bayesKappa": 30,
     "waveScheduling": true,
-    "settlementSources": true,
+    "settlementSources": false,
     "fillModel": true,
     "dailyBudgetCents": 10000,
     "fillModelPath": "strategy-fill-model.json",
