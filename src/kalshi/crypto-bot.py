@@ -798,6 +798,20 @@ def scan_and_trade():
     ss.finalize()
 
 
+def _check_short_horizon_markets():
+    """Check if any active crypto markets settle within 2 hours."""
+    try:
+        for prefix in CRYPTO_PREFIXES:
+            markets = client.get_all_markets(prefix=prefix, cache_ttl=60)
+            for m in markets:
+                mins = estimate_time_to_settlement(m)
+                if SETTLEMENT_BUFFER_MINUTES < mins < 120:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 # === Entry Point ===
 
 def main():
@@ -840,8 +854,15 @@ def main():
         if is_shutdown_requested():
             log.info("Graceful shutdown requested, exiting.")
             break
-        log.info(f"\nNext scan in {SCAN_INTERVAL} minutes...")
-        time.sleep(SCAN_INTERVAL * 60)
+
+        # Adaptive interval: faster when short-horizon markets exist
+        has_short_horizon = _check_short_horizon_markets()
+        if has_short_horizon:
+            interval = max(1, SCAN_INTERVAL // 3)  # ~1.5 min for default 5-min
+        else:
+            interval = SCAN_INTERVAL
+        log.info(f"\nNext scan in {interval} minutes{'  (short-horizon mode)' if has_short_horizon else ''}...")
+        time.sleep(interval * 60)
 
 
 if __name__ == "__main__":
