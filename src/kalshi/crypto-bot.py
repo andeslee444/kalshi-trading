@@ -396,10 +396,12 @@ def scan_and_trade():
         history = _price_history.get(asset, [])
         if len(history) >= 2:
             prev_price = history[-2][1]
+            prev_time = history[-2][0]
             if prev_price > 0:
                 log_ret = math.log(price / prev_price)
+                interval_sec = time.time() - prev_time
                 if asset in garch_forecasters:
-                    garch_forecasters[asset].update(log_ret)
+                    garch_forecasters[asset].update(log_ret, interval_seconds=interval_sec)
 
     # Update AR(1) vol forecasters
     for asset in spot_prices:
@@ -521,7 +523,7 @@ def scan_and_trade():
 
         # GARCH forecast (if available)
         garch_vol = garch_forecasters.get(asset)
-        garch_forecast = garch_vol.forecast_vol(annualize_factor=365.25*24*12) if garch_vol else None
+        garch_forecast = garch_vol.forecast_vol(use_actual_interval=True) if garch_vol else None
 
         # Use best available vol estimate
         if iv is not None and rv is not None:

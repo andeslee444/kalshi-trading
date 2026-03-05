@@ -331,6 +331,48 @@ class TestHestonFellerFallback:
         assert not math.isnan(prob)
 
 
+class TestGARCHActualInterval:
+    """GARCH should track actual observation intervals for annualization."""
+
+    def test_update_with_interval(self):
+        from vol_forecaster import GARCHForecaster
+        garch = GARCHForecaster()
+        # Feed 15 returns with known interval (5 min = 300 seconds)
+        for i in range(15):
+            garch.update(0.001 * (i % 3 - 1), interval_seconds=300)
+        vol = garch.forecast_vol()
+        assert vol is not None
+        assert vol > 0
+
+    def test_annualize_from_actual_interval(self):
+        from vol_forecaster import GARCHForecaster
+        garch = GARCHForecaster()
+        for i in range(15):
+            garch.update(0.001 * (i % 3 - 1), interval_seconds=300)
+        # Annualize using actual interval
+        vol_5min = garch.forecast_vol(use_actual_interval=True)
+        # Compare with hardcoded 5-min annualization
+        vol_hardcoded = garch.forecast_vol(annualize_factor=365.25 * 24 * 12)
+        # Should be similar when actual interval matches assumed
+        assert vol_5min is not None
+        assert abs(vol_5min - vol_hardcoded) / max(vol_hardcoded, 0.01) < 0.1
+
+    def test_longer_interval_lower_annualized_vol(self):
+        """Same per-step variance with longer interval should give lower annualized vol."""
+        from vol_forecaster import GARCHForecaster
+        garch_5m = GARCHForecaster()
+        garch_30m = GARCHForecaster()
+        returns = [0.001, -0.002, 0.0015, -0.001, 0.0005] * 3
+        for r in returns:
+            garch_5m.update(r, interval_seconds=300)
+            garch_30m.update(r, interval_seconds=1800)
+        vol_5m = garch_5m.forecast_vol(use_actual_interval=True)
+        vol_30m = garch_30m.forecast_vol(use_actual_interval=True)
+        # Same per-step variance, but 30-min has fewer intervals/year -> lower annualized vol
+        assert vol_30m is not None and vol_5m is not None
+        assert vol_30m < vol_5m
+
+
 class TestParticleFilterSmoothing:
     """Verify filter provides actual smoothing with reduced process noise."""
 
