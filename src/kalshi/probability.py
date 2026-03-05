@@ -1567,10 +1567,14 @@ def compute_limit_price(yes_bid, yes_ask, side, edge=None):
         no_bid = 100 - yes_ask if yes_ask else 0
         no_ask = 100 - yes_bid if yes_bid else 0
         if no_bid and no_ask and no_ask > no_bid:
+            spread = no_ask - no_bid
             if edge is not None and edge < 0.08:
-                return min((no_bid + no_ask) // 2 + 1, no_ask)
+                # Patient: inner third of spread (closer to bid)
+                return no_bid + max(1, spread // 3)
             elif edge is not None and edge < 0.15:
-                return max(no_ask - 1, no_bid + 1)
+                # Balanced: outer third of spread
+                return no_bid + max(1, spread * 2 // 3)
             else:
+                # Urgent (high edge or no edge specified): full ask
                 return no_ask
         return no_ask or 0

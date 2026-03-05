@@ -1574,17 +1574,17 @@ class TestEdgeAdaptivePricing:
         assert price == 50
 
     def test_no_side_pricing(self):
-        """NO-side tiers should work correctly."""
-        # NO bid=50, NO ask=60 (from yes_bid=40, yes_ask=50)
+        """NO-side tiers should work correctly with spread-fraction placement."""
+        # NO bid=50, NO ask=60, spread=10 (from yes_bid=40, yes_ask=50)
         # High edge: full NO ask = 60
         price_high = compute_limit_price(40, 50, "no", edge=0.20)
         assert price_high == 60
-        # Medium edge: NO ask - 1 = 59
+        # Medium edge: no_bid + spread*2//3 = 50 + 6 = 56
         price_med = compute_limit_price(40, 50, "no", edge=0.10)
-        assert price_med == 59
-        # Low edge: midpoint + 1 = (50+60)//2 + 1 = 56
+        assert price_med == 56
+        # Low edge: no_bid + spread//3 = 50 + 3 = 53
         price_low = compute_limit_price(40, 50, "no", edge=0.05)
-        assert price_low == 56
+        assert price_low == 53
 
     def test_no_spread_returns_ask(self):
         """When bid == ask (no spread), should return ask regardless of edge."""

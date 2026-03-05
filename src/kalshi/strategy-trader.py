@@ -128,7 +128,7 @@ def find_longshot_sells(markets, bankroll):
                                        edge=est_edge, price_cents=sell_price)
             continue
 
-        implied_prob = yes_ask / 100.0
+        implied_prob = sell_price / 100.0
         true_prob = implied_prob - est_edge
 
         candidates.append({
@@ -154,44 +154,6 @@ def find_longshot_sells(markets, bankroll):
         })
 
     candidates.sort(key=lambda x: -x["est_edge"] * math.log1p(max(x.get("volume", 0), 1)))
-    return candidates
-
-def find_near_settlement(markets):
-    """Find markets settling within 6 hours where we might have info edge."""
-    now = datetime.datetime.now(datetime.timezone.utc)
-    candidates = []
-    for m in markets:
-        close_str = m.get("close_time", "")
-        try:
-            close_time = datetime.datetime.fromisoformat(close_str.replace("Z", "+00:00"))
-            hours = (close_time - now).total_seconds() / 3600
-        except (ValueError, TypeError):
-            continue
-
-        if hours < 0.5 or hours > 6:
-            continue
-
-        yes_ask = m.get("yes_ask", 0)
-        yes_bid = m.get("yes_bid", 0)
-        if yes_ask <= 0:
-            continue
-
-        spread = yes_ask - yes_bid if yes_bid > 0 else 100
-        if spread > 20:
-            continue
-
-        candidates.append({
-            "ticker": m.get("ticker", ""),
-            "title": m.get("title", "")[:80],
-            "subtitle": m.get("subtitle", "")[:60],
-            "yes_ask": yes_ask,
-            "yes_bid": yes_bid,
-            "spread": spread,
-            "hours_to_close": hours,
-            "volume": m.get("volume", 0),
-        })
-
-    candidates.sort(key=lambda x: x["hours_to_close"])
     return candidates
 
 def check_settled_trades():
@@ -278,16 +240,6 @@ def run_scan():
         log.info(f"     YES@{c['yes_price']}c | Edge: {c['est_edge']*100:.1f}% | Contracts: {c['contracts']} | Risk: ${c['risk_cents']/100:.2f}")
         log.info(f"     Closes in {c['hours_to_close']:.1f}h | Vol: {c['volume']}")
 
-    # Strategy 2: Near-settlement info arb candidates
-    log.info("\n" + "=" * 70)
-    log.info("STRATEGY 2: Near-Settlement Markets (Info Arbitrage Candidates)")
-    log.info("=" * 70)
-    near_settle = find_near_settlement(markets)
-    log.info(f"  Found {len(near_settle)} markets settling within 6h with reasonable spreads")
-    for i, c in enumerate(near_settle[:10]):
-        log.info(f"  {i+1}. {c['ticker']} -- {c['title']}")
-        log.info(f"     Bid: {c['yes_bid']}c / Ask: {c['yes_ask']}c | Spread: {c['spread']}c | Close: {c['hours_to_close']:.1f}h")
-
     # Place trades — top 10 longshot sells
     log.info("\n" + "=" * 70)
     log.info("PLACING TRADES (Top 10 Longshot Sells)")
@@ -358,7 +310,7 @@ def run_scan():
 
     new_section = f"\n\n## Trade Session: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
     new_section += f"**Balance**: ${balance/100:.2f} | **Available**: ${avail/100:.2f}\n\n"
-    new_section += f"**Markets Scanned**: {len(markets)} | **Longshot Candidates**: {len(longshots)} | **Near-Settlement**: {len(near_settle)}\n\n"
+    new_section += f"**Markets Scanned**: {len(markets)} | **Longshot Candidates**: {len(longshots)}\n\n"
 
     if trades_executed:
         new_section += "### Trades Placed\n\n"
@@ -413,7 +365,7 @@ def main():
     args = parser.parse_args()
 
     log.info("=" * 60)
-    log.info("Kalshi Strategy Trader (Longshot Bias + Near-Settlement)")
+    log.info("Kalshi Strategy Trader (Longshot Bias)")
     log.info(f"  Max bet: ${MAX_BET/100:.0f} | Scan interval: {SCAN_INTERVAL} min")
     log.info("=" * 60)
 
