@@ -47,6 +47,8 @@ class FREDClient:
         "tips_breakeven_5y": "T5YIE",         # 5-Year Breakeven Inflation Rate
         "umich_expectations": "MICH",          # UMich Inflation Expectations
         "gdpnow": "GDPNOW",                   # Atlanta Fed GDPNow
+        "crude_oil": "DCOILWTICO",            # WTI Crude Oil Price
+        "yield_curve": "T10Y2Y",              # 10Y-2Y Treasury Spread
     }
 
     def __init__(self, api_key: str = ""):
