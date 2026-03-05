@@ -1063,9 +1063,9 @@ class TradeManager:
         return self._cached_balance_cents or 0
 
     def _effective_max_trade_cents(self):
-        """Resolve max trade amount: max(static config, bankroll * pct).
+        """Resolve max trade amount: min(static config, bankroll * pct).
 
-        Static config is the floor — percentage scales with bankroll.
+        Static config is the ceiling — percentage scales down with small bankroll.
         """
         static_cents = int(self.config["maxTradeAmount"] * 100)
         pct = self.config.get("maxTradeAmountPct")
@@ -1073,13 +1073,13 @@ class TradeManager:
             balance = self._get_available_balance()
             if balance > 0:
                 dynamic_cents = int(balance * pct)
-                return max(static_cents, dynamic_cents)
+                return min(static_cents, dynamic_cents)
         return static_cents
 
     def _effective_max_daily_loss_cents(self):
-        """Resolve max daily loss: max(static config, bankroll * pct).
+        """Resolve max daily loss: min(static config, bankroll * pct).
 
-        Static config is the floor — percentage scales with bankroll.
+        Static config is the ceiling — percentage scales down with small bankroll.
         """
         static_cents = int(self.config["maxDailyLoss"] * 100)
         pct = self.config.get("maxDailyLossPct")
@@ -1087,7 +1087,7 @@ class TradeManager:
             balance = self._get_available_balance()
             if balance > 0:
                 dynamic_cents = int(balance * pct)
-                return max(static_cents, dynamic_cents)
+                return min(static_cents, dynamic_cents)
         return static_cents
 
     @staticmethod
