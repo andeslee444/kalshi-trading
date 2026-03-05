@@ -24,6 +24,7 @@ from kalshi_auth import (
 from probability import (
     econ_nowcast_probability, cpi_nowcast_sigma, gdp_nowcast_sigma, quarter_kelly,
     uncertainty_kelly, compute_limit_price, kalshi_fee_cents, gas_price_probability,
+    is_market_liquid,
 )
 from capital_allocator import PortfolioAllocator
 from cpi_belief_filter import CPIBeliefFilter
@@ -927,6 +928,13 @@ def scan_and_trade():
 
         ss.markets_evaluated += 1
 
+        # Liquidity check — skip thin markets with no exit path
+        if not is_market_liquid(m, min_volume=5, max_spread=25):
+            ss.skip("illiquid")
+            trade_manager.log_decision(ticker, "skip", "skipped", "illiquid",
+                                       market_type=market_type, title=title[:80])
+            continue
+
         # Estimate uncertainty — use market-type-specific sigma
         days_to_release = estimate_days_to_release(m)
         ticker_upper = ticker.upper()
@@ -1031,6 +1039,10 @@ def scan_and_trade():
             ticker = gm.get("ticker", "")
             threshold, direction_type = parse_gas_threshold(gm)
             if threshold is None:
+                continue
+            if not is_market_liquid(gm, min_volume=5, max_spread=25):
+                trade_manager.log_decision(ticker, "skip", "skipped", "illiquid",
+                                           market_type="GAS", title=gm.get("title", "")[:80])
                 continue
             direction = "above" if direction_type == "T" else "below"
             prob = gas_price_probability(gas_price, threshold, direction)

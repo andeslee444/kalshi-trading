@@ -61,6 +61,7 @@ def _load_economics_bot():
     fake_prob.compute_limit_price = lambda *a, **kw: 50
     fake_prob.kalshi_fee_cents = lambda *a, **kw: 1.0
     fake_prob.gas_price_probability = lambda *a, **kw: 0.5
+    fake_prob.is_market_liquid = lambda *a, **kw: True
     fake_prob._norm_cdf = lambda x: 0.5 * (1 + __import__("math").erf(x / __import__("math").sqrt(2)))
     sys.modules["probability"] = fake_prob
 
@@ -436,3 +437,34 @@ class TestHorizonEdgeThreshold:
             t = _econ._horizon_edge_threshold(d)
             assert t >= prev
             prev = t
+
+
+# ===================================================================
+# Liquidity filter tests
+# ===================================================================
+
+class TestLiquidityFilter:
+
+    def test_market_with_no_bid_is_illiquid(self):
+        """Market with yes_bid=0 should be filtered."""
+        from probability import is_market_liquid
+        m = {"yes_bid": 0, "yes_ask": 5, "volume": 100}
+        assert not is_market_liquid(m)
+
+    def test_wide_spread_is_illiquid(self):
+        """Market with >20c spread should be filtered."""
+        from probability import is_market_liquid
+        m = {"yes_bid": 10, "yes_ask": 35, "volume": 100}
+        assert not is_market_liquid(m)
+
+    def test_low_volume_is_illiquid(self):
+        """Market with <10 volume should be filtered."""
+        from probability import is_market_liquid
+        m = {"yes_bid": 10, "yes_ask": 15, "volume": 5}
+        assert not is_market_liquid(m)
+
+    def test_normal_market_is_liquid(self):
+        """Market with reasonable spread/volume is liquid."""
+        from probability import is_market_liquid
+        m = {"yes_bid": 45, "yes_ask": 50, "volume": 100}
+        assert is_market_liquid(m)
