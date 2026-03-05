@@ -133,6 +133,45 @@ def _check_concentration(ticker, bankroll_cents, trades):
 
     return True, ""
 
+class EdgeScaler:
+    """Auto-scale exposure limits based on settlement track record.
+
+    Starts conservative (20% of bankroll), scales up as settlements prove
+    the model works. Halves on losing streaks.
+    """
+    TIERS = [
+        {"min_wins": 0,  "max_exposure_pct": 0.20},
+        {"min_wins": 5,  "max_exposure_pct": 0.40},
+        {"min_wins": 10, "max_exposure_pct": 0.60},
+        {"min_wins": 20, "max_exposure_pct": 1.00},
+    ]
+
+    def current_limit(self, settlement_record):
+        """Compute current max exposure as fraction of bankroll.
+
+        Args:
+            settlement_record: List of dicts with 'profitable' boolean key.
+
+        Returns:
+            Float in (0, 1] -- max fraction of bankroll to deploy.
+        """
+        wins = sum(1 for s in settlement_record if s.get("profitable"))
+        recent = settlement_record[-10:] if settlement_record else []
+        loss_streak = 0
+        for s in reversed(recent):
+            if not s.get("profitable"):
+                loss_streak += 1
+            else:
+                break
+        loss_penalty = 0.5 if loss_streak >= 3 else 1.0
+
+        tier = self.TIERS[0]
+        for t in self.TIERS:
+            if wins >= t["min_wins"]:
+                tier = t
+
+        return tier["max_exposure_pct"] * loss_penalty
+
 # === Market ticker prefixes ===
 # Note: KXFED removed — CME FedWatch is a JavaScript SPA, HTML scraper returns garbage.
 # Re-enable when a proper FedWatch data source (JSON API or FRED SOFR futures) is wired up.
@@ -952,6 +991,14 @@ def scan_and_trade():
     # Sort by edge
     opportunities.sort(key=lambda x: x["edge"], reverse=True)
     log.info(f"Found {len(opportunities)} opportunities with edge >= {EDGE_THRESHOLD*100:.0f}%")
+
+    # Edge scaler: limit total exposure based on settlement track record
+    edge_scaler = EdgeScaler()
+    settled = [t for t in trade_manager.load_trades() if t.get("settlement_result") is not None]
+    max_exposure_pct = edge_scaler.current_limit(settled)
+    max_econ_exposure = int(balance * max_exposure_pct)
+    log.info(f"  Edge scaler: {len([s for s in settled if s.get('profitable')])} wins -> "
+             f"max {max_exposure_pct*100:.0f}% exposure (${max_econ_exposure/100:.0f})")
 
     for opp in opportunities:
         ticker = opp["ticker"]
