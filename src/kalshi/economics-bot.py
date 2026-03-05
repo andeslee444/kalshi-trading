@@ -208,6 +208,29 @@ def _nowcast_cache_age_hours():
     return float("inf")
 
 
+def _nowcast_source_info():
+    """Return nowcast age and source timestamp for trade record auditing.
+
+    Returns:
+        Dict with:
+            - nowcast_age_hours: float (rounded to 1 decimal)
+            - data_source_timestamp: ISO 8601 string from cache's cached_at
+    """
+    try:
+        if NOWCAST_CACHE_PATH.exists():
+            cache = json.loads(NOWCAST_CACHE_PATH.read_text())
+            cached_at = cache.get("cached_at", 0)
+            age_hours = round((time.time() - cached_at) / 3600, 1)
+            ts = datetime.datetime.fromtimestamp(cached_at, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            return {"nowcast_age_hours": age_hours, "data_source_timestamp": ts}
+    except Exception:
+        pass
+    return {
+        "nowcast_age_hours": 0.0,
+        "data_source_timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+
 def _compute_cross_measure_dispersion(nowcast):
     """Compute cross-measure dispersion from available Fed YoY measures.
 
@@ -809,6 +832,9 @@ def scan_and_trade():
         if dispersion_ci is not None:
             log.info(f"  Cross-measure dispersion CI width: {dispersion_ci:.4f}")
 
+    # Nowcast source info for trade record auditing
+    source_info = _nowcast_source_info()
+
     # Evaluate each market
     opportunities = []
     for m in all_markets:
@@ -912,6 +938,8 @@ def scan_and_trade():
                     "posterior_sigma": posterior_sigma,
                     "scenario_agreement": result.agreement,
                     "per_scenario": result.per_scenario,
+                    "nowcast_age_hours": source_info["nowcast_age_hours"],
+                    "data_source_timestamp": source_info["data_source_timestamp"],
                 })
             else:
                 trade_manager.log_decision(
@@ -934,6 +962,8 @@ def scan_and_trade():
                     "posterior_sigma": posterior_sigma,
                     "scenario_agreement": result.agreement,
                     "per_scenario": result.per_scenario,
+                    "nowcast_age_hours": source_info["nowcast_age_hours"],
+                    "data_source_timestamp": source_info["data_source_timestamp"],
                 })
             else:
                 trade_manager.log_decision(
@@ -968,6 +998,8 @@ def scan_and_trade():
                         "prob": prob, "edge": edge, "threshold": threshold,
                         "nowcast_value": gas_price, "sigma": gas_price * 0.02,
                         "days_to_release": 0,
+                        "nowcast_age_hours": 0.0,
+                        "data_source_timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
                     })
             else:
                 no_prob = 1.0 - prob
@@ -981,6 +1013,8 @@ def scan_and_trade():
                         "prob": no_prob, "edge": edge, "threshold": threshold,
                         "nowcast_value": gas_price, "sigma": gas_price * 0.02,
                         "days_to_release": 0,
+                        "nowcast_age_hours": 0.0,
+                        "data_source_timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
                     })
 
     # Fed rate decision markets
@@ -1010,6 +1044,8 @@ def scan_and_trade():
                         "prob": cme_prob, "edge": edge, "threshold": 0,
                         "nowcast_value": cme_prob, "sigma": 0,
                         "days_to_release": 0,
+                        "nowcast_age_hours": 0.0,
+                        "data_source_timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
                     })
                 elif (-edge) > EDGE_THRESHOLD:
                     # Kalshi overpriced YES -> buy NO
@@ -1021,6 +1057,8 @@ def scan_and_trade():
                             "prob": no_prob, "edge": no_edge, "threshold": 0,
                             "nowcast_value": cme_prob, "sigma": 0,
                             "days_to_release": 0,
+                            "nowcast_age_hours": 0.0,
+                            "data_source_timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
                         })
 
     # Sort by edge
@@ -1127,7 +1165,9 @@ def scan_and_trade():
                                                 1 if truflation_cpi is not None else 0,
                                                 1 if tips_breakeven is not None else 0,
                                             ]),
-                                            scenario_agreement=round(opp.get("scenario_agreement", 0), 4))
+                                            scenario_agreement=round(opp.get("scenario_agreement", 0), 4),
+                                            nowcast_age_hours=opp.get("nowcast_age_hours"),
+                                            data_source_timestamp=opp.get("data_source_timestamp"))
         if result:
             ss.trades_placed += 1
             allocator.record_trade("economics", ticker, risk, edge=edge)
