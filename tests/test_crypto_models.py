@@ -248,17 +248,22 @@ class TestHorizonKelly:
     def test_5min_returns_eighth_kelly(self):
         from crypto_models import horizon_kelly_fraction
         frac = horizon_kelly_fraction(5)
-        assert abs(frac - 0.125) < 0.01
+        assert abs(frac - 0.15) < 0.02  # Updated: was 0.125
 
     def test_24h_returns_half_kelly(self):
         from crypto_models import horizon_kelly_fraction
         frac = horizon_kelly_fraction(1440)
         assert abs(frac - 0.50) < 0.01
 
-    def test_1h_returns_quarter_kelly(self):
+    def test_1h_returns_third_kelly(self):
         from crypto_models import horizon_kelly_fraction
         frac = horizon_kelly_fraction(60)
-        assert abs(frac - 0.25) < 0.02
+        assert abs(frac - 0.333) < 0.02  # Updated: was 0.25
+
+    def test_6h_returns_three_eighths_kelly(self):
+        from crypto_models import horizon_kelly_fraction
+        frac = horizon_kelly_fraction(360)
+        assert abs(frac - 0.375) < 0.02  # New tier
 
 
 class TestHorizonVolWeight:

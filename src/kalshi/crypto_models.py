@@ -49,17 +49,21 @@ def horizon_kelly_fraction(minutes_to_settle):
 
     Short horizons use smaller Kelly (more noise, less model confidence).
     Long horizons use larger Kelly (more data, better model accuracy).
+
+    Loosened from original schedule after audit showed effective Kelly
+    was dropping below 1/4 (academic growth threshold) after applying
+    CI, regime, and correlation multipliers.
     """
     if minutes_to_settle < 15:
-        return 0.125   # 1/8 Kelly
+        return 0.15    # ~1/7 Kelly (was 1/8)
     elif minutes_to_settle < 60:
-        return 0.20    # 1/5 Kelly
+        return 0.25    # 1/4 Kelly (was 1/5)
     elif minutes_to_settle < 360:
-        return 0.25    # 1/4 Kelly
+        return 0.333   # 1/3 Kelly (was 1/4) — best vol data, most confident
     elif minutes_to_settle < 1440:
-        return 0.333   # 1/3 Kelly
+        return 0.375   # 3/8 Kelly (was 1/3)
     else:
-        return 0.50    # 1/2 Kelly
+        return 0.50    # 1/2 Kelly (unchanged)
 
 
 def horizon_vol_weights(minutes_to_settle):
