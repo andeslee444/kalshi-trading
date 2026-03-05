@@ -131,6 +131,56 @@ class TestParseWeatherTicker:
     def test_inflation_ticker_returns_none(self):
         assert parse_weather_ticker("KXHIGHINFLATION-26DEC-T3.5") is None
 
+    # --- KXHIGHINFLATION regression tests ---
+
+    def test_kxhighinflation_variants_return_none(self):
+        """KXHIGHINFLATION tickers share KXHIGH prefix but are NOT weather markets."""
+        inflation_tickers = [
+            "KXHIGHINFLATION-26DEC-T3.5",
+            "KXHIGHINFLATION-26DEC-T3.0",
+            "KXHIGHINFLATION-26JAN-T3.0",
+            "KXHIGHINFLATION-26FEB-T2.5",
+            "KXHIGHINFLATION-26MAR-T4.0",
+        ]
+        for ticker in inflation_tickers:
+            assert parse_weather_ticker(ticker) is None, f"Expected None for {ticker}"
+
+    # --- All 20 config cities parse in KXHIGH format ---
+
+    def test_all_config_cities_parse(self):
+        """Every configured city code must parse successfully in KXHIGH{CITY} format."""
+        config_cities = [
+            "MIA", "LAX", "PHIL", "NY", "CHI", "AUS", "DEN", "HOU",
+            "ATL", "BOS", "SFO", "SEA", "LV", "DAL", "MIN", "PHX",
+            "DC", "NOLA", "OKC", "SATX",
+        ]
+        for city in config_cities:
+            ticker = f"KXHIGH{city}-26MAR05-T70"
+            r = parse_weather_ticker(ticker)
+            assert r is not None, f"Failed to parse KXHIGH{city}: {ticker}"
+            assert r["city"] == city, f"Expected city={city}, got {r['city']} for {ticker}"
+            assert r["date"] == "2026-03-05"
+            assert r["direction"] == "T"
+            assert r["threshold"] == 70.0
+
+    # --- All 20 config cities parse in KXHIGHT (T-prefix) format ---
+
+    def test_all_config_cities_parse_t_prefix(self):
+        """Every configured city code must parse in KXHIGHT{CITY} format too."""
+        config_cities = [
+            "MIA", "LAX", "PHIL", "NY", "CHI", "AUS", "DEN", "HOU",
+            "ATL", "BOS", "SFO", "SEA", "LV", "DAL", "MIN", "PHX",
+            "DC", "NOLA", "OKC", "SATX",
+        ]
+        for city in config_cities:
+            ticker = f"KXHIGHT{city}-26MAR05-T70"
+            r = parse_weather_ticker(ticker)
+            assert r is not None, f"Failed to parse KXHIGHT{city}: {ticker}"
+            assert r["city"] == city, f"Expected city={city}, got {r['city']} for {ticker}"
+            assert r["date"] == "2026-03-05"
+            assert r["direction"] == "T"
+            assert r["threshold"] == 70.0
+
 
 # ===================================================================
 # Crypto Ticker Parser

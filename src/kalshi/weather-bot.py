@@ -211,6 +211,9 @@ def scan_and_trade():
     opportunities = []
     for m in markets:
         ticker = m.get("ticker", "")
+        # Filter non-weather KXHIGH tickers (e.g., KXHIGHINFLATION)
+        if not ticker.startswith("KXHIGH") or ticker.startswith("KXHIGHINFLATION"):
+            continue
         parsed = parse_ticker(ticker)
         if not parsed:
             log.warning("Unparseable KXHIGH ticker: %s", ticker)
