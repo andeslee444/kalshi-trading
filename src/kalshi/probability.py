@@ -1684,10 +1684,15 @@ def is_market_liquid(market, min_volume=None, max_spread=None):
 def compute_limit_price(yes_bid, yes_ask, side, edge=None):
     """Compute a limit price within the spread, adapted to edge strength.
 
-    Three tiers based on edge:
-      - High edge (>=15%) or edge=None: pay full ask (urgency, maximize fill rate)
+    YES-side tiers:
+      - High edge (>=15%) or edge=None: full ask (urgency)
       - Medium edge (8%-15%): ask - 1c (balanced)
-      - Low edge (<8%): midpoint + 1c (patient, legacy behavior)
+      - Low edge (<8%): midpoint + 1c (patient)
+
+    NO-side tiers (spread-fraction placement):
+      - High edge (>=15%) or edge=None: full no_ask (urgency)
+      - Medium edge (8%-15%): no_bid + 2/3 spread (outer third)
+      - Low edge (<8%): no_bid + 1/3 spread (inner third, patient)
 
     Falls back to ask if no bid or no spread.
     Returns price in cents, or 0 if no valid price available.
