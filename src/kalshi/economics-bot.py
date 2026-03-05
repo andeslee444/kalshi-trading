@@ -69,6 +69,25 @@ def _horizon_edge_threshold(days_to_release, base=None):
     return min(base + extra, 0.40)
 
 
+def _adaptive_scan_interval(days_to_release=None):
+    """Return scan interval in minutes, scaled by proximity to release.
+
+    Release day: every 5 min (capture intraday price moves)
+    1-3 days: every 30 min (nowcast updates, late data revisions)
+    4-7 days: every 2 hours (weekly data arriving)
+    8+ days: configured interval (default 6 hours)
+    """
+    if days_to_release is None:
+        return SCAN_INTERVAL
+    if days_to_release <= 0:
+        return 5
+    elif days_to_release <= 3:
+        return 30
+    elif days_to_release <= 7:
+        return 120
+    return SCAN_INTERVAL
+
+
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
 health = HealthCheckMonitor(logger=log)
@@ -1269,6 +1288,31 @@ def scan_and_trade():
     ss.finalize()
 
 
+# === Adaptive Scheduling ===
+
+ECON_PREFIXES_FOR_SCAN = ["KXCPI", "KXECON", "KXGDP"]
+
+def _estimate_nearest_release_days():
+    """Estimate days to the nearest economic data release we're trading.
+
+    Checks KXCPI/KXGDP market close_times from the most recent scan.
+    Returns the minimum days_to_release, or None if unknown.
+    """
+    try:
+        min_days = None
+        for prefix in ECON_PREFIXES_FOR_SCAN:
+            markets = client.get_all_markets(prefix=prefix, cache_ttl=3600)
+            for m in markets:
+                days = estimate_days_to_release(m)
+                if days is not None and (min_days is None or days < min_days):
+                    min_days = days
+                    if min_days <= 0:
+                        return min_days
+        return min_days
+    except Exception:
+        return None
+
+
 # === Entry Point ===
 
 def main():
@@ -1311,8 +1355,12 @@ def main():
         if is_shutdown_requested():
             log.info("Graceful shutdown requested, exiting.")
             break
-        log.info(f"\nNext scan in {SCAN_INTERVAL} minutes...")
-        time.sleep(SCAN_INTERVAL * 60)
+
+        # Adaptive scan: faster near CPI/GDP release dates
+        next_release_days = _estimate_nearest_release_days()
+        interval = _adaptive_scan_interval(next_release_days)
+        log.info(f"\nNext scan in {interval} minutes (nearest release: {next_release_days}d)...")
+        time.sleep(interval * 60)
 
 
 if __name__ == "__main__":

@@ -483,3 +483,35 @@ class TestGdpNowcast:
     def test_classify_jobs_market(self):
         """Jobs ticker should classify as JOBS."""
         assert _econ._classify_econ_market("KXJOBS-26MAR-T200") == "JOBS"
+
+
+# ===================================================================
+# Adaptive scan interval tests
+# ===================================================================
+
+class TestAdaptiveScanInterval:
+
+    def test_normal_interval(self):
+        """Far from release, use configured interval."""
+        interval = _econ._adaptive_scan_interval(days_to_release=30)
+        assert interval == _econ.SCAN_INTERVAL
+
+    def test_near_release_faster(self):
+        """Within 3 days, scan every 30 minutes."""
+        interval = _econ._adaptive_scan_interval(days_to_release=2)
+        assert interval == 30
+
+    def test_release_day_fastest(self):
+        """On release day, scan every 5 minutes."""
+        interval = _econ._adaptive_scan_interval(days_to_release=0)
+        assert interval == 5
+
+    def test_one_week_out_moderate(self):
+        """7 days out, scan every 2 hours."""
+        interval = _econ._adaptive_scan_interval(days_to_release=7)
+        assert interval == 120
+
+    def test_none_uses_default(self):
+        """None days_to_release uses configured interval."""
+        interval = _econ._adaptive_scan_interval(days_to_release=None)
+        assert interval == _econ.SCAN_INTERVAL
