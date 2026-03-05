@@ -7,11 +7,12 @@ import json, time, datetime, os, sys, math, argparse, traceback
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log, _atomic_write_json, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary
-from probability import quarter_kelly_sell, quarter_kelly, longshot_edge, compute_limit_price, kalshi_fee_cents, classify_ticker_category
+from probability import quarter_kelly_sell, quarter_kelly, half_kelly, longshot_edge, compute_limit_price, kalshi_fee_cents, classify_ticker_category
 from capital_allocator import PortfolioAllocator
 from strategy_engine import (
     BayesianEdgeEstimator, CorrelationAwareSizer,
     bayesian_kelly_multiplier, longshot_edge_sell, longshot_edge_buy, EdgeEstimate,
+    ScheduledScanner, SettlementSourceChecker, FillProbabilityEstimator, InfoEdge,
 )
 
 setup_unbuffered()
@@ -45,6 +46,20 @@ correlation_sizer = CorrelationAwareSizer(
     category_cap_pct=_category_cap,
     single_trade_cap_pct=_single_trade_cap,
 )
+
+# Intraday wave scheduler
+_wave_scheduling_enabled = _bots_cfg.get("waveScheduling", True)
+_wave_daily_budget = _bots_cfg.get("dailyBudgetCents", _bots_cfg.get("maxDailyLoss", 100) * 100)
+scheduler = ScheduledScanner(daily_budget_cents=_wave_daily_budget) if _wave_scheduling_enabled else None
+
+# Settlement source checker
+_settlement_sources_enabled = _bots_cfg.get("settlementSources", True)
+settlement_checker = SettlementSourceChecker() if _settlement_sources_enabled else None
+
+# Fill probability model
+_fill_model_enabled = _bots_cfg.get("fillModel", True)
+FILL_MODEL_PATH = DATA_DIR / _bots_cfg.get("fillModelPath", "strategy-fill-model.json")
+fill_estimator = FillProbabilityEstimator(betas_path=FILL_MODEL_PATH) if _fill_model_enabled else None
 
 # Config flags for new features
 _bayesian_edge_enabled = _bots_cfg.get("bayesianEdge", True)
@@ -117,6 +132,16 @@ def find_longshot_sells(markets, bankroll):
 
         # Place limit within the spread instead of at full ask
         sell_price = compute_limit_price(yes_bid, yes_ask, "yes", edge=est_edge_prelim) if yes_bid else yes_ask
+
+        # Fill probability adjustment
+        if fill_estimator and _fill_model_enabled and yes_bid and yes_ask and yes_ask > yes_bid:
+            mid = (yes_bid + yes_ask) / 2.0
+            spread = yes_ask - yes_bid
+            fill_prob = fill_estimator.estimate_fill_prob(sell_price, mid, spread)
+            adjusted = fill_estimator.adjust_limit_price(sell_price, est_edge_prelim, fill_prob, yes_bid, yes_ask, "no")
+            if adjusted != sell_price:
+                log.debug(f"  Fill prob {fill_prob:.2f} -> adjusted limit {sell_price} -> {adjusted}")
+                sell_price = adjusted
 
         # Recompute edge at the actual entry price (limit may differ from ask)
         if _bayesian_edge_enabled:
@@ -276,6 +301,16 @@ def find_longshot_buys(markets, bankroll):
 
         # Limit price within spread
         buy_price = compute_limit_price(yes_bid, yes_ask, "yes", edge=est_edge) if yes_ask else yes_bid
+
+        # Fill probability adjustment
+        if fill_estimator and _fill_model_enabled and yes_bid and yes_ask and yes_ask > yes_bid:
+            mid = (yes_bid + yes_ask) / 2.0
+            spread = yes_ask - yes_bid
+            fill_prob = fill_estimator.estimate_fill_prob(buy_price, mid, spread)
+            adjusted = fill_estimator.adjust_limit_price(buy_price, est_edge, fill_prob, yes_bid, yes_ask, "yes")
+            if adjusted != buy_price:
+                buy_price = adjusted
+
         if buy_price <= 0 or buy_price >= 100:
             continue
 
@@ -397,6 +432,8 @@ def run_scan():
 
     # Reset daily correlation sizer caps
     correlation_sizer.reset_daily()
+    if scheduler:
+        scheduler.reset_daily()
 
     # Balance
     balance, avail = client.get_balance()
@@ -436,6 +473,64 @@ def run_scan():
     ss.markets_fetched = len(markets)
     log.info(f"  Found {len(markets)} open markets")
 
+    trades_executed = []
+
+    # Strategy 0: Settlement source info-arb (highest priority)
+    info_arb_trades = []
+    if settlement_checker and _settlement_sources_enabled:
+        log.info("\n" + "=" * 70)
+        log.info("STRATEGY 0: Settlement Source Info-Arb (High Conviction)")
+        log.info("=" * 70)
+        for m in markets:
+            ticker = m.get("ticker", "")
+            info_edge = settlement_checker.check_info_edge(ticker)
+            if info_edge is None:
+                continue
+            yes_bid = m.get("yes_bid", 0)
+            yes_ask = m.get("yes_ask", 0)
+            if yes_ask <= 0 or yes_bid <= 0:
+                continue
+
+            log.info(f"  INFO-ARB: {ticker} | Source: {info_edge.source} | Edge: {info_edge.edge*100:.0f}% | Confidence: {info_edge.confidence*100:.0f}%")
+
+            budget = allocator.request_budget("strategy", ticker, edge=info_edge.edge)
+            if not budget.approved:
+                log.info(f"    Allocator denied: {budget.reason}")
+                continue
+
+            fee = kalshi_fee_cents(yes_ask)
+            contracts, risk, kelly_details = half_kelly(
+                info_edge.edge, yes_ask, budget.max_cost_cents,
+                bankroll_cents=budget.bankroll_cents, fee_cents=fee,
+                return_details=True,
+            )
+            if contracts <= 0:
+                continue
+
+            buy_price = yes_ask
+            reasoning = f"Info-arb: {info_edge.source} confirms outcome. Edge {info_edge.edge*100:.0f}%, conf {info_edge.confidence*100:.0f}%. Half-Kelly @ full ask."
+            result = trade_manager.place_order(
+                ticker, "yes", buy_price, contracts, reasoning,
+                strategy="info_arb", est_edge=f"{info_edge.edge*100:.0f}%",
+                risk_cents=risk, title=m.get("title", "")[:80],
+                market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+                sizing_method="half_kelly",
+            )
+            if result:
+                allocator.record_trade("strategy", ticker, risk, edge=info_edge.edge)
+                if scheduler:
+                    scheduler.record_spend(risk)
+                info_arb_trades.append({"ticker": ticker, "source": info_edge.source, "edge": info_edge.edge})
+                trades_executed.append({
+                    "ticker": ticker, "title": m.get("title", "")[:80],
+                    "strategy": "info_arb", "direction": f"BUY YES @ {buy_price}c",
+                    "contracts": contracts, "risk_cents": risk,
+                    "est_edge": f"{info_edge.edge*100:.0f}%",
+                    "reasoning": reasoning,
+                    "order_id": result.get("order_id", "?"), "status": result.get("status", "?"),
+                })
+        log.info(f"  Info-arb trades: {len(info_arb_trades)}")
+
     # Strategy 1: Longshot bias selling
     log.info("\n" + "=" * 70)
     log.info("STRATEGY 1: Longshot Bias Exploitation (Sell YES on low-prob events)")
@@ -460,8 +555,6 @@ def run_scan():
     log.info("\n" + "=" * 70)
     log.info("PLACING TRADES (Top 10 Longshot Sells)")
     log.info("=" * 70)
-
-    trades_executed = []
     for c in longshots[:10]:
         ticker = c["ticker"]
         no_price = 100 - c["yes_price"]
@@ -490,6 +583,8 @@ def run_scan():
         if result:
             allocator.record_trade("strategy", ticker, c["risk_cents"], edge=c.get("est_edge", 0))
             correlation_sizer.record_trade(classify_ticker_category(ticker), c["risk_cents"])
+            if scheduler:
+                scheduler.record_spend(c["risk_cents"])
             trades_executed.append({
                 "ticker": ticker,
                 "title": c["title"],
@@ -559,6 +654,8 @@ def run_scan():
         if result:
             allocator.record_trade("strategy", ticker, c["risk_cents"], edge=c.get("est_edge", 0))
             correlation_sizer.record_trade(classify_ticker_category(ticker), c["risk_cents"])
+            if scheduler:
+                scheduler.record_spend(c["risk_cents"])
             trades_executed.append({
                 "ticker": ticker,
                 "title": c["title"],
@@ -683,6 +780,8 @@ def main():
         return
 
     # Daemon loop
+    if scheduler:
+        scheduler.reset_daily()
     while True:
         try:
             health.record_bot_heartbeat("strategy")
@@ -690,7 +789,30 @@ def main():
             if issues:
                 log.warning("Health issues: %s", "; ".join(issues))
             order_monitor.check_orders()
-            run_scan()
+
+            if scheduler and _wave_scheduling_enabled:
+                wave = scheduler.current_wave()
+                if wave and scheduler.should_scan():
+                    log.info(f"Wave {wave} scan (budget remaining: ${scheduler.remaining_budget()/100:.2f})")
+                    run_scan()
+                elif not wave:
+                    next_t = scheduler.next_scan_time()
+                    if next_t:
+                        wait_secs = max(60, (next_t - datetime.datetime.now(datetime.timezone.utc)).total_seconds())
+                        wait_secs = min(wait_secs, SCAN_INTERVAL * 60)
+                        log.info(f"Between waves. Next wave at {next_t.strftime('%H:%M ET')}. Sleeping {wait_secs/60:.0f}m")
+                        time.sleep(wait_secs)
+                        continue
+                    else:
+                        log.info("No more waves today. Sleeping until tomorrow.")
+                        time.sleep(SCAN_INTERVAL * 60)
+                        continue
+                else:
+                    log.info(f"Wave budget exhausted. Sleeping {SCAN_INTERVAL}m...")
+                    time.sleep(SCAN_INTERVAL * 60)
+                    continue
+            else:
+                run_scan()
         except Exception as e:
             log.error(f"Scan error: {e}")
             traceback.print_exc()

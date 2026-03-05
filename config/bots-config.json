@@ -66,6 +66,11 @@
     "singleTradeCap": 0.05,
     "bayesianEdge": true,
     "bayesKappa": 30,
+    "waveScheduling": true,
+    "settlementSources": true,
+    "fillModel": true,
+    "dailyBudgetCents": 10000,
+    "fillModelPath": "strategy-fill-model.json",
     "exit": {
       "takeProfitCents": 80,
       "stopLossCents": 30,
