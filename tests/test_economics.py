@@ -400,3 +400,39 @@ class TestNowcastSourceInfo:
             assert info["data_source_timestamp"].endswith("Z")
         finally:
             _econ.NOWCAST_CACHE_PATH = orig_path
+
+
+# ===================================================================
+# Horizon-scaled edge threshold tests
+# ===================================================================
+
+class TestHorizonEdgeThreshold:
+
+    def test_near_term_uses_base_threshold(self):
+        """7-day contract should use base 8% edge threshold."""
+        threshold = _econ._horizon_edge_threshold(days_to_release=7)
+        assert threshold == pytest.approx(0.08, abs=0.005)
+
+    def test_long_horizon_higher_threshold(self):
+        """107-day contract should require higher edge than 8%."""
+        threshold = _econ._horizon_edge_threshold(days_to_release=107)
+        assert threshold > 0.08
+        assert threshold < 0.50  # Not absurdly high
+
+    def test_30_day_moderate_threshold(self):
+        """30-day contract should have moderate threshold increase."""
+        threshold = _econ._horizon_edge_threshold(days_to_release=30)
+        assert 0.08 <= threshold <= 0.20
+
+    def test_zero_days_uses_base(self):
+        """Release day should use base threshold."""
+        threshold = _econ._horizon_edge_threshold(days_to_release=0)
+        assert threshold == pytest.approx(0.08, abs=0.005)
+
+    def test_monotonically_increasing(self):
+        """Threshold should increase with horizon."""
+        prev = _econ._horizon_edge_threshold(0)
+        for d in [7, 14, 30, 60, 107]:
+            t = _econ._horizon_edge_threshold(d)
+            assert t >= prev
+            prev = t

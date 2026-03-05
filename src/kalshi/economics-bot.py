@@ -53,6 +53,21 @@ SCAN_INTERVAL = econ_config.get("scanIntervalMinutes", 360)
 EDGE_THRESHOLD = econ_config.get("edgeThreshold", 0.08)
 GAS_EDGE_THRESHOLD = econ_config.get("gasEdgeThreshold", 0.04)
 
+
+def _horizon_edge_threshold(days_to_release, base=None):
+    """Scale edge threshold with horizon to account for model uncertainty growth.
+
+    Near-release (d<=14): use base threshold (model is well-calibrated).
+    Long-horizon: add 0.3% per day beyond 14, capped at 40%.
+    """
+    if base is None:
+        base = EDGE_THRESHOLD
+    if days_to_release is None or days_to_release <= 14:
+        return base
+    extra = 0.003 * (days_to_release - 14)
+    return min(base + extra, 0.40)
+
+
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
 health = HealthCheckMonitor(logger=log)
@@ -961,9 +976,10 @@ def scan_and_trade():
             continue
 
         # Determine trade direction (raw edge, fees handled in Kelly)
+        required_edge = _horizon_edge_threshold(days_to_release)
         if prob > 0.5:
             edge = prob - yes_ask / 100
-            if edge > EDGE_THRESHOLD:
+            if edge > required_edge:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "yes",
                     "prob": prob, "edge": edge, "threshold": threshold,
@@ -978,7 +994,7 @@ def scan_and_trade():
                 })
             else:
                 trade_manager.log_decision(
-                    ticker, "yes", "skipped", "edge below threshold",
+                    ticker, "yes", "skipped", f"edge below threshold ({required_edge:.1%})",
                     edge=edge, price_cents=yes_ask,
                 )
         else:
@@ -987,7 +1003,7 @@ def scan_and_trade():
                 trade_manager.log_decision(ticker, "no", "skipped", "no_no_ask", price_cents=0)
                 continue
             edge = no_prob - no_ask / 100
-            if edge > EDGE_THRESHOLD:
+            if edge > required_edge:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "no",
                     "prob": no_prob, "edge": edge, "threshold": threshold,
@@ -1002,7 +1018,7 @@ def scan_and_trade():
                 })
             else:
                 trade_manager.log_decision(
-                    ticker, "no", "skipped", "edge below threshold",
+                    ticker, "no", "skipped", f"edge below threshold ({required_edge:.1%})",
                     edge=edge, price_cents=no_ask,
                 )
 
