@@ -280,13 +280,91 @@ class TestParseCryptoTicker:
         assert r is not None
         assert r["asset"] == "DOGE"
 
-    # --- Exotic formats should return None ---
+    # --- 15-minute bracket format ---
 
-    def test_btc15m_returns_none(self):
-        assert parse_crypto_ticker("KXBTC15M-26FEB281800-00") is None
+    def test_btc15m_basic(self):
+        r = parse_crypto_ticker("KXBTC15M-26MAR042230-30")
+        assert r is not None
+        assert r["asset"] == "BTC"
+        assert r["date"] == "2026-03-04"
+        assert r["direction"] == "B"
+        assert r["threshold"] == 30.0
+        assert r["settlement_hour"] == 22
+        assert r["settlement_minute"] == 30
+        assert r["market_type"] == "15m"
+
+    def test_btc15m_early_morning(self):
+        r = parse_crypto_ticker("KXBTC15M-26MAR040100-97000")
+        assert r is not None
+        assert r["asset"] == "BTC"
+        assert r["date"] == "2026-03-04"
+        assert r["direction"] == "B"
+        assert r["threshold"] == 97000.0
+        assert r["settlement_hour"] == 1
+        assert r["settlement_minute"] == 0
+        assert r["market_type"] == "15m"
+
+    def test_eth15m_bracket(self):
+        r = parse_crypto_ticker("KXETH15M-26MAR042230-50")
+        assert r is not None
+        assert r["asset"] == "ETH"
+        assert r["date"] == "2026-03-04"
+        assert r["direction"] == "B"
+        assert r["threshold"] == 50.0
+        assert r["settlement_hour"] == 22
+        assert r["settlement_minute"] == 30
+        assert r["market_type"] == "15m"
+
+    def test_btc15m_midnight(self):
+        r = parse_crypto_ticker("KXBTC15M-26FEB281800-00")
+        assert r is not None
+        assert r["asset"] == "BTC"
+        assert r["date"] == "2026-02-28"
+        assert r["settlement_hour"] == 18
+        assert r["settlement_minute"] == 0
+        assert r["market_type"] == "15m"
+
+    # --- Monthly max/min format ---
+
+    def test_btcmaxmon_basic(self):
+        r = parse_crypto_ticker("KXBTCMAXMON-BTC-26MAR31-8750000")
+        assert r is not None
+        assert r["asset"] == "BTC"
+        assert r["date"] == "2026-03-31"
+        assert r["direction"] == "T"
+        assert r["threshold"] == 87500.0
+        assert r["market_type"] == "maxmon"
+
+    def test_btcminmon_basic(self):
+        r = parse_crypto_ticker("KXBTCMINMON-BTC-26MAR31-6500000")
+        assert r is not None
+        assert r["asset"] == "BTC"
+        assert r["date"] == "2026-03-31"
+        assert r["direction"] == "B"
+        assert r["threshold"] == 65000.0
+        assert r["market_type"] == "minmon"
+
+    def test_btcminmon_feb(self):
+        r = parse_crypto_ticker("KXBTCMINMON-BTC-26FEB28-275000")
+        assert r is not None
+        assert r["asset"] == "BTC"
+        assert r["date"] == "2026-02-28"
+        assert r["direction"] == "B"
+        assert r["threshold"] == 2750.0
+        assert r["market_type"] == "minmon"
+
+    def test_ethmaxmon(self):
+        r = parse_crypto_ticker("KXETHMAXMON-ETH-26MAR31-500000")
+        assert r is not None
+        assert r["asset"] == "ETH"
+        assert r["direction"] == "T"
+        assert r["threshold"] == 5000.0
+        assert r["market_type"] == "maxmon"
+
+    # --- Exotic formats that are truly invalid should still return None ---
 
     def test_btcmax100_returns_none(self):
         assert parse_crypto_ticker("KXBTCMAX100-26-SEP") is None
 
-    def test_btcminmon_returns_none(self):
-        assert parse_crypto_ticker("KXBTCMINMON-BTC-26FEB28-275000") is None
+    def test_truly_unknown_format_returns_none(self):
+        assert parse_crypto_ticker("KXBTCFOO-26MAR04-BAR") is None
