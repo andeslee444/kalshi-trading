@@ -24,7 +24,7 @@ See: .planning/PROJECT.md (updated 2026-03-04)
 
 Phase: ALL COMPLETE
 Status: All GSD phases (1-6), consolidated quant desk tracks (T1-P1 through T2-P3), and Phase 7 (Microstructure & Attribution) are complete and merged to main.
-Last activity: 2026-03-05 - Completed quick task 2: Fix weather bot bugs: tighten sigma, relax liquidity, add edge guard
+Last activity: 2026-03-05 - Completed quick task 5: Strategy bot bug fixes (reasoning, dead code, limit price)
 
 Progress: [████████████████████] 100%
 
@@ -92,8 +92,9 @@ None active. All tracks merged.
 |---|-------------|------|--------|-----------|
 | 1 | Fix crypto bot opportunity access: bracket liquidity, ticker parsing, price fallback, drift cap | 2026-03-05 | 492372f | [1-fix-crypto-bot-opportunity-access-bracke](./quick/1-fix-crypto-bot-opportunity-access-bracke/) |
 | 2 | Fix weather bot bugs: tighten sigma, relax liquidity, add edge guard | 2026-03-05 | c2033dd | [2-fix-weather-bot-bugs-calibration-ticker-](./quick/2-fix-weather-bot-bugs-calibration-ticker-/) |
+| 3 | World-class weather bot: skew-normal, hour-aware sigma, adaptive ensemble, forecast verifier | 2026-03-05 | b11330a | [3-world-class-weather-bot-advanced-probabi](./quick/3-world-class-weather-bot-advanced-probabi/) |
 
 ## Session Continuity
 
 Last session: 2026-03-05
-Status: All work complete. Quick task 2 (weather bot bugs) finished.
+Status: All work complete. Quick task 3 (advanced weather probability model) finished.
