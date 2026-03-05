@@ -7,8 +7,12 @@ import json, time, datetime, os, sys, math, argparse, traceback
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log, _atomic_write_json, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary
-from probability import quarter_kelly_sell, longshot_edge, compute_limit_price, kalshi_fee_cents, classify_ticker_category
+from probability import quarter_kelly_sell, quarter_kelly, longshot_edge, compute_limit_price, kalshi_fee_cents, classify_ticker_category
 from capital_allocator import PortfolioAllocator
+from strategy_engine import (
+    BayesianEdgeEstimator, CorrelationAwareSizer,
+    bayesian_kelly_multiplier, longshot_edge_sell, longshot_edge_buy, EdgeEstimate,
+)
 
 setup_unbuffered()
 log = setup_logging("strategy")
@@ -28,6 +32,26 @@ order_monitor = OrderMonitor(client, log=log)
 
 SCAN_INTERVAL = _bots_cfg.get("scanIntervalMinutes", 15)
 
+# Bayesian edge estimator (online learning from settlements)
+BAYES_PARAMS_PATH = PROJECT_DIR / "config" / "bayes-params.json"
+edge_estimator = BayesianEdgeEstimator(params_path=BAYES_PARAMS_PATH)
+
+# Correlation-aware sizer (copula-based Kelly + category caps)
+_daily_budget = _bots_cfg.get("maxDailyLoss", 100) * 100  # convert to cents
+_category_cap = _bots_cfg.get("categoryCap", 0.30)
+_single_trade_cap = _bots_cfg.get("singleTradeCap", 0.05)
+correlation_sizer = CorrelationAwareSizer(
+    daily_budget_cents=_daily_budget,
+    category_cap_pct=_category_cap,
+    single_trade_cap_pct=_single_trade_cap,
+)
+
+# Config flags for new features
+_bayesian_edge_enabled = _bots_cfg.get("bayesianEdge", True)
+_buy_longshots_enabled = _bots_cfg.get("enableBuyLongshots", True)
+_sell_max_price = _bots_cfg.get("sellMaxPrice", 30)
+_buy_min_price = _bots_cfg.get("buyMinPrice", 70)
+
 SPORTS_PREFIXES = ["KXNBA", "KXNFL", "KXNHL", "KXMLB", "KXUFC", "KXNCAA", "KXSPORT", "KXSOCCER", "KXMARMAD"]
 
 TRADES_JSON_PATH = DATA_DIR / "kalshi-strategy-trades.json"
@@ -41,20 +65,24 @@ trade_manager = TradeManager(client, TRADES_JSON_PATH, {
 trim_trade_log(TRADES_JSON_PATH)
 
 def find_longshot_sells(markets, bankroll):
-    """Find contracts priced <15c YES to SELL (exploit longshot bias).
+    """Find contracts priced <=30c YES to SELL (exploit longshot bias).
 
-    Uses category-adjusted Becker model via longshot_edge() which returns
-    a proper additive probability edge (implied_prob - true_prob).
+    Uses Bayesian edge model (when enabled) or category-adjusted Becker model
+    via longshot_edge(). Expanded range from 15c to sellMaxPrice (default 30c).
+    Applies copula-based correlation scaling and confidence-scaled Kelly.
     """
     now = datetime.datetime.now(datetime.timezone.utc)
     candidates = []
+    # Count concurrent same-category candidates for copula sizing
+    category_counts = {}
+
     for m in markets:
         yes_bid = m.get("yes_bid", 0)
         yes_ask = m.get("yes_ask", 0)
         volume = m.get("volume", 0)
         ticker = m.get("ticker", "")
 
-        if yes_ask <= 0 or yes_ask > 15:
+        if yes_ask <= 0 or yes_ask > _sell_max_price:
             trade_manager.log_decision(ticker, "no", "skipped", "price_out_of_range",
                                        yes_ask=yes_ask)
             continue
@@ -71,13 +99,14 @@ def find_longshot_sells(markets, bankroll):
                                        hours_to_close=round(hours, 2))
             continue
 
-        # Category-adjusted Becker model: returns additive edge
-        # (implied_prob - true_prob), correctly accounting for category-specific
-        # bias strength and time decay
-        est_edge_prelim = longshot_edge(yes_ask, ticker=ticker, hours_to_close=hours)
+        # Edge estimation: Bayesian posterior or fallback to point estimate
+        if _bayesian_edge_enabled:
+            est_edge_prelim = longshot_edge_sell(yes_ask, ticker=ticker,
+                                                 hours_to_close=hours, estimator=edge_estimator)
+        else:
+            est_edge_prelim = longshot_edge(yes_ask, ticker=ticker, hours_to_close=hours)
 
-        # Minimum edge filter — quarter_kelly_sell already deducts fees from
-        # win_amount, so no need to subtract fees here (avoids double-counting)
+        # Minimum edge filter
         fee_per_contract = kalshi_fee_cents(yes_ask)
         min_edge = 0.005  # 0.5% minimum edge (fees handled in Kelly sizing)
         if est_edge_prelim < min_edge:
@@ -88,8 +117,14 @@ def find_longshot_sells(markets, bankroll):
 
         # Place limit within the spread instead of at full ask
         sell_price = compute_limit_price(yes_bid, yes_ask, "yes", edge=est_edge_prelim) if yes_bid else yes_ask
+
         # Recompute edge at the actual entry price (limit may differ from ask)
-        est_edge = longshot_edge(sell_price, ticker=ticker, hours_to_close=hours)
+        if _bayesian_edge_enabled:
+            est_edge = longshot_edge_sell(sell_price, ticker=ticker,
+                                          hours_to_close=hours, estimator=edge_estimator)
+        else:
+            est_edge = longshot_edge(sell_price, ticker=ticker, hours_to_close=hours)
+
         if est_edge < min_edge:
             trade_manager.log_decision(ticker, "no", "skipped", "low_edge_limit",
                                        edge=round(est_edge, 4), min_edge=min_edge,
@@ -102,12 +137,30 @@ def find_longshot_sells(markets, bankroll):
                                        sell_price=sell_price, yes_bid=yes_bid, yes_ask=yes_ask)
             continue
 
-        # Rec 5: Only sell longshots when NO ≤ 96c (profit/risk ratio floor)
-        # At NO=99c, profit:risk = 1:99. At NO=96c, ratio = 4:96 ≈ 4.2%
+        # Rec 5: Only sell longshots when NO <= 96c (profit/risk ratio floor)
         no_price = 100 - sell_price
         if no_price > 96:
             trade_manager.log_decision(ticker, "no", "skipped", "profit_risk_ratio",
                                        no_price=no_price, sell_price=sell_price)
+            continue
+
+        # Bayesian edge estimate for confidence-scaled sizing
+        category = classify_ticker_category(ticker)
+        edge_est = None
+        kelly_mult = 1.0
+        copula_scale = 1.0
+        if _bayesian_edge_enabled:
+            edge_est = edge_estimator.estimate_edge(sell_price, category, hours)
+            kelly_mult = bayesian_kelly_multiplier(edge_est.confidence_ratio)
+            n_same = category_counts.get(category, 0) + 1
+            copula_scale = correlation_sizer.kelly_scale(
+                n_same, correlation_sizer.get_intra_category_rho(category)
+            )
+
+        # Check category cap before sizing
+        if not correlation_sizer.check_category_cap(category, no_price * 1):
+            trade_manager.log_decision(ticker, "no", "skipped", "category_cap_exceeded",
+                                       category=category)
             continue
 
         # Request budget from portfolio allocator
@@ -123,13 +176,28 @@ def find_longshot_sells(markets, bankroll):
             bankroll_cents=budget.bankroll_cents, fee_cents=fee_per_contract,
             return_details=True,
         )
+
+        # Apply Bayesian Kelly multiplier and copula scale
+        if contracts > 0 and _bayesian_edge_enabled:
+            adjusted = max(1, int(contracts * kelly_mult * copula_scale))
+            contracts = adjusted
+            risk_per = 100 - int(sell_price)
+            risk = contracts * risk_per if risk_per > 0 else 0
+
         if contracts <= 0:
             trade_manager.log_decision(ticker, "no", "skipped", "kelly_zero",
                                        edge=est_edge, price_cents=sell_price)
             continue
 
+        # Track for copula
+        category_counts[category] = category_counts.get(category, 0) + 1
+
         implied_prob = sell_price / 100.0
         true_prob = implied_prob - est_edge
+
+        mu_edge = edge_est.mu_edge if edge_est else est_edge
+        sigma_edge = edge_est.sigma_edge if edge_est else 0.0
+        conf_ratio = edge_est.confidence_ratio if edge_est else 0.0
 
         candidates.append({
             "ticker": ticker,
@@ -150,14 +218,142 @@ def find_longshot_sells(markets, bankroll):
             "close_time": m.get("close_time"),
             "kelly_fraction": kelly_details.get("kelly_fraction"),
             "bankroll_used": kelly_details.get("bankroll_used"),
-            "reasoning": f"Longshot bias: YES@{sell_price}c implies {implied_prob*100:.1f}% prob, Becker model est true prob ~{true_prob*100:.2f}%. Sell YES (buy NO@{100-sell_price}c) for ~{est_edge*100:.2f}% edge."
+            "mu_edge": mu_edge,
+            "sigma_edge": sigma_edge,
+            "confidence_ratio": conf_ratio,
+            "kelly_multiplier": kelly_mult,
+            "copula_scale": copula_scale,
+            "reasoning": f"Longshot bias: YES@{sell_price}c implies {implied_prob*100:.1f}% prob, Becker model est true prob ~{true_prob*100:.2f}%. Sell YES (buy NO@{100-sell_price}c) for ~{est_edge*100:.2f}% edge. Bayesian CR={conf_ratio:.2f}, kelly_mult={kelly_mult:.2f}, copula={copula_scale:.2f}."
         })
 
     candidates.sort(key=lambda x: -x["est_edge"] * math.log1p(max(x.get("volume", 0), 1)))
     return candidates
 
+def find_longshot_buys(markets, bankroll):
+    """Find YES 70-99c contracts to BUY (exploit NO-side longshot bias).
+
+    When YES is priced 70-99c, the NO side (1-30c) is the overpriced longshot.
+    Buy YES to profit from NO-side longshot bias.
+    """
+    if not _buy_longshots_enabled:
+        return []
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    candidates = []
+    category_counts = {}
+
+    for m in markets:
+        yes_bid = m.get("yes_bid", 0)
+        yes_ask = m.get("yes_ask", 0)
+        volume = m.get("volume", 0)
+        ticker = m.get("ticker", "")
+
+        if yes_bid < _buy_min_price or yes_bid > 99:
+            continue
+
+        close_str = m.get("close_time", "")
+        try:
+            close_time = datetime.datetime.fromisoformat(close_str.replace("Z", "+00:00"))
+            hours = (close_time - now).total_seconds() / 3600
+        except (ValueError, TypeError):
+            hours = 999
+
+        if hours < 0.5:
+            continue
+
+        # Edge estimation: NO-side longshot bias
+        if _bayesian_edge_enabled:
+            est_edge = longshot_edge_buy(yes_bid, ticker=ticker,
+                                          hours_to_close=hours, estimator=edge_estimator)
+        else:
+            est_edge = longshot_edge_buy(yes_bid, ticker=ticker, hours_to_close=hours)
+
+        min_edge = 0.005
+        if est_edge < min_edge:
+            trade_manager.log_decision(ticker, "yes", "skipped", "low_buy_edge",
+                                       edge=round(est_edge, 4), yes_bid=yes_bid)
+            continue
+
+        # Limit price within spread
+        buy_price = compute_limit_price(yes_bid, yes_ask, "yes", edge=est_edge) if yes_ask else yes_bid
+        if buy_price <= 0 or buy_price >= 100:
+            continue
+
+        # Bayesian confidence scaling
+        category = classify_ticker_category(ticker)
+        edge_est = None
+        kelly_mult = 1.0
+        copula_scale = 1.0
+        if _bayesian_edge_enabled:
+            no_price = 100 - yes_bid
+            edge_est = edge_estimator.estimate_edge(no_price, category, hours)
+            kelly_mult = bayesian_kelly_multiplier(edge_est.confidence_ratio)
+            n_same = category_counts.get(category, 0) + 1
+            copula_scale = correlation_sizer.kelly_scale(
+                n_same, correlation_sizer.get_intra_category_rho(category)
+            )
+
+        # Category cap check
+        if not correlation_sizer.check_category_cap(category, buy_price):
+            continue
+
+        # Budget from allocator
+        budget = allocator.request_budget("strategy", ticker, edge=est_edge)
+        if not budget.approved:
+            continue
+
+        fee_per_contract = kalshi_fee_cents(buy_price)
+        contracts, risk, kelly_details = quarter_kelly(
+            est_edge, buy_price, budget.max_cost_cents,
+            bankroll_cents=budget.bankroll_cents, fee_cents=fee_per_contract,
+            return_details=True,
+        )
+
+        # Apply Bayesian + copula scaling
+        if contracts > 0 and _bayesian_edge_enabled:
+            adjusted = max(1, int(contracts * kelly_mult * copula_scale))
+            contracts = adjusted
+            risk = contracts * buy_price
+
+        if contracts <= 0:
+            continue
+
+        category_counts[category] = category_counts.get(category, 0) + 1
+
+        no_equiv = 100 - yes_bid
+        mu_edge = edge_est.mu_edge if edge_est else est_edge
+        conf_ratio = edge_est.confidence_ratio if edge_est else 0.0
+
+        candidates.append({
+            "ticker": ticker,
+            "title": m.get("title", "")[:80],
+            "subtitle": m.get("subtitle", "")[:60],
+            "strategy": "longshot_buy",
+            "side": "yes",
+            "action": "buy",
+            "price": buy_price,
+            "yes_price": buy_price,
+            "contracts": contracts,
+            "est_edge": est_edge,
+            "risk_cents": risk,
+            "hours_to_close": hours,
+            "volume": volume,
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "close_time": m.get("close_time"),
+            "kelly_fraction": kelly_details.get("kelly_fraction"),
+            "bankroll_used": kelly_details.get("bankroll_used"),
+            "kelly_multiplier": kelly_mult,
+            "copula_scale": copula_scale,
+            "reasoning": f"Buy-side longshot: YES@{buy_price}c, NO equiv {no_equiv}c longshot. Becker model edge ~{est_edge*100:.2f}%. CR={conf_ratio:.2f}, kelly_mult={kelly_mult:.2f}."
+        })
+
+    candidates.sort(key=lambda x: -x["est_edge"] * math.log1p(max(x.get("volume", 0), 1)))
+    return candidates
+
+
 def check_settled_trades():
-    """Check if any previous trades have settled."""
+    """Check if any previous trades have settled and update Bayesian model."""
     settled = []
     try:
         positions = client.get("/portfolio/positions")
@@ -167,7 +363,24 @@ def check_settled_trades():
 
         try:
             settlements = client.get("/portfolio/settlements")
-            return settlements.get("settlements", [])
+            settled_list = settlements.get("settlements", [])
+            # Update Bayesian edge model with settlement outcomes
+            if settled_list and _bayesian_edge_enabled:
+                for s in settled_list:
+                    ticker = s.get("ticker", "")
+                    if not ticker:
+                        continue
+                    category = classify_ticker_category(ticker)
+                    # Determine if seller won (YES expired worthless)
+                    won = s.get("settlement_result") == "won" or s.get("revenue", 0) > 0
+                    # Estimate price from trade data (fallback to 5c)
+                    price_cents = s.get("yes_price_at_entry", 5)
+                    edge_estimator.update_posterior(category, price_cents, won)
+                try:
+                    edge_estimator.save_params(BAYES_PARAMS_PATH)
+                except Exception as e:
+                    log.warning(f"Failed to save Bayes params: {e}")
+            return settled_list
         except Exception:
             pass
     except Exception as e:
@@ -181,6 +394,9 @@ def run_scan():
     log.info("KALSHI STRATEGY TRADER")
     log.info(f"   {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log.info("=" * 70)
+
+    # Reset daily correlation sizer caps
+    correlation_sizer.reset_daily()
 
     # Balance
     balance, avail = client.get_balance()
@@ -273,6 +489,7 @@ def run_scan():
         )
         if result:
             allocator.record_trade("strategy", ticker, c["risk_cents"], edge=c.get("est_edge", 0))
+            correlation_sizer.record_trade(classify_ticker_category(ticker), c["risk_cents"])
             trades_executed.append({
                 "ticker": ticker,
                 "title": c["title"],
@@ -296,6 +513,75 @@ def run_scan():
                 "status": "BLOCKED/FAILED",
             })
 
+    # Strategy 2: Buy-side longshot exploitation
+    log.info("\n" + "=" * 70)
+    log.info("STRATEGY 2: Buy-Side Longshot Exploitation (Buy YES on high-prob events)")
+    log.info("=" * 70)
+    buy_longshots = find_longshot_buys(markets, avail)
+    log.info(f"  Found {len(buy_longshots)} buy-side longshot candidates")
+
+    for i, c in enumerate(buy_longshots[:5]):
+        log.info(f"\n  {i+1}. {c['ticker']}")
+        log.info(f"     {c['title']}")
+        log.info(f"     YES@{c['yes_price']}c | Edge: {c['est_edge']*100:.1f}% | Contracts: {c['contracts']} | Risk: ${c['risk_cents']/100:.2f}")
+
+    # Place buy-side trades (top 5)
+    if buy_longshots:
+        log.info("\n" + "=" * 70)
+        log.info("PLACING TRADES (Top 5 Buy-Side Longshots)")
+        log.info("=" * 70)
+
+    for c in buy_longshots[:5]:
+        ticker = c["ticker"]
+        buy_price = c["yes_price"]
+        contracts = c["contracts"]
+
+        log.info(f"\n  BUY {contracts}x YES @ {buy_price}c on {ticker}")
+        log.info(f"     ({c['reasoning']})")
+
+        result = trade_manager.place_order(
+            ticker, "yes", buy_price, contracts, c["reasoning"],
+            strategy="longshot_buy", est_edge=f"{c['est_edge']*100:.2f}%",
+            risk_cents=c["risk_cents"], title=c["title"],
+            subtitle=c.get("subtitle", ""),
+            yes_price_at_entry=c["yes_price"],
+            market_snapshot=build_market_snapshot(yes_bid=c.get("yes_bid", 0), yes_ask=c.get("yes_ask", 0)),
+            model_prob=round(1.0 - (100 - c["yes_price"]) / 100.0 + c["est_edge"], 4),
+            raw_edge=round(c["est_edge"], 4),
+            fee_cents=round(kalshi_fee_cents(c["yes_price"]), 2),
+            sizing_method="quarter_kelly_buy",
+            market_close_time=c.get("close_time"),
+            kelly_fraction=c.get("kelly_fraction"),
+            bankroll_used=c.get("bankroll_used"),
+            hours_to_close=round(c.get("hours_to_close", 0), 2),
+            ticker_category=classify_ticker_category(ticker),
+        )
+        if result:
+            allocator.record_trade("strategy", ticker, c["risk_cents"], edge=c.get("est_edge", 0))
+            correlation_sizer.record_trade(classify_ticker_category(ticker), c["risk_cents"])
+            trades_executed.append({
+                "ticker": ticker,
+                "title": c["title"],
+                "subtitle": c.get("subtitle", ""),
+                "strategy": "longshot_buy",
+                "direction": f"BUY YES @ {buy_price}c",
+                "yes_price": buy_price,
+                "contracts": contracts,
+                "risk_cents": c["risk_cents"],
+                "est_edge": f"{c['est_edge']*100:.1f}%",
+                "reasoning": c["reasoning"],
+                "order_id": result.get("order_id", "?"),
+                "status": result.get("status", "?"),
+            })
+        else:
+            trades_executed.append({
+                "ticker": ticker,
+                "title": c["title"],
+                "strategy": "longshot_buy",
+                "direction": f"BUY YES @ {buy_price}c",
+                "status": "BLOCKED/FAILED",
+            })
+
     # Final balance
     balance, avail = client.get_balance()
     log.info(f"\nFinal Balance: ${balance/100:.2f} | Available: ${avail/100:.2f}")
@@ -310,7 +596,7 @@ def run_scan():
 
     new_section = f"\n\n## Trade Session: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
     new_section += f"**Balance**: ${balance/100:.2f} | **Available**: ${avail/100:.2f}\n\n"
-    new_section += f"**Markets Scanned**: {len(markets)} | **Longshot Candidates**: {len(longshots)}\n\n"
+    new_section += f"**Markets Scanned**: {len(markets)} | **Sell Candidates**: {len(longshots)} | **Buy Candidates**: {len(buy_longshots)}\n\n"
 
     if trades_executed:
         new_section += "### Trades Placed\n\n"

@@ -59,6 +59,13 @@
     "maxDailyLoss": 100,
     "maxDailyLossPct": 0.10,
     "scanIntervalMinutes": 15,
+    "enableBuyLongshots": true,
+    "sellMaxPrice": 30,
+    "buyMinPrice": 70,
+    "categoryCap": 0.30,
+    "singleTradeCap": 0.05,
+    "bayesianEdge": true,
+    "bayesKappa": 30,
     "exit": {
       "takeProfitCents": 80,
       "stopLossCents": 30,
