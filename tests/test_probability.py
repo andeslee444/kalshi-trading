@@ -700,3 +700,40 @@ class TestBinarySigma:
         sigma = temp_sigma * _norm_pdf(z) * 100
         # phi(0) = 0.399, so 3.0 * 0.399 * 100 ≈ 120
         assert 110 < sigma < 130
+
+
+# ===================================================================
+# fed_ci_width dynamic sigma tests
+# ===================================================================
+
+class TestFedCiWidth:
+
+    def setup_method(self):
+        _reset_calibration()
+
+    def teardown_method(self):
+        _reset_calibration()
+
+    def test_fed_ci_width_overrides_hardcoded(self):
+        """cpi_nowcast_sigma(30, fed_ci_width=0.50) uses 0.50/3.29 ~ 0.152."""
+        sigma = cpi_nowcast_sigma(30, fed_ci_width=0.50)
+        expected = 0.50 / 3.29
+        assert abs(sigma - expected) < 0.001
+
+    def test_fed_ci_width_none_uses_default(self):
+        """cpi_nowcast_sigma(30) without fed_ci_width returns same as before."""
+        sigma_default = cpi_nowcast_sigma(30)
+        sigma_none = cpi_nowcast_sigma(30, fed_ci_width=None)
+        assert sigma_default == sigma_none
+
+    def test_fed_ci_width_zero_uses_default(self):
+        """cpi_nowcast_sigma(30, fed_ci_width=0) uses default formula."""
+        sigma_default = cpi_nowcast_sigma(30)
+        sigma_zero = cpi_nowcast_sigma(30, fed_ci_width=0)
+        assert sigma_default == sigma_zero
+
+    def test_fed_ci_width_floor(self):
+        """cpi_nowcast_sigma(0, fed_ci_width=0.05) returns max(0.05/3.29, 0.03) = 0.03."""
+        sigma = cpi_nowcast_sigma(0, fed_ci_width=0.05)
+        # 0.05 / 3.29 ~ 0.0152, which is below the floor of 0.03
+        assert sigma == pytest.approx(0.03, abs=0.001)

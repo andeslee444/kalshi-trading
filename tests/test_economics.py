@@ -16,9 +16,10 @@ from unittest.mock import MagicMock, patch
 # ---------------------------------------------------------------------------
 
 def _load_economics_bot():
-    orig_auth = sys.modules.get("kalshi_auth")
-    orig_prob = sys.modules.get("probability")
-    orig_alloc = sys.modules.get("capital_allocator")
+    # Track all modules we stub so we can restore them
+    stubs = ["kalshi_auth", "probability", "capital_allocator",
+             "cpi_belief_filter", "scenario_engine", "macro_engine"]
+    originals = {name: sys.modules.get(name) for name in stubs}
 
     # Lightweight kalshi_auth stub
     fake_auth = types.ModuleType("kalshi_auth")
@@ -56,9 +57,11 @@ def _load_economics_bot():
     fake_prob.cpi_nowcast_sigma = lambda *a, **kw: 0.05
     fake_prob.gdp_nowcast_sigma = lambda *a, **kw: 0.10
     fake_prob.quarter_kelly = lambda *a, **kw: (0, 0)
+    fake_prob.uncertainty_kelly = lambda *a, **kw: (0, 0, {})
     fake_prob.compute_limit_price = lambda *a, **kw: 50
     fake_prob.kalshi_fee_cents = lambda *a, **kw: 1.0
     fake_prob.gas_price_probability = lambda *a, **kw: 0.5
+    fake_prob._norm_cdf = lambda x: 0.5 * (1 + __import__("math").erf(x / __import__("math").sqrt(2)))
     sys.modules["probability"] = fake_prob
 
     # Lightweight capital_allocator stub
@@ -66,24 +69,38 @@ def _load_economics_bot():
     fake_alloc.PortfolioAllocator = lambda *a, **kw: MagicMock()
     sys.modules["capital_allocator"] = fake_alloc
 
+    # Lightweight cpi_belief_filter stub
+    fake_belief = types.ModuleType("cpi_belief_filter")
+    fake_belief.CPIBeliefFilter = type("CPIBeliefFilter", (), {
+        "__init__": lambda self, *a, **kw: None,
+        "update": lambda self, *a, **kw: None,
+        "posterior": property(lambda self: (2.8, 0.10)),
+    })
+    sys.modules["cpi_belief_filter"] = fake_belief
+
+    # Lightweight scenario_engine stub
+    fake_scenario = types.ModuleType("scenario_engine")
+    fake_scenario.compute_scenario_weights = lambda *a, **kw: {}
+    fake_scenario.scenario_probability = lambda *a, **kw: MagicMock(
+        probability=0.5, agreement=0.8, per_scenario={}, weights_used={})
+    sys.modules["scenario_engine"] = fake_scenario
+
+    # macro_engine — set to None (mimics ImportError path)
+    fake_macro = types.ModuleType("macro_engine")
+    fake_macro.MacroEngine = None
+    sys.modules["macro_engine"] = fake_macro
+
     bot_path = Path(__file__).resolve().parent.parent / "src" / "kalshi" / "economics-bot.py"
     spec = importlib.util.spec_from_file_location("economics_bot", bot_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
     # Restore originals
-    if orig_auth is not None:
-        sys.modules["kalshi_auth"] = orig_auth
-    else:
-        sys.modules.pop("kalshi_auth", None)
-    if orig_prob is not None:
-        sys.modules["probability"] = orig_prob
-    else:
-        sys.modules.pop("probability", None)
-    if orig_alloc is not None:
-        sys.modules["capital_allocator"] = orig_alloc
-    else:
-        sys.modules.pop("capital_allocator", None)
+    for name in stubs:
+        if originals[name] is not None:
+            sys.modules[name] = originals[name]
+        else:
+            sys.modules.pop(name, None)
 
     return mod
 
@@ -294,3 +311,38 @@ class TestNowcastParsing:
         result, strategy = _econ._parse_nowcast_bs4("<html><body></body></html>")
         assert result == {}
         assert strategy is None
+
+
+# ===================================================================
+# Cross-measure dispersion tests
+# ===================================================================
+
+class TestCrossMeasureDispersion:
+
+    def test_cross_measure_dispersion_three_measures(self):
+        """With cpi=2.83, core_cpi=3.14, pce=2.51 -> dispersion ~0.26, CI ~0.42."""
+        nowcast = {"cpi_yoy": 2.83, "core_cpi_yoy": 3.14, "pce_yoy": 2.51}
+        result = _econ._compute_cross_measure_dispersion(nowcast)
+        assert result is not None
+        # std([2.83, 3.14, 2.51]) ~ 0.258
+        assert abs(result - 0.258 * 1.645) < 0.05  # CI width
+
+    def test_cross_measure_dispersion_two_measures(self):
+        """With cpi=2.8, core_cpi=3.1 -> dispersion = 0.15, CI ~0.25."""
+        nowcast = {"cpi_yoy": 2.8, "core_cpi_yoy": 3.1}
+        result = _econ._compute_cross_measure_dispersion(nowcast)
+        assert result is not None
+        # abs(2.8 - 3.1) / 2 = 0.15, CI = 0.15 * 1.645 ~ 0.247
+        assert abs(result - 0.15 * 1.645) < 0.02
+
+    def test_cross_measure_dispersion_one_measure(self):
+        """With only one measure, returns None."""
+        nowcast = {"cpi_yoy": 2.8}
+        result = _econ._compute_cross_measure_dispersion(nowcast)
+        assert result is None
+
+    def test_cross_measure_dispersion_stored_in_nowcast(self):
+        """After calling the function, nowcast dict has cross_measure_dispersion key."""
+        nowcast = {"cpi_yoy": 2.83, "core_cpi_yoy": 3.14, "pce_yoy": 2.51}
+        _econ._compute_cross_measure_dispersion(nowcast)
+        assert "cross_measure_dispersion" in nowcast
