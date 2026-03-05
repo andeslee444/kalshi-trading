@@ -26,6 +26,7 @@ from probability import (
     compute_limit_price, kalshi_fee_cents, gas_price_probability,
 )
 from capital_allocator import PortfolioAllocator
+from cpi_belief_filter import CPIBeliefFilter
 try:
     from macro_engine import MacroEngine
 except ImportError:
@@ -647,6 +648,20 @@ def scan_and_trade():
     if gas_price:
         ss.source_ok("aaa-gas")
 
+    # Fetch Bayesian filter data sources
+    truflation_cpi = None
+    tips_breakeven = None
+    if macro is not None:
+        try:
+            truflation_cpi = macro._truflation.fetch() if hasattr(macro, '_truflation') else None
+        except Exception as e:
+            log.warning(f"  Truflation fetch failed (non-fatal): {e}")
+        try:
+            fred_data = macro._fred.fetch_all() if hasattr(macro, '_fred') else {}
+            tips_breakeven = fred_data.get("tips_breakeven_10y")
+        except Exception as e:
+            log.warning(f"  FRED fetch failed (non-fatal): {e}")
+
     # Macro adjustment (if available)
     macro_signal = None
     if macro is not None:
@@ -668,6 +683,15 @@ def scan_and_trade():
             nowcast["cpi_yoy"] = adjusted_cpi
             log.info(f"  Macro-adjusted CPI nowcast: {adjusted_cpi:.3f}% "
                      f"(bias={macro_signal.cpi_bias:+.3f}%, conf={macro_signal.confidence:.2f})")
+
+    # Bayesian belief filter (replaces heuristic macro bias)
+    # Sources: Cleveland Fed (prior) + Truflation + TIPS breakeven
+    if truflation_cpi is not None:
+        log.info(f"  Truflation CPI: {truflation_cpi:.2f}%")
+        ss.source_ok("truflation")
+    if tips_breakeven is not None:
+        log.info(f"  TIPS 10Y breakeven: {tips_breakeven:.2f}%")
+        ss.source_ok("tips-breakeven")
 
     if not nowcast and not gas_price:
         log.info("No data sources available (nowcast + gas), skipping scan.")
@@ -756,11 +780,19 @@ def scan_and_trade():
         if macro is not None and macro_signal and macro_signal.confidence > 0.3:
             sigma *= macro.compute_sigma_multiplier(macro_signal.confidence)
 
-        # Compute probability
+        # Bayesian belief fusion
+        belief = CPIBeliefFilter(nowcast_value, sigma)
+        if truflation_cpi is not None:
+            belief.update(truflation_cpi, obs_sigma=0.15)
+        if tips_breakeven is not None:
+            belief.update(tips_breakeven, obs_sigma=0.25)
+        fused_nowcast, posterior_sigma = belief.posterior
+
+        # Compute probability using fused nowcast
         if direction_type == "T":
-            prob = econ_nowcast_probability(nowcast_value, sigma, threshold, "above")
+            prob = econ_nowcast_probability(fused_nowcast, posterior_sigma, threshold, "above")
         else:
-            prob = econ_nowcast_probability(nowcast_value, sigma, threshold, "below")
+            prob = econ_nowcast_probability(fused_nowcast, posterior_sigma, threshold, "below")
 
         yes_ask = m.get("yes_ask", 0)
         no_ask = m.get("no_ask", 0)
@@ -776,8 +808,10 @@ def scan_and_trade():
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "yes",
                     "prob": prob, "edge": edge, "threshold": threshold,
-                    "nowcast_value": nowcast_value, "sigma": sigma,
+                    "nowcast_value": fused_nowcast, "sigma": posterior_sigma,
                     "days_to_release": days_to_release,
+                    "raw_nowcast": nowcast_value,
+                    "posterior_sigma": posterior_sigma,
                 })
             else:
                 trade_manager.log_decision(
@@ -794,8 +828,10 @@ def scan_and_trade():
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "no",
                     "prob": no_prob, "edge": edge, "threshold": threshold,
-                    "nowcast_value": nowcast_value, "sigma": sigma,
+                    "nowcast_value": fused_nowcast, "sigma": posterior_sigma,
                     "days_to_release": days_to_release,
+                    "raw_nowcast": nowcast_value,
+                    "posterior_sigma": posterior_sigma,
                 })
             else:
                 trade_manager.log_decision(
@@ -956,7 +992,14 @@ def scan_and_trade():
                                             sigma_used=round(opp.get("sigma", 0), 4),
                                             nowcast_value=opp.get("nowcast_value"),
                                             days_to_release=opp.get("days_to_release"),
-                                            market_type=_classify_econ_market(ticker))
+                                            market_type=_classify_econ_market(ticker),
+                                            fused_nowcast=round(opp.get("nowcast_value", 0), 4) if opp.get("raw_nowcast") else None,
+                                            posterior_sigma=round(opp.get("posterior_sigma", 0), 4) if opp.get("posterior_sigma") else None,
+                                            sources_fused=sum([
+                                                1,  # Cleveland Fed (always)
+                                                1 if truflation_cpi is not None else 0,
+                                                1 if tips_breakeven is not None else 0,
+                                            ]))
         if result:
             ss.trades_placed += 1
             allocator.record_trade("economics", ticker, risk, edge=edge)
