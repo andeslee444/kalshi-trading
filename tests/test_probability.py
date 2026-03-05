@@ -377,34 +377,58 @@ class TestCpiNowcastSigma:
     def teardown_method(self):
         _reset_calibration()
 
-    def test_release_day_floor(self):
-        """At release day (days=0), sigma should be 0.03 (lowest uncertainty)."""
-        assert cpi_nowcast_sigma(0) == 0.03
+    def test_release_day(self):
+        """At d=0, sigma should be the floor (0.05%)."""
+        assert cpi_nowcast_sigma(0) == pytest.approx(0.05, abs=0.005)
 
-    def test_day_14_near_010(self):
-        """At 14 days out, sigma should be near 0.10."""
+    def test_one_week(self):
+        """At d=7, sigma should be moderate (~0.17%)."""
+        sigma = cpi_nowcast_sigma(7)
+        assert 0.13 <= sigma <= 0.20
+
+    def test_two_weeks(self):
+        """At d=14, sigma should be ~0.21%."""
         sigma = cpi_nowcast_sigma(14)
-        assert 0.08 <= sigma <= 0.11
+        assert 0.18 <= sigma <= 0.25
 
-    def test_monotonically_decreasing_to_release(self):
-        """Sigma should decrease (or stay flat) from 14d down to 0d (release)."""
-        sigmas = [cpi_nowcast_sigma(d) for d in [14, 10, 7, 3, 1, 0]]
-        for i in range(len(sigmas) - 1):
-            assert sigmas[i] >= sigmas[i + 1]
+    def test_one_month(self):
+        """At d=30, sigma should be ~0.27-0.33%."""
+        sigma = cpi_nowcast_sigma(30)
+        assert 0.24 <= sigma <= 0.33
 
-    def test_release_day_not_higher_than_day_before(self):
-        """Release day (0) has tighter or equal sigma to day-before."""
-        assert cpi_nowcast_sigma(0) <= cpi_nowcast_sigma(1)
+    def test_long_horizon(self):
+        """At d=107, sigma should approach ~0.40% (Cleveland Fed CI width)."""
+        sigma = cpi_nowcast_sigma(107)
+        assert 0.35 <= sigma <= 0.42
 
-    def test_negative_days_use_floor(self):
-        """Negative days_to_release should return the floor (0.03)."""
-        assert cpi_nowcast_sigma(-1) == 0.03
-        assert cpi_nowcast_sigma(-5) == 0.03
+    def test_very_long_horizon(self):
+        """At d=200, sigma should be near the asymptote (~0.40%)."""
+        sigma = cpi_nowcast_sigma(200)
+        assert 0.38 <= sigma <= 0.41
+
+    def test_monotonically_increasing(self):
+        """Sigma should increase with days_to_release."""
+        prev = cpi_nowcast_sigma(0)
+        for d in [1, 3, 7, 14, 30, 60, 107]:
+            sigma = cpi_nowcast_sigma(d)
+            assert sigma >= prev
+            prev = sigma
+
+    def test_negative_days_clamped(self):
+        """Negative days_to_release should clamp to 0."""
+        assert cpi_nowcast_sigma(-5) == cpi_nowcast_sigma(0)
+
+    def test_model_prob_not_one_at_long_horizon(self):
+        """With widened sigma, model_prob should NOT be 1.0 for 107-day contracts."""
+        sigma = cpi_nowcast_sigma(107)
+        prob = econ_nowcast_probability(2.41, sigma, 2.0, "above")
+        assert prob < 0.99, f"prob={prob} should be <0.99 with sigma={sigma}"
+        assert prob > 0.70, f"prob={prob} should be >0.70 (still likely)"
 
     def test_integration_with_econ_nowcast(self):
         """CPI sigma feeds into econ_nowcast_probability correctly."""
         sigma = cpi_nowcast_sigma(0)
-        # 5bp gap with 3bp sigma -> z=1.67 -> high confidence
+        # 5bp gap with 5bp sigma -> z=1.0 -> high confidence
         prob = econ_nowcast_probability(2.80, sigma, 2.85, "above")
         # nowcast (2.80) is below threshold (2.85), so P(above 2.85) < 0.5
         assert prob < 0.5
@@ -414,7 +438,7 @@ class TestCpiNowcastSigma:
         test_cases = [
             (2.80, 0.10, 2.85),
             (3.0, 0.06, 2.5),
-            (2.5, 0.03, 2.5),
+            (2.5, 0.05, 2.5),
             (1.0, 0.10, 1.5),
             (5.0, 0.20, 4.0),
         ]
@@ -564,12 +588,12 @@ class TestCpiSigmaSmooth:
         for d in range(0, 20):
             s1 = cpi_nowcast_sigma(d)
             s2 = cpi_nowcast_sigma(d + 1)
-            # Adjacent days should differ by at most ~0.01 (no step jumps)
-            assert abs(s2 - s1) < 0.015, f"Discontinuity at d={d}: {s1:.4f} -> {s2:.4f}"
+            # Adjacent days should differ by at most ~0.02 (wider sigma range, still smooth)
+            assert abs(s2 - s1) < 0.02, f"Discontinuity at d={d}: {s1:.4f} -> {s2:.4f}"
 
     def test_cpi_sigma_at_release(self):
-        """At release (d=0), sigma should be exactly 0.03 (floor)."""
-        assert cpi_nowcast_sigma(0) == 0.03
+        """At release (d=0), sigma should be approximately 0.05 (floor)."""
+        assert cpi_nowcast_sigma(0) == pytest.approx(0.05, abs=0.005)
 
 
 # ===================================================================
