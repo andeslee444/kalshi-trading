@@ -24,7 +24,7 @@ See: .planning/PROJECT.md (updated 2026-03-04)
 
 Phase: ALL COMPLETE
 Status: All GSD phases (1-6), consolidated quant desk tracks (T1-P1 through T2-P3), and Phase 7 (Microstructure & Attribution) are complete and merged to main.
-Last activity: 2026-03-04
+Last activity: 2026-03-05 - Completed quick task 1: Fix crypto bot opportunity access: bracket liquidity, ticker parsing, price fallback, drift cap
 
 Progress: [████████████████████] 100%
 
@@ -85,6 +85,12 @@ None.
 ### Blockers/Concerns
 
 None active. All tracks merged.
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 1 | Fix crypto bot opportunity access: bracket liquidity, ticker parsing, price fallback, drift cap | 2026-03-05 | 492372f | [1-fix-crypto-bot-opportunity-access-bracke](./quick/1-fix-crypto-bot-opportunity-access-bracke/) |
 
 ## Session Continuity
 
