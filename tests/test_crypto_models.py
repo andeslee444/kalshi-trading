@@ -140,25 +140,22 @@ class TestAR1Vol:
 class TestSmoothEdgeThreshold:
     """Smooth edge threshold function."""
 
-    def test_extreme_prob_uses_base_threshold(self):
+    def test_extreme_prob_near_base(self):
         from crypto_models import smooth_edge_threshold
-        # prob=0.05 (very confident) -> near base threshold
         threshold = smooth_edge_threshold(0.05, base=0.06)
-        assert 0.06 <= threshold < 0.07
+        assert 0.06 <= threshold < 0.065
 
-    def test_mid_prob_uses_higher_threshold(self):
+    def test_mid_prob_highest_threshold(self):
         from crypto_models import smooth_edge_threshold
-        # prob=0.50 (max uncertainty) -> highest threshold
         threshold = smooth_edge_threshold(0.50, base=0.06)
-        assert threshold > 0.07
+        # base + 0.09 * 0.25 = 0.0825
+        assert abs(threshold - 0.0825) < 0.001
 
     def test_smooth_no_discontinuity(self):
-        """No jump at the old 0.25/0.75 boundary."""
         from crypto_models import smooth_edge_threshold
         t_24 = smooth_edge_threshold(0.24, base=0.06)
         t_25 = smooth_edge_threshold(0.25, base=0.06)
         t_26 = smooth_edge_threshold(0.26, base=0.06)
-        # Should be smooth — no big jump between adjacent values
         assert abs(t_25 - t_24) < 0.005
         assert abs(t_26 - t_25) < 0.005
 
