@@ -115,13 +115,13 @@ npm run backfill            # Backfill settlement data from market endpoints
 ## Testing
 
 ```bash
-pytest tests/                      # Run all tests (22 test files)
+pytest tests/                      # Run all tests (41 test files, ~1259 tests)
 pytest tests/ -v                   # Verbose output
 pytest tests/test_kelly.py         # Run specific test file
 pytest tests/test_kelly.py -k "test_returns_zero"  # Run matching tests
 ```
 
-Tests cover pure functions — no API calls or credentials required. Test files: `test_allocator`, `test_arb`, `test_audit`, `test_backtest`, `test_calibration`, `test_crypto`, `test_economics`, `test_entertainment`, `test_golden_record`, `test_health_monitor`, `test_hdd_parser`, `test_kelly`, `test_model_shift`, `test_optimization`, `test_performance`, `test_probability`, `test_supervisor`, `test_ticker_utils`, `test_trade_manager`, `test_trades`, `test_weather`, `test_webhook`.
+Tests cover pure functions — no API calls or credentials required.
 
 **Test import patterns**:
 - `conftest.py` adds `src/kalshi/` to `sys.path`, so shared modules import directly: `from probability import half_kelly`
@@ -259,6 +259,44 @@ Bots enforce: max trade amount ($5-10), max daily trades (10-20), max daily loss
 - **Crypto GBM** (crypto-bot): Log-normal model using spot price, IV/realized vol, and time to settlement. Quarter-Kelly sizing.
 - **Cross-platform arb** (cross-platform-arb): Monitors Kalshi vs Polymarket price discrepancies. Phase 1 = monitoring only.
 - **Market making** (market-maker): Avellaneda-Stoikov reservation price with gamma increasing near settlement. Disabled by default.
+
+## Bot Development Scope Rules
+
+When working on a specific bot, ONLY modify files owned by that bot. Do NOT touch shared modules or other bots' files.
+
+### File Ownership
+
+| Bot Task | Can Modify | CANNOT Modify |
+|----------|-----------|---------------|
+| weather-bot | `weather-bot.py`, `weather_data.py`, `forecast_verifier.py`, `test_weather*.py`, `test_advanced_weather.py`, `test_empirical_ensemble.py`, `kalshi-config.json` | probability.py, kalshi_auth.py, other bots |
+| crypto-bot | `crypto-bot.py`, `crypto_models.py`, `vol_forecaster.py`, `regime_detector.py`, `particle_filter.py`, `test_crypto*.py`, `test_heston.py`, `test_vol_forecaster.py` | probability.py, kalshi_auth.py, other bots |
+| economics-bot | `economics-bot.py`, `scenario_engine.py`, `cpi_belief_filter.py`, `macro_engine.py`, `test_economics.py`, `test_econ*.py`, `test_scenario*.py` | probability.py, kalshi_auth.py, other bots |
+| strategy-trader | `strategy-trader.py`, `strategy_engine.py`, `test_strategy*.py` | probability.py, kalshi_auth.py, other bots |
+| entertainment-bot | `entertainment-bot.py`, `test_entertainment*.py` | probability.py, kalshi_auth.py, other bots |
+| source-monitor | `source-monitor.py`, `hdd_parser.py`, `test_source*.py` | probability.py, kalshi_auth.py, other bots |
+
+### Shared Modules (require dedicated session)
+
+These files are shared across bots. Changes require a dedicated "shared infrastructure" session, NOT a bot-specific session:
+
+- `probability.py` — All probability models and Kelly sizing
+- `kalshi_auth.py` — Auth, TradeManager, safety infrastructure
+- `capital_allocator.py` — Cross-bot capital allocation
+- `ticker_utils.py` — Ticker parsing (used by multiple bots + dashboard)
+- `config/bots-config.json` — Only modify YOUR bot's section
+
+### If you need a shared module change
+
+1. Do NOT modify the shared file
+2. Document the needed change in your plan/summary
+3. Flag it: "SHARED MODULE CHANGE NEEDED: [file] — [what and why]"
+4. It will be handled in a separate session that can run all affected tests
+
+### Test discipline
+
+- Run ONLY your bot's tests, not the full suite
+- If your bot's tests import from shared modules and fail, that's a signal to stop — don't "fix" the shared module
+- Never update tests for other bots to match changes you made
 
 ## Research
 
