@@ -1201,8 +1201,8 @@ def crypto_price_probability_heston(
 ):
     """Heston stochastic volatility model for crypto binary options.
 
-    Uses the semi-closed-form characteristic function approach with numerical
-    integration (scipy.integrate.quad) to compute P(S_T > K).
+    Uses Formulation 2 (Albrecher et al. 2007) of the characteristic function
+    for numerical stability. Computes P(S_T > K) via Fourier inversion.
 
     Parameters:
         current_price: Current spot price
@@ -1226,55 +1226,63 @@ def crypto_price_probability_heston(
             return 0.999 if current_price > threshold else 0.001
         return 0.999 if current_price < threshold else 0.001
 
+    if 2 * kappa * theta < xi ** 2:
+        _log.debug("Heston Feller condition violated: 2*kappa*theta=%.3f < xi^2=%.3f",
+                   2 * kappa * theta, xi ** 2)
+
     S = current_price
     K = threshold
     mu = drift_pct
     x = math.log(S / K)
 
-    def heston_cf(phi, j):
-        """Heston characteristic function for P1 (j=1) and P2 (j=2)."""
-        if j == 1:
-            u = 0.5
-            b = kappa - rho * xi
-        else:
-            u = -0.5
-            b = kappa
+    def heston_cf_p2(phi):
+        """Heston CF for P2 (risk-neutral prob), Formulation 2 (stable)."""
+        u = -0.5
+        b = kappa
 
-        d = np.sqrt((rho * xi * 1j * phi - b) ** 2 - xi ** 2 * (2 * u * 1j * phi - phi ** 2))
-        g = (b - rho * xi * 1j * phi + d) / (b - rho * xi * 1j * phi - d)
+        a_val = rho * xi * 1j * phi - b
+        d = np.sqrt(a_val ** 2 - xi ** 2 * (2 * u * 1j * phi - phi ** 2))
 
-        if abs(g) > 1e10:
-            C = 0.0
-            D = 0.0
+        # Enforce Re(d) >= 0 to select correct branch
+        if np.real(d) < 0:
+            d = -d
+
+        # Formulation 2: |g| <= 1 always when Re(d) >= 0
+        denom = -a_val + d
+        if abs(denom) < 1e-15:
+            g = 0.0
         else:
-            exp_dT = np.exp(d * T)
-            C = mu * 1j * phi * T + (kappa * theta / xi ** 2) * (
-                (b - rho * xi * 1j * phi + d) * T - 2 * np.log((1 - g * exp_dT) / (1 - g))
-            )
-            D = ((b - rho * xi * 1j * phi + d) / xi ** 2) * (1 - exp_dT) / (1 - g * exp_dT)
+            g = (-a_val - d) / denom
+
+        exp_neg_dT = np.exp(-d * T)
+
+        C = mu * 1j * phi * T + (kappa * theta / xi ** 2) * (
+            (-a_val - d) * T - 2 * np.log((1 - g * exp_neg_dT) / (1 - g + 1e-30))
+        )
+        D = ((-a_val - d) / xi ** 2) * (1 - exp_neg_dT) / (1 - g * exp_neg_dT + 1e-30)
 
         return np.exp(C + D * v0 + 1j * phi * x)
 
-    def integrand_p(phi, j):
-        """Integrand for P_j = 0.5 + (1/pi) * integral."""
-        cf = heston_cf(phi, j)
-        return np.real(np.exp(-1j * phi * 0) * cf / (1j * phi))
+    def integrand_p2(phi):
+        """Integrand for P2 = 0.5 + (1/pi) * integral."""
+        cf = heston_cf_p2(phi)
+        return np.real(cf / (1j * phi))
 
-    # Numerical integration with error handling
+    # Adaptive upper limit: higher for low vol or short horizons
+    upper = max(200, min(1000, 50 / math.sqrt(v0 * T + 1e-10)))
+
     try:
-        int1, _ = integrate.quad(lambda phi: integrand_p(phi, 1), 1e-8, 200, limit=100)
-        int2, _ = integrate.quad(lambda phi: integrand_p(phi, 2), 1e-8, 200, limit=100)
-        P1 = 0.5 + int1 / math.pi
+        int2, _ = integrate.quad(integrand_p2, 1e-8, upper, limit=150)
         P2 = 0.5 + int2 / math.pi
     except Exception:
-        # Fallback to GBM if Heston integration fails
-        vol = math.sqrt(v0)
+        _log.warning("Heston integration failed (v0=%.3f, xi=%.3f, rho=%.3f), falling back to GBM",
+                     v0, xi, rho)
+        vol = math.sqrt(max(v0, 1e-10))
         return crypto_price_probability(
             current_price, threshold, direction,
             time_horizon_minutes, realized_vol_pct=vol, drift_pct=drift_pct,
         )
 
-    # For binary: P(S_T > K) = P2 (risk-neutral probability)
     prob_above = max(0.001, min(0.999, P2))
 
     if direction == "above":

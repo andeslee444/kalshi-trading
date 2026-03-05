@@ -31,7 +31,7 @@ from crypto_models import EnsembleModel, REGIME_BMA_WEIGHTS, REGIME_JUMP_INTENSI
 CALIBRATION_PATH = PROJECT_DIR / "config" / "crypto-calibration.json"
 ASSETS = ["BTC", "ETH"]
 HORIZONS_MINUTES = [15, 60, 360, 1440]
-THRESHOLD_OFFSETS = [0.97, 0.99, 1.01, 1.03]  # relative to current price
+THRESHOLD_OFFSETS = [0.90, 0.95, 0.97, 0.99, 1.01, 1.03, 1.05, 1.10]
 
 
 def fetch_coinbase_candles(asset, days=90, granularity=300):
@@ -132,13 +132,14 @@ def generate_synthetic_markets(candles, horizons=HORIZONS_MINUTES, offsets=THRES
     return markets
 
 
-def evaluate_model(model_fn, markets, candles):
+def evaluate_model(model_fn, markets, candles, split_idx=None):
     """Evaluate a model on synthetic markets and return Brier score.
 
     Args:
         model_fn: callable(current_price, threshold, direction, horizon_min, vol) -> prob
         markets: list of synthetic market dicts
         candles: for computing rolling vol
+        split_idx: if provided, only evaluate markets with candle_idx >= split_idx
 
     Returns:
         dict with brier_score, per_horizon_brier, n_markets
@@ -148,8 +149,9 @@ def evaluate_model(model_fn, markets, candles):
     n = 0
 
     for m in markets:
-        # Compute vol from candles up to this point
         idx = m["candle_idx"]
+        if split_idx is not None and idx < split_idx:
+            continue
         window = min(idx, m["rv_window"])
         if window < 5:
             continue
@@ -198,13 +200,19 @@ def calibrate(days=90, assets=None, dry_run=False):
         markets = generate_synthetic_markets(candles)
         print(f"  Generated {len(markets)} synthetic markets")
 
-        # 3. Evaluate each model
+        # Train/test split: first 70% for optimization, last 30% for validation
+        max_idx = max(m["candle_idx"] for m in markets) if markets else 0
+        split_idx = int(max_idx * 0.7)
+        train_markets = [m for m in markets if m["candle_idx"] < split_idx]
+        print(f"  Train/test split at candle index {split_idx} (train={len(train_markets)}, test={len(markets)-len(train_markets)})")
+
+        # 3. Evaluate each model (train set for optimization)
         print(f"  Evaluating models...")
 
         # GBM
         def gbm_fn(p, k, d, t, v):
             return crypto_price_probability(p, k, d, t, realized_vol_pct=v)
-        gbm_result = evaluate_model(gbm_fn, markets, candles)
+        gbm_result = evaluate_model(gbm_fn, train_markets, candles)
         print(f"    GBM Brier:     {gbm_result['brier_score']:.4f} ({gbm_result['n_markets']} markets)")
 
         # JD (with various lambda)
@@ -213,22 +221,33 @@ def calibrate(days=90, assets=None, dry_run=False):
         for lam in [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]:
             def jd_fn(p, k, d, t, v, _lam=lam):
                 return crypto_price_probability_jd(p, k, d, t, realized_vol_pct=v, jump_intensity=_lam)
-            jd_result = evaluate_model(jd_fn, markets, candles)
+            jd_result = evaluate_model(jd_fn, train_markets, candles)
             if jd_result["brier_score"] < best_jd_brier:
                 best_jd_brier = jd_result["brier_score"]
                 best_jd_lambda = lam
         print(f"    JD Brier:      {best_jd_brier:.4f} (best lambda={best_jd_lambda})")
 
-        # Heston (with default params)
-        def heston_fn(p, k, d, t, v):
-            return crypto_price_probability_heston(p, k, d, t, v0=v**2, kappa=2.0, theta=v**2, xi=0.3, rho=-0.7)
-        heston_result = evaluate_model(heston_fn, markets, candles)
-        print(f"    Heston Brier:  {heston_result['brier_score']:.4f}")
+        # Heston parameter search
+        best_heston_params = {"kappa": 2.0, "xi": 0.3, "rho": -0.7}
+        best_heston_brier = 1.0
+        for h_kappa in [1.0, 2.0, 5.0]:
+            for h_xi in [0.1, 0.3, 0.5, 1.0]:
+                for h_rho in [-0.9, -0.7, -0.5, -0.3]:
+                    def heston_fn(p, k, d, t, v, _kap=h_kappa, _xi=h_xi, _rho=h_rho):
+                        return crypto_price_probability_heston(
+                            p, k, d, t, v0=v**2, kappa=_kap, theta=v**2, xi=_xi, rho=_rho)
+                    result = evaluate_model(heston_fn, train_markets, candles)
+                    if result["brier_score"] < best_heston_brier:
+                        best_heston_brier = result["brier_score"]
+                        best_heston_params = {"kappa": h_kappa, "xi": h_xi, "rho": h_rho}
+        print(f"    Heston Brier:  {best_heston_brier:.4f} (kappa={best_heston_params['kappa']}, "
+              f"xi={best_heston_params['xi']}, rho={best_heston_params['rho']})")
 
-        # 4. Optimize ensemble weights
+        # 4. Optimize ensemble weights (using calibrated Heston params)
         print(f"  Optimizing ensemble weights...")
         best_weights = [0.33, 0.34, 0.33]
         best_ensemble_brier = 1.0
+        hp = best_heston_params
 
         for w_gbm in [x / 20 for x in range(0, 21, 2)]:
             for w_jd in [x / 20 for x in range(0, 21 - int(w_gbm * 20), 2)]:
@@ -236,28 +255,44 @@ def calibrate(days=90, assets=None, dry_run=False):
                 if w_heston < 0:
                     continue
 
-                def ensemble_fn(p, k, d, t, v, _wg=w_gbm, _wj=w_jd, _wh=w_heston, _lam=best_jd_lambda):
+                def ensemble_fn(p, k, d, t, v, _wg=w_gbm, _wj=w_jd, _wh=w_heston,
+                                _lam=best_jd_lambda, _hp=hp):
                     pg = crypto_price_probability(p, k, d, t, realized_vol_pct=v)
                     pj = crypto_price_probability_jd(p, k, d, t, realized_vol_pct=v, jump_intensity=_lam)
-                    ph = crypto_price_probability_heston(p, k, d, t, v0=v**2, kappa=2.0, theta=v**2, xi=0.3, rho=-0.7)
+                    ph = crypto_price_probability_heston(p, k, d, t, v0=v**2,
+                                                        kappa=_hp["kappa"], theta=v**2,
+                                                        xi=_hp["xi"], rho=_hp["rho"])
                     return max(0.001, min(0.999, _wg * pg + _wj * pj + _wh * ph))
 
-                result = evaluate_model(ensemble_fn, markets, candles)
+                result = evaluate_model(ensemble_fn, train_markets, candles)
                 if result["brier_score"] < best_ensemble_brier:
                     best_ensemble_brier = result["brier_score"]
                     best_weights = [w_gbm, w_jd, w_heston]
 
         print(f"    Ensemble Brier: {best_ensemble_brier:.4f} (weights: GBM={best_weights[0]:.2f}, JD={best_weights[1]:.2f}, Heston={best_weights[2]:.2f})")
 
+        # 5. Validation Brier on held-out test set
+        def final_ensemble_fn(p, k, d, t, v, _wg=best_weights[0], _wj=best_weights[1],
+                              _wh=best_weights[2], _lam=best_jd_lambda, _hp=hp):
+            pg = crypto_price_probability(p, k, d, t, realized_vol_pct=v)
+            pj = crypto_price_probability_jd(p, k, d, t, realized_vol_pct=v, jump_intensity=_lam)
+            ph = crypto_price_probability_heston(p, k, d, t, v0=v**2,
+                                                kappa=_hp["kappa"], theta=v**2,
+                                                xi=_hp["xi"], rho=_hp["rho"])
+            return max(0.001, min(0.999, _wg * pg + _wj * pj + _wh * ph))
+        validation_result = evaluate_model(final_ensemble_fn, markets, candles, split_idx=split_idx)
+        print(f"    Validation Brier: {validation_result['brier_score']:.4f} ({validation_result['n_markets']} test markets)")
+
         results[asset] = {
             "gbm_brier": round(gbm_result["brier_score"], 4),
             "jd_brier": round(best_jd_brier, 4),
             "jd_lambda": best_jd_lambda,
-            "heston_brier": round(heston_result["brier_score"], 4),
+            "heston_brier": round(best_heston_brier, 4),
+            "heston_params": best_heston_params,
             "ensemble_brier": round(best_ensemble_brier, 4),
+            "validation_brier": round(validation_result["brier_score"], 4),
             "ensemble_weights": [round(w, 2) for w in best_weights],
             "per_horizon_gbm": {str(k): round(v, 4) for k, v in gbm_result["per_horizon"].items()},
-            "per_horizon_heston": {str(k): round(v, 4) for k, v in heston_result["per_horizon"].items()},
             "n_markets": gbm_result["n_markets"],
         }
 
@@ -274,10 +309,12 @@ def calibrate(days=90, assets=None, dry_run=False):
     print(f"{'='*60}")
     for asset, r in results.items():
         print(f"\n{asset}:")
-        print(f"  GBM:      {r['gbm_brier']:.4f}")
-        print(f"  JD:       {r['jd_brier']:.4f} (lambda={r['jd_lambda']})")
-        print(f"  Heston:   {r['heston_brier']:.4f}")
-        print(f"  Ensemble: {r['ensemble_brier']:.4f} (w={r['ensemble_weights']})")
+        print(f"  GBM:        {r['gbm_brier']:.4f}")
+        print(f"  JD:         {r['jd_brier']:.4f} (lambda={r['jd_lambda']})")
+        hp = r.get('heston_params', {})
+        print(f"  Heston:     {r['heston_brier']:.4f} (kappa={hp.get('kappa')}, xi={hp.get('xi')}, rho={hp.get('rho')})")
+        print(f"  Ensemble:   {r['ensemble_brier']:.4f} (w={r['ensemble_weights']})")
+        print(f"  Validation: {r.get('validation_brier', 'N/A')}")
         improvement = (r['gbm_brier'] - r['ensemble_brier']) / r['gbm_brier'] * 100
         print(f"  Improvement over GBM: {improvement:.1f}%")
 

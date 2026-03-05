@@ -33,16 +33,15 @@ DEFAULT_HESTON = {"v0": 0.25, "kappa": 2.0, "theta": 0.25, "xi": 0.3, "rho": -0.
 DEFAULT_JD = {"jump_mean": -0.05, "jump_std": 0.10, "max_jumps": 10}
 
 
-def smooth_edge_threshold(prob, base=0.06, peak_extra=0.03):
+def smooth_edge_threshold(prob, base=0.06, scale=0.09):
     """Smooth edge threshold — higher near prob=0.5, lower at extremes.
 
-    Replaces hard cutoff at 0.25/0.75 with continuous quadratic function.
-    Returns required edge threshold as float.
+    Formula: base + scale * (0.5 - |prob - 0.5|)^2
+    At prob=0.50: base + scale*0.25 (max uncertainty -> highest threshold)
+    At prob=0.05: base + scale*0.0025 (high confidence -> near base)
     """
-    distance_from_center = abs(prob - 0.5)
-    # Quadratic: 0 at extremes (distance=0.5), peak_extra at center (distance=0)
-    extra = peak_extra * (1.0 - (distance_from_center / 0.5) ** 2)
-    return base + extra
+    proximity = 0.5 - abs(prob - 0.5)
+    return base + scale * proximity ** 2
 
 
 def horizon_kelly_fraction(minutes_to_settle):
@@ -112,7 +111,7 @@ class AR1VolForecast:
         obs = self._observations
         if self._alpha is not None and self._beta is not None:
             # Use provided parameters
-            return self._alpha + self._beta * obs[-1]
+            return max(0.01, self._alpha + self._beta * obs[-1])
 
         # Estimate AR(1) via OLS: sigma_t = alpha + beta * sigma_{t-1}
         x = obs[:-1]  # sigma_{t-1}
@@ -127,7 +126,7 @@ class AR1VolForecast:
         alpha = y_mean - beta * x_mean
         # Clamp beta to [0, 0.999] for stationarity
         beta = max(0.0, min(0.999, beta))
-        return alpha + beta * obs[-1]
+        return max(0.01, alpha + beta * obs[-1])
 
 
 class EnsembleModel:
