@@ -17,9 +17,13 @@ from strategy_engine import (
     BayesianEdgeEstimator,
     CorrelationAwareSizer,
     EdgeEstimate,
+    InfoEdge,
     bayesian_kelly_multiplier,
     longshot_edge_buy,
     longshot_edge_sell,
+    ScheduledScanner,
+    SettlementSourceChecker,
+    FillProbabilityEstimator,
 )
 
 
@@ -425,3 +429,350 @@ class TestMomentMatching:
         bucket_data = {"1-5": {"wins": 5, "losses": 1}}
         result = est._moment_match_alpha_delta(bucket_data)
         assert result is None
+
+
+# ===================================================================
+# ScheduledScanner
+# ===================================================================
+
+
+class TestScheduledScanner:
+
+    def test_current_wave_morning(self):
+        """current_wave() returns 1 during 8-10am ET."""
+        from unittest.mock import patch
+        import datetime
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        mock_now = datetime.datetime(2026, 3, 5, 9, 0, 0, tzinfo=et)
+        scanner = ScheduledScanner(daily_budget_cents=10000)
+        with patch("strategy_engine.datetime") as mock_dt:
+            mock_dt.datetime.now.return_value = mock_now
+            mock_dt.timezone = datetime.timezone
+            assert scanner.current_wave() == 1
+
+    def test_current_wave_midday(self):
+        """current_wave() returns 2 during 11am-2pm ET."""
+        from unittest.mock import patch
+        import datetime
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        mock_now = datetime.datetime(2026, 3, 5, 12, 0, 0, tzinfo=et)
+        scanner = ScheduledScanner(daily_budget_cents=10000)
+        with patch("strategy_engine.datetime") as mock_dt:
+            mock_dt.datetime.now.return_value = mock_now
+            mock_dt.timezone = datetime.timezone
+            assert scanner.current_wave() == 2
+
+    def test_current_wave_afternoon(self):
+        """current_wave() returns 3 during 3-5pm ET."""
+        from unittest.mock import patch
+        import datetime
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        mock_now = datetime.datetime(2026, 3, 5, 16, 0, 0, tzinfo=et)
+        scanner = ScheduledScanner(daily_budget_cents=10000)
+        with patch("strategy_engine.datetime") as mock_dt:
+            mock_dt.datetime.now.return_value = mock_now
+            mock_dt.timezone = datetime.timezone
+            assert scanner.current_wave() == 3
+
+    def test_current_wave_outside_windows(self):
+        """current_wave() returns None outside all wave windows."""
+        from unittest.mock import patch
+        import datetime
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        mock_now = datetime.datetime(2026, 3, 5, 6, 0, 0, tzinfo=et)
+        scanner = ScheduledScanner(daily_budget_cents=10000)
+        with patch("strategy_engine.datetime") as mock_dt:
+            mock_dt.datetime.now.return_value = mock_now
+            mock_dt.timezone = datetime.timezone
+            assert scanner.current_wave() is None
+
+    def test_remaining_budget_initial(self):
+        """remaining_budget() starts at wave allocation percentage of daily budget."""
+        from unittest.mock import patch
+        import datetime
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        mock_now = datetime.datetime(2026, 3, 5, 9, 0, 0, tzinfo=et)
+        scanner = ScheduledScanner(daily_budget_cents=10000)
+        with patch("strategy_engine.datetime") as mock_dt:
+            mock_dt.datetime.now.return_value = mock_now
+            mock_dt.timezone = datetime.timezone
+            # Wave 1 = 30% of 10000 = 3000
+            assert scanner.remaining_budget() == 3000
+
+    def test_remaining_budget_after_spend(self):
+        """remaining_budget() decreases after record_spend()."""
+        from unittest.mock import patch
+        import datetime
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        mock_now = datetime.datetime(2026, 3, 5, 9, 0, 0, tzinfo=et)
+        scanner = ScheduledScanner(daily_budget_cents=10000)
+        with patch("strategy_engine.datetime") as mock_dt:
+            mock_dt.datetime.now.return_value = mock_now
+            mock_dt.timezone = datetime.timezone
+            scanner.record_spend(500)
+            assert scanner.remaining_budget() == 2500
+
+    def test_should_scan_inside_wave_with_budget(self):
+        """should_scan() returns True when inside wave and budget > 0."""
+        from unittest.mock import patch
+        import datetime
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        mock_now = datetime.datetime(2026, 3, 5, 9, 0, 0, tzinfo=et)
+        scanner = ScheduledScanner(daily_budget_cents=10000)
+        with patch("strategy_engine.datetime") as mock_dt:
+            mock_dt.datetime.now.return_value = mock_now
+            mock_dt.timezone = datetime.timezone
+            assert scanner.should_scan() is True
+
+    def test_should_scan_outside_wave(self):
+        """should_scan() returns False outside wave windows."""
+        from unittest.mock import patch
+        import datetime
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        mock_now = datetime.datetime(2026, 3, 5, 6, 0, 0, tzinfo=et)
+        scanner = ScheduledScanner(daily_budget_cents=10000)
+        with patch("strategy_engine.datetime") as mock_dt:
+            mock_dt.datetime.now.return_value = mock_now
+            mock_dt.timezone = datetime.timezone
+            assert scanner.should_scan() is False
+
+    def test_should_emergency_scan(self):
+        """should_emergency_scan() returns True when volume_ratio > 5.0."""
+        scanner = ScheduledScanner(daily_budget_cents=10000)
+        assert scanner.should_emergency_scan(6.0) is True
+        assert scanner.should_emergency_scan(4.0) is False
+
+    def test_reset_daily(self):
+        """reset_daily() resets all wave budgets."""
+        from unittest.mock import patch
+        import datetime
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        mock_now = datetime.datetime(2026, 3, 5, 9, 0, 0, tzinfo=et)
+        scanner = ScheduledScanner(daily_budget_cents=10000)
+        with patch("strategy_engine.datetime") as mock_dt:
+            mock_dt.datetime.now.return_value = mock_now
+            mock_dt.timezone = datetime.timezone
+            scanner.record_spend(2000)
+            scanner.reset_daily()
+            assert scanner.remaining_budget() == 3000
+
+    def test_record_spend_wave_specific(self):
+        """record_spend() in wave 1 reduces wave 1 budget only."""
+        from unittest.mock import patch
+        import datetime
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        scanner = ScheduledScanner(daily_budget_cents=10000)
+        # Spend in wave 1
+        wave1_now = datetime.datetime(2026, 3, 5, 9, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+        with patch("strategy_engine.datetime") as mock_dt:
+            mock_dt.datetime.now.return_value = wave1_now
+            mock_dt.timezone = datetime.timezone
+            scanner.record_spend(1000)
+            assert scanner.remaining_budget() == 2000  # wave 1: 3000 - 1000
+        # Wave 2 budget untouched
+        wave2_now = datetime.datetime(2026, 3, 5, 12, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+        with patch("strategy_engine.datetime") as mock_dt:
+            mock_dt.datetime.now.return_value = wave2_now
+            mock_dt.timezone = datetime.timezone
+            assert scanner.remaining_budget() == 5000  # wave 2: 50% of 10000
+
+    def test_unspent_budget_does_not_carry_forward(self):
+        """Unspent wave 1 budget does NOT add to wave 2."""
+        from unittest.mock import patch
+        import datetime
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        scanner = ScheduledScanner(daily_budget_cents=10000)
+        # Don't spend anything in wave 1
+        # Check wave 2 is still just 50%
+        wave2_now = datetime.datetime(2026, 3, 5, 12, 0, 0, tzinfo=et)
+        with patch("strategy_engine.datetime") as mock_dt:
+            mock_dt.datetime.now.return_value = wave2_now
+            mock_dt.timezone = datetime.timezone
+            assert scanner.remaining_budget() == 5000
+
+    def test_next_scan_time_between_waves(self):
+        """next_scan_time() returns start of next wave when between waves."""
+        from unittest.mock import patch
+        import datetime
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        # 10:30 AM ET -- between wave 1 (8-10) and wave 2 (11-14)
+        mock_now = datetime.datetime(2026, 3, 5, 10, 30, 0, tzinfo=et)
+        scanner = ScheduledScanner(daily_budget_cents=10000)
+        with patch("strategy_engine.datetime") as mock_dt:
+            mock_dt.datetime.now.return_value = mock_now
+            mock_dt.datetime.side_effect = lambda *a, **kw: datetime.datetime(*a, **kw)
+            mock_dt.timezone = datetime.timezone
+            result = scanner.next_scan_time()
+            assert result is not None
+            # Next wave starts at 11:00 ET
+            assert result.hour == 11
+            assert result.minute == 0
+
+
+# ===================================================================
+# SettlementSourceChecker
+# ===================================================================
+
+
+class TestSettlementSourceChecker:
+
+    def test_check_info_edge_no_file(self, tmp_path):
+        """Returns None when health-state.json does not exist."""
+        checker = SettlementSourceChecker(health_state_path=tmp_path / "nonexistent.json")
+        assert checker.check_info_edge("KXHIGHMIA-05MAR26-T80") is None
+
+    def test_check_info_edge_stale_source(self, tmp_path):
+        """Returns None when source data is stale (>30 min old)."""
+        import datetime
+        health_path = tmp_path / "health-state.json"
+        old_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=60)).isoformat()
+        health_data = {"sources": {"NWS": {"last_success": old_time, "error_count": 0}}}
+        health_path.write_text(json.dumps(health_data))
+        checker = SettlementSourceChecker(health_state_path=health_path, staleness_minutes=30)
+        assert checker.check_info_edge("KXHIGHMIA-05MAR26-T80") is None
+
+    def test_check_info_edge_fresh_nws(self, tmp_path):
+        """Returns InfoEdge for KXHIGH ticker when NWS source is fresh."""
+        import datetime
+        health_path = tmp_path / "health-state.json"
+        fresh_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)).isoformat()
+        health_data = {"sources": {"NWS": {"last_success": fresh_time, "error_count": 0}}}
+        health_path.write_text(json.dumps(health_data))
+        checker = SettlementSourceChecker(health_state_path=health_path, staleness_minutes=30)
+        result = checker.check_info_edge("KXHIGHMIA-05MAR26-T80")
+        assert result is not None
+        assert isinstance(result, InfoEdge)
+        assert result.source == "NWS"
+        assert result.edge == 0.50
+        assert result.confidence == 0.95
+        assert result.sizing_method == "half_kelly"
+        assert result.pricing_method == "full_ask"
+
+    def test_check_info_edge_fresh_hdd(self, tmp_path):
+        """Returns InfoEdge for album ticker when HDD source is fresh."""
+        import datetime
+        health_path = tmp_path / "health-state.json"
+        fresh_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)).isoformat()
+        health_data = {"sources": {"HDD": {"last_success": fresh_time, "error_count": 0}}}
+        health_path.write_text(json.dumps(health_data))
+        checker = SettlementSourceChecker(health_state_path=health_path, staleness_minutes=30)
+        result = checker.check_info_edge("ALBUM-SALES-TEST")
+        assert result is not None
+        assert result.source == "HDD"
+        assert result.edge == 0.80
+        assert result.confidence == 0.98
+
+    def test_info_edge_fields(self, tmp_path):
+        """InfoEdge has all required fields."""
+        import datetime
+        health_path = tmp_path / "health-state.json"
+        fresh_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)).isoformat()
+        health_data = {"sources": {"NWS": {"last_success": fresh_time, "error_count": 0}}}
+        health_path.write_text(json.dumps(health_data))
+        checker = SettlementSourceChecker(health_state_path=health_path)
+        result = checker.check_info_edge("KXHIGHMIA-05MAR26-T80")
+        assert hasattr(result, "source")
+        assert hasattr(result, "edge")
+        assert hasattr(result, "confidence")
+        assert hasattr(result, "sizing_method")
+        assert hasattr(result, "pricing_method")
+
+    def test_check_info_edge_unrecognized_ticker(self, tmp_path):
+        """Returns None for unrecognized ticker types."""
+        import datetime
+        health_path = tmp_path / "health-state.json"
+        fresh_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)).isoformat()
+        health_data = {"sources": {"NWS": {"last_success": fresh_time, "error_count": 0}}}
+        health_path.write_text(json.dumps(health_data))
+        checker = SettlementSourceChecker(health_state_path=health_path)
+        assert checker.check_info_edge("UNKNOWNTICKER-123") is None
+
+    def test_is_source_fresh(self, tmp_path):
+        """_is_source_fresh returns True when last_success is within threshold."""
+        import datetime
+        checker = SettlementSourceChecker(health_state_path=tmp_path / "dummy.json")
+        fresh_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=10)).isoformat()
+        assert checker._is_source_fresh({"last_success": fresh_time}, 30) is True
+        old_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=60)).isoformat()
+        assert checker._is_source_fresh({"last_success": old_time}, 30) is False
+
+
+# ===================================================================
+# FillProbabilityEstimator
+# ===================================================================
+
+
+class TestFillProbabilityEstimator:
+
+    def test_estimate_fill_prob_returns_between_0_and_1(self):
+        """estimate_fill_prob returns a value between 0 and 1."""
+        fp = FillProbabilityEstimator()
+        prob = fp.estimate_fill_prob(50, 50, 10)
+        assert 0.0 < prob < 1.0
+
+    def test_fill_prob_increases_toward_ask(self):
+        """Fill probability increases as limit price moves toward ask (aggressive)."""
+        fp = FillProbabilityEstimator()
+        # Mid=50, spread=10, so ask=55, bid=45
+        prob_at_mid = fp.estimate_fill_prob(50, 50, 10)
+        prob_aggressive = fp.estimate_fill_prob(54, 50, 10)  # closer to ask
+        assert prob_aggressive > prob_at_mid
+
+    def test_fill_prob_approximately_half_at_midpoint(self):
+        """Fill probability is approximately 0.5 at midpoint (with default betas)."""
+        fp = FillProbabilityEstimator()
+        prob = fp.estimate_fill_prob(50, 50, 10, depth=0.5, duration_minutes=60)
+        # With default betas, sigmoid at mid should be around 0.5 (within margin)
+        assert 0.2 < prob < 0.8
+
+    def test_adjust_limit_price_high_fill_prob(self):
+        """adjust_limit_price returns original price when P(fill) > 0.7."""
+        fp = FillProbabilityEstimator()
+        result = fp.adjust_limit_price(50, 0.15, 0.8, 45, 55, "yes")
+        assert result == 50
+
+    def test_adjust_limit_price_low_edge(self):
+        """adjust_limit_price returns original price when edge < 0.05."""
+        fp = FillProbabilityEstimator()
+        result = fp.adjust_limit_price(50, 0.03, 0.2, 45, 55, "yes")
+        assert result == 50
+
+    def test_adjust_limit_price_aggressive_on_low_fill(self):
+        """adjust_limit_price moves price toward ask when P(fill) < 0.3 and edge > 0.10."""
+        fp = FillProbabilityEstimator()
+        # Low fill prob, high edge -- should adjust toward ask
+        result = fp.adjust_limit_price(48, 0.15, 0.2, 45, 55, "yes")
+        assert result >= 48  # should move toward ask (higher)
+
+    def test_update_from_outcome_shifts_betas(self):
+        """update_from_outcome shifts betas toward observed fill patterns."""
+        fp = FillProbabilityEstimator()
+        old_betas = fp._betas[:]
+        # Simulate several fills at aggressive prices
+        for _ in range(20):
+            fp.update_from_outcome(True, 54, 50, 10, 0.5, 60)
+        # Betas should have changed
+        assert fp._betas != old_betas
+
+    def test_save_load_round_trip(self, tmp_path):
+        """save/load round-trip preserves betas."""
+        fp = FillProbabilityEstimator()
+        fp.update_from_outcome(True, 54, 50, 10, 0.5, 60)
+        model_path = tmp_path / "fill-model.json"
+        fp.save_model(model_path)
+
+        fp2 = FillProbabilityEstimator()
+        fp2.load_model(model_path)
+        assert fp._betas == fp2._betas

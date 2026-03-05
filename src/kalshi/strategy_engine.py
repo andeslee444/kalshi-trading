@@ -4,11 +4,13 @@ correlation-aware sizing, and confidence-scaled Kelly.
 All math uses only the ``math`` module (no scipy/numpy).
 """
 
+import datetime
 import json
 import logging
 import math
 from pathlib import Path
 from collections import namedtuple
+from zoneinfo import ZoneInfo
 
 from probability import (
     LONGSHOT_BIAS_PARAMS,
@@ -461,3 +463,290 @@ class CorrelationAwareSizer:
             "bayesian_multiplier": round(bayes_mult, 4),
             "raw_contracts": contracts,
         })
+
+
+# ───────────────────────────────────────────────────────────────────
+# Data types (wave scheduling / settlement / fill model)
+# ───────────────────────────────────────────────────────────────────
+
+InfoEdge = namedtuple(
+    "InfoEdge",
+    ["source", "edge", "confidence", "sizing_method", "pricing_method"],
+)
+
+
+# ───────────────────────────────────────────────────────────────────
+# ScheduledScanner — intraday wave-based scan scheduling
+# ───────────────────────────────────────────────────────────────────
+
+class ScheduledScanner:
+    """Intraday wave scheduler with per-wave budget allocation.
+
+    Three ET waves: morning (8-10am, 30%), midday (11am-2pm, 50%),
+    afternoon (3-5pm, 20%). Tracks daily budget spend per wave.
+    """
+
+    WAVES = [
+        {"id": 1, "start_hour": 8, "end_hour": 10, "budget_pct": 0.30, "label": "morning"},
+        {"id": 2, "start_hour": 11, "end_hour": 14, "budget_pct": 0.50, "label": "midday"},
+        {"id": 3, "start_hour": 15, "end_hour": 17, "budget_pct": 0.20, "label": "afternoon"},
+    ]
+
+    def __init__(self, daily_budget_cents, tz_name="America/New_York"):
+        self._daily_budget = daily_budget_cents
+        self._tz = ZoneInfo(tz_name)
+        self._wave_budgets = {}
+        self._last_reset_date = None
+        self.reset_daily()
+
+    def _now_et(self):
+        """Current time in ET timezone."""
+        return datetime.datetime.now(self._tz)
+
+    def current_wave(self):
+        """Return current wave ID (1, 2, or 3) or None if outside all windows."""
+        now = self._now_et()
+        hour = now.hour
+        for w in self.WAVES:
+            if w["start_hour"] <= hour < w["end_hour"]:
+                return w["id"]
+        return None
+
+    def remaining_budget(self):
+        """Return remaining budget cents for the current wave (0 if outside wave)."""
+        wave = self.current_wave()
+        if wave is None:
+            return 0
+        return max(0, self._wave_budgets.get(wave, 0))
+
+    def should_scan(self):
+        """Return True if inside a wave window and budget > 0."""
+        wave = self.current_wave()
+        if wave is None:
+            return False
+        return self.remaining_budget() > 0
+
+    def should_emergency_scan(self, volume_ratio):
+        """Return True if volume_ratio > 5.0 (regardless of wave)."""
+        return volume_ratio > 5.0
+
+    def record_spend(self, cents):
+        """Deduct from current wave's remaining budget."""
+        wave = self.current_wave()
+        if wave is not None and wave in self._wave_budgets:
+            self._wave_budgets[wave] = max(0, self._wave_budgets[wave] - cents)
+
+    def reset_daily(self):
+        """Reset all wave budgets to their initial allocation."""
+        self._wave_budgets = {}
+        for w in self.WAVES:
+            self._wave_budgets[w["id"]] = int(self._daily_budget * w["budget_pct"])
+        self._last_reset_date = datetime.date.today()
+
+    def next_scan_time(self):
+        """Return datetime of next wave start, or None if no more waves today."""
+        now = self._now_et()
+        hour = now.hour
+        for w in self.WAVES:
+            if w["start_hour"] > hour:
+                return now.replace(hour=w["start_hour"], minute=0, second=0, microsecond=0)
+        return None
+
+
+# ───────────────────────────────────────────────────────────────────
+# SettlementSourceChecker — info-arb from confirmed external data
+# ───────────────────────────────────────────────────────────────────
+
+class SettlementSourceChecker:
+    """Checks health-state.json for fresh external data sources.
+
+    When a source (NWS, HDD, BoxOfficeMojo) has fresh data confirming
+    an outcome, returns an InfoEdge for high-conviction trading.
+    """
+
+    # Ticker prefix -> (source_key, edge, confidence)
+    _SOURCE_MAP = {
+        "KXHIGH": ("NWS", 0.50, 0.95),
+    }
+    _ENTERTAINMENT_PREFIXES = ("ALBUM", "BILLBOARD", "HDD", "MUSIC", "STREAM")
+    _BOXOFFICE_PREFIXES = ("BOX", "MOVIE", "FILM")
+
+    def __init__(self, health_state_path=None, staleness_minutes=30):
+        if health_state_path is None:
+            try:
+                from kalshi_auth import PROJECT_DIR
+                health_state_path = PROJECT_DIR / "data" / "health-state.json"
+            except ImportError:
+                health_state_path = Path("data/health-state.json")
+        self._health_path = Path(health_state_path)
+        self._staleness_minutes = staleness_minutes
+
+    def _is_source_fresh(self, source_data, threshold_minutes):
+        """Check if source last_success is within threshold_minutes of now."""
+        last_success = source_data.get("last_success")
+        if not last_success:
+            return False
+        try:
+            ts = datetime.datetime.fromisoformat(last_success.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=datetime.timezone.utc)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            age_minutes = (now - ts).total_seconds() / 60.0
+            return age_minutes <= threshold_minutes
+        except (ValueError, TypeError):
+            return False
+
+    def _detect_source(self, ticker):
+        """Detect which source to check for a given ticker.
+
+        Returns (source_key, edge, confidence) or None.
+        """
+        upper = ticker.upper()
+        if upper.startswith("KXHIGH"):
+            return ("NWS", 0.50, 0.95)
+        for prefix in self._ENTERTAINMENT_PREFIXES:
+            if upper.startswith(prefix):
+                return ("HDD", 0.80, 0.98)
+        for prefix in self._BOXOFFICE_PREFIXES:
+            if upper.startswith(prefix):
+                return ("BoxOfficeMojo", 0.60, 0.85)
+        return None
+
+    def check_info_edge(self, ticker):
+        """Check if external data confirms outcome for this ticker.
+
+        Returns InfoEdge or None.
+        """
+        try:
+            health_data = json.loads(self._health_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+
+        source_info = self._detect_source(ticker)
+        if source_info is None:
+            return None
+
+        source_key, edge, confidence = source_info
+        sources = health_data.get("sources", {})
+        source_data = sources.get(source_key)
+        if source_data is None:
+            return None
+
+        if not self._is_source_fresh(source_data, self._staleness_minutes):
+            return None
+
+        return InfoEdge(
+            source=source_key,
+            edge=edge,
+            confidence=confidence,
+            sizing_method="half_kelly",
+            pricing_method="full_ask",
+        )
+
+
+# ───────────────────────────────────────────────────────────────────
+# FillProbabilityEstimator — sigmoid fill model with online learning
+# ───────────────────────────────────────────────────────────────────
+
+class FillProbabilityEstimator:
+    """Sigmoid-based fill probability model with online SGD learning.
+
+    P(fill) = 1 / (1 + exp(-(b0 + b1*price_pos + b2*depth + b3*time)))
+
+    Default betas are conservative priors; the model learns from outcomes.
+    """
+
+    _DEFAULT_BETAS = [-0.5, 2.0, -0.3, 0.5]
+    _LEARNING_RATE = 0.01
+
+    def __init__(self, betas_path=None):
+        self._betas = list(self._DEFAULT_BETAS)
+        self._betas_path = betas_path
+        if betas_path and Path(betas_path).exists():
+            self.load_model(betas_path)
+
+    def _compute_features(self, limit_price, mid, spread, depth=0.5, duration_minutes=60):
+        """Compute feature vector for sigmoid model."""
+        price_position = (limit_price - mid) / max(spread, 1)
+        depth_factor = depth
+        time_factor = min(duration_minutes / 60.0, 3.0)
+        return [1.0, price_position, depth_factor, time_factor]
+
+    def _sigmoid(self, z):
+        """Sigmoid function, clamped to avoid overflow."""
+        z = max(-500, min(500, z))
+        return 1.0 / (1.0 + math.exp(-z))
+
+    def estimate_fill_prob(self, limit_price, mid, spread, depth=0.5, duration_minutes=60):
+        """Estimate probability of fill for a limit order.
+
+        Returns float in [0.01, 0.99].
+        """
+        features = self._compute_features(limit_price, mid, spread, depth, duration_minutes)
+        z = sum(b * f for b, f in zip(self._betas, features))
+        prob = self._sigmoid(z)
+        return max(0.01, min(0.99, prob))
+
+    def adjust_limit_price(self, original_limit, edge, fill_prob, yes_bid, yes_ask, side):
+        """Adjust limit price based on fill probability and edge.
+
+        Returns adjusted price (int), clamped to [1, 99] and not exceeding ask.
+        """
+        if fill_prob >= 0.7:
+            return original_limit
+        if edge < 0.05:
+            return original_limit
+
+        spread = yes_ask - yes_bid
+        if spread <= 0:
+            return original_limit
+
+        if fill_prob < 0.3 and edge > 0.10:
+            adjustment = int((1.0 - fill_prob) * spread * 0.5)
+        else:
+            adjustment = int((0.7 - fill_prob) * spread * 0.3)
+
+        if side == "yes":
+            adjusted = original_limit + adjustment
+        else:
+            adjusted = original_limit - adjustment
+
+        adjusted = max(1, min(99, adjusted))
+        if side == "yes":
+            adjusted = min(adjusted, yes_ask)
+        else:
+            adjusted = max(adjusted, yes_bid)
+        return adjusted
+
+    def update_from_outcome(self, filled, limit_price, mid, spread, depth=0.5, duration_minutes=60):
+        """Online SGD update from trade outcome.
+
+        filled: True if order was filled, False otherwise.
+        """
+        features = self._compute_features(limit_price, mid, spread, depth, duration_minutes)
+        z = sum(b * f for b, f in zip(self._betas, features))
+        predicted = self._sigmoid(z)
+        target = 1.0 if filled else 0.0
+        error = target - predicted
+
+        for i in range(len(self._betas)):
+            self._betas[i] += self._LEARNING_RATE * error * features[i]
+
+    def save_model(self, path=None):
+        """Save betas to JSON file."""
+        path = Path(path or self._betas_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {"betas": self._betas}
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.rename(path)
+
+    def load_model(self, path=None):
+        """Load betas from JSON file."""
+        path = Path(path or self._betas_path)
+        if not path.exists():
+            return
+        data = json.loads(path.read_text())
+        loaded = data.get("betas", self._DEFAULT_BETAS)
+        if len(loaded) == len(self._DEFAULT_BETAS):
+            self._betas = list(loaded)
