@@ -888,10 +888,19 @@ def econ_nowcast_probability(nowcast_value, nowcast_sigma, threshold, direction=
     return prob_above
 
 
-def cpi_nowcast_sigma(days_to_release):
+def cpi_nowcast_sigma(days_to_release, fed_ci_width=None):
     """Exponential decay for CPI nowcast uncertainty based on time to release.
 
     Returns sigma in percentage points (e.g. 0.10 = 0.10%).
+
+    Args:
+        days_to_release: Days until the CPI release date.
+        fed_ci_width: Optional dynamic CI width derived from cross-measure
+            dispersion (e.g. std of CPI/CoreCPI/PCE/CorePCE * 1.645).
+            When provided and > 0, converts to sigma via 90% CI formula
+            (sigma = fed_ci_width / 3.29) and uses it instead of the
+            hardcoded exponential decay, with a floor of 0.03 to prevent
+            unreasonably tight estimates.
 
     If config/calibration.json has cpi.sigma_by_days (from calibrate-cpi-sigma.py),
     uses empirically calibrated values. Otherwise falls back to heuristic:
@@ -903,6 +912,12 @@ def cpi_nowcast_sigma(days_to_release):
         key = str(min(14, max(0, days_to_release)))
         if key in cpi_cal:
             return cpi_cal[key]
+
+    # Dynamic sigma from cross-measure dispersion (when available)
+    if fed_ci_width is not None and fed_ci_width > 0:
+        # 90% CI = 3.29 sigma for normal distribution (z=1.645 * 2)
+        dynamic_sigma = fed_ci_width / 3.29
+        return max(dynamic_sigma, 0.03)
 
     # Fallback: continuous exponential decay
     # sigma = 0.05 + 0.35 * (1 - exp(-0.05 * d))

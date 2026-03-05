@@ -84,7 +84,6 @@ def _classify_econ_market(ticker):
 
 # === Concentration Limits ===
 FAMILY_EXPOSURE_PCT = 0.15   # 15% of bankroll per ticker family
-RELEASE_EXPOSURE_PCT = 0.25  # 25% per release date
 TOTAL_ECON_PCT = 0.40        # 40% total economics exposure
 
 def _ticker_family(ticker):
@@ -115,12 +114,7 @@ def _check_concentration(ticker, bankroll_cents, trades):
     if family_exposure >= family_cap:
         return False, f"family_cap: ${family_exposure/100:.0f} >= ${family_cap/100:.0f} (15%)"
 
-    # Level 3: Per-release-date (25%) — same as family for econ markets
-    release_cap = int(bankroll_cents * RELEASE_EXPOSURE_PCT)
-    if family_exposure >= release_cap:
-        return False, f"release_cap: ${family_exposure/100:.0f} >= ${release_cap/100:.0f} (25%)"
-
-    # Level 4: Total econ exposure (40%)
+    # Level 3: Total econ exposure (40%)
     total_cap = int(bankroll_cents * TOTAL_ECON_PCT)
     total_exposure = _compute_exposure(trades, "KXECON", "prefix")
     total_exposure += _compute_exposure(trades, "KXCPI", "prefix")
@@ -212,6 +206,40 @@ def _nowcast_cache_age_hours():
     except Exception:
         pass
     return float("inf")
+
+
+def _compute_cross_measure_dispersion(nowcast):
+    """Compute cross-measure dispersion from available Fed YoY measures.
+
+    Uses the spread across CPI/Core CPI/PCE/Core PCE as a proxy for model
+    uncertainty. When 3+ measures are available, their standard deviation
+    provides a dynamic sigma floor that auto-calibrates.
+
+    Args:
+        nowcast: Dict with keys like cpi_yoy, core_cpi_yoy, pce_yoy, core_pce_yoy.
+            Modified in-place to add "cross_measure_dispersion" key.
+
+    Returns:
+        CI width (dispersion * 1.645) if 2+ measures available, else None.
+    """
+    measure_keys = ["cpi_yoy", "core_cpi_yoy", "pce_yoy", "core_pce_yoy"]
+    values = [nowcast[k] for k in measure_keys if k in nowcast and nowcast[k] is not None]
+
+    if len(values) < 2:
+        return None
+
+    if len(values) >= 3:
+        # Standard deviation as dispersion
+        mean_val = sum(values) / len(values)
+        variance = sum((v - mean_val) ** 2 for v in values) / len(values)
+        dispersion = math.sqrt(variance)
+    else:
+        # 2 values: use abs(diff)/2 as rough dispersion
+        dispersion = abs(values[0] - values[1]) / 2
+
+    ci_width = dispersion * 1.645  # 1-sigma to 90% CI approximation
+    nowcast["cross_measure_dispersion"] = ci_width
+    return ci_width
 
 
 # === Data Sources ===
@@ -774,6 +802,13 @@ def scan_and_trade():
     ss.markets_fetched = len(all_markets)
     log.info(f"Found {len(all_markets)} economics markets")
 
+    # Compute cross-measure dispersion for dynamic sigma
+    dispersion_ci = None
+    if nowcast:
+        dispersion_ci = _compute_cross_measure_dispersion(nowcast)
+        if dispersion_ci is not None:
+            log.info(f"  Cross-measure dispersion CI width: {dispersion_ci:.4f}")
+
     # Evaluate each market
     opportunities = []
     for m in all_markets:
@@ -822,7 +857,7 @@ def scan_and_trade():
         days_to_release = estimate_days_to_release(m)
         ticker_upper = ticker.upper()
         if "CPI" in ticker_upper:
-            sigma = cpi_nowcast_sigma(days_to_release)
+            sigma = cpi_nowcast_sigma(days_to_release, fed_ci_width=dispersion_ci)
         elif "GAS" in ticker_upper:
             # Gas handled separately via gas_price_probability path
             continue
@@ -833,7 +868,7 @@ def scan_and_trade():
             # Fed markets handled via FedWatch path
             continue
         else:
-            sigma = cpi_nowcast_sigma(days_to_release)  # default fallback
+            sigma = cpi_nowcast_sigma(days_to_release, fed_ci_width=dispersion_ci)  # default fallback
 
         # Macro-adjusted sigma tightening
         if macro is not None and macro_signal and macro_signal.confidence > 0.3:
