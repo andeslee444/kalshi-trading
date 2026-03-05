@@ -192,8 +192,7 @@ class DCCCorrelation:
             for a in self._assets if a in self._garch
         )
         if not all_warmed:
-            self._count += 1
-            return
+            return  # Don't count as DCC update — Q matrix not being updated
 
         # Build standardized residuals
         eps = np.zeros(self._n)

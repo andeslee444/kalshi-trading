@@ -326,6 +326,31 @@ class TestHestonFellerFallback:
         assert not math.isnan(prob)
 
 
+class TestDCCWarmup:
+    """DCC should not report ready before actual warmup."""
+
+    def test_correlation_matrix_none_during_warmup(self):
+        from vol_forecaster import DCCCorrelation
+        dcc = DCCCorrelation(assets=["BTC", "ETH"], min_observations=10)
+        # Feed 14 returns — GARCH needs 10 to warm up
+        # Buggy code: _count=14, 14>=10 → matrix returned (wrong!)
+        # Fixed code: real DCC updates=4 (obs 11-14), 4<10 → None (correct)
+        for i in range(14):
+            dcc.update({"BTC": 0.01 * (i % 3 - 1), "ETH": 0.008 * (i % 3 - 1)})
+        result = dcc.correlation_matrix()
+        assert result is None
+
+    def test_correlation_matrix_ready_after_real_warmup(self):
+        from vol_forecaster import DCCCorrelation
+        dcc = DCCCorrelation(assets=["BTC", "ETH"], min_observations=5)
+        # Feed 30 returns (enough for GARCH warmup + 20 DCC updates)
+        for i in range(30):
+            dcc.update({"BTC": 0.01 * (i % 3 - 1), "ETH": 0.008 * (i % 3 - 1)})
+        result = dcc.correlation_matrix()
+        # After 30 updates with 10 GARCH warmup, DCC has ~20 actual updates > 5
+        assert result is not None
+
+
 class TestAR1NegativeVol:
     """AR1 should never return negative vol."""
 
