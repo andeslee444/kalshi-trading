@@ -23,7 +23,7 @@ from kalshi_auth import (
 )
 from probability import (
     econ_nowcast_probability, cpi_nowcast_sigma, gdp_nowcast_sigma, quarter_kelly,
-    compute_limit_price, kalshi_fee_cents, gas_price_probability,
+    uncertainty_kelly, compute_limit_price, kalshi_fee_cents, gas_price_probability,
 )
 from capital_allocator import PortfolioAllocator
 from cpi_belief_filter import CPIBeliefFilter
@@ -985,7 +985,23 @@ def scan_and_trade():
             continue
 
         fee = kalshi_fee_cents(price)
-        count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+        # Use uncertainty_kelly for CPI/GDP markets (scenario-aware sizing)
+        # Fall back to quarter_kelly for gas/fed markets (no scenario model)
+        is_scenario_market = not (ticker.startswith("KXGAS") or ticker.startswith("KXFED"))
+        if is_scenario_market and "scenario_agreement" in opp:
+            count, risk, kelly_details = uncertainty_kelly(
+                edge, price, budget.max_cost_cents,
+                bankroll_cents=budget.bankroll_cents,
+                scenario_agreement=opp.get("scenario_agreement", 0.5),
+                posterior_sigma=opp.get("posterior_sigma", 0.20),
+                fee_cents=fee,
+            )
+        else:
+            count, risk, kelly_details = quarter_kelly(
+                edge, price, budget.max_cost_cents,
+                bankroll_cents=budget.bankroll_cents, fee_cents=fee,
+                return_details=True,
+            )
         if count <= 0:
             ss.skip("kelly_zero")
             trade_manager.log_decision(ticker, side, "skipped", "kelly_zero: edge too small for price",
@@ -1013,7 +1029,8 @@ def scan_and_trade():
                                             edge=round(edge, 4),
                                             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                             model_prob=round(opp["prob"], 4), raw_edge=round(edge, 4),
-                                            fee_cents=round(kalshi_fee_cents(price), 2), sizing_method="quarter_kelly",
+                                            fee_cents=round(kalshi_fee_cents(price), 2),
+                                            sizing_method="uncertainty_kelly" if is_scenario_market else "quarter_kelly",
                                             market_close_time=m.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
