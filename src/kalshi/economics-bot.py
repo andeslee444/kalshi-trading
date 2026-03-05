@@ -27,6 +27,7 @@ from probability import (
 )
 from capital_allocator import PortfolioAllocator
 from cpi_belief_filter import CPIBeliefFilter
+from scenario_engine import compute_scenario_weights, scenario_probability
 try:
     from macro_engine import MacroEngine
 except ImportError:
@@ -693,6 +694,25 @@ def scan_and_trade():
         log.info(f"  TIPS 10Y breakeven: {tips_breakeven:.2f}%")
         ss.source_ok("tips-breakeven")
 
+    # Fetch scenario weight data
+    fred_scenario_data = {}
+    polymarket_scenario_data = {}
+    if macro is not None:
+        try:
+            fred_all = macro._fred.fetch_all() if hasattr(macro, '_fred') else {}
+            fred_scenario_data = {
+                "crude_oil": fred_all.get("crude_oil"),
+                "crude_oil_90d_ma": fred_all.get("crude_oil"),  # TODO: compute actual 90d MA
+                "T10Y2Y": fred_all.get("yield_curve"),
+                "gdpnow": fred_all.get("gdpnow"),
+            }
+        except Exception as e:
+            log.warning(f"  FRED scenario data fetch failed (non-fatal): {e}")
+
+    # Compute scenario weights
+    scenario_weights = compute_scenario_weights(polymarket_scenario_data, fred_scenario_data)
+    log.info(f"  Scenario weights: { {k: f'{v:.2f}' for k, v in scenario_weights.items()} }")
+
     if not nowcast and not gas_price:
         log.info("No data sources available (nowcast + gas), skipping scan.")
         ss.finalize()
@@ -788,11 +808,15 @@ def scan_and_trade():
             belief.update(tips_breakeven, obs_sigma=0.25)
         fused_nowcast, posterior_sigma = belief.posterior
 
-        # Compute probability using fused nowcast
-        if direction_type == "T":
-            prob = econ_nowcast_probability(fused_nowcast, posterior_sigma, threshold, "above")
-        else:
-            prob = econ_nowcast_probability(fused_nowcast, posterior_sigma, threshold, "below")
+        # Compute probability using scenario-weighted mixture
+        result = scenario_probability(
+            fused_nowcast=fused_nowcast,
+            posterior_sigma=posterior_sigma,
+            threshold=threshold,
+            direction="above" if direction_type == "T" else "below",
+            scenario_weights=scenario_weights,
+        )
+        prob = result.probability
 
         yes_ask = m.get("yes_ask", 0)
         no_ask = m.get("no_ask", 0)
@@ -812,6 +836,8 @@ def scan_and_trade():
                     "days_to_release": days_to_release,
                     "raw_nowcast": nowcast_value,
                     "posterior_sigma": posterior_sigma,
+                    "scenario_agreement": result.agreement,
+                    "per_scenario": result.per_scenario,
                 })
             else:
                 trade_manager.log_decision(
@@ -832,6 +858,8 @@ def scan_and_trade():
                     "days_to_release": days_to_release,
                     "raw_nowcast": nowcast_value,
                     "posterior_sigma": posterior_sigma,
+                    "scenario_agreement": result.agreement,
+                    "per_scenario": result.per_scenario,
                 })
             else:
                 trade_manager.log_decision(
@@ -999,7 +1027,8 @@ def scan_and_trade():
                                                 1,  # Cleveland Fed (always)
                                                 1 if truflation_cpi is not None else 0,
                                                 1 if tips_breakeven is not None else 0,
-                                            ]))
+                                            ]),
+                                            scenario_agreement=round(opp.get("scenario_agreement", 0), 4))
         if result:
             ss.trades_placed += 1
             allocator.record_trade("economics", ticker, risk, edge=edge)
