@@ -645,3 +645,26 @@ class TestDriftZeroShortHorizon:
     def test_negative_drift_zeroed_short_horizon(self):
         """Negative drift also zeroed for short horizons."""
         assert self._apply_drift(-2.0, 120) == 0.0
+
+
+class TestEnsembleIntegration:
+    """Verify crypto-bot uses ensemble model correctly."""
+
+    def test_smooth_edge_replaces_hard_cutoff(self):
+        from crypto_models import smooth_edge_threshold
+        t_24 = smooth_edge_threshold(0.24, base=0.08)
+        t_25 = smooth_edge_threshold(0.25, base=0.08)
+        t_26 = smooth_edge_threshold(0.26, base=0.08)
+        assert abs(t_25 - t_24) < 0.003
+        assert abs(t_26 - t_25) < 0.003
+
+    def test_horizon_kelly_shorter_is_smaller(self):
+        from crypto_models import horizon_kelly_fraction
+        assert horizon_kelly_fraction(5) < horizon_kelly_fraction(60)
+        assert horizon_kelly_fraction(60) < horizon_kelly_fraction(1440)
+
+    def test_horizon_vol_weights_sum_to_one(self):
+        from crypto_models import horizon_vol_weights
+        for t in [5, 15, 60, 360, 1440]:
+            w_iv, w_rv = horizon_vol_weights(t)
+            assert abs(w_iv + w_rv - 1.0) < 0.001

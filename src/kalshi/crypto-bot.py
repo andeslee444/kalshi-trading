@@ -31,6 +31,8 @@ from ticker_utils import parse_crypto_ticker
 from capital_allocator import PortfolioAllocator
 from particle_filter import FilterManager, FilterConfig, ci_kelly_multiplier
 from regime_detector import RegimeDetector, regime_kelly_multiplier
+from crypto_models import EnsembleModel, smooth_edge_threshold, horizon_kelly_fraction, horizon_vol_weights, AR1VolForecast
+from vol_forecaster import GARCHForecaster, DCCCorrelation, intraday_vol_multiplier, correct_bid_ask_bounce
 
 setup_unbuffered()
 log = setup_logging("crypto")
@@ -98,6 +100,28 @@ regime_detector = RegimeDetector()
 regime_state_path = PROJECT_DIR / "data" / "regime-state.json"
 regime_detector.load(str(regime_state_path))
 
+# Ensemble model (loads calibration if available)
+_calibration_path = PROJECT_DIR / "config" / "crypto-calibration.json"
+_calibration = {}
+if _calibration_path.exists():
+    try:
+        _calibration = json.loads(_calibration_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        pass
+ensemble_model = EnsembleModel()
+
+# Default Heston parameters
+DEFAULT_HESTON_PARAMS = {"v0": 0.25, "kappa": 2.0, "theta": 0.25, "xi": 0.3, "rho": -0.7}
+
+# GARCH vol forecasters per asset
+garch_forecasters = {}  # populated after DEFAULT_VOLS is defined
+
+# AR(1) vol forecasters per asset
+ar1_forecasters = {}  # populated after DEFAULT_VOLS is defined
+
+# DCC correlation tracker
+dcc_tracker = None  # populated after DEFAULT_VOLS is defined
+
 # === Market ticker prefixes ===
 CRYPTO_PREFIXES = ["KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXXRP", "KXCRYPTO"]
 
@@ -109,6 +133,11 @@ DEFAULT_VOLS = {
     "DOGE": 0.90,  # meme coin, high vol
     "XRP": 0.75,   # mid-cap alt, moderate-high vol
 }
+
+# Initialize forecasters now that DEFAULT_VOLS is defined
+garch_forecasters = {asset: GARCHForecaster() for asset in DEFAULT_VOLS}
+ar1_forecasters = {asset: AR1VolForecast() for asset in DEFAULT_VOLS}
+dcc_tracker = DCCCorrelation(assets=list(DEFAULT_VOLS.keys()))
 
 # Recent price cache for realized vol computation
 _price_history = {}  # asset -> [(timestamp, price), ...]
@@ -426,6 +455,33 @@ def scan_and_trade():
                  regime_detector.regime_confidence(),
                  regime_kelly_multiplier(regime_detector))
 
+    # Update GARCH forecasters with new returns
+    for asset, price in spot_prices.items():
+        history = _price_history.get(asset, [])
+        if len(history) >= 2:
+            prev_price = history[-2][1]
+            if prev_price > 0:
+                log_ret = math.log(price / prev_price)
+                if asset in garch_forecasters:
+                    garch_forecasters[asset].update(log_ret)
+
+    # Update AR(1) vol forecasters
+    for asset in spot_prices:
+        rv = realized_vols.get(asset)
+        if rv is not None and asset in ar1_forecasters:
+            ar1_forecasters[asset].update(rv)
+
+    # Update DCC correlation tracker
+    returns_for_dcc = {}
+    for asset, price in spot_prices.items():
+        history = _price_history.get(asset, [])
+        if len(history) >= 2:
+            prev_price = history[-2][1]
+            if prev_price > 0:
+                returns_for_dcc[asset] = math.log(price / prev_price)
+    if returns_for_dcc:
+        dcc_tracker.update(returns_for_dcc)
+
     # Compute trailing drift per asset
     drift_by_asset = {}
     for asset in spot_prices:
@@ -517,34 +573,74 @@ def scan_and_trade():
         else:
             rv_lookback = 86400      # 24h for daily/weekly
 
-        # Get volatility — IV is forward-looking so gets more weight
+        # Horizon-dependent vol weighting
+        w_iv, w_rv = horizon_vol_weights(minutes_to_settle)
+
         iv = iv_data.get(asset)
-        # Use horizon-matched RV if shorter lookback needed, else use pre-computed 24h RV
         if rv_lookback < 86400:
             rv = compute_realized_vol(asset, lookback_seconds=rv_lookback)
         else:
             rv = realized_vols.get(asset)
         default_vol = DEFAULT_VOLS.get(asset, 0.50)
+
+        # GARCH forecast (if available)
+        garch_vol = garch_forecasters.get(asset)
+        garch_forecast = garch_vol.forecast_vol(annualize_factor=365.25*24*12) if garch_vol else None
+
+        # Use best available vol estimate
         if iv is not None and rv is not None:
-            vol_to_use = 0.6 * iv + 0.4 * rv  # IV more predictive for short-term crypto
+            vol_to_use = w_iv * iv + w_rv * rv
         elif iv is not None:
             vol_to_use = iv
+        elif garch_forecast is not None:
+            vol_to_use = garch_forecast
         elif rv is not None:
             vol_to_use = 0.3 * default_vol + 0.7 * rv
         else:
             vol_to_use = default_vol
 
+        # Intraday seasonality adjustment
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        season_mult = intraday_vol_multiplier(now_utc.hour, now_utc.weekday())
+        vol_to_use *= season_mult
+
         drift = drift_by_asset.get(asset, DRIFT_PCT)
         # Drift is negligible for sub-daily horizons and introduces noise
         if minutes_to_settle < 1440:
             drift = 0.0
-        prob_fn_args = dict(
-            current_price=current_price, threshold=threshold, direction="above",
-            time_horizon_minutes=minutes_to_settle,
-            realized_vol_pct=vol_to_use, iv_pct=None,
-            drift_pct=drift,
-        )
-        prob, _debug = _compute_crypto_prob(prob_fn_args, direction, ticker, asset, all_markets)
+        # Get current regime
+        current_regime = regime_detector.current_regime()
+
+        # Heston params from GARCH (dynamic v0, vol-of-vol)
+        garch = garch_forecasters.get(asset)
+        heston_params = dict(DEFAULT_HESTON_PARAMS)
+        if garch:
+            v0 = garch.heston_v0()
+            if v0 is not None:
+                heston_params["v0"] = v0
+            vov = garch.vol_of_vol()
+            if vov is not None:
+                heston_params["xi"] = max(0.1, min(2.0, vov))
+
+        if direction == "T":
+            prob = ensemble_model.estimate_prob(
+                current_price=current_price, threshold=threshold,
+                direction="above", time_horizon_minutes=minutes_to_settle,
+                vol=vol_to_use, regime=current_regime,
+                drift_pct=drift, heston_params=heston_params,
+                use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
+            )
+        else:
+            # Bracket
+            range_size = _parse_bracket_range(ticker, asset, all_markets)
+            prob = ensemble_model.estimate_bracket_prob(
+                current_price=current_price,
+                low_threshold=threshold,
+                high_threshold=threshold + range_size,
+                time_horizon_minutes=minutes_to_settle,
+                vol=vol_to_use, regime=current_regime,
+                drift_pct=drift, heston_params=heston_params,
+            )
 
         # Particle filter: update belief state and use filtered prob
         pf = filter_mgr.get_filter(ticker)
@@ -580,7 +676,7 @@ def scan_and_trade():
         # Determine trade direction and edge (raw edge, fees handled in Kelly)
         # Use market_price (with fallback) for edge computation
         if prob > 0.5:
-            eff_threshold = _effective_edge_threshold(prob)
+            eff_threshold = smooth_edge_threshold(prob, base=EDGE_THRESHOLD)
             edge = prob - market_price / 100
             if edge > eff_threshold:
                 opportunities.append({
@@ -600,7 +696,7 @@ def scan_and_trade():
                 )
         elif prob <= 0.5:
             no_prob = 1.0 - prob
-            eff_threshold = _effective_edge_threshold(no_prob)
+            eff_threshold = smooth_edge_threshold(no_prob, base=EDGE_THRESHOLD)
             # Use no_ask directly if available, else derive from market_price
             no_price = no_ask if no_ask else (100 - market_price)
             edge = no_prob - no_price / 100
@@ -656,16 +752,43 @@ def scan_and_trade():
         if not price or price <= 0:
             continue
 
-        # Use quarter-Kelly for crypto (high volatility uncertainty)
+        # Horizon-scaled Kelly fraction
+        kelly_frac = horizon_kelly_fraction(opp["minutes_to_settle"])
         fee = kalshi_fee_cents(price)
-        count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+
+        # Use half_kelly with manual fraction scaling
+        count, risk, kelly_details = half_kelly(
+            edge, price, budget.max_cost_cents,
+            bankroll_cents=budget.bankroll_cents, fee_cents=fee,
+            return_details=True,
+        )
+        # Scale from half-Kelly to horizon-appropriate fraction
+        count = max(0, int(count * kelly_frac / 0.5))
+
+        # Bankroll-scaled cap (2% of bankroll, min $5)
+        max_exposure = max(500, int((budget.bankroll_cents or 50000) * 0.02))
+        if count * price > max_exposure:
+            count = max(1, max_exposure // price)
 
         # CI-aware sizing: reduce position when filter is uncertain
         filtered_est = opp["filtered_est"]
         kelly_mult = ci_kelly_multiplier(filtered_est)
-        # Apply regime detector Kelly multiplier (crisis/high_vol regimes reduce size)
         regime_mult = regime_kelly_multiplier(regime_detector)
-        combined_mult = kelly_mult * regime_mult
+
+        # Correlation adjustment: reduce if heavily correlated with existing positions
+        corr_mult = 1.0
+        corr_matrix = dcc_tracker.correlation_matrix()
+        if corr_matrix is not None:
+            max_corr = 0.0
+            for other_asset in spot_prices:
+                if other_asset != opp["asset"]:
+                    rho = dcc_tracker.pair_correlation(opp["asset"], other_asset)
+                    if rho is not None:
+                        max_corr = max(max_corr, abs(rho))
+            if max_corr > 0.5:
+                corr_mult = 1.0 - 0.3 * (max_corr - 0.5) / 0.5
+
+        combined_mult = kelly_mult * regime_mult * corr_mult
         count = max(0, int(count * combined_mult))
 
         if count <= 0:
@@ -694,12 +817,12 @@ def scan_and_trade():
         )
 
         log.info(f"\n-> TRADE: {reasoning}")
-        log.info(f"  Placing: {count}x {side} @ {price}c on {ticker} (quarter-Kelly)")
+        log.info(f"  Placing: {count}x {side} @ {price}c on {ticker} ({kelly_frac:.0%}-Kelly)")
 
         result = trade_manager.place_order(ticker, side, price, count, reasoning,
                                             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                             model_prob=round(opp["prob"] if side == "yes" else 1.0 - opp["prob"], 4), raw_edge=round(edge, 4),
-                                            fee_cents=round(kalshi_fee_cents(price), 2), sizing_method="quarter_kelly",
+                                            fee_cents=round(kalshi_fee_cents(price), 2), sizing_method=f"horizon_{kelly_frac:.0%}_kelly",
                                             market_close_time=m.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
