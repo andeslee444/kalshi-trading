@@ -7,10 +7,11 @@ import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
-from probability import weather_probability, weather_sigma, ensemble_weather_probability, ensemble_spread_sigma_multiplier, ensemble_weather_probability_v2, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, _load_calibration
+from probability import weather_probability, weather_sigma, ensemble_weather_probability, ensemble_spread_sigma_multiplier, ensemble_weather_probability_v2, empirical_ensemble_probability, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, _load_calibration
 from ticker_utils import parse_weather_ticker as parse_ticker
 from capital_allocator import PortfolioAllocator
 from forecast_verifier import ForecastVerifier, DEFAULT_STATION_MAP
+from weather_data import EnsembleCollector, STATION_MAP
 
 setup_unbuffered()
 log = setup_logging("weather")
@@ -53,6 +54,9 @@ VERIFICATION_CONFIG = config.get("verification", {})
 verifier = ForecastVerifier(PROJECT_DIR / "data" / "weather-verification.json", logger=log) if VERIFICATION_ENABLED else None
 if verifier:
     verifier.load()
+
+# Ensemble member collector for empirical CDF model
+ensemble_collector = EnsembleCollector(logger=log)
 
 
 def get_forecast(lat, lon):
@@ -202,6 +206,18 @@ def scan_and_trade():
         except Exception as e:
             log.warning("Verification summary failed (non-blocking): %s", e)
 
+    # Fetch raw ensemble member data for empirical CDF model
+    ensemble_members = {}  # {city_code: {date_str: [member_temps]}}
+    for code, info in CITIES.items():
+        try:
+            members = ensemble_collector.fetch_ensemble(info["lat"], info["lon"])
+            if members:
+                ensemble_members[code] = members
+        except Exception as e:
+            log.warning("Ensemble member fetch failed for %s: %s", code, e)
+    if ensemble_members:
+        log.info("Ensemble member data available for %d cities", len(ensemble_members))
+
     # Current hour for intra-day sigma (day-0 markets only)
     current_hour = now.hour
 
@@ -235,9 +251,11 @@ def scan_and_trade():
         except (ValueError, TypeError):
             days_out = 0
 
-        # Compute probability — ensemble or single-model
+        # Compute probability — empirical ensemble CDF > parametric ensemble > single-model
         spread_mult = 1.0
         disagreement_score = 0.0
+        used_empirical = False
+
         if ENSEMBLE_ENABLED and isinstance(forecast_data, dict):
             if not forecast_data:
                 ss.skip("empty_forecast")
@@ -247,35 +265,56 @@ def scan_and_trade():
             if forecast_temp is None:
                 ss.skip("null_forecast")
                 continue
-            # Compute spread multiplier once — widens sigma AND gates edge
-            if len(valid_temps) >= 2:
-                spread = max(valid_temps) - min(valid_temps)
-                spread_mult = ensemble_spread_sigma_multiplier(spread)
-                if spread_mult > 1.0:
-                    log.info(f"  {ticker}: ensemble spread {spread:.1f}F (sigma_mult={spread_mult:.2f})")
 
-            # Use v2 ensemble with adaptive weights, hour-aware sigma, disagreement scoring
-            # Get city-specific skew from verification bias data
-            city_skew = city_bias.get(city, {}).get("skew_alpha", 0.0) if city_bias else 0.0
-            hour_for_sigma = current_hour if days_out == 0 else None
+            # Primary model: empirical ensemble CDF (if member data available)
+            if city in ensemble_members and date_str in ensemble_members.get(city, {}):
+                members = ensemble_members[city][date_str]
+                if members and len(members) >= 10:
+                    # Get station bias from verifier if available
+                    bias = city_bias.get(city, {}).get("bias_f", 0.0) if city_bias else 0.0
+                    our_prob = empirical_ensemble_probability(
+                        members, parsed["threshold"], parsed["direction"],
+                        bias_offset=bias
+                    )
+                    if our_prob is not None:
+                        log.info("  %s: empirical CDF from %d members (bias=%.1fF) -> P=%.3f",
+                                 ticker, len(members), bias, our_prob)
+                        used_empirical = True
+                        # Empirical CDF already captures model disagreement
+                        disagreement_score = 0.0
+                    else:
+                        log.warning("  %s: empirical CDF returned None, falling back to parametric", ticker)
 
-            result = ensemble_weather_probability_v2(
-                forecast_data, parsed["threshold"], parsed["direction"],
-                days_out, city=city, sigma_multiplier=spread_mult,
-                hour_of_day=hour_for_sigma,
-                verification_data=verification_summary if verification_summary else None,
-                return_details=True,
-            )
+            # Fallback: parametric ensemble (v2 with adaptive weights)
+            if not used_empirical:
+                # Compute spread multiplier once — widens sigma AND gates edge
+                if len(valid_temps) >= 2:
+                    spread = max(valid_temps) - min(valid_temps)
+                    spread_mult = ensemble_spread_sigma_multiplier(spread)
+                    if spread_mult > 1.0:
+                        log.info(f"  {ticker}: ensemble spread {spread:.1f}F (sigma_mult={spread_mult:.2f})")
 
-            if result[0] is not None:
-                our_prob, ensemble_details = result
-                disagreement_score = ensemble_details.get("disagreement_score", 0.0)
-                if disagreement_score > 0.3:
-                    log.info(f"  {ticker}: high ensemble disagreement ({disagreement_score:.2f}), doubling edge threshold")
-            else:
-                # Ensemble failed (zero weight) — fall back to single-model
-                log.warning("Ensemble returned None for %s, falling back to single-model", ticker)
-                our_prob = compute_probability(forecast_temp, parsed["threshold"], parsed["direction"], days_out, city=city)
+                # Use v2 ensemble with adaptive weights, hour-aware sigma, disagreement scoring
+                city_skew = city_bias.get(city, {}).get("skew_alpha", 0.0) if city_bias else 0.0
+                hour_for_sigma = current_hour if days_out == 0 else None
+
+                result = ensemble_weather_probability_v2(
+                    forecast_data, parsed["threshold"], parsed["direction"],
+                    days_out, city=city, sigma_multiplier=spread_mult,
+                    hour_of_day=hour_for_sigma,
+                    verification_data=verification_summary if verification_summary else None,
+                    return_details=True,
+                )
+
+                if result[0] is not None:
+                    our_prob, ensemble_details = result
+                    disagreement_score = ensemble_details.get("disagreement_score", 0.0)
+                    if disagreement_score > 0.3:
+                        log.info(f"  {ticker}: high ensemble disagreement ({disagreement_score:.2f}), doubling edge threshold")
+                else:
+                    # Ensemble failed (zero weight) — fall back to single-model
+                    log.warning("Ensemble returned None for %s, falling back to single-model", ticker)
+                    our_prob = compute_probability(forecast_temp, parsed["threshold"], parsed["direction"], days_out, city=city)
         else:
             if isinstance(forecast_data, dict):
                 if not forecast_data:

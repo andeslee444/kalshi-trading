@@ -716,6 +716,54 @@ def ensemble_weather_probability_v2(forecasts, threshold, direction, days_out=0,
     return final_prob
 
 
+def empirical_ensemble_probability(member_temps, threshold, direction, bias_offset=0.0):
+    """Empirical CDF from raw ensemble member temperatures.
+
+    Ranks ensemble members, applies optional station bias correction,
+    and computes KDE-smoothed probability. No parametric sigma assumption.
+
+    Args:
+        member_temps: list of forecast temperatures (F) from ensemble members.
+            Typically 82 members (31 GEFS + 51 ECMWF ENS).
+        threshold: market threshold temperature (F).
+        direction: "T" (P(T > threshold)) or "B" (P(threshold <= T < threshold+1)).
+        bias_offset: station bias correction (F) added to all members before CDF.
+            Positive = warm bias in forecasts (subtract from members).
+            Default 0.0 (no correction).
+
+    Returns:
+        float probability in [0, 1], or None if member_temps is empty/invalid.
+    """
+    if not member_temps or len(member_temps) < 5:
+        return None
+
+    # Apply bias correction: positive bias = forecasts run warm, so subtract
+    corrected = [t - bias_offset for t in member_temps]
+    n = len(corrected)
+
+    # Compute standard deviation for KDE bandwidth
+    mean = sum(corrected) / n
+    variance = sum((t - mean) ** 2 for t in corrected) / n
+    std = math.sqrt(variance) if variance > 0 else 0.5
+
+    # Silverman's rule of thumb bandwidth, with minimum of 0.5 deg F
+    h = max(0.5, 1.06 * std * n ** (-1.0 / 5.0))
+
+    if direction == "T":
+        # P(T > threshold) using kernel CDF estimator
+        prob = sum(1.0 - _norm_cdf((threshold - t) / h) for t in corrected) / n
+    elif direction == "B":
+        # P(threshold <= T < threshold + 1) = CDF(threshold+1) - CDF(threshold)
+        cdf_upper = sum(_norm_cdf((threshold + 1 - t) / h) for t in corrected) / n
+        cdf_lower = sum(_norm_cdf((threshold - t) / h) for t in corrected) / n
+        prob = cdf_upper - cdf_lower
+    else:
+        return None
+
+    # Clamp to [0.01, 0.99] to avoid extremes with limited ensemble size
+    return max(0.01, min(0.99, prob))
+
+
 def nws_sigma_for_hour(hour_of_day):
     """NWS temperature uncertainty (sigma in degrees F) for a given hour.
 
@@ -911,6 +959,8 @@ def cpi_nowcast_sigma(days_to_release, fed_ci_width=None):
     if cpi_cal:
         key = str(min(14, max(0, days_to_release)))
         if key in cpi_cal:
+            if fed_ci_width is not None and fed_ci_width > 0:
+                _log.debug("Calibration sigma_by_days overrides fed_ci_width=%.4f at d=%s", fed_ci_width, key)
             return cpi_cal[key]
 
     # Dynamic sigma from cross-measure dispersion (when available)
