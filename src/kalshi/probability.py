@@ -937,7 +937,7 @@ def econ_nowcast_probability(nowcast_value, nowcast_sigma, threshold, direction=
 
 
 def cpi_nowcast_sigma(days_to_release, fed_ci_width=None):
-    """Exponential decay for CPI nowcast uncertainty based on time to release.
+    """Piecewise exponential for CPI nowcast uncertainty based on time to release.
 
     Returns sigma in percentage points (e.g. 0.10 = 0.10%).
 
@@ -952,7 +952,7 @@ def cpi_nowcast_sigma(days_to_release, fed_ci_width=None):
 
     If config/calibration.json has cpi.sigma_by_days (from calibrate-cpi-sigma.py),
     uses empirically calibrated values. Otherwise falls back to heuristic:
-    ~0.05 at release, ~0.17 at 7d, ~0.27 at 30d, ~0.40 at 107d+.
+    ~0.04 at release, ~0.11 at 7d, ~0.23 at 30d, ~0.37 at 107d+.
     """
     cal = _load_calibration()
     cpi_cal = cal.get("cpi", {}).get("sigma_by_days", {})
@@ -979,12 +979,12 @@ def cpi_nowcast_sigma(days_to_release, fed_ci_width=None):
     d = max(0, days_to_release)
     if d <= 14:
         # Near-release: sigma decays rapidly as BLS component data arrives
-        # d=0: 0.04, d=3: 0.06, d=7: 0.10, d=14: 0.15
+        # d=0: 0.04, d=3: 0.08, d=7: 0.11, d=14: 0.14
         return 0.04 + 0.11 * (1 - math.exp(-0.15 * d))
     else:
         # Long-horizon: structural uncertainty, slower decay
-        # d=14: 0.15, d=30: 0.25, d=60: 0.35, d=107: 0.40
-        near_val = 0.04 + 0.11 * (1 - math.exp(-0.15 * 14))  # ~0.15 at d=14
+        # d=14: 0.14, d=30: 0.23, d=60: 0.32, d=107: 0.37
+        near_val = 0.04 + 0.11 * (1 - math.exp(-0.15 * 14))  # ~0.14 at d=14
         return near_val + 0.25 * (1 - math.exp(-0.03 * (d - 14)))
 
 

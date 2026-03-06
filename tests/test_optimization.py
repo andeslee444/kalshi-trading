@@ -1120,22 +1120,22 @@ class TestEconNowcastProbability:
 class TestCpiNowcastSigma:
 
     def test_release_day(self):
-        assert cpi_nowcast_sigma(0) == 0.05
+        assert cpi_nowcast_sigma(0) == 0.04
 
     def test_one_day_out(self):
-        """Smooth exponential: day 1 is above floor."""
+        """Piecewise exponential: day 1 is above floor."""
         sigma = cpi_nowcast_sigma(1)
-        assert 0.05 < sigma < 0.08
+        assert 0.04 < sigma < 0.07
 
     def test_one_week_out(self):
-        """Smooth exponential: day 7 should be around 0.17."""
+        """Piecewise exponential: day 7 should be around 0.11."""
         sigma = cpi_nowcast_sigma(7)
-        assert 0.13 < sigma < 0.20
+        assert 0.09 < sigma < 0.14
 
     def test_two_weeks_out(self):
-        """Smooth exponential: day 14 should be around 0.23."""
+        """Piecewise exponential: day 14 should be around 0.14."""
         sigma = cpi_nowcast_sigma(14)
-        assert 0.18 < sigma < 0.25
+        assert 0.12 < sigma < 0.16
 
     def test_sigma_decreases_toward_release(self):
         """Sigma should decrease monotonically from 14d down to 1d before release."""
