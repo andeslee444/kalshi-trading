@@ -533,6 +533,9 @@ def scan_and_trade():
                 side_depth = depth_data["total_ask_depth"] if side == "yes" else depth_data["total_bid_depth"]
                 if side_depth < min_depth:
                     log.info(f"  Skipping {ticker}: insufficient depth ({side_depth} < {min_depth})")
+                    ss.skip("low_depth")
+                    trade_manager.log_decision(ticker, side, "skipped", f"insufficient depth ({side_depth} < {min_depth})",
+                                               edge=edge, price_cents=yes_ask if side == "yes" else no_ask)
                     continue
 
         if side == "yes" and yes_ask and yes_ask < 99:
@@ -550,23 +553,11 @@ def scan_and_trade():
             price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge)
             if not price or price <= 0:
                 price = yes_ask
-            # Phase 3: Improve limit price using orderbook depth
-            if depth_data:
-                fill_price = orderbook.estimate_fill_price(depth_data, "yes", 1)
-                if fill_price and fill_price < price:
-                    log.info(f"  {ticker}: depth suggests better fill at {fill_price:.0f}c (vs {price}c)")
-                    price = int(fill_price)
             reasoning = f"{city_name} forecast: {forecast}F, {ticker} YES at {price}c -> our prob {opp['our_prob']*100:.0f}%, edge +{edge*100:.1f}%, buying YES"
         elif side == "no" and no_ask and no_ask < 99:
             price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge)
             if not price or price <= 0:
                 price = no_ask
-            # Phase 3: Improve limit price using orderbook depth
-            if depth_data:
-                fill_price = orderbook.estimate_fill_price(depth_data, "no", 1)
-                if fill_price and fill_price > price:
-                    log.info(f"  {ticker}: depth suggests better sell at {fill_price:.0f}c (vs {price}c)")
-                    price = int(fill_price)
             reasoning = f"{city_name} forecast: {forecast}F, {ticker} NO at {price}c -> our prob {(1-opp['our_prob'])*100:.0f}%, edge +{edge*100:.1f}%, buying NO"
         else:
             continue
@@ -617,6 +608,21 @@ def scan_and_trade():
                 bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True,
             )
             sizing_label = "quarter-Kelly (uncalibrated)"
+
+        # Phase 3: Improve limit price using orderbook depth (after Kelly sizing for accurate qty)
+        if depth_data and count > 0:
+            if side == "yes":
+                fill_price = orderbook.estimate_fill_price(depth_data, "yes", count)
+                if fill_price is not None and fill_price < price:
+                    log.info(f"  {ticker}: depth suggests better YES fill at {fill_price:.0f}c (vs {price}c)")
+                    price = int(fill_price)
+            elif side == "no":
+                fill_price_yes = orderbook.estimate_fill_price(depth_data, "no", count)
+                if fill_price_yes is not None:
+                    fill_price_no = 100 - int(fill_price_yes)
+                    if fill_price_no < price:
+                        log.info(f"  {ticker}: depth suggests better NO fill at {fill_price_no}c (vs {price}c)")
+                        price = fill_price_no
 
         if count <= 0:
             log.info(f"  Kelly says 0 contracts for {ticker} (edge too small for price), skipping")

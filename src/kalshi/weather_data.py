@@ -310,7 +310,7 @@ class HRRRFetcher:
             f"https://api.open-meteo.com/v1/forecast?"
             f"latitude={lat}&longitude={lon}"
             f"&hourly=temperature_2m&temperature_unit=fahrenheit"
-            f"&timezone=America%2FNew_York&forecast_days=2"
+            f"&timezone=auto&forecast_days=2"
             f"&models=hrrr_conus"
         )
 
@@ -460,65 +460,47 @@ MODEL_RUN_SCHEDULE = {
 
 
 def next_model_run(now_utc=None):
-    """Find the model run that will become available soonest.
+    """Find the next model run that will become available in the future.
+
+    Only reports future runs (minutes > 0). Already-available runs are skipped
+    so callers only trigger pre-scans when fresh data is truly imminent.
 
     Args:
-        now_utc: datetime.datetime in UTC. If None, uses datetime.datetime.utcnow().
+        now_utc: datetime.datetime in UTC. If None, uses current UTC time.
 
     Returns:
-        Tuple of (model_name, minutes_until_available).
-        If a run is already available (minutes <= 0), returns (model_name, 0).
+        Tuple of (model_name, minutes_until_available) where minutes > 0.
     """
     if now_utc is None:
         now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
 
     best_model = None
     best_minutes = float("inf")
-
     now_minutes = now_utc.hour * 60 + now_utc.minute
 
     for model_name, schedule in MODEL_RUN_SCHEDULE.items():
         delay = schedule["delay_minutes"]
         for run_hour in schedule["hours_utc"]:
-            # Output available at: run_hour * 60 + delay minutes from midnight
             available_at = run_hour * 60 + delay
             minutes_until = available_at - now_minutes
-
-            # If available_at is in the past (today), it's available now
             if minutes_until <= 0:
-                # This run is already available — check if it's "recent"
-                # (within the last cycle period for this model)
-                if minutes_until >= -60:  # available within last hour
-                    return (model_name, 0)
-                continue
-
+                continue  # already available, skip
             if minutes_until < best_minutes:
                 best_minutes = minutes_until
                 best_model = model_name
 
-    # If nothing found in future, check wrap-around (next day's first run)
+    # Wrap-around: if all today's runs are past, find earliest tomorrow
     if best_model is None:
-        # Everything was in the past — find earliest tomorrow
         for model_name, schedule in MODEL_RUN_SCHEDULE.items():
             delay = schedule["delay_minutes"]
             first_hour = schedule["hours_utc"][0]
-            available_at = first_hour * 60 + delay + 1440  # tomorrow
+            available_at = first_hour * 60 + delay + 1440
             minutes_until = available_at - now_minutes
             if minutes_until < best_minutes:
                 best_minutes = minutes_until
                 best_model = model_name
 
-    # Check if any run from the current cycle is already available
-    # (this handles the case where recent runs exist)
-    for model_name, schedule in MODEL_RUN_SCHEDULE.items():
-        delay = schedule["delay_minutes"]
-        for run_hour in schedule["hours_utc"]:
-            available_at = run_hour * 60 + delay
-            minutes_until = available_at - now_minutes
-            if minutes_until <= 0 and minutes_until >= -120:
-                return (model_name, 0)
-
-    return (best_model, max(0, best_minutes))
+    return (best_model, best_minutes)
 
 
 class TrainingStore:

@@ -358,7 +358,7 @@ class TestHRRRFetcher:
 
     @patch("weather_data._retry_request")
     def test_fetch_hrrr_url_uses_hrrr_conus(self, mock_retry):
-        """Verify the URL uses the hrrr_conus model."""
+        """Verify the URL uses the hrrr_conus model and auto timezone."""
         mock_retry.return_value = self._make_mock_response(
             {"hourly": {"time": ["2026-03-05T00:00"], "temperature_2m": [72.0]}}
         )
@@ -370,6 +370,7 @@ class TestHRRRFetcher:
         assert "models=hrrr_conus" in url
         assert "hourly=temperature_2m" in url
         assert "temperature_unit=fahrenheit" in url
+        assert "timezone=auto" in url
 
 
 # ===================================================================
@@ -507,23 +508,42 @@ class TestModelRunSchedule:
         assert minutes <= 15
         assert minutes >= 0
 
-    def test_next_model_run_available_now(self):
-        """If a model run output is already available, minutes should be 0."""
-        # HRRR 00Z available at 00:45. If we check at 01:00, the 00Z run
-        # was available 15 min ago. Return 0 for "available now".
+    def test_next_model_run_skips_already_available(self):
+        """Already-available runs should be skipped; only future runs returned."""
+        # At 01:00, HRRR 00Z was at 00:45 (already past, skip)
+        # HRRR 01Z will be at 01:45 (45min away)
         now = datetime.datetime(2026, 3, 5, 1, 0, 0)
         model, minutes = next_model_run(now)
-        # At 01:00, HRRR 00Z was at 00:45 (15min ago, avail now)
-        # HRRR 01Z will be at 01:45 (45min away)
-        # So something should be available now (0 min)
-        assert minutes == 0
+        assert minutes > 0  # must be a future run
+        assert minutes == 45  # HRRR 01Z at 01:45
 
     def test_next_model_run_prefers_soonest(self):
         """Should return the model run that becomes available soonest."""
         # At 05:00 UTC:
-        # GFS 00Z: available at 03:30 (already past) -> 0
-        # HRRR 04Z: available at 04:45 (already past) -> 0
-        # Either could be returned, both are "available now"
+        # HRRR 05Z available at 05:45 = 45 min away (soonest)
+        # GFS 06Z available at 09:30 = 270 min away
         now = datetime.datetime(2026, 3, 5, 5, 0, 0)
         model, minutes = next_model_run(now)
-        assert minutes == 0
+        assert minutes > 0
+        assert model == "hrrr"
+        assert minutes == 45
+
+    def test_next_model_run_never_returns_zero(self):
+        """next_model_run should never return 0 at any time of day."""
+        for h in range(24):
+            for m in [0, 15, 30, 45]:
+                _, mins = next_model_run(datetime.datetime(2026, 3, 5, h, m))
+                assert mins > 0, f"Returned 0 at {h:02d}:{m:02d}"
+
+    def test_next_model_run_hrrr_imminent(self):
+        """At 10:43 UTC, HRRR 10Z available at 10:45 -> 2 minutes away."""
+        now = datetime.datetime(2026, 3, 5, 10, 43, 0)
+        model, minutes = next_model_run(now)
+        assert model == "hrrr"
+        assert minutes == 2
+
+    def test_next_model_run_after_last_hrrr(self):
+        """At 10:50 UTC, HRRR 10Z already past. Next is HRRR 11Z at 11:45 -> 55 min."""
+        now = datetime.datetime(2026, 3, 5, 10, 50, 0)
+        model, minutes = next_model_run(now)
+        assert minutes == 55

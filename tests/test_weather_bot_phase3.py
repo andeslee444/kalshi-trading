@@ -85,8 +85,39 @@ from weather_data import HRRRFetcher, OrderBookDepth, next_model_run, MODEL_RUN_
 
 
 class TestAdaptiveInterval:
-    """Test compute_adaptive_interval() returns correct scan intervals
-    based on nearest market settlement date."""
+    """Test compute_adaptive_interval() by extracting the function source.
+
+    The bot module has heavy module-level side effects (API client init, config reads),
+    so we extract and exec just the function rather than importing the full module.
+    """
+
+    @staticmethod
+    def _load_compute_adaptive_interval():
+        """Extract compute_adaptive_interval from weather-bot.py source."""
+        bot_path = os.path.join(os.path.dirname(__file__), "..", "src", "kalshi", "weather-bot.py")
+        with open(os.path.abspath(bot_path)) as f:
+            source = f.read()
+
+        # Extract the function definition
+        import textwrap
+        start = source.index("def compute_adaptive_interval(")
+        # Find the next top-level def or class
+        rest = source[start:]
+        lines = rest.split("\n")
+        func_lines = [lines[0]]
+        for line in lines[1:]:
+            if line and not line[0].isspace() and not line.startswith("#"):
+                break
+            func_lines.append(line)
+
+        func_source = "\n".join(func_lines)
+
+        # Create a namespace with the needed imports and a mock parse_ticker
+        parse_mock = MagicMock(return_value=None)
+        ns = {"datetime": datetime, "parse_ticker": parse_mock}
+        exec(func_source, ns)
+
+        return ns["compute_adaptive_interval"], parse_mock
 
     def _make_config(self, enabled=True):
         return {
@@ -100,107 +131,81 @@ class TestAdaptiveInterval:
             },
         }
 
-    def _make_market(self, ticker):
-        return {"ticker": ticker, "yes_ask": 50, "no_ask": 50, "volume": 100}
-
     def test_adaptive_disabled_returns_default(self):
         """When adaptiveScan is disabled, return scanIntervalMinutes."""
-        # We can test this by importing the function directly
-        # but compute_adaptive_interval uses parse_ticker, so we need the bot context
-        # Instead, test via the pure logic
+        compute, _ = self._load_compute_adaptive_interval()
         config = self._make_config(enabled=False)
-        # Without loading the bot, just verify config structure
-        adaptive_cfg = config.get("adaptiveScan", {})
-        assert not adaptive_cfg.get("enabled", False) or config.get("scanIntervalMinutes") == 30
+        assert compute([], config) == 30
+
+    def test_empty_markets_returns_day2plus(self):
+        """Empty market list should default to day2+ interval."""
+        compute, _ = self._load_compute_adaptive_interval()
+        config = self._make_config()
+        assert compute([], config) == 30
 
     def test_day0_market_returns_5_min(self):
         """Day-0 markets should trigger 5-minute scan interval."""
+        compute, parse_mock = self._load_compute_adaptive_interval()
         today = datetime.date.today()
-        date_str = today.isoformat()
-        # The ticker date format for parse_ticker would be parsed externally
-        # We test the logic: if min_days_out == 0, return 5
+        parse_mock.return_value = {"date": today.isoformat(), "city": "MIA"}
         config = self._make_config()
-        assert config["adaptiveScan"]["day0Minutes"] == 5
+        markets = [{"ticker": "KXHIGHMIA-26MAR05-T86"}]
+        assert compute(markets, config) == 5
 
     def test_day1_market_returns_15_min(self):
         """Day-1 markets should trigger 15-minute scan interval."""
+        compute, parse_mock = self._load_compute_adaptive_interval()
+        tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+        parse_mock.return_value = {"date": tomorrow.isoformat(), "city": "MIA"}
         config = self._make_config()
-        assert config["adaptiveScan"]["day1Minutes"] == 15
+        markets = [{"ticker": "KXHIGHMIA-26MAR06-T86"}]
+        assert compute(markets, config) == 15
 
     def test_day2plus_returns_30_min(self):
         """Day-2+ markets should use 30-minute default."""
+        compute, parse_mock = self._load_compute_adaptive_interval()
+        future = datetime.date.today() + datetime.timedelta(days=3)
+        parse_mock.return_value = {"date": future.isoformat(), "city": "MIA"}
         config = self._make_config()
-        assert config["adaptiveScan"]["day2PlusMinutes"] == 30
-
-    def test_no_markets_returns_day2plus(self):
-        """Empty market list should default to day2+ interval."""
-        config = self._make_config()
-        assert config["adaptiveScan"]["day2PlusMinutes"] == 30
-
-
-class TestAdaptiveIntervalFunction:
-    """Test compute_adaptive_interval as a standalone function with mocked parse_ticker."""
-
-    def setup_method(self):
-        """Load weather_data module and import compute_adaptive_interval via importlib."""
-        # We need to test the actual function, so let's load it
-        bot_path = os.path.join(os.path.dirname(__file__), "..", "src", "kalshi", "weather-bot.py")
-        bot_path = os.path.abspath(bot_path)
-
-        # We can't import weather-bot.py directly due to hyphens and module-level side effects
-        # Instead, test via a simulated implementation that mirrors compute_adaptive_interval
-        pass
-
-    def test_day0_logic(self):
-        """Verify the day-0 detection logic."""
-        today = datetime.date.today()
-        days_out = (today - today).days  # 0
-        assert days_out == 0
-
-    def test_day1_logic(self):
-        """Verify day-1 detection."""
-        today = datetime.date.today()
-        tomorrow = today + datetime.timedelta(days=1)
-        days_out = (tomorrow - today).days
-        assert days_out == 1
+        markets = [{"ticker": "KXHIGHMIA-26MAR08-T86"}]
+        assert compute(markets, config) == 30
 
 
 class TestHRRRMemberInjection:
-    """Test HRRR member injection logic for empirical CDF."""
+    """Test HRRR member injection via empirical_ensemble_probability."""
 
-    def test_day0_injects_60_percent(self):
-        """Day-0: 60% weight means inject ~60% of member count."""
-        members = list(range(82))  # 82 ensemble members
+    def test_hrrr_injection_shifts_probability(self):
+        """Injecting HRRR temps into ensemble should shift probability toward HRRR value."""
+        # Base ensemble: 82 members all at 80F
+        base_members = [80.0] * 82
+        # HRRR says 90F — injecting should raise probability of exceeding 85F threshold
+        hrrr_temp = 90.0
         hrrr_weight = 0.60
-        n_inject = max(1, int(len(members) * hrrr_weight))
-        assert n_inject == 49  # int(82 * 0.60) = 49
+        n_inject = max(1, int(len(base_members) * hrrr_weight))
+        assert n_inject == 49
 
-        # After injection, total should be 82 + 49 = 131
-        hrrr_temp = 85.0
-        injected = members + [hrrr_temp] * n_inject
+        injected = base_members + [hrrr_temp] * n_inject
         assert len(injected) == 131
 
-    def test_day1_injects_30_percent(self):
-        """Day-1: 30% weight means inject ~30% of member count."""
-        members = list(range(82))
-        hrrr_weight = 0.30
-        n_inject = max(1, int(len(members) * hrrr_weight))
-        assert n_inject == 24  # int(82 * 0.30) = 24
-
-        injected = members + [85.0] * n_inject
-        assert len(injected) == 106
-
-    def test_day2_no_injection(self):
-        """Day-2+: weight=0, no injection."""
-        hrrr_weight = 0.0
-        assert hrrr_weight == 0
+        # Empirical CDF: fraction above 85F should increase after injection
+        above_threshold_base = sum(1 for t in base_members if t >= 85) / len(base_members)
+        above_threshold_injected = sum(1 for t in injected if t >= 85) / len(injected)
+        assert above_threshold_base == 0.0
+        assert above_threshold_injected > 0.3  # 49/131 ≈ 0.374
 
     def test_small_ensemble_injects_at_least_1(self):
         """Even with tiny ensemble, inject at least 1 HRRR member."""
-        members = [80.0]  # only 1 member
+        members = [80.0]
         hrrr_weight = 0.30
         n_inject = max(1, int(len(members) * hrrr_weight))
-        assert n_inject == 1  # max(1, int(1*0.30)=0) = 1
+        assert n_inject == 1
+
+    def test_day2_no_injection(self):
+        """Day-2+: weight=0, no injection."""
+        members = [80.0] * 82
+        hrrr_weight = 0.0
+        n_inject = max(1, int(len(members) * hrrr_weight)) if hrrr_weight > 0 else 0
+        assert n_inject == 0
 
 
 class TestModelRunTimingOverride:
@@ -212,19 +217,16 @@ class TestModelRunTimingOverride:
         # At XX:43, next HRRR run available at XX:45 = 2 min away
         now = datetime.datetime(2026, 3, 5, 10, 43, 0)
         model, minutes = next_model_run(now)
-        assert minutes <= 2
+        assert model == "hrrr"
+        assert minutes == 2
 
     def test_no_imminent_run_keeps_base(self):
         """When no model run is imminent, interval stays at base."""
-        # At XX:50, HRRR was at XX:45 (5 min ago), next at (XX+1):45 = 55 min away
+        # At XX:50, HRRR 10Z was at 10:45 (already past), next HRRR 11Z at 11:45 = 55 min
         now = datetime.datetime(2026, 3, 5, 10, 50, 0)
         model, minutes = next_model_run(now)
-        # Should not be imminent (> 2 min)
-        # HRRR 10Z was at 10:45, already available (minutes=0)
-        # This is "available now" so bot would scan, but
-        # the logic in main() only shortens if minutes_until <= trigger
-        # When minutes == 0, it means "already available", which is <= 2
-        assert minutes == 0  # Available now triggers immediate scan
+        # 55 min > 2 min trigger, so interval stays at base
+        assert minutes > 2
 
 
 class TestOrderbookDepthGating:
@@ -271,6 +273,35 @@ class TestOrderbookDepthGating:
         # If we need 8, it's (80*5 + 82*3) / 8 = 80.75
         fill_price_8 = ob.estimate_fill_price(depth, "yes", 8)
         assert fill_price_8 == pytest.approx(80.75, abs=0.01)
+
+    def test_no_side_fill_price_conversion(self):
+        """NO-side fill price must convert YES-VWAP to NO price space (100 - yes_price).
+
+        Bug: estimate_fill_price('no') walks yes_bids and returns YES-price VWAP.
+        The bot must convert: NO_price = 100 - YES_VWAP, and only improve if lower.
+        """
+        ob = OrderBookDepth()
+        depth = {
+            "yes_bids": [(85, 10), (84, 20)],
+            "yes_asks": [(15, 10)],
+            "total_bid_depth": 30,
+            "total_ask_depth": 10,
+        }
+        # estimate_fill_price for NO side walks yes_bids -> returns YES VWAP
+        fill_price_yes = ob.estimate_fill_price(depth, "no", 5)
+        assert fill_price_yes == 85  # all 5 fill at best yes_bid of 85
+
+        # Convert to NO price space
+        fill_price_no = 100 - int(fill_price_yes)
+        assert fill_price_no == 15  # correct NO price
+
+        # If current NO price is 16c, the depth-suggested 15c is better (lower)
+        current_no_price = 16
+        assert fill_price_no < current_no_price  # 15 < 16 -> improvement
+
+        # If current NO price is 14c, depth price of 15c is worse (higher) -> no improvement
+        current_no_price_low = 14
+        assert not (fill_price_no < current_no_price_low)  # 15 < 14 is False
 
 
 class TestConfigPhase3:
