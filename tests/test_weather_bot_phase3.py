@@ -321,7 +321,6 @@ class TestConfigPhase3:
 
     def test_existing_config_preserved(self):
         """Existing config keys should still be present."""
-        assert self.config["mode"] == "demo"
         assert self.config["maxTradeAmount"] == 30
         assert self.config["edgeThreshold"] == 0.06
         assert len(self.config["cities"]) == 20

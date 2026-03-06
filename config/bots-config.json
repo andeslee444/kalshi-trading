@@ -1,4 +1,5 @@
 {
+  "_naming_convention": "Single-word sections: flat (crypto, weather, economics). Multi-word: snake_case (position_monitor, market_maker, cross_platform_arb). Values in dollars unless key ends with Cents. Times in minutes unless key ends with Hours or Seconds.",
   "weather": {
     "exit": {
       "takeProfitCents": 80,
