@@ -69,6 +69,11 @@ def _local_today(city_code):
     return datetime.datetime.now(tz).date().isoformat()
 
 
+def _utc_now_iso():
+    """Return current UTC time as ISO 8601 string with timezone offset."""
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
 def round_half_up(value):
     """Round a float using arithmetic rounding (0.5 rounds up).
 
@@ -251,7 +256,17 @@ class KalshiClient:
                     continue
 
                 r.raise_for_status()
-                return r.json()
+                if r.status_code == 204 or not r.content:
+                    return {}
+                try:
+                    return r.json()
+                except (ValueError, json.JSONDecodeError) as e:
+                    _log.error("Non-JSON response from %s %s (status %d): %s",
+                               method, path, r.status_code, r.text[:200])
+                    raise ValueError(
+                        f"Non-JSON response from {method} {path} "
+                        f"(status {r.status_code}): {r.text[:100]}"
+                    ) from e
 
             except requests.exceptions.ConnectionError as e:
                 if not is_idempotent:
@@ -392,7 +407,7 @@ def load_trades(trades_path: Path) -> list:
     return []
 
 
-def _atomic_write_json(path: Path, data):
+def atomic_write_json(path: Path, data):
     """Write JSON data to a file atomically using a temp file + os.replace()."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
@@ -406,6 +421,9 @@ def _atomic_write_json(path: Path, data):
         except OSError:
             pass
         raise
+
+# Backward-compatible alias
+_atomic_write_json = atomic_write_json
 
 
 def save_trade(trades_path: Path, trade: dict):
@@ -538,14 +556,16 @@ class RecentTradeTracker:
     def _load(self):
         """Load recent tickers from the trade file."""
         trades = load_trades(self.trades_path)
-        cutoff = datetime.datetime.now() - datetime.timedelta(hours=self.cooldown_hours)
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=self.cooldown_hours)
         for t in trades:
             ts_str = t.get("timestamp", "")
             ticker = t.get("ticker", "")
             if not ts_str or not ticker:
                 continue
             try:
-                ts = datetime.datetime.fromisoformat(ts_str).replace(tzinfo=None)
+                ts = datetime.datetime.fromisoformat(ts_str)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=datetime.timezone.utc)
                 if ts > cutoff:
                     existing = self._recent.get(ticker)
                     if not existing or ts > existing:
@@ -559,7 +579,7 @@ class RecentTradeTracker:
         Lazily prunes expired entries to prevent unbounded memory growth
         in long-running daemon sessions.
         """
-        cutoff = datetime.datetime.now() - datetime.timedelta(hours=self.cooldown_hours)
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=self.cooldown_hours)
         # Prune expired entries every 100 calls (amortized O(1))
         if not hasattr(self, "_prune_counter"):
             self._prune_counter = 0
@@ -575,7 +595,7 @@ class RecentTradeTracker:
 
     def record(self, ticker):
         """Record a trade on this ticker."""
-        self._recent[ticker] = datetime.datetime.now()
+        self._recent[ticker] = datetime.datetime.now(datetime.timezone.utc)
 
 
 # === Kill switch ===
@@ -658,8 +678,8 @@ class CircuitBreaker:
                 "max_failures": self.max_failures,
             }
             _atomic_write_json(self.state_path, existing)
-        except Exception:
-            pass  # Don't crash on breaker persistence failure
+        except Exception as e:
+            _log.warning("Failed to save circuit breaker state: %s", e)
 
     def record_success(self):
         """Record a successful operation — resets the failure counter."""
@@ -771,13 +791,15 @@ def trim_trade_log(trades_path, max_age_days=90, max_entries=5000):
             if not trades:
                 return
 
-            cutoff = datetime.datetime.now() - datetime.timedelta(days=max_age_days)
+            cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=max_age_days)
             filtered = []
             for t in trades:
                 ts_str = t.get("timestamp", "")
                 if ts_str:
                     try:
-                        ts = datetime.datetime.fromisoformat(ts_str).replace(tzinfo=None)
+                        ts = datetime.datetime.fromisoformat(ts_str)
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=datetime.timezone.utc)
                         if ts < cutoff:
                             continue
                     except (ValueError, TypeError):
@@ -823,7 +845,7 @@ class ScanSummary:
         duration = round(time.time() - self._start, 1)
         total_skipped = sum(self.skips.values())
         summary = {
-            "timestamp": datetime.datetime.now().isoformat(),
+            "timestamp": _utc_now_iso(),
             "bot": self.bot,
             "duration_seconds": duration,
             "markets_fetched": self.markets_fetched,
@@ -865,8 +887,8 @@ def _append_scan_summary(summary):
                 _atomic_write_json(SCAN_SUMMARIES_PATH, existing)
             finally:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
-    except Exception:
-        pass
+    except Exception as e:
+        _log.warning("Failed to append scan summary: %s", e)
 
 
 # === Order Monitor ===
@@ -1058,8 +1080,8 @@ class TradeManager:
                 self._cached_balance_cents = available
                 self._balance_fetched_at = now
                 return available
-            except Exception:
-                pass
+            except Exception as e:
+                self.log.warning("Failed to fetch balance, using cached: %s", e)
         return self._cached_balance_cents or 0
 
     def _effective_max_trade_cents(self):
@@ -1108,10 +1130,22 @@ class TradeManager:
 
         Flattens market snapshot fields and adds settlement placeholders
         for later reconciliation.
+
+        Standard extra_fields that bots SHOULD pass for debuggability:
+            model_prob (float): Model's estimated probability
+            raw_edge (float): Our prob - market implied prob
+            fee_cents (int): Estimated fee in cents
+            sizing_method (str): e.g. "half_kelly", "quarter_kelly"
+            model_inputs (dict): Upstream data that produced model_prob, e.g.:
+                - weather: {"forecast_temp": 85.2, "sigma": 3.1, "days_out": 2, "city": "MIA"}
+                - crypto: {"spot_price": 67500, "iv": 0.55, "realized_vol": 0.48, "horizon_min": 720}
+                - economics: {"nowcast": 3.1, "sigma": 0.06, "days_to_release": 3}
+                - entertainment: {"observed": 150000, "threshold": 100000, "data_sigma": 0.10}
         """
         record = {
-            "timestamp": datetime.datetime.now().isoformat(),
+            "timestamp": _utc_now_iso(),
             "ticker": ticker,
+            "action": "buy",
             "side": side,
             "price_cents": price_cents,
             "count": count,
@@ -1121,8 +1155,9 @@ class TradeManager:
             "status": order_info.get("status"),
             "source_bot": self.log.name,
         }
-        # Merge all extra fields (model_prob, raw_edge, fee_cents, sizing_method, etc.)
-        record.update(extra_fields)
+        # Merge extra fields, excluding canonical keys that must not be overridden
+        _protected = {"timestamp", "ticker", "action", "side", "source_bot"}
+        record.update({k: v for k, v in extra_fields.items() if k not in _protected})
 
         # Flatten market_snapshot into top-level fields for easy querying
         snapshot = extra_fields.get("market_snapshot", {})
@@ -1176,7 +1211,19 @@ class TradeManager:
             **extra_fields: Additional fields to store in the trade record.
 
         Returns:
-            Order info dict from API on success, or None if blocked/failed.
+            dict: Order info from API on success (contains 'order_id', 'status').
+            None: On any failure. Check log for reason. Failure causes include:
+                - invalid_side: Side not 'yes' or 'no'
+                - kill_switch: Trading halted via data/HALT_TRADING
+                - circuit_breaker: Too many consecutive API failures
+                - daily_trade_limit: Max trades per day reached
+                - daily_loss_limit: Max daily loss reached
+                - dedup: Same ticker traded recently (cooldown)
+                - cost_cap: Order cost exceeds max trade amount
+                - balance: Insufficient available balance
+                - stale_data: Market data too old
+                - api_error: Kalshi API returned an error
+                - allocator_denied: Capital allocator rejected the request
         """
         self._reset_daily_if_needed()
         caps_applied = []
@@ -1432,7 +1479,7 @@ class TradeManager:
         """
         decisions_path = self.trades_path.parent / f"{self.trades_path.stem}-decisions.json"
         record = {
-            "timestamp": datetime.datetime.now().isoformat(),
+            "timestamp": _utc_now_iso(),
             "ticker": ticker,
             "side": side,
             "action": action,
@@ -1561,7 +1608,7 @@ class HealthCheckMonitor:
         """Record a successful data source fetch."""
         if source not in self._state["sources"]:
             self._state["sources"][source] = {"last_success": None, "last_error": None, "error_count": 0}
-        self._state["sources"][source]["last_success"] = datetime.datetime.now().isoformat()
+        self._state["sources"][source]["last_success"] = _utc_now_iso()
         self._state["sources"][source]["error_count"] = 0
         self._save()
 
@@ -1569,25 +1616,25 @@ class HealthCheckMonitor:
         """Record a data source error."""
         if source not in self._state["sources"]:
             self._state["sources"][source] = {"last_success": None, "last_error": None, "error_count": 0}
-        self._state["sources"][source]["last_error"] = datetime.datetime.now().isoformat()
+        self._state["sources"][source]["last_error"] = _utc_now_iso()
         self._state["sources"][source]["error_count"] = self._state["sources"][source].get("error_count", 0) + 1
         self._save()
 
     def record_bot_heartbeat(self, bot):
         """Record a bot heartbeat (proves the bot loop is running)."""
-        self._state["bots"][bot] = {"last_heartbeat": datetime.datetime.now().isoformat()}
+        self._state["bots"][bot] = {"last_heartbeat": _utc_now_iso()}
         self._save()
 
     def should_send_alert(self, alert_key):
         """Check if an alert should be sent (respects cooldown window)."""
         if alert_key not in self._alerts_sent:
             return True
-        elapsed = (datetime.datetime.now() - self._alerts_sent[alert_key]).total_seconds() / 60
+        elapsed = (datetime.datetime.now(datetime.timezone.utc) - self._alerts_sent[alert_key]).total_seconds() / 60
         return elapsed >= self._alert_cooldown_minutes
 
     def record_alert_sent(self, alert_key):
         """Record that an alert was sent (for deduplication)."""
-        self._alerts_sent[alert_key] = datetime.datetime.now()
+        self._alerts_sent[alert_key] = datetime.datetime.now(datetime.timezone.utc)
 
     def get_summary(self):
         """Get a structured health summary for dashboard display.
@@ -1614,7 +1661,7 @@ class HealthCheckMonitor:
             stale = False
             if last_hb:
                 try:
-                    age_min = (datetime.datetime.now() -
+                    age_min = (datetime.datetime.now(datetime.timezone.utc) -
                                datetime.datetime.fromisoformat(last_hb)).total_seconds() / 60
                     stale = age_min > self.staleness_minutes
                 except (ValueError, TypeError):
@@ -1642,7 +1689,7 @@ class HealthCheckMonitor:
           - Source errors: consecutive error count > 5
         """
         stale_min = staleness_minutes or self.staleness_minutes
-        now = datetime.datetime.now()
+        now = datetime.datetime.now(datetime.timezone.utc)
         issues = []
 
         # Check bot staleness
