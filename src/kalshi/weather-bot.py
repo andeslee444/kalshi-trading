@@ -518,6 +518,10 @@ def scan_and_trade():
         # Rec 1: Brackets require 2x edge threshold (higher model uncertainty)
         if is_bracket and edge < config["edgeThreshold"] * 2:
             log.info(f"  Skipping bracket {ticker}: edge {edge*100:.1f}% < {config['edgeThreshold']*200:.0f}% (2x threshold)")
+            ss.skip("bracket_low_edge")
+            trade_manager.log_decision(ticker, opp["side"], "skipped",
+                                       f"bracket edge {edge*100:.1f}% < 2x threshold",
+                                       edge=edge, price_cents=yes_ask if opp["side"] == "yes" else no_ask)
             continue
 
         # Edge is always positive (computed against the ask for the side we'd trade)
@@ -619,7 +623,7 @@ def scan_and_trade():
             elif side == "no":
                 fill_price_yes = orderbook.estimate_fill_price(depth_data, "no", count)
                 if fill_price_yes is not None:
-                    fill_price_no = 100 - int(fill_price_yes)
+                    fill_price_no = 100 - round(fill_price_yes)
                     if fill_price_no < price:
                         log.info(f"  {ticker}: depth suggests better NO fill at {fill_price_no}c (vs {price}c)")
                         price = fill_price_no
