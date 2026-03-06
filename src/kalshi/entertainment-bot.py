@@ -7,7 +7,7 @@ DEMO API ONLY — $5 max per trade.
 import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, quarter_kelly, compute_limit_price, kalshi_fee_cents
 from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_threshold, configure_sanity
 from capital_allocator import PortfolioAllocator

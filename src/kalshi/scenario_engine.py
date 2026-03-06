@@ -12,12 +12,10 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-# Use probability module's normal CDF
-try:
-    from probability import _norm_cdf
-except ImportError:
-    def _norm_cdf(x):
-        return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+from probability import _student_t_cdf, _norm_cdf
+
+# Default degrees of freedom — matches probability.py's econ_nowcast_probability default
+_ECON_DF = 5
 
 
 @dataclass
@@ -152,10 +150,17 @@ def scenario_probability(
             scaled_sigma = 0.001
 
         z = (threshold - shifted_mean) / scaled_sigma
-        if direction == "above":
-            p = 1.0 - _norm_cdf(z)
+        # Use Student-t(df=5) for fatter tails — matches probability.py econ model
+        if _student_t_cdf is not None:
+            if direction == "above":
+                p = 1.0 - _student_t_cdf(z, _ECON_DF)
+            else:
+                p = _student_t_cdf(z, _ECON_DF)
         else:
-            p = _norm_cdf(z)
+            if direction == "above":
+                p = 1.0 - _norm_cdf(z)
+            else:
+                p = _norm_cdf(z)
 
         per_scenario[name] = p
         total_prob += weight * p

@@ -252,7 +252,12 @@ def _load_calibration():
         return _calibration
     try:
         _calibration = json.loads(_CALIBRATION_PATH.read_text()) if _CALIBRATION_PATH.exists() else {}
-    except (json.JSONDecodeError, OSError):
+        if not isinstance(_calibration, dict):
+            _log.warning("calibration.json has wrong schema (expected dict, got %s), using defaults",
+                         type(_calibration).__name__)
+            _calibration = {}
+    except (json.JSONDecodeError, OSError) as e:
+        _log.warning("Failed to load calibration.json, using defaults: %s", e)
         _calibration = {}
     if _calibration:
         _log.info("Calibration loaded: %d cities, %d market types",
@@ -1076,20 +1081,6 @@ def kalshi_fee_cents(price_cents):
     p = price_cents / 100.0
     return KALSHI_FEE_RATE * p * (1 - p) * 100
 
-
-def _edge_after_fees(raw_edge, price_cents):
-    """DEPRECATED internal helper. Use raw edge + fee_cents param instead.
-
-    This function subtracts fee as a probability delta, but the mathematically
-    correct treatment is to reduce the payout (100 -> 100-fee) in the Kelly
-    formula. All bots now pass fee_cents directly to half_kelly/quarter_kelly.
-    """
-    fee = kalshi_fee_cents(price_cents)
-    return raw_edge - fee / 100
-
-
-# Backward-compatible alias — underscore prefix signals deprecation to developers
-edge_after_fees = _edge_after_fees
 
 
 # ─── Crypto probability model ───

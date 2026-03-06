@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from probability import (
     half_kelly, half_kelly_sell, quarter_kelly, high_conviction_kelly,
-    kalshi_fee_cents, edge_after_fees,
+    kalshi_fee_cents,
     weather_probability, nws_probability, info_arb_probability,
     crypto_price_probability, econ_nowcast_probability, cpi_nowcast_sigma,
     album_data_sigma, boxoffice_data_sigma, longshot_edge,
@@ -74,12 +74,6 @@ class TestFeeBugQuantification:
     def test_fee_symmetric(self):
         """Fee at 30c should equal fee at 70c (symmetric in P*(1-P))."""
         assert abs(kalshi_fee_cents(30) - kalshi_fee_cents(70)) < 0.001
-
-    def test_edge_after_fees_reduces_edge(self):
-        """edge_after_fees should always return less than raw edge."""
-        raw = 0.15
-        adjusted = edge_after_fees(raw, 50)
-        assert adjusted < raw
 
     def test_fee_cents_param_reduces_kelly(self):
         """half_kelly with fee_cents should produce <= contracts vs without."""

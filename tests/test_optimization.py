@@ -1255,7 +1255,7 @@ class TestCryptoPriceProbability:
 # Kalshi fee helpers tests (Tier 2.3)
 # ===================================================================
 
-from probability import kalshi_fee_cents, edge_after_fees, KALSHI_FEE_RATE
+from probability import kalshi_fee_cents, KALSHI_FEE_RATE
 
 
 class TestKalshiFeeHelpers:
@@ -1278,18 +1278,6 @@ class TestKalshiFeeHelpers:
         """At 1c, fee = 0.07 * 0.01 * 0.99 * 100 = 0.0693c."""
         fee = kalshi_fee_cents(1)
         assert abs(fee - 0.0693) < 0.001
-
-    def test_edge_after_fees_positive(self):
-        """Net edge after fees should be less than raw edge."""
-        raw_edge = 0.10
-        net = edge_after_fees(raw_edge, 50)
-        assert net < raw_edge
-        assert net > 0
-
-    def test_edge_after_fees_can_go_negative(self):
-        """Very small edge can go negative after fees."""
-        net = edge_after_fees(0.005, 50)
-        assert net < 0
 
     def test_fee_rate_constant(self):
         assert KALSHI_FEE_RATE == 0.07
@@ -1464,40 +1452,6 @@ class TestQuarterKellyScaling:
 # ===================================================================
 # Fee-adjusted edge rollout tests
 # ===================================================================
-
-class TestFeeAdjustedEdgeRollout:
-
-    def test_edge_after_fees_reduces_edge(self):
-        """edge_after_fees(0.10, 50) should be less than 0.10."""
-        net = edge_after_fees(0.10, 50)
-        assert net < 0.10
-
-    def test_fee_impact_on_cheap_contracts(self):
-        """At 5c, fee = 0.33c, edge reduced by ~0.33%."""
-        fee = kalshi_fee_cents(5)
-        assert abs(fee - 0.3325) < 0.01
-        raw_edge = 0.10
-        net = edge_after_fees(raw_edge, 5)
-        assert abs(net - (raw_edge - fee / 100)) < 0.0001
-
-    def test_fee_impact_on_midprice(self):
-        """At 50c, fee = 1.75c, edge reduced by 1.75%."""
-        fee = kalshi_fee_cents(50)
-        assert abs(fee - 1.75) < 0.01
-        raw_edge = 0.10
-        net = edge_after_fees(raw_edge, 50)
-        assert abs(net - (raw_edge - 0.0175)) < 0.001
-
-    def test_zero_and_boundary_prices(self):
-        """edge_after_fees at 0c and 100c returns raw edge (fee = 0)."""
-        raw_edge = 0.10
-        assert edge_after_fees(raw_edge, 0) == raw_edge
-        assert edge_after_fees(raw_edge, 100) == raw_edge
-
-    def test_negative_edge_stays_negative(self):
-        """Fee adjustment on already-negative edge makes it more negative."""
-        net = edge_after_fees(-0.05, 50)
-        assert net < -0.05
 
 
 # ===================================================================
@@ -1879,7 +1833,6 @@ class TestSettlementAwareCleanup:
         fake_prob.compute_limit_price = lambda *a, **kw: 50
         fake_prob.weather_probability = lambda *a, **kw: 0.5
         fake_prob.nws_probability = lambda *a, **kw: 0.5
-        fake_prob.edge_after_fees = lambda *a, **kw: 0.0
         fake_prob.kalshi_fee_cents = lambda p: 0.07 * (p / 100) * (1 - p / 100) * 100
         fake_prob.crypto_price_probability = lambda *a, **kw: 0.5
         sys.modules["probability"] = fake_prob

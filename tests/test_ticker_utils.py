@@ -216,7 +216,7 @@ class TestParseCryptoTicker:
         assert r["asset"] == "BTC"
         assert r["direction"] == "T"
         assert r["threshold"] == 95000.0
-        assert "date" not in r
+        assert r["date"] is None
 
     def test_invalid_ticker_returns_none(self):
         assert parse_crypto_ticker("KXHIGHMIA-21FEB26-T86") is None
@@ -263,7 +263,7 @@ class TestParseCryptoTicker:
         r = parse_crypto_ticker("KXBTC-26FEB28-T70000")
         assert r is not None
         assert r["date"] == "2026-02-28"
-        assert "settlement_hour" not in r
+        assert r["settlement_hour"] is None
 
     # --- DOGE and XRP ---
 
@@ -301,13 +301,13 @@ class TestParseCryptoTicker:
         assert r is not None
         assert r["asset"] == "DOGE"
         assert r["threshold"] == 0.20
-        assert "date" not in r
+        assert r["date"] is None
 
     def test_xrp_simple_fallback(self):
         r = parse_crypto_ticker("KXXRP-B2.50")
         assert r is not None
         assert r["asset"] == "XRP"
-        assert "date" not in r
+        assert r["date"] is None
 
     # --- Asset suffixes (D=daily, E=expiry) ---
 
@@ -418,3 +418,43 @@ class TestParseCryptoTicker:
 
     def test_truly_unknown_format_returns_none(self):
         assert parse_crypto_ticker("KXBTCFOO-26MAR04-BAR") is None
+
+
+# ===================================================================
+# Crypto Ticker Return Type Consistency
+# ===================================================================
+
+class TestCryptoTickerReturnConsistency:
+    """All parse_crypto_ticker return paths must include the same keys."""
+
+    REQUIRED_KEYS = {"asset", "date", "direction", "threshold", "market_type"}
+
+    def test_15min_ticker_has_all_keys(self):
+        result = parse_crypto_ticker("KXBTC15M-26MAR042230-30")
+        assert result is not None
+        missing = self.REQUIRED_KEYS - set(result.keys())
+        assert not missing, f"15-min ticker missing keys: {missing}"
+
+    def test_monthly_ticker_has_all_keys(self):
+        result = parse_crypto_ticker("KXBTCMAXMON-BTC-26MAR31-8750000")
+        assert result is not None
+        missing = self.REQUIRED_KEYS - set(result.keys())
+        assert not missing, f"Monthly ticker missing keys: {missing}"
+
+    def test_standard_ticker_has_all_keys(self):
+        result = parse_crypto_ticker("KXBTC-26MAR06-T68000")
+        assert result is not None
+        missing = self.REQUIRED_KEYS - set(result.keys())
+        assert not missing, f"Standard ticker missing keys: {missing}"
+
+    def test_hourly_ticker_has_all_keys(self):
+        result = parse_crypto_ticker("KXBTC-26MAR0117-T72999.99")
+        assert result is not None
+        missing = self.REQUIRED_KEYS - set(result.keys())
+        assert not missing, f"Hourly ticker missing keys: {missing}"
+
+    def test_simple_fallback_has_all_keys(self):
+        result = parse_crypto_ticker("KXBTC-T50000")
+        assert result is not None
+        missing = self.REQUIRED_KEYS - set(result.keys())
+        assert not missing, f"Simple fallback missing keys: {missing}"

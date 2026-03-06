@@ -32,7 +32,7 @@ from probability import (
     econ_nowcast_probability, cpi_nowcast_sigma, crypto_price_probability,
     longshot_edge, classify_ticker_category, LONGSHOT_BIAS_PARAMS,
     half_kelly, half_kelly_sell, quarter_kelly, high_conviction_kelly,
-    kalshi_fee_cents, edge_after_fees, KALSHI_FEE_RATE,
+    kalshi_fee_cents, KALSHI_FEE_RATE,
     is_market_liquid, compute_limit_price,
 )
 
