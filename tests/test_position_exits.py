@@ -4,14 +4,15 @@ Tests cover per-bot exit config routing, partial exits, market vs limit
 order types, and multi-model probability routing for model-shift.
 """
 
+import decimal
 import json
 import sys
 import types
-import importlib.util
-import logging
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+from conftest import make_fake_auth, load_bot_module
 
 
 # ---------------------------------------------------------------------------
@@ -92,110 +93,50 @@ _BOT_CONFIG = {
     },
 }
 
+_fake_project = Path("/tmp/fake_posmon_exits")
+(_fake_project / "data").mkdir(parents=True, exist_ok=True)
+(_fake_project / "config").mkdir(parents=True, exist_ok=True)
+(_fake_project / "config" / "bots-config.json").write_text(json.dumps(_BOT_CONFIG))
 
-def _load_position_monitor():
-    """Load position-monitor.py module with mock dependencies."""
-    orig_modules = {}
-    for mod_name in ("kalshi_auth", "probability", "capital_allocator", "ticker_utils"):
-        if mod_name in sys.modules:
-            orig_modules[mod_name] = sys.modules[mod_name]
+KALSHI_FEE_RATE = 0.07
 
-    fake_client = MagicMock()
-
-    fake_auth = types.ModuleType("kalshi_auth")
-    fake_auth.KalshiClient = lambda *a, **kw: fake_client
-    fake_auth.setup_unbuffered = lambda: None
-    fake_auth.setup_signal_handlers = lambda: None
-    fake_auth.is_shutdown_requested = lambda: False
-    fake_auth.setup_logging = lambda *a, **kw: logging.getLogger("test")
-    fake_auth.PROJECT_DIR = Path("/tmp/fake_posmon_exits")
-    fake_auth.TradeManager = type("TradeManager", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "sell_position": lambda self, *a, **kw: None,
-        "log_decision": lambda self, *a, **kw: None,
-    })
-    fake_auth.trim_trade_log = lambda *a, **kw: None
-    fake_auth.load_trades = lambda *a, **kw: []
-    fake_auth._atomic_write_json = lambda *a, **kw: None
-    fake_auth.CITY_TIMEZONES = {
+_fake_auth = make_fake_auth(
+    PROJECT_DIR=_fake_project,
+    CITY_TIMEZONES={
         "MIA": "America/New_York", "LAX": "America/Los_Angeles",
         "PHIL": "America/New_York", "NY": "America/New_York",
         "CHI": "America/Chicago", "AUS": "America/Chicago",
         "DEN": "America/Denver", "HOU": "America/Chicago",
-    }
-    fake_auth._local_today = lambda city_code="NY": "2026-02-20"
-    fake_auth.round_half_up = lambda v: int(
-        __import__("decimal").Decimal(str(v)).quantize(
-            __import__("decimal").Decimal("1"),
-            rounding=__import__("decimal").ROUND_HALF_UP,
+    },
+    _local_today=lambda city_code="NY": "2026-02-20",
+    round_half_up=lambda v: int(
+        decimal.Decimal(str(v)).quantize(
+            decimal.Decimal("1"), rounding=decimal.ROUND_HALF_UP,
         )
-    )
-    fake_auth.retry_request = lambda *a, **kw: MagicMock()
-    fake_auth.fetch_parallel = lambda *a, **kw: []
-    fake_auth.HealthCheckMonitor = type("HealthCheckMonitor", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "record_bot_heartbeat": lambda self, *a, **kw: None,
-        "check_health": lambda self, *a, **kw: [],
-    })
-    fake_auth.ScanSummary = type("ScanSummary", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "markets_fetched": 0,
-        "markets_evaluated": 0,
-        "trades_placed": 0,
-        "skip": lambda self, *a, **kw: None,
-        "finalize": lambda self: None,
-    })
-    fake_auth.notify_whatsapp = lambda *a, **kw: None
-    sys.modules["kalshi_auth"] = fake_auth
+    ),
+    retry_request=lambda *a, **kw: MagicMock(),
+)
 
-    # Real kalshi_fee_cents formula for accurate testing
-    KALSHI_FEE_RATE = 0.07
-    fake_prob = types.ModuleType("probability")
-    fake_prob.half_kelly = lambda *a, **kw: (0, 0)
-    fake_prob.weather_probability = lambda *a, **kw: 0.5
-    fake_prob.nws_probability = lambda *a, **kw: 0.5
-    fake_prob.crypto_price_probability = lambda *a, **kw: 0.5
-    fake_prob.kalshi_fee_cents = lambda p: KALSHI_FEE_RATE * (p / 100) * (1 - p / 100) * 100
-    sys.modules["probability"] = fake_prob
+_fake_prob = types.ModuleType("probability")
+_fake_prob.half_kelly = lambda *a, **kw: (0, 0)
+_fake_prob.weather_probability = lambda *a, **kw: 0.5
+_fake_prob.nws_probability = lambda *a, **kw: 0.5
+_fake_prob.crypto_price_probability = lambda *a, **kw: 0.5
+_fake_prob.kalshi_fee_cents = lambda p: KALSHI_FEE_RATE * (p / 100) * (1 - p / 100) * 100
 
-    fake_ticker = types.ModuleType("ticker_utils")
-    fake_ticker.parse_weather_ticker = lambda ticker: None
-    fake_ticker.parse_crypto_ticker = lambda ticker: None
-    sys.modules["ticker_utils"] = fake_ticker
+_fake_ticker = types.ModuleType("ticker_utils")
+_fake_ticker.parse_weather_ticker = lambda ticker: None
+_fake_ticker.parse_crypto_ticker = lambda ticker: None
 
-    fake_alloc = types.ModuleType("capital_allocator")
-    fake_alloc.PortfolioAllocator = type("PortfolioAllocator", (), {
-        "__init__": lambda self, *a, **kw: None,
-    })
-    sys.modules["capital_allocator"] = fake_alloc
-
-    # Create dirs and config
-    data_dir = Path("/tmp/fake_posmon_exits/data")
-    data_dir.mkdir(parents=True, exist_ok=True)
-    config_dir = Path("/tmp/fake_posmon_exits/config")
-    config_dir.mkdir(parents=True, exist_ok=True)
-    (config_dir / "bots-config.json").write_text(json.dumps(_BOT_CONFIG))
-
-    # Load the module
-    spec = importlib.util.spec_from_file_location(
-        "position_monitor",
-        str(Path(__file__).resolve().parent.parent / "src" / "kalshi" / "position-monitor.py"),
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    # Restore original modules
-    for mod_name in ("kalshi_auth", "probability", "capital_allocator", "ticker_utils"):
-        if mod_name in orig_modules:
-            sys.modules[mod_name] = orig_modules[mod_name]
-        elif mod_name in sys.modules:
-            del sys.modules[mod_name]
-
-    return mod
-
+_fake_alloc = types.ModuleType("capital_allocator")
+_fake_alloc.PortfolioAllocator = lambda *a, **kw: None
 
 # Load module once at import time (fast: all dependencies are mocked)
-_mod = _load_position_monitor()
+_mod = load_bot_module("position-monitor.py", _fake_auth, extra_stubs={
+    "probability": _fake_prob,
+    "ticker_utils": _fake_ticker,
+    "capital_allocator": _fake_alloc,
+})
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 """Tests for economics-bot.py helper functions (Fed matching, gas threshold parsing, nowcast cache)."""
 
-import importlib
 import json
+import math
 import time
 import types
 import sys
@@ -9,104 +9,61 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from conftest import make_fake_auth, load_bot_module
+
 
 # ---------------------------------------------------------------------------
 # Import helper -- economics-bot.py has a hyphen and performs side-effects
 # at import time. Stub kalshi_auth, probability, and capital_allocator.
 # ---------------------------------------------------------------------------
 
-def _load_economics_bot():
-    # Track all modules we stub so we can restore them
-    stubs = ["kalshi_auth", "probability", "capital_allocator",
-             "cpi_belief_filter", "scenario_engine", "macro_engine"]
-    originals = {name: sys.modules.get(name) for name in stubs}
+def _fake_atomic_write(path, data):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(data, indent=2))
 
-    # Lightweight kalshi_auth stub
-    fake_auth = types.ModuleType("kalshi_auth")
-    fake_auth.KalshiClient = lambda *a, **kw: MagicMock()
-    fake_auth.setup_unbuffered = lambda: None
-    fake_auth.setup_signal_handlers = lambda: None
-    fake_auth.is_shutdown_requested = lambda: False
-    fake_auth.setup_logging = lambda *a, **kw: __import__("logging").getLogger("test")
-    fake_auth.PROJECT_DIR = Path(__file__).resolve().parent.parent
-    fake_auth.retry_request = lambda *a, **kw: MagicMock()
-    fake_auth.TradeManager = lambda *a, **kw: MagicMock()
-    fake_auth.trim_trade_log = lambda *a, **kw: None
-    fake_auth.build_market_snapshot = lambda *a, **kw: {}
-    fake_auth.HealthCheckMonitor = lambda *a, **kw: MagicMock()
-    fake_auth.OrderMonitor = lambda *a, **kw: MagicMock()
-    def _fake_atomic_write(path, data):
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(json.dumps(data, indent=2))
-    fake_auth._atomic_write_json = _fake_atomic_write
-    fake_auth.ScanSummary = type("ScanSummary", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "skip": lambda self, *a, **kw: None,
-        "source_ok": lambda self, *a, **kw: None,
-        "source_fail": lambda self, *a, **kw: None,
-        "finalize": lambda self, *a, **kw: {},
-        "markets_fetched": 0,
-        "markets_evaluated": 0,
-        "trades_placed": 0,
-    })
-    sys.modules["kalshi_auth"] = fake_auth
+_fake_auth = make_fake_auth(
+    retry_request=lambda *a, **kw: MagicMock(),
+    _atomic_write_json=_fake_atomic_write,
+)
 
-    # Lightweight probability stub
-    fake_prob = types.ModuleType("probability")
-    fake_prob.econ_nowcast_probability = lambda *a, **kw: 0.5
-    fake_prob.cpi_nowcast_sigma = lambda *a, **kw: 0.05
-    fake_prob.gdp_nowcast_sigma = lambda *a, **kw: 0.10
-    fake_prob.quarter_kelly = lambda *a, **kw: (0, 0)
-    fake_prob.uncertainty_kelly = lambda *a, **kw: (0, 0, {})
-    fake_prob.compute_limit_price = lambda *a, **kw: 50
-    fake_prob.kalshi_fee_cents = lambda *a, **kw: 1.0
-    fake_prob.gas_price_probability = lambda *a, **kw: 0.5
-    fake_prob.is_market_liquid = lambda *a, **kw: True
-    fake_prob._norm_cdf = lambda x: 0.5 * (1 + __import__("math").erf(x / __import__("math").sqrt(2)))
-    sys.modules["probability"] = fake_prob
+# Extra module stubs
+_fake_prob = types.ModuleType("probability")
+_fake_prob.econ_nowcast_probability = lambda *a, **kw: 0.5
+_fake_prob.cpi_nowcast_sigma = lambda *a, **kw: 0.05
+_fake_prob.gdp_nowcast_sigma = lambda *a, **kw: 0.10
+_fake_prob.quarter_kelly = lambda *a, **kw: (0, 0)
+_fake_prob.uncertainty_kelly = lambda *a, **kw: (0, 0, {})
+_fake_prob.compute_limit_price = lambda *a, **kw: 50
+_fake_prob.kalshi_fee_cents = lambda *a, **kw: 1.0
+_fake_prob.gas_price_probability = lambda *a, **kw: 0.5
+_fake_prob.is_market_liquid = lambda *a, **kw: True
+_fake_prob._norm_cdf = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
-    # Lightweight capital_allocator stub
-    fake_alloc = types.ModuleType("capital_allocator")
-    fake_alloc.PortfolioAllocator = lambda *a, **kw: MagicMock()
-    sys.modules["capital_allocator"] = fake_alloc
+_fake_alloc = types.ModuleType("capital_allocator")
+_fake_alloc.PortfolioAllocator = lambda *a, **kw: MagicMock()
 
-    # Lightweight cpi_belief_filter stub
-    fake_belief = types.ModuleType("cpi_belief_filter")
-    fake_belief.CPIBeliefFilter = type("CPIBeliefFilter", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "update": lambda self, *a, **kw: None,
-        "posterior": property(lambda self: (2.8, 0.10)),
-    })
-    sys.modules["cpi_belief_filter"] = fake_belief
+_fake_belief = types.ModuleType("cpi_belief_filter")
+_fake_belief.CPIBeliefFilter = type("CPIBeliefFilter", (), {
+    "__init__": lambda self, *a, **kw: None,
+    "update": lambda self, *a, **kw: None,
+    "posterior": property(lambda self: (2.8, 0.10)),
+})
 
-    # Lightweight scenario_engine stub
-    fake_scenario = types.ModuleType("scenario_engine")
-    fake_scenario.compute_scenario_weights = lambda *a, **kw: {}
-    fake_scenario.scenario_probability = lambda *a, **kw: MagicMock(
-        probability=0.5, agreement=0.8, per_scenario={}, weights_used={})
-    sys.modules["scenario_engine"] = fake_scenario
+_fake_scenario = types.ModuleType("scenario_engine")
+_fake_scenario.compute_scenario_weights = lambda *a, **kw: {}
+_fake_scenario.scenario_probability = lambda *a, **kw: MagicMock(
+    probability=0.5, agreement=0.8, per_scenario={}, weights_used={})
 
-    # macro_engine — set to None (mimics ImportError path)
-    fake_macro = types.ModuleType("macro_engine")
-    fake_macro.MacroEngine = None
-    sys.modules["macro_engine"] = fake_macro
+_fake_macro = types.ModuleType("macro_engine")
+_fake_macro.MacroEngine = None
 
-    bot_path = Path(__file__).resolve().parent.parent / "src" / "kalshi" / "economics-bot.py"
-    spec = importlib.util.spec_from_file_location("economics_bot", bot_path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    # Restore originals
-    for name in stubs:
-        if originals[name] is not None:
-            sys.modules[name] = originals[name]
-        else:
-            sys.modules.pop(name, None)
-
-    return mod
-
-
-_econ = _load_economics_bot()
+_econ = load_bot_module("economics-bot.py", _fake_auth, extra_stubs={
+    "probability": _fake_prob,
+    "capital_allocator": _fake_alloc,
+    "cpi_belief_filter": _fake_belief,
+    "scenario_engine": _fake_scenario,
+    "macro_engine": _fake_macro,
+})
 
 
 # ===================================================================

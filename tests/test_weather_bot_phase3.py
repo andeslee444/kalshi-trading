@@ -9,39 +9,25 @@ import sys
 import os
 import types
 import datetime
-import importlib
 import json
 import pytest
 from unittest.mock import patch, MagicMock, PropertyMock
+
+from conftest import make_fake_auth
 
 
 # ===================================================================
 # Bot module loading with kalshi_auth stubbing
 # ===================================================================
 
-def _load_weather_bot():
-    """Load weather-bot.py with stubbed kalshi_auth to avoid real API calls."""
-    # Create a stub kalshi_auth module
-    stub_auth = types.ModuleType("kalshi_auth")
-    stub_auth.KalshiClient = MagicMock
-    stub_auth.load_trades = MagicMock(return_value=[])
-    stub_auth.save_trade = MagicMock()
-    stub_auth.setup_unbuffered = MagicMock()
-    stub_auth.setup_signal_handlers = MagicMock()
-    stub_auth.setup_logging = MagicMock(return_value=MagicMock())
-    stub_auth.PROJECT_DIR = MagicMock()
-    stub_auth.PROJECT_DIR.__truediv__ = MagicMock(return_value=MagicMock())
-    stub_auth.retry_request = MagicMock()
-    stub_auth.TradeManager = MagicMock
-    stub_auth.trim_trade_log = MagicMock()
-    stub_auth.build_market_snapshot = MagicMock(return_value={})
-    stub_auth.HealthCheckMonitor = MagicMock
-    stub_auth.OrderMonitor = MagicMock
-    stub_auth.ScanSummary = MagicMock
-    stub_auth.is_shutdown_requested = MagicMock(return_value=False)
-    stub_auth.fetch_parallel = MagicMock(return_value={})
+def _setup_weather_bot_stubs():
+    """Register stubbed modules so weather-bot.py imports succeed.
 
-    # Stub other imports
+    Returns the stub objects for tests that need to inspect or configure them.
+    Does NOT load the full bot module (tests extract individual functions).
+    """
+    stub_auth = make_fake_auth()
+
     stub_prob = types.ModuleType("probability")
     for fn in ["weather_probability", "weather_sigma", "ensemble_weather_probability",
                "ensemble_spread_sigma_multiplier", "ensemble_weather_probability_v2",
@@ -54,13 +40,12 @@ def _load_weather_bot():
     stub_ticker.parse_weather_ticker = MagicMock(return_value=None)
 
     stub_alloc = types.ModuleType("capital_allocator")
-    stub_alloc.PortfolioAllocator = MagicMock
+    stub_alloc.PortfolioAllocator = lambda *a, **kw: MagicMock()
 
     stub_verifier = types.ModuleType("forecast_verifier")
-    stub_verifier.ForecastVerifier = MagicMock
+    stub_verifier.ForecastVerifier = lambda *a, **kw: MagicMock()
     stub_verifier.DEFAULT_STATION_MAP = {}
 
-    # Register stubs in sys.modules before importing bot
     saved_modules = {}
     for mod_name in ["kalshi_auth", "probability", "ticker_utils",
                      "capital_allocator", "forecast_verifier"]:

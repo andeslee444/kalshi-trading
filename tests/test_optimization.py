@@ -47,6 +47,7 @@ from capital_allocator import (
     PortfolioAllocator, BudgetResponse, MAX_TICKER_FRACTION,
     MAX_CITY_FRACTION, _extract_city_key, DEFAULT_STATE_PATH,
 )
+from conftest import make_fake_auth, load_bot_module
 
 # Counter for unique temp state paths in tests
 _state_counter = 0
@@ -65,60 +66,13 @@ def _temp_state_path():
 
 def _load_beatrelease_scanner():
     """Import beatrelease-scanner.py with stubbed-out side effects."""
-    orig_auth = sys.modules.get("kalshi_auth")
-    orig_alloc = sys.modules.get("capital_allocator")
-
-    fake_auth = types.ModuleType("kalshi_auth")
-    fake_auth.KalshiClient = lambda *a, **kw: MagicMock()
-    fake_auth.setup_unbuffered = lambda: None
-    fake_auth.setup_signal_handlers = lambda: None
-    fake_auth.is_shutdown_requested = lambda: False
-    fake_auth.setup_logging = lambda *a, **kw: __import__("logging").getLogger("test")
-    fake_auth.PROJECT_DIR = Path("/tmp/fake_beatrelease")
-    fake_auth.fetch_parallel = lambda *a, **kw: {}
-    fake_auth.retry_request = lambda *a, **kw: None
-    fake_auth.TradeManager = type("TradeManager", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "place_order": lambda self, *a, **kw: None,
-    })
-    fake_auth.trim_trade_log = lambda *a, **kw: None
-    fake_auth.notify_whatsapp = lambda *a, **kw: False
-    fake_auth._atomic_write_json = lambda *a, **kw: None
-    fake_auth.HealthCheckMonitor = type("HealthCheckMonitor", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "record_bot_heartbeat": lambda self, *a, **kw: None,
-        "record_source_success": lambda self, *a, **kw: None,
-        "record_source_error": lambda self, *a, **kw: None,
-    })
-    fake_auth.ScanSummary = type("ScanSummary", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "markets_fetched": 0,
-        "markets_evaluated": 0,
-        "trades_placed": 0,
-        "skips": {},
-        "log_summary": lambda self: None,
-    })
-    fake_auth.load_trades = lambda *a, **kw: []
-    sys.modules["kalshi_auth"] = fake_auth
-
-    fake_alloc = types.ModuleType("capital_allocator")
-    _FakeBudget = type("BudgetResponse", (), {"approved": True, "reason": "", "max_cost_cents": 500, "bankroll_cents": 50000})
-    fake_alloc.PortfolioAllocator = type("PortfolioAllocator", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "request_budget": lambda self, *a, **kw: _FakeBudget(),
-        "record_trade": lambda self, *a, **kw: None,
-    })
-    sys.modules["capital_allocator"] = fake_alloc
-
-    # Create config/data dirs and a minimal bots-config.json
-    config_dir = Path("/tmp/fake_beatrelease/config")
+    _fake_project = Path("/tmp/fake_beatrelease")
+    config_dir = _fake_project / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     keys_dir = config_dir / "keys"
     keys_dir.mkdir(parents=True, exist_ok=True)
-    deepseek_key = keys_dir / "deepseek.txt"
-    deepseek_key.write_text("test-key")
-    bots_config = config_dir / "bots-config.json"
-    bots_config.write_text(json.dumps({
+    (keys_dir / "deepseek.txt").write_text("test-key")
+    (config_dir / "bots-config.json").write_text(json.dumps({
         "beatrelease": {
             "checkIntervalHours": 1,
             "maxTradeCents": 500,
@@ -127,30 +81,28 @@ def _load_beatrelease_scanner():
             "blogUrls": ["https://www.beatrelease.com/blog"],
         }
     }))
-    data_dir = Path("/tmp/fake_beatrelease/data")
+    data_dir = _fake_project / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
-    pids_dir = data_dir / "pids"
-    pids_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "pids").mkdir(parents=True, exist_ok=True)
 
-    spec = importlib.util.spec_from_file_location(
-        "beatrelease_scanner",
-        str(Path(__file__).resolve().parent.parent / "src" / "kalshi" / "beatrelease-scanner.py"),
+    fake_auth = make_fake_auth(
+        PROJECT_DIR=_fake_project,
+        notify_whatsapp=lambda *a, **kw: False,
     )
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["beatrelease_scanner"] = mod
-    spec.loader.exec_module(mod)
 
-    if orig_auth is not None:
-        sys.modules["kalshi_auth"] = orig_auth
-    else:
-        del sys.modules["kalshi_auth"]
+    _FakeBudget = type("BudgetResponse", (), {
+        "approved": True, "reason": "", "max_cost_cents": 500, "bankroll_cents": 50000,
+    })
+    fake_alloc = types.ModuleType("capital_allocator")
+    fake_alloc.PortfolioAllocator = type("PortfolioAllocator", (), {
+        "__init__": lambda self, *a, **kw: None,
+        "request_budget": lambda self, *a, **kw: _FakeBudget(),
+        "record_trade": lambda self, *a, **kw: None,
+    })
 
-    if orig_alloc is not None:
-        sys.modules["capital_allocator"] = orig_alloc
-    elif "capital_allocator" in sys.modules:
-        del sys.modules["capital_allocator"]
-
-    return mod
+    return load_bot_module("beatrelease-scanner.py", fake_auth, extra_stubs={
+        "capital_allocator": fake_alloc,
+    })
 
 
 _br_mod = _load_beatrelease_scanner()

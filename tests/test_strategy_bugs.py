@@ -6,14 +6,15 @@ BUG-4: compute_limit_price NO-side low-edge places near full ask for tight sprea
 """
 
 import math
+import json
 import sys
 import types
-import importlib.util
 from pathlib import Path
 
 import pytest
 
 from probability import longshot_edge, compute_limit_price, _reset_calibration
+from conftest import make_fake_auth, load_bot_module
 
 
 @pytest.fixture(autouse=True)
@@ -89,54 +90,10 @@ class TestBug3DeadCodeRemoval:
 
     def _load_strategy_trader(self):
         """Load strategy-trader.py with stubbed side effects."""
-        from unittest.mock import MagicMock
-
-        orig_auth = sys.modules.get("kalshi_auth")
-        orig_alloc = sys.modules.get("capital_allocator")
-        orig_prob = sys.modules.get("probability")
-
-        fake_auth = types.ModuleType("kalshi_auth")
-        fake_auth.KalshiClient = lambda *a, **kw: MagicMock()
-        fake_auth.setup_unbuffered = lambda: None
-        fake_auth.setup_signal_handlers = lambda: None
-        fake_auth.setup_logging = lambda *a, **kw: __import__("logging").getLogger("test")
-        fake_auth.PROJECT_DIR = Path("/tmp/fake_strategy_test")
-        fake_auth.TradeManager = type("TradeManager", (), {
-            "__init__": lambda self, *a, **kw: None,
-            "place_order": lambda self, *a, **kw: None,
-            "log_decision": lambda self, *a, **kw: None,
-        })
-        fake_auth.trim_trade_log = lambda *a, **kw: None
-        fake_auth._atomic_write_json = lambda *a, **kw: None
-        fake_auth.build_market_snapshot = lambda **kw: {}
-        fake_auth.HealthCheckMonitor = type("HealthCheckMonitor", (), {
-            "__init__": lambda self, *a, **kw: None,
-        })
-        fake_auth.OrderMonitor = type("OrderMonitor", (), {
-            "__init__": lambda self, *a, **kw: None,
-        })
-        fake_auth.ScanSummary = type("ScanSummary", (), {
-            "__init__": lambda self, *a, **kw: None,
-            "markets_fetched": 0,
-            "trades_placed": 0,
-            "finalize": lambda self: None,
-        })
-        sys.modules["kalshi_auth"] = fake_auth
-
-        fake_alloc = types.ModuleType("capital_allocator")
-        fake_alloc.PortfolioAllocator = type("PortfolioAllocator", (), {
-            "__init__": lambda self, *a, **kw: None,
-        })
-        sys.modules["capital_allocator"] = fake_alloc
-
-        # Create required dirs and config
-        config_dir = Path("/tmp/fake_strategy_test/config")
-        config_dir.mkdir(parents=True, exist_ok=True)
-        data_dir = Path("/tmp/fake_strategy_test/data")
-        data_dir.mkdir(parents=True, exist_ok=True)
-        import json
-        bots_config = config_dir / "bots-config.json"
-        bots_config.write_text(json.dumps({
+        _fake_project = Path("/tmp/fake_strategy_test")
+        (_fake_project / "config").mkdir(parents=True, exist_ok=True)
+        (_fake_project / "data").mkdir(parents=True, exist_ok=True)
+        (_fake_project / "config" / "bots-config.json").write_text(json.dumps({
             "strategy": {
                 "maxBetCents": 500,
                 "scanIntervalMinutes": 15,
@@ -145,24 +102,14 @@ class TestBug3DeadCodeRemoval:
             }
         }))
 
-        spec = importlib.util.spec_from_file_location(
-            "strategy_trader",
-            str(Path(__file__).resolve().parent.parent / "src" / "kalshi" / "strategy-trader.py"),
-        )
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        fake_auth = make_fake_auth(PROJECT_DIR=_fake_project)
 
-        # Restore original modules
-        if orig_auth is not None:
-            sys.modules["kalshi_auth"] = orig_auth
-        else:
-            del sys.modules["kalshi_auth"]
-        if orig_alloc is not None:
-            sys.modules["capital_allocator"] = orig_alloc
-        elif "capital_allocator" in sys.modules:
-            del sys.modules["capital_allocator"]
+        fake_alloc = types.ModuleType("capital_allocator")
+        fake_alloc.PortfolioAllocator = lambda *a, **kw: None
 
-        return mod
+        return load_bot_module("strategy-trader.py", fake_auth, extra_stubs={
+            "capital_allocator": fake_alloc,
+        })
 
     def test_find_near_settlement_removed(self):
         """find_near_settlement function should not exist in strategy-trader.py."""

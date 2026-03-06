@@ -4,8 +4,6 @@ cross-market consistency, retry logic, and edge thresholds."""
 import math
 import datetime
 import sys
-import os
-import importlib.util
 import tempfile
 import json
 import pytest
@@ -14,10 +12,10 @@ from unittest.mock import MagicMock, patch
 from probability import album_data_sigma, boxoffice_data_sigma, _reset_calibration
 from probability import nws_sigma_for_hour, nws_probability
 
+from conftest import make_fake_auth, load_bot_module
+
 
 # === Module import helper for source-monitor.py ===
-# source-monitor.py has module-level initialization (KalshiClient, TradeManager, etc.)
-# that requires API keys. Stub the dependencies before importing.
 
 _sm_module = None
 
@@ -28,43 +26,6 @@ def _load_source_monitor():
     if _sm_module is not None:
         return _sm_module
 
-    # Stub kalshi_auth so module-level KalshiClient() doesn't need real keys
-    mock_auth = MagicMock()
-    mock_auth.KalshiClient.return_value = MagicMock()
-    mock_auth.setup_unbuffered = MagicMock()
-    mock_auth.setup_signal_handlers = MagicMock()
-    mock_auth.setup_logging.return_value = MagicMock()
-    mock_auth.TradeManager.return_value = MagicMock()
-    mock_auth.trim_trade_log = MagicMock()
-    mock_auth.PROJECT_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    mock_auth.HealthCheckMonitor.return_value = MagicMock()
-    mock_auth.OrderMonitor.return_value = MagicMock()
-    mock_auth.ScanSummary = MagicMock()
-    mock_auth.build_market_snapshot = MagicMock(return_value={})
-    mock_auth.CITY_TIMEZONES = {}
-    mock_auth._local_today = MagicMock()
-    mock_auth.round_half_up = round
-    mock_auth.load_trades.return_value = []
-    mock_auth.fetch_parallel = MagicMock(return_value={})
-    mock_auth.retry_request = MagicMock()
-    mock_auth.is_market_liquid = MagicMock(return_value=True)
-    mock_auth.compute_limit_price = MagicMock(return_value=50)
-    mock_auth.kalshi_fee_cents = MagicMock(return_value=1)
-
-    # Stub capital_allocator
-    mock_allocator_mod = MagicMock()
-    mock_allocator_mod.PortfolioAllocator.return_value = MagicMock()
-
-    # Stub hdd_parser
-    mock_hdd = MagicMock()
-    mock_hdd.get_album_sales = MagicMock(return_value=[])
-    mock_hdd.compute_data_age_hours = MagicMock(return_value=0)
-    mock_hdd.parse_album_threshold = MagicMock(return_value=None)
-
-    # Stub ticker_utils
-    mock_ticker = MagicMock()
-
-    # Write a minimal config file for the module to load
     _config = {
         "maxTradeAmount": 25, "maxDailyTrades": 25, "maxDailyLoss": 50,
         "sources": {
@@ -73,43 +34,26 @@ def _load_source_monitor():
             "nws": {"enabled": True, "intervalMinutes": 10, "stations": {}},
         },
     }
-    config_dir = Path(tempfile.mkdtemp()) / "config"
+    _tmp_dir = Path(tempfile.mkdtemp())
+    config_dir = _tmp_dir / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / "kalshi-monitor-config.json").write_text(json.dumps(_config))
-    # Ensure data dirs exist for module-level mkdir calls
-    data_dir = config_dir.parent / "data"
+    data_dir = _tmp_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "kalshi-source-snapshots").mkdir(parents=True, exist_ok=True)
-    # Create empty trades file
     (data_dir / "kalshi-monitor-trades.json").write_text("[]")
 
-    # Save originals before stubbing
-    stub_names = ["kalshi_auth", "capital_allocator", "hdd_parser", "ticker_utils"]
-    originals = {name: sys.modules.get(name) for name in stub_names}
+    fake_auth = make_fake_auth(
+        PROJECT_DIR=_tmp_dir,
+        round_half_up=round,
+    )
 
-    # Inject stubs
-    sys.modules["kalshi_auth"] = mock_auth
-    sys.modules["capital_allocator"] = mock_allocator_mod
-    sys.modules["hdd_parser"] = mock_hdd
-    sys.modules["ticker_utils"] = mock_ticker
-
-    # Temporarily patch PROJECT_DIR so config loads from our temp dir
-    mock_auth.PROJECT_DIR = config_dir.parent
-
-    src_dir = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) / "src" / "kalshi"
-    spec = importlib.util.spec_from_file_location("source_monitor", src_dir / "source-monitor.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    # Restore originals
-    for name in stub_names:
-        if originals[name] is None:
-            sys.modules.pop(name, None)
-        else:
-            sys.modules[name] = originals[name]
-
-    _sm_module = mod
-    return mod
+    _sm_module = load_bot_module("source-monitor.py", fake_auth, extra_stubs={
+        "capital_allocator": MagicMock(),
+        "hdd_parser": MagicMock(),
+        "ticker_utils": MagicMock(),
+    })
+    return _sm_module
 
 
 class TestTimeDecaySigma:

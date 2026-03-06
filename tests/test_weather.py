@@ -1,12 +1,12 @@
 """Tests for parse_ticker() and compute_probability() in weather-bot.py."""
 
-import importlib
-import types
+import json
 import sys
 import pytest
 from pathlib import Path
 
 from probability import _reset_calibration
+from conftest import make_fake_auth, load_bot_module
 
 
 # ---------------------------------------------------------------------------
@@ -15,99 +15,21 @@ from probability import _reset_calibration
 # We stub those out so we can test the pure functions.
 # ---------------------------------------------------------------------------
 
-def _load_weather_bot():
-    # Save the real kalshi_auth entry (if any) so we can restore it after
-    # loading weather-bot.py and avoid polluting other test modules.
-    orig_auth = sys.modules.get("kalshi_auth")
+_fake_project = Path("/tmp/fake_project")
+(_fake_project / "config").mkdir(parents=True, exist_ok=True)
+(_fake_project / "config" / "kalshi-config.json").write_text(json.dumps({
+    "cities": {},
+    "mode": "demo",
+    "maxTradeAmount": 1,
+    "edgeThreshold": 0.10,
+    "scanIntervalMinutes": 60,
+    "maxDailyTrades": 10,
+    "maxDailyLoss": 10,
+}))
+(_fake_project / "data").mkdir(parents=True, exist_ok=True)
 
-    # Lightweight kalshi_auth stub
-    fake_auth = types.ModuleType("kalshi_auth")
-    fake_auth.KalshiClient = lambda *a, **kw: None
-    fake_auth.setup_unbuffered = lambda: None
-    fake_auth.setup_signal_handlers = lambda: None
-    fake_auth.is_shutdown_requested = lambda: False
-    fake_auth.setup_logging = lambda *a, **kw: __import__("logging").getLogger("test")
-    fake_auth.PROJECT_DIR = Path("/tmp/fake_project")
-    fake_auth.load_trades = lambda *a, **kw: []
-    fake_auth.save_trade = lambda *a, **kw: None
-    fake_auth.fetch_parallel = lambda *a, **kw: {}
-    fake_auth.retry_request = lambda *a, **kw: None
-    fake_auth.RecentTradeTracker = type("RecentTradeTracker", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "is_recent": lambda self, t: False,
-        "record": lambda self, t: None,
-    })
-    fake_auth.TradeManager = type("TradeManager", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "place_order": lambda self, *a, **kw: None,
-    })
-    fake_auth.CircuitBreaker = type("CircuitBreaker", (), {
-        "__init__": lambda self, *a, **kw: None,
-    })
-    fake_auth.check_kill_switch = lambda *a, **kw: False
-    fake_auth.validate_trade_config = lambda *a, **kw: None
-    fake_auth.trim_trade_log = lambda *a, **kw: None
-    fake_auth._atomic_write_json = lambda *a, **kw: None
-    fake_auth.build_market_snapshot = lambda **kw: {k: v for k, v in kw.items() if v is not None}
-    fake_auth.HealthCheckMonitor = type("HealthCheckMonitor", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "record_bot_heartbeat": lambda self, *a, **kw: None,
-        "record_source_success": lambda self, *a, **kw: None,
-        "record_source_error": lambda self, *a, **kw: None,
-        "check_health": lambda self, *a, **kw: [],
-    })
-    fake_auth.OrderMonitor = type("OrderMonitor", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "track": lambda self, *a, **kw: None,
-        "check_orders": lambda self, *a, **kw: {},
-    })
-    fake_auth.ScanSummary = type("ScanSummary", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "skip": lambda self, *a, **kw: None,
-        "source_ok": lambda self, *a, **kw: None,
-        "source_fail": lambda self, *a, **kw: None,
-        "finalize": lambda self, *a, **kw: {},
-        "markets_fetched": 0,
-        "markets_evaluated": 0,
-        "trades_placed": 0,
-    })
-    sys.modules["kalshi_auth"] = fake_auth
-
-    # The module reads config at import time -- provide a minimal stub file.
-    config_dir = Path("/tmp/fake_project/config")
-    config_dir.mkdir(parents=True, exist_ok=True)
-    config_path = config_dir / "kalshi-config.json"
-    import json
-    config_path.write_text(json.dumps({
-        "cities": {},
-        "mode": "demo",
-        "maxTradeAmount": 1,
-        "edgeThreshold": 0.10,
-        "scanIntervalMinutes": 60,
-        "maxDailyTrades": 10,
-        "maxDailyLoss": 10,
-    }))
-    # Also create the data directory the module expects
-    data_dir = Path("/tmp/fake_project/data")
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    spec = importlib.util.spec_from_file_location(
-        "weather_bot",
-        str(Path(__file__).resolve().parent.parent / "src" / "kalshi" / "weather-bot.py"),
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    # Restore so later test modules get the real kalshi_auth.
-    if orig_auth is not None:
-        sys.modules["kalshi_auth"] = orig_auth
-    else:
-        del sys.modules["kalshi_auth"]
-
-    return mod
-
-
-_mod = _load_weather_bot()
+_fake_auth = make_fake_auth(PROJECT_DIR=_fake_project)
+_mod = load_bot_module("weather-bot.py", _fake_auth)
 parse_ticker = _mod.parse_ticker
 compute_probability = _mod.compute_probability
 
