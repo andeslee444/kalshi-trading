@@ -13,7 +13,6 @@ from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_thre
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
-setup_signal_handlers()
 
 TRADES_PATH = PROJECT_DIR / "data" / "kalshi-entertainment-trades.json"
 PID_PATH = PROJECT_DIR / "data" / "pids" / "kalshi-entertainment.pid"
@@ -28,6 +27,7 @@ Path(PID_PATH).write_text(str(os.getpid()))
 
 # Logging — auto file logging via setup_logging (writes to data/logs/entertainment.log)
 log = setup_logging("entertainment")
+setup_signal_handlers()
 
 # === Config from file ===
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
