@@ -1,5 +1,4 @@
 {
-  "mode": "demo",
   "maxTradeAmount": 25,
   "maxTradeAmountPct": 0.05,
   "maxDailyTrades": 25,

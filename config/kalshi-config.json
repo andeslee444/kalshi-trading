@@ -1,6 +1,5 @@
 {
   "_comment": "City coordinates are NWS airport weather station locations (not city centers). Kalshi settles against these stations. NY uses KNYC (Central Park).",
-  "mode": "demo",
   "maxTradeAmount": 30,
   "maxTradeAmountPct": 0.03,
   "maxDailyTrades": 10,
