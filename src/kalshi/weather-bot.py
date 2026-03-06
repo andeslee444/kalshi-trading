@@ -615,6 +615,7 @@ def scan_and_trade():
 
         # Phase 3: Improve limit price using orderbook depth (after Kelly sizing for accurate qty)
         if depth_data and count > 0:
+            old_price = price
             if side == "yes":
                 fill_price = orderbook.estimate_fill_price(depth_data, "yes", count)
                 if fill_price is not None and fill_price < price:
@@ -627,6 +628,8 @@ def scan_and_trade():
                     if fill_price_no < price:
                         log.info(f"  {ticker}: depth suggests better NO fill at {fill_price_no}c (vs {price}c)")
                         price = fill_price_no
+            if price != old_price:
+                fee = kalshi_fee_cents(price)
 
         if count <= 0:
             log.info(f"  Kelly says 0 contracts for {ticker} (edge too small for price), skipping")
