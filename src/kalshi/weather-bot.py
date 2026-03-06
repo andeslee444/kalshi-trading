@@ -11,7 +11,7 @@ from probability import weather_probability, weather_sigma, ensemble_weather_pro
 from ticker_utils import parse_weather_ticker as parse_ticker
 from capital_allocator import PortfolioAllocator
 from forecast_verifier import ForecastVerifier, DEFAULT_STATION_MAP
-from weather_data import EnsembleCollector, STATION_MAP
+from weather_data import EnsembleCollector, HRRRFetcher, OrderBookDepth, next_model_run, STATION_MAP
 
 setup_unbuffered()
 log = setup_logging("weather")
@@ -57,6 +57,12 @@ if verifier:
 
 # Ensemble member collector for empirical CDF model
 ensemble_collector = EnsembleCollector(logger=log)
+
+# HRRR deterministic forecast fetcher (Phase 3)
+hrrr_fetcher = HRRRFetcher(logger=log)
+
+# Order book depth analyzer (Phase 3)
+orderbook = OrderBookDepth(logger=log)
 
 
 def get_forecast(lat, lon):
@@ -131,6 +137,55 @@ def compute_probability(forecast_temp, threshold, direction, days_out=0, city=No
     If city is provided and calibration data exists, uses calibrated sigma.
     """
     return weather_probability(forecast_temp, threshold, direction, days_out, city=city)
+
+def compute_adaptive_interval(markets, config):
+    """Compute scan interval based on nearest market settlement date.
+
+    Returns shorter intervals when day-0 markets exist (5 min) vs day-1 (15 min)
+    vs day-2+ (30 min), as short-lived opportunities concentrate near settlement.
+
+    Args:
+        markets: list of market dicts from Kalshi API
+        config: bot config dict
+
+    Returns:
+        Interval in minutes (float).
+    """
+    adaptive_cfg = config.get("adaptiveScan", {})
+    if not adaptive_cfg.get("enabled", False):
+        return config.get("scanIntervalMinutes", 30)
+
+    day0_min = adaptive_cfg.get("day0Minutes", 5)
+    day1_min = adaptive_cfg.get("day1Minutes", 15)
+    day2_min = adaptive_cfg.get("day2PlusMinutes", 30)
+
+    if not markets:
+        return day2_min
+
+    today = datetime.date.today()
+    min_days_out = float("inf")
+
+    for m in markets:
+        ticker = m.get("ticker", "")
+        if not ticker.startswith("KXHIGH") or ticker.startswith("KXHIGHINFLATION"):
+            continue
+        parsed = parse_ticker(ticker)
+        if not parsed:
+            continue
+        try:
+            market_date = datetime.date.fromisoformat(parsed["date"])
+            days_out = max(0, (market_date - today).days)
+            min_days_out = min(min_days_out, days_out)
+        except (ValueError, TypeError):
+            continue
+
+    if min_days_out == 0:
+        return day0_min
+    elif min_days_out == 1:
+        return day1_min
+    else:
+        return day2_min
+
 
 def scan_and_trade():
     now = datetime.datetime.now()
@@ -218,6 +273,20 @@ def scan_and_trade():
     if ensemble_members:
         log.info("Ensemble member data available for %d cities", len(ensemble_members))
 
+    # Fetch HRRR deterministic forecast (Phase 3: 3km resolution, hourly updates)
+    hrrr_data = {}  # {city_code: {date_str: max_temp_f}}
+    hrrr_cfg = config.get("hrrr", {})
+    if hrrr_cfg.get("enabled", False):
+        for code, info in CITIES.items():
+            try:
+                data = hrrr_fetcher.fetch_hrrr(info["lat"], info["lon"])
+                if data:
+                    hrrr_data[code] = data
+            except Exception as e:
+                log.warning("HRRR fetch failed for %s: %s", code, e)
+        if hrrr_data:
+            log.info("HRRR data available for %d cities", len(hrrr_data))
+
     # Current hour for intra-day sigma (day-0 markets only)
     current_hour = now.hour
 
@@ -268,8 +337,26 @@ def scan_and_trade():
 
             # Primary model: empirical ensemble CDF (if member data available)
             if city in ensemble_members and date_str in ensemble_members.get(city, {}):
-                members = ensemble_members[city][date_str]
+                members = list(ensemble_members[city][date_str])  # copy to avoid mutation
                 if members and len(members) >= 10:
+                    # Phase 3: Inject HRRR forecast as additional ensemble members
+                    # with day-dependent weighting (60% day-0, 30% day-1)
+                    if city in hrrr_data and date_str in hrrr_data.get(city, {}):
+                        hrrr_temp = hrrr_data[city][date_str]
+                        if days_out == 0:
+                            hrrr_weight = hrrr_cfg.get("weight_day0", 0.60)
+                        elif days_out == 1:
+                            hrrr_weight = hrrr_cfg.get("weight_day1", 0.30)
+                        else:
+                            hrrr_weight = 0.0
+
+                        if hrrr_weight > 0:
+                            # Replicate HRRR temp as fraction of existing member count
+                            n_inject = max(1, int(len(members) * hrrr_weight))
+                            members.extend([hrrr_temp] * n_inject)
+                            log.info("  %s: HRRR temp %.1fF injected %d members (weight=%.0f%%, total=%d)",
+                                     ticker, hrrr_temp, n_inject, hrrr_weight * 100, len(members))
+
                     # Get station bias from verifier if available
                     bias = city_bias.get(city, {}).get("bias_f", 0.0) if city_bias else 0.0
                     our_prob = empirical_ensemble_probability(
@@ -287,9 +374,17 @@ def scan_and_trade():
 
             # Fallback: parametric ensemble (v2 with adaptive weights)
             if not used_empirical:
+                # Phase 3: Blend HRRR into parametric forecast data
+                parametric_data = dict(forecast_data)
+                if city in hrrr_data and date_str in hrrr_data.get(city, {}) and days_out <= 1:
+                    parametric_data["hrrr"] = hrrr_data[city][date_str]
+                    log.info("  %s: HRRR temp %.1fF added to parametric ensemble",
+                             ticker, hrrr_data[city][date_str])
+
                 # Compute spread multiplier once — widens sigma AND gates edge
-                if len(valid_temps) >= 2:
-                    spread = max(valid_temps) - min(valid_temps)
+                pvalid = [t for t in parametric_data.values() if t is not None]
+                if len(pvalid) >= 2:
+                    spread = max(pvalid) - min(pvalid)
                     spread_mult = ensemble_spread_sigma_multiplier(spread)
                     if spread_mult > 1.0:
                         log.info(f"  {ticker}: ensemble spread {spread:.1f}F (sigma_mult={spread_mult:.2f})")
@@ -299,7 +394,7 @@ def scan_and_trade():
                 hour_for_sigma = current_hour if days_out == 0 else None
 
                 result = ensemble_weather_probability_v2(
-                    forecast_data, parsed["threshold"], parsed["direction"],
+                    parametric_data, parsed["threshold"], parsed["direction"],
                     days_out, city=city, sigma_multiplier=spread_mult,
                     hour_of_day=hour_for_sigma,
                     verification_data=verification_summary if verification_summary else None,
@@ -423,10 +518,29 @@ def scan_and_trade():
         # Rec 1: Brackets require 2x edge threshold (higher model uncertainty)
         if is_bracket and edge < config["edgeThreshold"] * 2:
             log.info(f"  Skipping bracket {ticker}: edge {edge*100:.1f}% < {config['edgeThreshold']*200:.0f}% (2x threshold)")
+            ss.skip("bracket_low_edge")
+            trade_manager.log_decision(ticker, opp["side"], "skipped",
+                                       f"bracket edge {edge*100:.1f}% < 2x threshold",
+                                       edge=edge, price_cents=yes_ask if opp["side"] == "yes" else no_ask)
             continue
 
         # Edge is always positive (computed against the ask for the side we'd trade)
         side = opp["side"]
+
+        # Phase 3: Order book depth gating — skip thin books, improve limit pricing
+        ob_cfg = config.get("orderbookDepth", {})
+        depth_data = None
+        if ob_cfg.get("enabled", False):
+            depth_data = orderbook.fetch_depth(client, ticker)
+            if depth_data:
+                min_depth = ob_cfg.get("minDepthContracts", 5)
+                side_depth = depth_data["total_ask_depth"] if side == "yes" else depth_data["total_bid_depth"]
+                if side_depth < min_depth:
+                    log.info(f"  Skipping {ticker}: insufficient depth ({side_depth} < {min_depth})")
+                    ss.skip("low_depth")
+                    trade_manager.log_decision(ticker, side, "skipped", f"insufficient depth ({side_depth} < {min_depth})",
+                                               edge=edge, price_cents=yes_ask if side == "yes" else no_ask)
+                    continue
 
         if side == "yes" and yes_ask and yes_ask < 99:
             # Config-level YES disable — if set, skip all weather YES trades
@@ -499,6 +613,24 @@ def scan_and_trade():
             )
             sizing_label = "quarter-Kelly (uncalibrated)"
 
+        # Phase 3: Improve limit price using orderbook depth (after Kelly sizing for accurate qty)
+        if depth_data and count > 0:
+            old_price = price
+            if side == "yes":
+                fill_price = orderbook.estimate_fill_price(depth_data, "yes", count)
+                if fill_price is not None and fill_price < price:
+                    log.info(f"  {ticker}: depth suggests better YES fill at {fill_price:.0f}c (vs {price}c)")
+                    price = int(fill_price)
+            elif side == "no":
+                fill_price_yes = orderbook.estimate_fill_price(depth_data, "no", count)
+                if fill_price_yes is not None:
+                    fill_price_no = 100 - round(fill_price_yes)
+                    if fill_price_no < price:
+                        log.info(f"  {ticker}: depth suggests better NO fill at {fill_price_no}c (vs {price}c)")
+                        price = fill_price_no
+            if price != old_price:
+                fee = kalshi_fee_cents(price)
+
         if count <= 0:
             log.info(f"  Kelly says 0 contracts for {ticker} (edge too small for price), skipping")
             ss.skip("kelly_zero")
@@ -547,6 +679,7 @@ def scan_and_trade():
             log.warning("Verification save failed (non-blocking): %s", e)
 
     ss.finalize()
+    return markets
 
 def main():
     log.info("=" * 60)
@@ -564,6 +697,7 @@ def main():
         sys.exit(1)
 
     # Main loop
+    last_markets = []
     while True:
         try:
             health.record_bot_heartbeat("weather")
@@ -571,12 +705,29 @@ def main():
             if issues:
                 log.warning("Health issues: %s", "; ".join(issues))
             order_monitor.check_orders()
-            scan_and_trade()
+            result = scan_and_trade()
+            if result:
+                last_markets = result
         except Exception as e:
             log.error(f"Scan error: {e}")
             import traceback; traceback.print_exc()
 
-        interval = config["scanIntervalMinutes"]
+        # Phase 3: Adaptive scan cadence based on nearest market settlement
+        base_interval = compute_adaptive_interval(last_markets, config)
+        interval = base_interval
+
+        # Phase 3: Model-run timing — shorten interval when fresh data imminent
+        adaptive_cfg = config.get("adaptiveScan", {})
+        if adaptive_cfg.get("enabled", False):
+            try:
+                model, minutes_until = next_model_run()
+                trigger_min = adaptive_cfg.get("modelRunTriggerMinutes", 2)
+                if minutes_until <= trigger_min:
+                    interval = min(interval, max(1, minutes_until))
+                    log.info(f"New {model} run imminent in {minutes_until:.0f}min, scanning in {interval:.0f}min")
+            except Exception as e:
+                log.warning("Model-run timing check failed (non-blocking): %s", e)
+
         if is_shutdown_requested():
             log.info("Graceful shutdown requested, exiting.")
             break

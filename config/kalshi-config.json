@@ -42,5 +42,21 @@
     "min_samples_for_adaptive": 10,
     "disagreement_edge_multiplier": 2.0,
     "max_api_calls_per_scan": 5
+  },
+  "hrrr": {
+    "enabled": true,
+    "weight_day0": 0.60,
+    "weight_day1": 0.30
+  },
+  "adaptiveScan": {
+    "enabled": true,
+    "day0Minutes": 5,
+    "day1Minutes": 15,
+    "day2PlusMinutes": 30,
+    "modelRunTriggerMinutes": 2
+  },
+  "orderbookDepth": {
+    "enabled": true,
+    "minDepthContracts": 5
   }
 }
