@@ -15,12 +15,12 @@ Usage:
     python3 src/kalshi/market-maker.py --once    # single scan
 """
 
-import json, time, datetime, os, sys, re, math, argparse, traceback
+import json, time, datetime, os, sys, re, math, argparse
 from pathlib import Path
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, TradeManager, trim_trade_log, build_market_snapshot,
-    is_shutdown_requested,
+    is_shutdown_requested, HealthCheckMonitor,
 )
 from probability import weather_probability, weather_sigma, is_market_liquid, _probit, _norm_pdf
 from capital_allocator import PortfolioAllocator
@@ -28,6 +28,7 @@ from capital_allocator import PortfolioAllocator
 setup_unbuffered()
 log = setup_logging("market-maker")
 setup_signal_handlers()
+health = HealthCheckMonitor(logger=log)
 
 # === Paths ===
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
@@ -393,6 +394,8 @@ def scan_and_quote():
             budget = allocator.request_budget("market-maker", ticker, edge=0.0)
             if not budget.approved:
                 log.info(f"  {ticker}: allocator denied: {budget.reason}")
+                trade_manager.log_decision(ticker, "yes", "skipped", f"allocator denied: {budget.reason}",
+                                           price_cents=round(mid))
                 continue
 
             log.info(f"  {ticker}: mid={mid:.0f}c inv={inventory} r={reservation}c spread={half_spread*2}c -> bid={bid_price} ask={ask_price}")
@@ -416,6 +419,9 @@ def scan_and_quote():
                     allocator.record_trade("market-maker", ticker, 0, edge=0.0)  # quotes don't consume allocation
         else:
             log.info(f"  {ticker}: our spread ({bid_price}-{ask_price}) doesn't improve market ({yes_bid}-{yes_ask}), skipping")
+            trade_manager.log_decision(ticker, "yes", "skipped",
+                                       f"spread doesn't improve market ({bid_price}-{ask_price} vs {yes_bid}-{yes_ask})",
+                                       price_cents=round(mid))
 
     log.info(f"Scan complete. Quoted {quoted} markets.")
 
@@ -476,10 +482,10 @@ def main():
     # Daemon loop
     while True:
         try:
+            health.record_bot_heartbeat("market-maker")
             scan_and_quote()
         except Exception as e:
-            log.error(f"Scan error: {e}")
-            traceback.print_exc()
+            log.error("Scan error: %s", e, exc_info=True)
 
         if is_shutdown_requested():
             log.info("Graceful shutdown requested, exiting.")
