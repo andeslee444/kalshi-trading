@@ -9,7 +9,7 @@ Sources:
   3. NWS actual temperatures — every 10 min
 """
 
-import json, time, datetime, os, sys, re, hashlib, traceback
+import json, time, datetime, os, sys, re, hashlib
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
@@ -80,11 +80,10 @@ def _check_with_retry(check_fn, source_name, prefetched, ss, max_retries=2):
                 log.warning(f"{source_name} attempt {attempt+1} failed: {e}, retrying in {delay}s")
                 time.sleep(delay)
             else:
-                log.error(f"{source_name} failed after {max_retries+1} attempts: {e}")
+                log.error("%s failed after %d attempts: %s", source_name, max_retries+1, e, exc_info=True)
                 health.record_source_error(source_name, str(e))
                 if ss:
                     ss.source_fail(source_name, str(e))
-                traceback.print_exc()
 
 def _validate_market_cluster(entity_key, market_signals):
     """Check that markets for the same entity have monotonically decreasing
@@ -1108,8 +1107,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                         allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
     except Exception as e:
-        log.error(f"  NWS market matching failed: {e}")
-        traceback.print_exc()
+        log.error("  NWS market matching failed: %s", e, exc_info=True)
 
 
 # ============================================================
@@ -1133,9 +1131,14 @@ def _nws_interval_seconds(config):
 # ============================================================
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Settlement source monitor (info arbitrage)")
+    parser.add_argument("--once", action="store_true", help="Run single scan of all sources then exit")
+    args = parser.parse_args()
+
     log.info("=" * 70)
     log.info("Kalshi Settlement Source Monitor -- Information Arbitrage Bot")
-    log.info(f"   Mode: {config['mode']} | Max: ${config['maxTradeAmount']}/trade | Daily limit: {config['maxDailyTrades']} trades")
+    log.info(f"   Mode: {os.environ.get('KALSHI_MODE', 'demo')} | Max: ${config['maxTradeAmount']}/trade | Daily limit: {config['maxDailyTrades']} trades")
     log.info(f"   Sources: HDD={config['sources']['hdd']['enabled']} | BoxOffice={config['sources']['boxoffice']['enabled']} | NWS={config['sources']['nws']['enabled']}")
     log.info("=" * 70)
 
@@ -1150,6 +1153,28 @@ def main():
     last_hdd = 0
     last_boxoffice = 0
     last_nws = 0
+
+    if args.once:
+        # Run one full cycle of all enabled sources
+        ss = ScanSummary("source-monitor", log)
+        prefetched = {}
+        if config["sources"]["hdd"]["enabled"]:
+            album_markets = get_markets_by_prefix("KXALBUMSALES")
+            if not album_markets:
+                album_markets = get_markets_by_prefix("KXALBUM")
+            prefetched["album"] = album_markets
+            _check_with_retry(check_hdd, "hdd", prefetched, ss)
+        if config["sources"]["boxoffice"]["enabled"]:
+            box_markets = []
+            for prefix in ["KXBOXOFFICE", "KXBOX", "KXMOVIE", "KXFILM"]:
+                box_markets.extend(get_markets_by_prefix(prefix))
+            prefetched["boxoffice"] = box_markets
+            _check_with_retry(scan_boxoffice, "boxoffice", prefetched, ss)
+        if config["sources"]["nws"]["enabled"]:
+            prefetched["weather"] = get_markets_by_prefix("KXHIGH")
+            _check_with_retry(check_nws, "nws", prefetched, ss)
+        ss.finalize()
+        return
 
     hdd_interval = config["sources"]["hdd"]["intervalMinutes"] * 60
     box_interval = config["sources"]["boxoffice"]["intervalMinutes"] * 60
@@ -1220,8 +1245,7 @@ def main():
             health.record_bot_heartbeat("source-monitor")
 
         except Exception as e:
-            log.error(f"Main loop error: {e}")
-            traceback.print_exc()
+            log.error("Main loop error: %s", e, exc_info=True)
 
         if is_shutdown_requested():
             log.info("Graceful shutdown requested, exiting.")

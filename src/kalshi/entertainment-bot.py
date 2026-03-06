@@ -4,7 +4,7 @@ Monitors HITS Daily Double and Box Office Mojo for settlement data before market
 DEMO API ONLY — $5 max per trade.
 """
 
-import json, time, datetime, os, sys, re, traceback
+import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
@@ -674,20 +674,18 @@ def scan():
         health.record_source_success("hdd")
         ss.source_ok("hdd")
     except Exception as e:
-        log.error(f"HDD scrape error: {e}")
+        log.error("HDD scrape error: %s", e, exc_info=True)
         health.record_source_error("hdd", str(e))
         ss.source_fail("hdd", str(e))
-        traceback.print_exc()
 
     try:
         box_data = scrape_box_office()
         health.record_source_success("boxoffice")
         ss.source_ok("boxoffice")
     except Exception as e:
-        log.error(f"Box office scrape error: {e}")
+        log.error("Box office scrape error: %s", e, exc_info=True)
         health.record_source_error("boxoffice", str(e))
         ss.source_fail("boxoffice", str(e))
-        traceback.print_exc()
 
     log.info(f"Source data: {len(album_data)} album entries, {len(box_data)} box office entries")
 
@@ -700,6 +698,11 @@ def scan():
     ss.finalize()
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Entertainment markets trading bot")
+    parser.add_argument("--once", action="store_true", help="Run single scan then exit")
+    args = parser.parse_args()
+
     log.info("=" * 60)
     log.info("Kalshi Entertainment Markets Bot (DEMO)")
     log.info(f"   Max trade: ${MAX_TRADE_AMOUNT} | Confidence threshold: {CONFIDENCE_THRESHOLD*100:.0f}%")
@@ -716,6 +719,10 @@ def main():
         log.error(f"Auth failed: {e}")
         sys.exit(1)
 
+    if args.once:
+        scan()
+        return
+
     while True:
         try:
             health.record_bot_heartbeat("entertainment")
@@ -725,8 +732,7 @@ def main():
             order_monitor.check_orders()
             scan()
         except Exception as e:
-            log.error(f"Scan error: {e}")
-            traceback.print_exc()
+            log.error("Scan error: %s", e, exc_info=True)
 
         if is_shutdown_requested():
             log.info("Graceful shutdown requested, exiting.")

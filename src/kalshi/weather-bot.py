@@ -3,7 +3,7 @@
 Scans KXHIGH temperature markets, compares to Open-Meteo forecasts, and places trades on edge.
 """
 
-import json, time, datetime, os, sys, re
+import json, time, datetime, os, sys, re, threading
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
@@ -48,6 +48,79 @@ ENSEMBLE_MODELS = {
 }
 ENSEMBLE_ENABLED = config.get("ensemble", {}).get("enabled", False)
 
+
+# === Rate Limiter ===
+
+class RateLimiter:
+    """Token-bucket rate limiter for API requests (max N req/s with backoff)."""
+
+    def __init__(self, max_per_second=5, burst=5):
+        self._lock = threading.Lock()
+        self._max_per_second = max_per_second
+        self._tokens = burst
+        self._last_refill = time.monotonic()
+        self._interval = 1.0 / max_per_second
+
+    def acquire(self):
+        """Block until a token is available."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_refill
+                self._tokens = min(self._max_per_second, self._tokens + elapsed * self._max_per_second)
+                self._last_refill = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+            time.sleep(self._interval)
+
+
+_open_meteo_limiter = RateLimiter(max_per_second=4, burst=4)
+
+
+def _rate_limited_request(url, timeout=15, max_retries=2):
+    """Open-Meteo request with rate limiting."""
+    _open_meteo_limiter.acquire()
+    return retry_request("GET", url, timeout=timeout, max_retries=max_retries)
+
+
+# === Source-level circuit breaker ===
+
+class SourceCircuitBreaker:
+    """Per-source circuit breaker. Opens after N consecutive failures, resets after cooldown."""
+
+    def __init__(self, max_failures=5, cooldown_seconds=300):
+        self._max_failures = max_failures
+        self._cooldown = cooldown_seconds
+        self._failures = {}  # source -> consecutive failure count
+        self._opened_at = {}  # source -> timestamp when circuit opened
+
+    def is_open(self, source):
+        if source not in self._opened_at:
+            return False
+        elapsed = time.monotonic() - self._opened_at[source]
+        if elapsed > self._cooldown:
+            # Half-open: allow one attempt
+            del self._opened_at[source]
+            self._failures[source] = 0
+            return False
+        return True
+
+    def record_success(self, source):
+        self._failures[source] = 0
+        self._opened_at.pop(source, None)
+
+    def record_failure(self, source):
+        self._failures[source] = self._failures.get(source, 0) + 1
+        if self._failures[source] >= self._max_failures:
+            self._opened_at[source] = time.monotonic()
+            log.warning("Circuit breaker opened for %s after %d consecutive failures",
+                        source, self._failures[source])
+
+
+_source_breaker = SourceCircuitBreaker(max_failures=5, cooldown_seconds=600)
+
+
 # === Forecast Verification ===
 VERIFICATION_ENABLED = config.get("verification", {}).get("enabled", True)
 VERIFICATION_CONFIG = config.get("verification", {})
@@ -68,9 +141,125 @@ orderbook = OrderBookDepth(logger=log)
 def get_forecast(lat, lon):
     """Single-model GFS forecast (fallback)."""
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max&temperature_unit=fahrenheit&timezone=America%2FNew_York&forecast_days=14"
-    r = retry_request("GET", url, timeout=10)
+    r = _rate_limited_request(url, timeout=10)
     d = r.json()["daily"]
     return dict(zip(d["time"], d["temperature_2m_max"]))
+
+
+def get_batch_forecasts(cities_dict):
+    """Batch forecast for all cities in a single Open-Meteo API call.
+
+    Open-Meteo supports comma-separated lat/lon for multi-location requests.
+    Returns {city_code: {date: temp}} for all cities, or empty dict on failure.
+    """
+    codes = list(cities_dict.keys())
+    lats = ",".join(str(cities_dict[c]["lat"]) for c in codes)
+    lons = ",".join(str(cities_dict[c]["lon"]) for c in codes)
+
+    url = (
+        f"https://api.open-meteo.com/v1/forecast?"
+        f"latitude={lats}&longitude={lons}"
+        f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
+        f"&timezone=America%2FNew_York&forecast_days=14"
+    )
+
+    try:
+        r = _rate_limited_request(url, timeout=30)
+        data = r.json()
+
+        # Multi-location returns a list of results
+        if isinstance(data, list):
+            results = {}
+            for i, city_data in enumerate(data):
+                if i >= len(codes):
+                    break
+                d = city_data.get("daily", {})
+                if d and "time" in d and "temperature_2m_max" in d:
+                    results[codes[i]] = dict(zip(d["time"], d["temperature_2m_max"]))
+            return results
+        else:
+            # Single location response (only 1 city)
+            d = data.get("daily", {})
+            if d and "time" in d and "temperature_2m_max" in d:
+                return {codes[0]: dict(zip(d["time"], d["temperature_2m_max"]))}
+    except Exception as e:
+        log.error(f"Batch forecast failed: {e}")
+
+    return {}
+
+
+def get_batch_ensemble_forecasts(cities_dict):
+    """Batch ensemble forecast for all cities in a single API call per model.
+
+    Returns {city_code: {date: {model: temp}}} using 1 API call per model
+    (3 total instead of 3*N_cities).
+    """
+    codes = list(cities_dict.keys())
+    lats = ",".join(str(cities_dict[c]["lat"]) for c in codes)
+    lons = ",".join(str(cities_dict[c]["lon"]) for c in codes)
+
+    # Fetch each model in a single batch request
+    model_results = {}  # model_key -> {city_code: {date: temp}}
+    for model_key, model_name in ENSEMBLE_MODELS.items():
+        if _source_breaker.is_open(f"open-meteo-{model_key}"):
+            log.warning(f"Circuit breaker open for {model_key}, skipping")
+            continue
+
+        url = (
+            f"https://api.open-meteo.com/v1/forecast?"
+            f"latitude={lats}&longitude={lons}"
+            f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
+            f"&timezone=America%2FNew_York&forecast_days=14"
+            f"&models={model_name}"
+        )
+
+        try:
+            r = _rate_limited_request(url, timeout=30)
+            data = r.json()
+
+            city_forecasts = {}
+            if isinstance(data, list):
+                for i, city_data in enumerate(data):
+                    if i >= len(codes):
+                        break
+                    d = city_data.get("daily", {})
+                    if d and "time" in d and "temperature_2m_max" in d:
+                        city_forecasts[codes[i]] = dict(zip(d["time"], d["temperature_2m_max"]))
+            else:
+                d = data.get("daily", {})
+                if d and "time" in d and "temperature_2m_max" in d:
+                    city_forecasts[codes[0]] = dict(zip(d["time"], d["temperature_2m_max"]))
+
+            model_results[model_key] = city_forecasts
+            _source_breaker.record_success(f"open-meteo-{model_key}")
+        except Exception as e:
+            log.warning(f"Batch ensemble {model_key} failed: {e}")
+            _source_breaker.record_failure(f"open-meteo-{model_key}")
+
+    if not model_results:
+        return {}
+
+    # Combine: {city_code: {date: {model: temp}}}
+    combined = {}
+    for code in codes:
+        city_data = {}
+        all_dates = set()
+        for model_key, city_forecasts in model_results.items():
+            if code in city_forecasts:
+                all_dates.update(city_forecasts[code].keys())
+
+        for date_str in sorted(all_dates):
+            day = {}
+            for model_key, city_forecasts in model_results.items():
+                if code in city_forecasts and date_str in city_forecasts[code]:
+                    day[model_key] = city_forecasts[code][date_str]
+            if day:
+                city_data[date_str] = day
+
+        if city_data:
+            combined[code] = city_data
+
+    return combined
 
 
 def get_ensemble_forecast(lat, lon):
@@ -217,18 +406,43 @@ def scan_and_trade():
         ss.finalize()
         return
 
-    # Get forecasts (ensemble or single-model)
+    # Get forecasts (batch API: 1-3 requests instead of 20-60+)
     forecasts = {}
+    if _source_breaker.is_open("open-meteo"):
+        log.warning("Open-Meteo circuit breaker open, skipping forecast fetch")
+    else:
+        try:
+            if ENSEMBLE_ENABLED:
+                forecasts = get_batch_ensemble_forecasts(CITIES)
+            else:
+                forecasts = get_batch_forecasts(CITIES)
+            if forecasts:
+                health.record_source_success("open-meteo")
+                _source_breaker.record_success("open-meteo")
+                log.info(f"Batch forecasts received for {len(forecasts)} cities")
+            else:
+                log.warning("Batch forecast returned empty, falling back to per-city")
+                _source_breaker.record_failure("open-meteo")
+        except Exception as e:
+            log.error(f"Batch forecast error: {e}")
+            _source_breaker.record_failure("open-meteo")
+            health.record_source_error("open-meteo", str(e))
+
+    # Fallback: per-city fetch for any missing cities
     for code, info in CITIES.items():
+        if code in forecasts:
+            continue
+        if _source_breaker.is_open("open-meteo"):
+            break
         try:
             if ENSEMBLE_ENABLED:
                 forecasts[code] = get_ensemble_forecast(info["lat"], info["lon"])
             else:
                 forecasts[code] = get_forecast(info["lat"], info["lon"])
-            health.record_source_success("open-meteo")
+            _source_breaker.record_success("open-meteo")
         except Exception as e:
             log.error(f"Forecast error for {info['name']}: {e}")
-            health.record_source_error("open-meteo", str(e))
+            _source_breaker.record_failure("open-meteo")
 
     # Forecast verification: verify past forecasts and record new ones
     if verifier:
@@ -263,13 +477,19 @@ def scan_and_trade():
 
     # Fetch raw ensemble member data for empirical CDF model
     ensemble_members = {}  # {city_code: {date_str: [member_temps]}}
-    for code, info in CITIES.items():
-        try:
-            members = ensemble_collector.fetch_ensemble(info["lat"], info["lon"])
-            if members:
-                ensemble_members[code] = members
-        except Exception as e:
-            log.warning("Ensemble member fetch failed for %s: %s", code, e)
+    if not _source_breaker.is_open("open-meteo-ensemble"):
+        for code, info in CITIES.items():
+            if _source_breaker.is_open("open-meteo-ensemble"):
+                break
+            try:
+                _open_meteo_limiter.acquire()  # rate limit ensemble API too
+                members = ensemble_collector.fetch_ensemble(info["lat"], info["lon"])
+                if members:
+                    ensemble_members[code] = members
+                    _source_breaker.record_success("open-meteo-ensemble")
+            except Exception as e:
+                log.warning("Ensemble member fetch failed for %s: %s", code, e)
+                _source_breaker.record_failure("open-meteo-ensemble")
     if ensemble_members:
         log.info("Ensemble member data available for %d cities", len(ensemble_members))
 
@@ -682,9 +902,14 @@ def scan_and_trade():
     return markets
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Weather temperature trading bot")
+    parser.add_argument("--once", action="store_true", help="Run single scan then exit")
+    args = parser.parse_args()
+
     log.info("=" * 60)
     log.info("Kalshi Weather Trading Bot (DEMO)")
-    log.info(f"Mode: {config['mode']} | Max: ${config['maxTradeAmount']}/trade | Edge: {config['edgeThreshold']*100:.0f}%")
+    log.info(f"Mode: {os.environ.get('KALSHI_MODE', 'demo')} | Max: ${config['maxTradeAmount']}/trade | Edge: {config['edgeThreshold']*100:.0f}%")
     log.info("=" * 60)
 
     # Verify auth
@@ -695,6 +920,10 @@ def main():
     except Exception as e:
         log.error(f"Auth failed: {e}")
         sys.exit(1)
+
+    if args.once:
+        scan_and_trade()
+        return
 
     # Main loop
     last_markets = []
@@ -709,8 +938,7 @@ def main():
             if result:
                 last_markets = result
         except Exception as e:
-            log.error(f"Scan error: {e}")
-            import traceback; traceback.print_exc()
+            log.error("Scan error: %s", e, exc_info=True)
 
         # Phase 3: Adaptive scan cadence based on nearest market settlement
         base_interval = compute_adaptive_interval(last_markets, config)
