@@ -7,6 +7,7 @@ Produces MacroSignal with quantified bias adjustments for economics bot.
 import json
 import logging
 import math
+import os
 import re
 import time
 from dataclasses import dataclass, field, asdict
@@ -339,7 +340,7 @@ class MacroEngine:
         self._bias_clamp = self._config.get("biasClampPp", 0.15)
         self._sigma_tightening_max = self._config.get("sigmaTighteningMax", 0.30)
         self._max_sentiment_articles = self._config.get("maxSentimentArticles", 5)
-        self._fred = FREDClient(api_key=self._config.get("fred_api_key", ""))
+        self._fred = FREDClient(api_key=self._config.get("fredApiKey", "") or os.environ.get("FRED_API_KEY", ""))
         self._truflation = TruflationClient()
         self._rss = RSSFeedParser()
         self._deepseek_key = self._load_deepseek_key()

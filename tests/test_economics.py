@@ -61,6 +61,7 @@ def _load_economics_bot():
     fake_prob.compute_limit_price = lambda *a, **kw: 50
     fake_prob.kalshi_fee_cents = lambda *a, **kw: 1.0
     fake_prob.gas_price_probability = lambda *a, **kw: 0.5
+    fake_prob.is_market_liquid = lambda *a, **kw: True
     fake_prob._norm_cdf = lambda x: 0.5 * (1 + __import__("math").erf(x / __import__("math").sqrt(2)))
     sys.modules["probability"] = fake_prob
 
@@ -400,3 +401,117 @@ class TestNowcastSourceInfo:
             assert info["data_source_timestamp"].endswith("Z")
         finally:
             _econ.NOWCAST_CACHE_PATH = orig_path
+
+
+# ===================================================================
+# Horizon-scaled edge threshold tests
+# ===================================================================
+
+class TestHorizonEdgeThreshold:
+
+    def test_near_term_uses_base_threshold(self):
+        """7-day contract should use base 8% edge threshold."""
+        threshold = _econ._horizon_edge_threshold(days_to_release=7)
+        assert threshold == pytest.approx(0.08, abs=0.005)
+
+    def test_long_horizon_higher_threshold(self):
+        """107-day contract should require higher edge than 8%."""
+        threshold = _econ._horizon_edge_threshold(days_to_release=107)
+        assert threshold > 0.08
+        assert threshold < 0.50  # Not absurdly high
+
+    def test_30_day_moderate_threshold(self):
+        """30-day contract should have moderate threshold increase."""
+        threshold = _econ._horizon_edge_threshold(days_to_release=30)
+        assert 0.08 <= threshold <= 0.20
+
+    def test_zero_days_uses_base(self):
+        """Release day should use base threshold."""
+        threshold = _econ._horizon_edge_threshold(days_to_release=0)
+        assert threshold == pytest.approx(0.08, abs=0.005)
+
+    def test_monotonically_increasing(self):
+        """Threshold should increase with horizon."""
+        prev = _econ._horizon_edge_threshold(0)
+        for d in [7, 14, 30, 60, 107]:
+            t = _econ._horizon_edge_threshold(d)
+            assert t >= prev
+            prev = t
+
+
+# ===================================================================
+# Liquidity filter tests
+# ===================================================================
+
+class TestLiquidityFilter:
+
+    def test_market_with_no_bid_is_illiquid(self):
+        """Market with yes_bid=0 should be filtered."""
+        from probability import is_market_liquid
+        m = {"yes_bid": 0, "yes_ask": 5, "volume": 100}
+        assert not is_market_liquid(m)
+
+    def test_wide_spread_is_illiquid(self):
+        """Market with >20c spread should be filtered."""
+        from probability import is_market_liquid
+        m = {"yes_bid": 10, "yes_ask": 35, "volume": 100}
+        assert not is_market_liquid(m)
+
+    def test_low_volume_is_illiquid(self):
+        """Market with <10 volume should be filtered."""
+        from probability import is_market_liquid
+        m = {"yes_bid": 10, "yes_ask": 15, "volume": 5}
+        assert not is_market_liquid(m)
+
+    def test_normal_market_is_liquid(self):
+        """Market with reasonable spread/volume is liquid."""
+        from probability import is_market_liquid
+        m = {"yes_bid": 45, "yes_ask": 50, "volume": 100}
+        assert is_market_liquid(m)
+
+
+# ===================================================================
+# GDP nowcast classification tests
+# ===================================================================
+
+class TestGdpNowcast:
+
+    def test_classify_gdp_market(self):
+        """GDP ticker should classify as GDP."""
+        assert _econ._classify_econ_market("KXGDP-26Q1-T2.0") == "GDP"
+
+    def test_classify_jobs_market(self):
+        """Jobs ticker should classify as JOBS."""
+        assert _econ._classify_econ_market("KXJOBS-26MAR-T200") == "JOBS"
+
+
+# ===================================================================
+# Adaptive scan interval tests
+# ===================================================================
+
+class TestAdaptiveScanInterval:
+
+    def test_normal_interval(self):
+        """Far from release, use configured interval."""
+        interval = _econ._adaptive_scan_interval(days_to_release=30)
+        assert interval == _econ.SCAN_INTERVAL
+
+    def test_near_release_faster(self):
+        """Within 3 days, scan every 30 minutes."""
+        interval = _econ._adaptive_scan_interval(days_to_release=2)
+        assert interval == 30
+
+    def test_release_day_fastest(self):
+        """On release day, scan every 5 minutes."""
+        interval = _econ._adaptive_scan_interval(days_to_release=0)
+        assert interval == 5
+
+    def test_one_week_out_moderate(self):
+        """7 days out, scan every 2 hours."""
+        interval = _econ._adaptive_scan_interval(days_to_release=7)
+        assert interval == 120
+
+    def test_none_uses_default(self):
+        """None days_to_release uses configured interval."""
+        interval = _econ._adaptive_scan_interval(days_to_release=None)
+        assert interval == _econ.SCAN_INTERVAL

@@ -24,6 +24,7 @@ from kalshi_auth import (
 from probability import (
     econ_nowcast_probability, cpi_nowcast_sigma, gdp_nowcast_sigma, quarter_kelly,
     uncertainty_kelly, compute_limit_price, kalshi_fee_cents, gas_price_probability,
+    is_market_liquid,
 )
 from capital_allocator import PortfolioAllocator
 from cpi_belief_filter import CPIBeliefFilter
@@ -52,6 +53,40 @@ MAX_DAILY_LOSS = econ_config.get("maxDailyLoss", 30)
 SCAN_INTERVAL = econ_config.get("scanIntervalMinutes", 360)
 EDGE_THRESHOLD = econ_config.get("edgeThreshold", 0.08)
 GAS_EDGE_THRESHOLD = econ_config.get("gasEdgeThreshold", 0.04)
+
+
+def _horizon_edge_threshold(days_to_release, base=None):
+    """Scale edge threshold with horizon to account for model uncertainty growth.
+
+    Near-release (d<=14): use base threshold (model is well-calibrated).
+    Long-horizon: add 0.3% per day beyond 14, capped at 40%.
+    """
+    if base is None:
+        base = EDGE_THRESHOLD
+    if days_to_release is None or days_to_release <= 14:
+        return base
+    extra = 0.003 * (days_to_release - 14)
+    return min(base + extra, 0.40)
+
+
+def _adaptive_scan_interval(days_to_release=None):
+    """Return scan interval in minutes, scaled by proximity to release.
+
+    Release day: every 5 min (capture intraday price moves)
+    1-3 days: every 30 min (nowcast updates, late data revisions)
+    4-7 days: every 2 hours (weekly data arriving)
+    8+ days: configured interval (default 6 hours)
+    """
+    if days_to_release is None:
+        return SCAN_INTERVAL
+    if days_to_release <= 0:
+        return 5
+    elif days_to_release <= 3:
+        return 30
+    elif days_to_release <= 7:
+        return 120
+    return SCAN_INTERVAL
+
 
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
@@ -524,6 +559,37 @@ def fetch_gas_prices():
         return None
 
 
+def fetch_gdpnow(api_key=None):
+    """Fetch Atlanta Fed GDPNow estimate from FRED.
+
+    Returns GDP growth estimate as percentage (e.g. 2.3), or None on failure.
+    """
+    try:
+        key = api_key or os.environ.get("FRED_API_KEY", "")
+        if not key:
+            log.warning("  GDPNow: no FRED API key available, skipping")
+            return None
+        params = {
+            "series_id": "GDPNOW",
+            "sort_order": "desc",
+            "limit": "1",
+            "file_type": "json",
+            "api_key": key,
+        }
+        resp = retry_request("GET", "https://api.stlouisfed.org/fred/series/observations",
+                             params=params, timeout=15)
+        obs = resp.json().get("observations", [])
+        if obs and obs[0].get("value", ".") != ".":
+            val = float(obs[0]["value"])
+            log.info(f"  GDPNow: {val:.2f}%")
+            health.record_source_success("gdpnow")
+            return val
+    except Exception as e:
+        log.error(f"  GDPNow fetch failed: {e}")
+        health.record_source_error("gdpnow", str(e))
+    return None
+
+
 # === Market Matching ===
 
 def parse_econ_threshold(market):
@@ -729,12 +795,38 @@ def scan_and_trade():
     if gas_price:
         health.record_source_success("aaa-gas")
 
+    fred_key = getattr(getattr(macro, '_fred', None), 'api_key', None) if macro else None
+    gdpnow_value = fetch_gdpnow(api_key=fred_key)
+    if gdpnow_value is not None:
+        ss.source_ok("gdpnow")
+
     nowcast_stale = nowcast.pop("_stale", False) if nowcast else False
     if nowcast_stale:
         log.warning("Nowcast data is stale (>24h) — skipping CPI/GDP/Jobs trading this cycle")
 
     if nowcast:
         ss.source_ok("cleveland-fed")
+        # Record nowcast snapshot for empirical sigma calibration
+        try:
+            from nowcast_tracker import NowcastTracker
+            tracker = NowcastTracker()
+            if nowcast.get("cpi_yoy") is not None:
+                for prefix in ["KXCPI", "KXECON"]:
+                    try:
+                        markets = client.get_all_markets(prefix=prefix, cache_ttl=300)
+                        for nm in markets[:1]:
+                            days = estimate_days_to_release(nm)
+                            tracker.record_snapshot(
+                                nowcast["cpi_yoy"], "cpi_yoy",
+                                nm.get("close_time", "")[:7],  # YYYY-MM
+                                days,
+                            )
+                            break
+                        break
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.debug(f"  Nowcast tracking error (non-fatal): {e}")
     else:
         ss.source_fail("cleveland-fed", "no data")
     if gas_price:
@@ -791,11 +883,43 @@ def scan_and_trade():
     if macro is not None:
         try:
             fred_all = macro._fred.fetch_all() if hasattr(macro, '_fred') else {}
+            crude_oil = fred_all.get("crude_oil")
+
+            # Compute 90-day MA from FRED (fetch last 90 observations of daily WTI)
+            crude_oil_90d_ma = None
+            if hasattr(macro, '_fred') and crude_oil is not None:
+                try:
+                    import datetime as _dt
+                    start = (_dt.date.today() - _dt.timedelta(days=120)).isoformat()
+                    params = {
+                        "series_id": "DCOILWTICO",
+                        "observation_start": start,
+                        "file_type": "json",
+                    }
+                    if macro._fred.api_key:
+                        params["api_key"] = macro._fred.api_key
+                    resp = retry_request("GET", macro._fred.BASE_URL, params=params, timeout=15)
+                    obs = resp.json().get("observations", [])
+                    vals = [float(o["value"]) for o in obs if o.get("value", ".") != "."]
+                    if len(vals) >= 30:
+                        crude_oil_90d_ma = sum(vals[-90:]) / len(vals[-90:])
+                        log.info(f"  Crude oil 90d MA: ${crude_oil_90d_ma:.2f} (current: ${crude_oil:.2f})")
+                except Exception as e:
+                    log.warning(f"  Crude oil 90d MA calc failed (non-fatal): {e}")
+
+            # TIPS 5Y-10Y spread for stagflation signal
+            tips_5y = fred_all.get("tips_breakeven_5y")
+            tips_10y = fred_all.get("tips_breakeven_10y")
+            tips_5y_minus_10y = None
+            if tips_5y is not None and tips_10y is not None:
+                tips_5y_minus_10y = tips_5y - tips_10y
+
             fred_scenario_data = {
-                "crude_oil": fred_all.get("crude_oil"),
-                "crude_oil_90d_ma": fred_all.get("crude_oil"),  # TODO: compute actual 90d MA
+                "crude_oil": crude_oil,
+                "crude_oil_90d_ma": crude_oil_90d_ma,
                 "T10Y2Y": fred_all.get("yield_curve"),
                 "gdpnow": fred_all.get("gdpnow"),
+                "tips_5y_minus_10y": tips_5y_minus_10y,
             }
         except Exception as e:
             log.warning(f"  FRED scenario data fetch failed (non-fatal): {e}")
@@ -855,11 +979,12 @@ def scan_and_trade():
         if "CPI" in ticker.upper() or "INFLATION" in ticker.upper():
             nowcast_value = nowcast.get("cpi_yoy") or nowcast.get("core_cpi_yoy")
         elif "GDP" in ticker.upper():
-            # Primary: Cleveland Fed GDP nowcast. Fallback: Atlanta Fed GDPNow via macro engine
-            nowcast_value = nowcast.get("gdp_growth")
+            # Primary: direct GDPNow fetch. Fallback: Cleveland Fed, then macro engine
+            nowcast_value = gdpnow_value if gdpnow_value is not None else nowcast.get("gdp_growth")
             if nowcast_value is None and macro_signal and hasattr(macro_signal, 'gdpnow') and macro_signal.gdpnow:
                 nowcast_value = macro_signal.gdpnow
-                log.info(f"  Using GDPNow from macro engine for {ticker}: {nowcast_value:.2f}%")
+            if nowcast_value is not None:
+                log.info(f"  GDP nowcast for {ticker}: {nowcast_value:.2f}%")
         elif "JOBS" in ticker.upper() or "EMPLOYMENT" in ticker.upper():
             # Jobs nowcast not yet available — skip with clear log message
             log.info(f"  Skipping {ticker}: no Jobs/NFP nowcast data source connected")
@@ -879,6 +1004,13 @@ def scan_and_trade():
             continue
 
         ss.markets_evaluated += 1
+
+        # Liquidity check — skip thin markets with no exit path
+        if not is_market_liquid(m, min_volume=5, max_spread=25):
+            ss.skip("illiquid")
+            trade_manager.log_decision(ticker, "skip", "skipped", "illiquid",
+                                       market_type=market_type, title=title[:80])
+            continue
 
         # Estimate uncertainty — use market-type-specific sigma
         days_to_release = estimate_days_to_release(m)
@@ -904,9 +1036,11 @@ def scan_and_trade():
         # Bayesian belief fusion
         belief = CPIBeliefFilter(nowcast_value, sigma)
         if truflation_cpi is not None:
-            belief.update(truflation_cpi, obs_sigma=0.15)
+            # Truflation tracks different basket than BLS CPI. Historical RMSE ~0.30pp.
+            belief.update(truflation_cpi, obs_sigma=0.30)
         if tips_breakeven is not None:
-            belief.update(tips_breakeven, obs_sigma=0.25)
+            # TIPS 10Y breakeven is a long-term measure. Mapping to 1-month CPI has ~0.60pp noise.
+            belief.update(tips_breakeven, obs_sigma=0.60)
         fused_nowcast, posterior_sigma = belief.posterior
 
         # Compute probability using scenario-weighted mixture
@@ -927,9 +1061,10 @@ def scan_and_trade():
             continue
 
         # Determine trade direction (raw edge, fees handled in Kelly)
+        required_edge = _horizon_edge_threshold(days_to_release)
         if prob > 0.5:
             edge = prob - yes_ask / 100
-            if edge > EDGE_THRESHOLD:
+            if edge > required_edge:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "yes",
                     "prob": prob, "edge": edge, "threshold": threshold,
@@ -944,7 +1079,7 @@ def scan_and_trade():
                 })
             else:
                 trade_manager.log_decision(
-                    ticker, "yes", "skipped", "edge below threshold",
+                    ticker, "yes", "skipped", f"edge below threshold ({required_edge:.1%})",
                     edge=edge, price_cents=yes_ask,
                 )
         else:
@@ -953,7 +1088,7 @@ def scan_and_trade():
                 trade_manager.log_decision(ticker, "no", "skipped", "no_no_ask", price_cents=0)
                 continue
             edge = no_prob - no_ask / 100
-            if edge > EDGE_THRESHOLD:
+            if edge > required_edge:
                 opportunities.append({
                     "ticker": ticker, "market": m, "side": "no",
                     "prob": no_prob, "edge": edge, "threshold": threshold,
@@ -968,7 +1103,7 @@ def scan_and_trade():
                 })
             else:
                 trade_manager.log_decision(
-                    ticker, "no", "skipped", "edge below threshold",
+                    ticker, "no", "skipped", f"edge below threshold ({required_edge:.1%})",
                     edge=edge, price_cents=no_ask,
                 )
 
@@ -981,6 +1116,10 @@ def scan_and_trade():
             ticker = gm.get("ticker", "")
             threshold, direction_type = parse_gas_threshold(gm)
             if threshold is None:
+                continue
+            if not is_market_liquid(gm, min_volume=5, max_spread=25):
+                trade_manager.log_decision(ticker, "skip", "skipped", "illiquid",
+                                           market_type="GAS", title=gm.get("title", "")[:80])
                 continue
             direction = "above" if direction_type == "T" else "below"
             prob = gas_price_probability(gas_price, threshold, direction)
@@ -1176,6 +1315,31 @@ def scan_and_trade():
     ss.finalize()
 
 
+# === Adaptive Scheduling ===
+
+ECON_PREFIXES_FOR_SCAN = ["KXCPI", "KXECON", "KXGDP"]
+
+def _estimate_nearest_release_days():
+    """Estimate days to the nearest economic data release we're trading.
+
+    Checks KXCPI/KXGDP market close_times from the most recent scan.
+    Returns the minimum days_to_release, or None if unknown.
+    """
+    try:
+        min_days = None
+        for prefix in ECON_PREFIXES_FOR_SCAN:
+            markets = client.get_all_markets(prefix=prefix, cache_ttl=3600)
+            for m in markets:
+                days = estimate_days_to_release(m)
+                if days is not None and (min_days is None or days < min_days):
+                    min_days = days
+                    if min_days <= 0:
+                        return min_days
+        return min_days
+    except Exception:
+        return None
+
+
 # === Entry Point ===
 
 def main():
@@ -1218,8 +1382,12 @@ def main():
         if is_shutdown_requested():
             log.info("Graceful shutdown requested, exiting.")
             break
-        log.info(f"\nNext scan in {SCAN_INTERVAL} minutes...")
-        time.sleep(SCAN_INTERVAL * 60)
+
+        # Adaptive scan: faster near CPI/GDP release dates
+        next_release_days = _estimate_nearest_release_days()
+        interval = _adaptive_scan_interval(next_release_days)
+        log.info(f"\nNext scan in {interval} minutes (nearest release: {next_release_days}d)...")
+        time.sleep(interval * 60)
 
 
 if __name__ == "__main__":

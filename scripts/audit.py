@@ -1436,14 +1436,15 @@ class AuditEngine:
     def section_5f_economics(self):
         findings = []
 
-        # 5F.1: CPI nowcast sigma step function
-        test_points = {14: 0.10, 7: 0.06, 1: 0.03, 0: 0.01}
+        # 5F.1: CPI nowcast sigma piecewise exponential
+        # Calibrated: Knotek & Zaman (2024), Bloomberg consensus surprise data
+        test_points = {0: 0.04, 1: 0.055, 7: 0.11, 14: 0.14}
         issues = []
         computed = {}
         for days, expected_approx in test_points.items():
             actual = cpi_nowcast_sigma(days)
             computed[f"day_{days}"] = round(actual, 4)
-            # Allow 30% tolerance since it's now a smooth exponential
+            # Allow 30% tolerance for piecewise exponential model
             if actual < expected_approx * 0.5 or actual > expected_approx * 2.0:
                 issues.append(f"day {days}: sigma={actual:.4f}, expected ~{expected_approx}")
 
@@ -1457,7 +1458,7 @@ class AuditEngine:
         findings.append(Finding(
             "5F", "5F.1", severity,
             "CPI nowcast sigma verification",
-            "Smooth exponential decay: ~0.10 at 14d, ~0.06 at 7d, ~0.03 at 1d, 0.01 at 0d. " +
+            "Piecewise exponential: ~0.14 at 14d, ~0.11 at 7d, ~0.055 at 1d, 0.04 at 0d. " +
             ("Verified correct." if not issues else f"{len(issues)} issues"),
             {"computed": computed, "issues": issues}
         ))

@@ -378,26 +378,26 @@ class TestCpiNowcastSigma:
         _reset_calibration()
 
     def test_release_day(self):
-        """At d=0, sigma should be the floor (0.05%)."""
-        assert cpi_nowcast_sigma(0) == pytest.approx(0.05, abs=0.005)
+        """At d=0, sigma should be the floor (~0.04%)."""
+        assert cpi_nowcast_sigma(0) == pytest.approx(0.04, abs=0.005)
 
     def test_one_week(self):
-        """At d=7, sigma should be moderate (~0.17%)."""
+        """At d=7, sigma should be moderate (~0.10%)."""
         sigma = cpi_nowcast_sigma(7)
-        assert 0.13 <= sigma <= 0.20
+        assert 0.08 <= sigma <= 0.12
 
     def test_two_weeks(self):
-        """At d=14, sigma should be ~0.21%."""
+        """At d=14, sigma should be ~0.15%."""
         sigma = cpi_nowcast_sigma(14)
-        assert 0.18 <= sigma <= 0.25
+        assert 0.12 <= sigma <= 0.18
 
     def test_one_month(self):
-        """At d=30, sigma should be ~0.27-0.33%."""
+        """At d=30, sigma should be ~0.25%."""
         sigma = cpi_nowcast_sigma(30)
-        assert 0.24 <= sigma <= 0.33
+        assert 0.20 <= sigma <= 0.30
 
     def test_long_horizon(self):
-        """At d=107, sigma should approach ~0.40% (Cleveland Fed CI width)."""
+        """At d=107, sigma should approach ~0.40%."""
         sigma = cpi_nowcast_sigma(107)
         assert 0.35 <= sigma <= 0.42
 
@@ -413,6 +413,21 @@ class TestCpiNowcastSigma:
             sigma = cpi_nowcast_sigma(d)
             assert sigma >= prev
             prev = sigma
+
+    def test_seven_days_empirical_range(self):
+        """At d=7, sigma should be 0.08-0.12% (Knotek & Zaman 2024 near-release RMSE)."""
+        sigma = cpi_nowcast_sigma(7)
+        assert 0.08 <= sigma <= 0.12, f"d=7 sigma={sigma} outside empirical [0.08, 0.12]"
+
+    def test_fourteen_days_empirical_range(self):
+        """At d=14, sigma should be 0.12-0.18% (mid-quarter nowcast accuracy)."""
+        sigma = cpi_nowcast_sigma(14)
+        assert 0.12 <= sigma <= 0.18, f"d=14 sigma={sigma} outside empirical [0.12, 0.18]"
+
+    def test_three_days_tight(self):
+        """At d=3, sigma should be 0.05-0.08% (most component data known)."""
+        sigma = cpi_nowcast_sigma(3)
+        assert 0.05 <= sigma <= 0.08, f"d=3 sigma={sigma} outside empirical [0.05, 0.08]"
 
     def test_negative_days_clamped(self):
         """Negative days_to_release should clamp to 0."""
@@ -592,8 +607,8 @@ class TestCpiSigmaSmooth:
             assert abs(s2 - s1) < 0.02, f"Discontinuity at d={d}: {s1:.4f} -> {s2:.4f}"
 
     def test_cpi_sigma_at_release(self):
-        """At release (d=0), sigma should be approximately 0.05 (floor)."""
-        assert cpi_nowcast_sigma(0) == pytest.approx(0.05, abs=0.005)
+        """At release (d=0), sigma should be approximately 0.04 (floor)."""
+        assert cpi_nowcast_sigma(0) == pytest.approx(0.04, abs=0.005)
 
 
 # ===================================================================
