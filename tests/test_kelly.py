@@ -318,30 +318,30 @@ class TestQuarterKellyPreservesSingleContract:
 
     def test_quarter_kelly_preserves_single_contract(self):
         """quarter_kelly should return 1 contract when half_kelly returns 1, not zero."""
-        # Use params where half_kelly returns exactly 1 contract:
-        # tiny edge + small bankroll + high price = 1 contract from half_kelly
-        hk_contracts, _, _ = half_kelly(0.08, 90, 500, bankroll_cents=2000, return_details=True)
-        if hk_contracts >= 1 and hk_contracts <= 2:
-            qk_contracts, _, _ = quarter_kelly(0.08, 90, 500, bankroll_cents=2000, return_details=True)
-            assert qk_contracts >= 1, (
-                f"quarter_kelly zeroed out: half_kelly={hk_contracts}, quarter_kelly={qk_contracts}"
-            )
+        # Params calibrated to produce hk=1: edge=0.08, price=80, bankroll=500
+        hk_contracts, _, _ = half_kelly(0.08, 80, 500, bankroll_cents=500, return_details=True)
+        assert hk_contracts >= 1, f"half_kelly should return >= 1 contract, got {hk_contracts}"
+        assert hk_contracts <= 2, f"half_kelly should return <= 2 contracts, got {hk_contracts}"
+        qk_contracts, _, _ = quarter_kelly(0.08, 80, 500, bankroll_cents=500, return_details=True)
+        assert qk_contracts >= 1, (
+            f"quarter_kelly zeroed out: half_kelly={hk_contracts}, quarter_kelly={qk_contracts}"
+        )
 
     def test_quarter_kelly_sell_preserves_single_contract(self):
         """quarter_kelly_sell should return 1 contract when half_kelly_sell returns 1, not zero."""
-        hk_contracts, _, _ = half_kelly_sell(0.08, 10, 500, bankroll_cents=2000, return_details=True)
-        if hk_contracts >= 1 and hk_contracts <= 2:
-            qk_contracts, _, _ = quarter_kelly_sell(0.08, 10, 500, bankroll_cents=2000, return_details=True)
-            assert qk_contracts >= 1, (
-                f"quarter_kelly_sell zeroed out: half_kelly_sell={hk_contracts}, quarter_kelly_sell={qk_contracts}"
-            )
+        # Params calibrated to produce hk=1: edge=0.05, price=10, bankroll=500
+        hk_contracts, _, _ = half_kelly_sell(0.05, 10, 500, bankroll_cents=500, return_details=True)
+        assert hk_contracts >= 1, f"half_kelly_sell should return >= 1 contract, got {hk_contracts}"
+        assert hk_contracts <= 2, f"half_kelly_sell should return <= 2 contracts, got {hk_contracts}"
+        qk_contracts, _, _ = quarter_kelly_sell(0.05, 10, 500, bankroll_cents=500, return_details=True)
+        assert qk_contracts >= 1, (
+            f"quarter_kelly_sell zeroed out: half_kelly_sell={hk_contracts}, quarter_kelly_sell={qk_contracts}"
+        )
 
     def test_quarter_kelly_one_becomes_one_not_zero(self):
         """Directly verify: if half_kelly gives 1, round(1/2)=0 but max(1,...) saves it."""
-        # Construct scenario: half_kelly returns 1 contract
-        # edge=0.05, price=80, max_cost=500, bankroll=2000
-        # half_f ≈ small, int(half_f * 2000 / 80) should be ~1
-        hk, _, details = half_kelly(0.05, 80, 500, bankroll_cents=2000, return_details=True)
-        if hk == 1:
-            qk, _, _ = quarter_kelly(0.05, 80, 500, bankroll_cents=2000, return_details=True)
-            assert qk == 1, f"Expected 1 contract, got {qk}"
+        # Params calibrated to produce hk=1: edge=0.05, price=80, bankroll=800
+        hk, _, details = half_kelly(0.05, 80, 500, bankroll_cents=800, return_details=True)
+        assert hk == 1, f"Expected half_kelly to return 1 contract, got {hk}"
+        qk, _, _ = quarter_kelly(0.05, 80, 500, bankroll_cents=800, return_details=True)
+        assert qk == 1, f"Expected 1 contract, got {qk}"
