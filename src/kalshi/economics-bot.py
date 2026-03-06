@@ -559,17 +559,22 @@ def fetch_gas_prices():
         return None
 
 
-def fetch_gdpnow():
+def fetch_gdpnow(api_key=None):
     """Fetch Atlanta Fed GDPNow estimate from FRED.
 
     Returns GDP growth estimate as percentage (e.g. 2.3), or None on failure.
     """
     try:
+        key = api_key or os.environ.get("FRED_API_KEY", "")
+        if not key:
+            log.warning("  GDPNow: no FRED API key available, skipping")
+            return None
         params = {
             "series_id": "GDPNOW",
             "sort_order": "desc",
             "limit": "1",
             "file_type": "json",
+            "api_key": key,
         }
         resp = retry_request("GET", "https://api.stlouisfed.org/fred/series/observations",
                              params=params, timeout=15)
@@ -790,8 +795,9 @@ def scan_and_trade():
     if gas_price:
         health.record_source_success("aaa-gas")
 
-    gdpnow_value = fetch_gdpnow()
-    if gdpnow_value:
+    fred_key = getattr(getattr(macro, '_fred', None), 'api_key', None) if macro else None
+    gdpnow_value = fetch_gdpnow(api_key=fred_key)
+    if gdpnow_value is not None:
         ss.source_ok("gdpnow")
 
     nowcast_stale = nowcast.pop("_stale", False) if nowcast else False
@@ -974,7 +980,7 @@ def scan_and_trade():
             nowcast_value = nowcast.get("cpi_yoy") or nowcast.get("core_cpi_yoy")
         elif "GDP" in ticker.upper():
             # Primary: direct GDPNow fetch. Fallback: Cleveland Fed, then macro engine
-            nowcast_value = gdpnow_value or nowcast.get("gdp_growth")
+            nowcast_value = gdpnow_value if gdpnow_value is not None else nowcast.get("gdp_growth")
             if nowcast_value is None and macro_signal and hasattr(macro_signal, 'gdpnow') and macro_signal.gdpnow:
                 nowcast_value = macro_signal.gdpnow
             if nowcast_value is not None:
