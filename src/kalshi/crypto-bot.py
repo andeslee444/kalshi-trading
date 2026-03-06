@@ -13,7 +13,7 @@ Usage:
     python3 src/kalshi/crypto-bot.py --once    # single scan
 """
 
-import json, time, datetime, os, sys, re, argparse, traceback, math
+import json, time, datetime, os, sys, re, argparse, math
 import requests
 from pathlib import Path
 from kalshi_auth import (
@@ -224,17 +224,9 @@ def fetch_deribit_iv(asset="BTC"):
         )
         r = retry_request("GET", url, timeout=10)
         data = r.json()
-        result = data.get("result", {})
-        points = result.get("data", [])
-        if not points:
-            log.info(f"  Deribit DVOL: no data points for {asset}")
-            return None
-        # Each point: [timestamp, open, high, low, close]
-        latest_close = points[-1][4]
-        iv = latest_close / 100.0  # DVOL is in percentage, convert to decimal
-        # Sanity clamp: 10%-300%
-        if iv < 0.10 or iv > 3.0:
-            log.warning(f"  Deribit DVOL {asset} out of range: {iv*100:.1f}%, ignoring")
+        iv = parse_dvol_response(data)
+        if iv is None:
+            log.info(f"  Deribit DVOL: no valid data for {asset}")
             return None
         log.info(f"  Deribit DVOL {asset}: {iv*100:.1f}%")
         return iv
@@ -328,6 +320,106 @@ def _parse_bracket_range(ticker, asset, markets):
             break
     return 1000 if asset == "BTC" else 100  # fallback defaults
 
+
+
+# === Helper functions (extracted from scan_and_trade for testability) ===
+
+def parse_dvol_response(data):
+    """Parse a Deribit DVOL API response into an IV decimal.
+
+    Returns annualized IV as decimal (e.g. 0.55), or None if data is
+    empty/missing or IV is out of the 10%-300% sanity range.
+    """
+    result = data.get("result", {})
+    points = result.get("data", [])
+    if not points:
+        return None
+    latest_close = points[-1][4]
+    iv = latest_close / 100.0
+    if iv < 0.10 or iv > 3.0:
+        return None
+    return iv
+
+
+def blend_vol(iv, rv, default_vol=0.50, garch_forecast=None, w_iv=0.6, w_rv=0.4):
+    """Blend available volatility estimates into a single vol.
+
+    Priority: (iv+rv) weighted blend > iv only > garch > rv-heavy blend > default.
+    """
+    if iv is not None and rv is not None:
+        return w_iv * iv + w_rv * rv
+    elif iv is not None:
+        return iv
+    elif garch_forecast is not None:
+        return garch_forecast
+    elif rv is not None:
+        return 0.3 * default_vol + 0.7 * rv
+    else:
+        return default_vol
+
+
+def select_rv_lookback(minutes_to_settle):
+    """Select RV lookback window based on market horizon.
+
+    Returns lookback in seconds: 1h for <=30min, 6h for <=2h, 24h for longer.
+    """
+    if minutes_to_settle <= 30:
+        return 3600
+    elif minutes_to_settle <= 120:
+        return 6 * 3600
+    else:
+        return 86400
+
+
+def bracket_eligible(market, max_spread=15, min_volume=5):
+    """Check if a bracket market has sufficient liquidity.
+
+    Returns True if EITHER side has a tight spread, or if the market
+    has recent trades with sufficient volume.
+    """
+    yes_bid = market.get("yes_bid", 0) or 0
+    yes_ask = market.get("yes_ask", 0) or 0
+    no_bid = market.get("no_bid", 0) or 0
+    no_ask = market.get("no_ask", 0) or 0
+    volume = market.get("volume", 0) or 0
+
+    yes_spread = (yes_ask - yes_bid) if (yes_bid and yes_ask) else 999
+    no_spread = (no_ask - no_bid) if (no_bid and no_ask) else 999
+    b_spread = min(yes_spread, no_spread)
+
+    has_recent_trade = bool(market.get("last_price"))
+    if b_spread > max_spread and not (has_recent_trade and volume >= 10):
+        return False
+    if volume < min_volume:
+        return False
+    return True
+
+
+def get_market_price(market):
+    """Extract usable price from market data with fallback chain.
+
+    Returns price in cents, or None if no usable price found.
+    Priority: yes_ask -> implied from no_ask -> last_price.
+    """
+    yes_ask = market.get("yes_ask", 0) or 0
+    no_ask = market.get("no_ask", 0) or 0
+    last_price = market.get("last_price", 0) or 0
+
+    if yes_ask and 1 <= yes_ask < 99:
+        return yes_ask
+    elif no_ask and 1 <= no_ask < 99:
+        return 100 - no_ask
+    elif last_price and 1 <= last_price < 99:
+        return last_price
+    else:
+        return None
+
+
+def apply_drift(drift, minutes_to_settle):
+    """Zero out drift for sub-daily markets where it's negligible noise."""
+    if minutes_to_settle < 1440:
+        return 0.0
+    return drift
 
 
 # === Scanning ===
@@ -451,8 +543,8 @@ def scan_and_trade():
         parsed = parse_crypto_ticker(ticker)
         if not parsed:
             ss.skip("unparseable")
-            if ss.skips.get("unparseable", 0) <= 10:
-                log.info(f"  Unparseable ticker: {ticker}")
+            if ss.skips.get("unparseable", 0) <= 5:
+                log.info(f"  Unparseable ticker: {ticker} repr={repr(ticker)}")
             continue
 
         asset = parsed["asset"]
@@ -469,30 +561,10 @@ def scan_and_trade():
             if not crypto_config.get("enableBrackets", True):
                 ss.skip("brackets_disabled")
                 continue
-            yes_bid_b = m.get("yes_bid", 0) or 0
-            yes_ask_b = m.get("yes_ask", 0) or 0
-            no_bid_b = m.get("no_bid", 0) or 0
-            no_ask_b = m.get("no_ask", 0) or 0
-            b_volume = m.get("volume", 0) or 0
-
-            # Check YES-side spread
-            yes_spread = (yes_ask_b - yes_bid_b) if (yes_bid_b and yes_ask_b) else 999
-            # Check NO-side spread
-            no_spread = (no_ask_b - no_bid_b) if (no_bid_b and no_ask_b) else 999
-            # Market is liquid if EITHER side has a tight spread
-            b_spread = min(yes_spread, no_spread)
-
-            # Also accept if market has recent trades even with empty book
-            has_recent_trade = bool(m.get("last_price"))
-            if b_spread > 15 and not (has_recent_trade and b_volume >= 10):
+            if not bracket_eligible(m):
                 ss.skip("bracket_illiquid")
                 trade_manager.log_decision(ticker, "yes", "skipped", "bracket_illiquid",
-                                           spread=b_spread, volume=b_volume, asset=asset)
-                continue
-            if b_volume < 5:  # Lower volume floor (was 10) since we have spread confirmation
-                ss.skip("bracket_illiquid")
-                trade_manager.log_decision(ticker, "yes", "skipped", "bracket_illiquid",
-                                           spread=b_spread, volume=b_volume, asset=asset)
+                                           volume=m.get("volume", 0), asset=asset)
                 continue
 
         # Estimate time to settlement
@@ -504,12 +576,7 @@ def scan_and_trade():
             continue
 
         # Horizon-matched vol lookback
-        if minutes_to_settle <= 30:
-            rv_lookback = 3600       # 1h for <=30-min markets
-        elif minutes_to_settle <= 120:
-            rv_lookback = 6 * 3600   # 6h for hourly markets
-        else:
-            rv_lookback = 86400      # 24h for daily/weekly
+        rv_lookback = select_rv_lookback(minutes_to_settle)
 
         # Horizon-dependent vol weighting
         w_iv, w_rv = horizon_vol_weights(minutes_to_settle)
@@ -526,16 +593,7 @@ def scan_and_trade():
         garch_forecast = garch_vol.forecast_vol(use_actual_interval=True) if garch_vol else None
 
         # Use best available vol estimate
-        if iv is not None and rv is not None:
-            vol_to_use = w_iv * iv + w_rv * rv
-        elif iv is not None:
-            vol_to_use = iv
-        elif garch_forecast is not None:
-            vol_to_use = garch_forecast
-        elif rv is not None:
-            vol_to_use = 0.3 * default_vol + 0.7 * rv
-        else:
-            vol_to_use = default_vol
+        vol_to_use = blend_vol(iv, rv, default_vol, garch_forecast, w_iv, w_rv)
 
         # Intraday seasonality adjustment
         now_utc = datetime.datetime.now(datetime.timezone.utc)
@@ -547,10 +605,7 @@ def scan_and_trade():
         skew_mult = vol_skew_multiplier(moneyness)
         vol_to_use *= skew_mult
 
-        drift = drift_by_asset.get(asset, DRIFT_PCT)
-        # Drift is negligible for sub-daily horizons and introduces noise
-        if minutes_to_settle < 1440:
-            drift = 0.0
+        drift = apply_drift(drift_by_asset.get(asset, DRIFT_PCT), minutes_to_settle)
         # Get current regime
         current_regime = regime_detector.current_regime()
 
@@ -593,20 +648,12 @@ def scan_and_trade():
         prob = filtered_est.prob  # use filtered probability for edge computation
 
         yes_ask = m.get("yes_ask", 0) or 0
+        yes_ask = m.get("yes_ask", 0) or 0
         no_ask = m.get("no_ask", 0) or 0
         yes_bid = m.get("yes_bid", 0) or 0
-        last_price = m.get("last_price", 0) or 0
 
-        # Primary: use yes_ask if available and reasonable
-        # Fallback 1: compute from no_ask (yes_ask ~ 100 - no_ask)
-        # Fallback 2: use last_price as stale reference
-        if yes_ask and 1 <= yes_ask < 99:
-            market_price = yes_ask
-        elif no_ask and 1 <= no_ask < 99:
-            market_price = 100 - no_ask  # implied yes price from NO side
-        elif last_price and 1 <= last_price < 99:
-            market_price = last_price
-        else:
+        market_price = get_market_price(m)
+        if market_price is None:
             ss.skip("no_price")
             continue
 
@@ -850,8 +897,7 @@ def main():
             order_monitor.check_orders()
             scan_and_trade()
         except Exception as e:
-            log.error(f"Scan error: {e}")
-            traceback.print_exc()
+            log.error("Scan error: %s", e, exc_info=True)
 
         if is_shutdown_requested():
             log.info("Graceful shutdown requested, exiting.")
