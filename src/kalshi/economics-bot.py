@@ -121,8 +121,8 @@ def _classify_econ_market(ticker):
     return "other"
 
 # === Concentration Limits ===
-FAMILY_EXPOSURE_PCT = 0.10   # 10% of bankroll per ticker family
-TOTAL_ECON_PCT = 0.20        # 20% total economics exposure (was 40% — caused $2.3k on $1.8k bankroll)
+FAMILY_EXPOSURE_PCT = 0.15   # 15% of bankroll per ticker family
+TOTAL_ECON_PCT = 0.40        # 40% total economics exposure
 MAX_CONTRACTS_PER_ORDER = 200  # Hard cap: prevent enormous penny-contract positions
 
 def _ticker_family(ticker):
