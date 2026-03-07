@@ -1739,6 +1739,30 @@ def high_conviction_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None
     return (contracts, risk)
 
 
+def apply_kelly_multipliers(base_kelly_contracts, multipliers, floor_pct=0.25):
+    """Apply multiple Kelly reduction multipliers with a floor.
+
+    Prevents multiplicative crushing: 4 independent 0.7-0.9 factors can
+    reduce position to ~43% of optimal, but 4 independent 0.1 factors
+    would crush to 0.01%. The floor ensures positions stay meaningful.
+
+    Args:
+        base_kelly_contracts: Output from half_kelly/quarter_kelly (contracts or numeric).
+        multipliers: List of [0,1] reduction factors.
+        floor_pct: Minimum fraction of base Kelly to preserve (default 25%).
+
+    Returns:
+        Adjusted value, at least floor_pct * base_kelly_contracts.
+    """
+    if base_kelly_contracts <= 0:
+        return 0
+    adjusted = base_kelly_contracts
+    for m in multipliers:
+        adjusted *= m
+    floor = base_kelly_contracts * floor_pct
+    return max(adjusted, floor)
+
+
 # ─── Market filters ───
 
 # Minimum spread to consider a market liquid enough to trade

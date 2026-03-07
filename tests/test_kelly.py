@@ -7,7 +7,7 @@ conftest.py adds src/kalshi/ to sys.path so direct import works.
 import math
 import pytest
 
-from probability import half_kelly, half_kelly_sell, quarter_kelly, quarter_kelly_sell
+from probability import half_kelly, half_kelly_sell, quarter_kelly, quarter_kelly_sell, apply_kelly_multipliers
 
 
 # ---------------------------------------------------------------------------
@@ -345,3 +345,56 @@ class TestQuarterKellyPreservesSingleContract:
         assert hk == 1, f"Expected half_kelly to return 1 contract, got {hk}"
         qk, _, _ = quarter_kelly(0.05, 80, 500, bankroll_cents=800, return_details=True)
         assert qk == 1, f"Expected 1 contract, got {qk}"
+
+
+# ---------------------------------------------------------------------------
+# apply_kelly_multipliers tests
+# ---------------------------------------------------------------------------
+
+class TestApplyKellyMultipliers:
+    """Tests for apply_kelly_multipliers with floor protection."""
+
+    def test_single_multiplier(self):
+        result = apply_kelly_multipliers(100, [0.5])
+        assert result == 50
+
+    def test_multiple_multipliers(self):
+        result = apply_kelly_multipliers(100, [0.5, 0.5])
+        assert result == 25
+
+    def test_floor_prevents_crushing(self):
+        """4 multipliers that would crush to ~43% should be respected (above 25% floor)."""
+        result = apply_kelly_multipliers(100, [0.7, 0.8, 0.9, 0.85])
+        expected_product = 100 * 0.7 * 0.8 * 0.9 * 0.85  # ~42.84
+        assert result == pytest.approx(expected_product, abs=0.01)
+
+    def test_floor_kicks_in_when_crushed_below(self):
+        """Extreme multipliers that would crush below floor should be clamped."""
+        result = apply_kelly_multipliers(100, [0.1, 0.1, 0.1])
+        # 100 * 0.001 = 0.1, but floor = 25
+        assert result == 25.0
+
+    def test_custom_floor(self):
+        result = apply_kelly_multipliers(100, [0.1, 0.1], floor_pct=0.50)
+        # 100 * 0.01 = 1, but floor = 50
+        assert result == 50.0
+
+    def test_zero_base_returns_zero(self):
+        result = apply_kelly_multipliers(0, [0.5, 0.5])
+        assert result == 0
+
+    def test_empty_multipliers(self):
+        result = apply_kelly_multipliers(100, [])
+        assert result == 100
+
+    def test_all_ones_no_change(self):
+        result = apply_kelly_multipliers(100, [1.0, 1.0, 1.0])
+        assert result == 100
+
+    def test_with_real_kelly_output(self):
+        """Integration: apply multipliers to actual half_kelly output."""
+        contracts, _ = half_kelly(0.20, 30, 500, 50000)
+        assert contracts > 0
+        reduced = apply_kelly_multipliers(contracts, [0.7, 0.8, 0.9, 0.85])
+        assert reduced >= contracts * 0.25  # floor
+        assert reduced <= contracts  # can't increase
