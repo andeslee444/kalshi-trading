@@ -10,8 +10,8 @@ from scenario_engine import (
     compute_scenario_weights, scenario_probability, DEFAULT_WEIGHTS,
 )
 from probability import (
-    cpi_nowcast_sigma, econ_nowcast_probability, uncertainty_kelly,
-    _reset_calibration,
+    cpi_nowcast_sigma, gdp_nowcast_sigma, econ_nowcast_probability,
+    uncertainty_kelly, _reset_calibration,
 )
 
 
@@ -120,6 +120,34 @@ class TestFullPipeline:
         # With tariff risk, probability should be higher (CPI shifts up)
         # but agreement should be lower (scenarios disagree more)
         assert result_tariff.agreement <= result_calm.agreement
+
+    def test_gdp_sigma_uses_correct_floor_and_range(self):
+        """GDP sigma should use floor=0.15, range=0.45 (fixed in Plan 1).
+
+        At d=0: sigma = 0.15 (floor)
+        At d=30: sigma = 0.15 + 0.45 * (1 - exp(-0.12*30)) ~ 0.59
+        At d=107: sigma ~ 0.60 (near ceiling)
+        """
+        import math
+
+        sigma_0 = gdp_nowcast_sigma(0)
+        assert sigma_0 == pytest.approx(0.15, abs=0.001), \
+            f"GDP sigma at d=0 should be 0.15 (floor), got {sigma_0}"
+
+        sigma_7 = gdp_nowcast_sigma(7)
+        expected_7 = 0.15 + 0.45 * (1 - math.exp(-0.12 * 7))
+        assert sigma_7 == pytest.approx(expected_7, abs=0.01), \
+            f"GDP sigma at d=7 should be ~{expected_7:.3f}, got {sigma_7}"
+
+        sigma_30 = gdp_nowcast_sigma(30)
+        expected_30 = 0.15 + 0.45 * (1 - math.exp(-0.12 * 30))
+        assert sigma_30 == pytest.approx(expected_30, abs=0.01), \
+            f"GDP sigma at d=30 should be ~{expected_30:.3f}, got {sigma_30}"
+
+        # GDP sigma should always be wider than CPI sigma at the same horizon
+        for d in [0, 7, 14, 30]:
+            assert gdp_nowcast_sigma(d) > cpi_nowcast_sigma(d), \
+                f"GDP sigma should be wider than CPI at d={d}"
 
     def test_near_threshold_produces_small_edge(self):
         """When nowcast is very close to threshold, edge should be small."""
