@@ -5,6 +5,7 @@ plus generalized half-Kelly position sizing. Uses math.erf for normal CDF
 to avoid a scipy dependency.
 """
 
+import datetime
 import json
 import logging
 import math
@@ -277,6 +278,23 @@ def _reset_calibration():
     """
     global _calibration
     _calibration = {}
+
+
+def check_calibration_freshness(max_age_days=7):
+    """Warn if calibration is older than max_age_days. Returns age in days or None."""
+    cal = _load_calibration()
+    generated = cal.get("generated_at")
+    if not generated:
+        return None
+    try:
+        gen_dt = datetime.datetime.fromisoformat(generated)
+        now = datetime.datetime.now()
+        age_days = (now - gen_dt).days
+        if age_days > max_age_days:
+            _log.warning("Calibration is %d days old (max %d). Run: npm run calibrate", age_days, max_age_days)
+        return age_days
+    except (ValueError, TypeError):
+        return None
 
 
 # ─── Probability models ───

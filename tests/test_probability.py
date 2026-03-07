@@ -1,5 +1,6 @@
 """Tests for the shared probability module (src/kalshi/probability.py)."""
 
+import datetime
 import math
 import pytest
 
@@ -20,6 +21,7 @@ from probability import (
     cpi_nowcast_sigma,
     gdp_nowcast_sigma,
     econ_nowcast_probability,
+    check_calibration_freshness,
 )
 
 
@@ -791,3 +793,37 @@ class TestCalibrationLoadLogging:
                 "Should log WARNING with the actual parse error"
         finally:
             probability._CALIBRATION_PATH = original
+
+
+class TestCalibrationFreshness:
+    def setup_method(self):
+        _reset_calibration()
+
+    def teardown_method(self):
+        _reset_calibration()
+
+    def test_fresh_calibration_returns_age(self):
+        import probability
+        probability._calibration = {"generated_at": datetime.datetime.now().isoformat()}
+        age = check_calibration_freshness(max_age_days=7)
+        assert age == 0
+
+    def test_stale_calibration_warns(self, caplog):
+        import probability
+        import logging
+        old = (datetime.datetime.now() - datetime.timedelta(days=10)).isoformat()
+        probability._calibration = {"generated_at": old}
+        with caplog.at_level(logging.WARNING):
+            age = check_calibration_freshness(max_age_days=7)
+        assert age == 10
+        assert any("10 days old" in r.message for r in caplog.records)
+
+    def test_missing_generated_at_returns_none(self):
+        import probability
+        probability._calibration = {}
+        assert check_calibration_freshness() is None
+
+    def test_invalid_date_returns_none(self):
+        import probability
+        probability._calibration = {"generated_at": "not-a-date"}
+        assert check_calibration_freshness() is None
