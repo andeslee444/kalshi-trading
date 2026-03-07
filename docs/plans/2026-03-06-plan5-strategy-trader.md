@@ -106,3 +106,6 @@ The 16 orphan strategy-trader trades from the zombie period (11 sports, 2 politi
 | Daily P&L | -$0.36 total | +$10-20/day | Trade log |
 | Strategy Brier (backtest) | 0.8325 (catastrophic: 98.9% pred → 14.7% actual) | <0.350 | npm run backtest |
 | Orphan strategy trades | 16 from zombie period (unlogged) | 0 (WAL from Plan 1) | snapshot |
+| Longshot bias calibration | Manual (bayes-params.json) | Automated weekly (Plan 10 Task 10.5) | calibrate-strategy.py |
+
+**Note:** Plan 10 (Weekly Self-Improvement) creates `calibrate-strategy.py` which recalibrates longshot bias parameters from settled trades. Task 5.3 (fix the edge formula) should be completed BEFORE enabling the calibrator — calibrating against a broken formula is pointless.

@@ -39,6 +39,7 @@
 | [Plan 7: Entertainment/Beat](./2026-03-06-plan7-entertainment-beat.md) | Re-enable with proper Kelly, fix trade log integration | +$10-20/day potential | Pending |
 | [Plan 8: Position Monitor](./2026-03-06-plan8-position-monitor.md) | Decision path fix, model-shift exit improvement | Loss prevention | Pending |
 | [Plan 9: Data Quality & S3 Sync](./2026-03-06-plan9-data-quality-and-s3-sync.md) | Pre-upload validation, sync scope, integrity reports | Data reliability | Pending |
+| [Plan 10: Weekly Self-Improvement](./2026-03-07-weekly-self-improvement.md) | Auto-calibrate all bots weekly, regression gate, auto-apply | Compounding edge | Pending |
 
 ## Cross-Cutting Recommendations (A-F)
 
@@ -68,11 +69,12 @@ Real-time correlation monitoring across bots. If weather and economics are both 
 Plan 0 (Ops Triage) ──> Plan 1 (Shared Infra) ──┬──> Plan 2 (Weather)
                                                   ├──> Plan 3 (Crypto)
                                                   ├──> Plan 4 (Economics)
-                                                  ├──> Plan 5 (Strategy)
-                                                  ├──> Plan 6 (Source Monitor)
-                                                  ├──> Plan 7 (Entertainment)
-                                                  ├──> Plan 8 (Position Monitor)
-                                                  └──> Plan 9 (Data Quality & S3 Sync)
+                                                  ├──> Plan 5 (Strategy) ──┐
+                                                  ├──> Plan 6 (Source Monitor)  │
+                                                  ├──> Plan 7 (Entertainment)   │
+                                                  ├──> Plan 8 (Position Monitor)│
+                                                  ├──> Plan 9 (Data Quality)    │
+                                                  └──> Plan 10 (Self-Improve) <─┘
 ```
 
 Plans 2-8 can be executed in parallel after Plan 1, each in its own session respecting CLAUDE.md file ownership.
@@ -93,6 +95,10 @@ Plans 2-8 can be executed in parallel after Plan 1, each in its own session resp
 | Strategy Brier | 0.8325 (catastrophic overconfidence) | <0.350 | Plan 5 |
 | Open-Meteo errors | 1,870 since Mar 6 | 0 | Plan 2 |
 | Orphan trades | 32 (zombie period, no local log) | 0 (WAL) | Plan 1 |
+| Calibrators in pipeline | 1 (weather only) | 4 (weather + crypto + CPI + strategy) | Plan 10 |
+| Auto-calibration cadence | Manual | Weekly (Sunday 5 AM) with auto-apply | Plan 10 |
+| Calibration history | Single backup | Versioned archive with rollback | Plan 10 |
+| Per-bot regression gate | None | 5% max regression per bot | Plan 10 |
 
 ## Plan Review Findings (2026-03-07)
 
