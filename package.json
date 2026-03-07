@@ -18,6 +18,8 @@
     "calibrate": "python3 scripts/calibrate-sigma.py",
     "calibrate:mm": "python3 scripts/calibrate-mm.py",
     "calibrate:crypto": "python3 scripts/calibrate-crypto.py",
+    "calibrate:strategy": "python3 scripts/calibrate-strategy.py",
+    "calibrate:weekly": "python3 scripts/calibration-pipeline.py --auto-apply",
     "attribution": "python3 scripts/daily-attribution.py",
     "attribution:save": "python3 scripts/daily-attribution.py --save",
     "attribution:notify": "python3 scripts/daily-attribution.py --save --notify",
