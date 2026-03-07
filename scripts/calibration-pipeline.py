@@ -56,12 +56,17 @@ STAGES_CORE = [
 
 # Calibration stages run independently -- if one fails, others still proceed.
 STAGES_CALIBRATE = [
-    ("calibrate_weather", SCRIPTS_DIR / "calibrate-sigma.py", ["--json"], 300),
-    ("calibrate_crypto",  SCRIPTS_DIR / "calibrate-crypto.py", ["--dry-run"], 300),
-    ("calibrate_cpi",     SCRIPTS_DIR / "calibrate-cpi-sigma.py", ["--json"], 120),
+    ("calibrate_weather",  SCRIPTS_DIR / "calibrate-sigma.py", ["--json"], 300),
+    ("calibrate_crypto",   SCRIPTS_DIR / "calibrate-crypto.py", ["--dry-run"], 300),
+    ("calibrate_cpi",      SCRIPTS_DIR / "calibrate-cpi-sigma.py", ["--json"], 120),
+    ("calibrate_strategy", SCRIPTS_DIR / "calibrate-strategy.py", ["--json"], 120),
 ]
 
 STAGES = STAGES_CORE + STAGES_CALIBRATE
+
+# Minimum requirements before strategy calibration runs
+STRATEGY_MIN_TRADES = 20
+STRATEGY_MAX_BRIER = 0.50  # PM guard: do NOT calibrate if model is broken
 
 
 # ── Stage Runner ─────────────────────────────────────────────────────────────
@@ -100,6 +105,24 @@ def run_stage(name, script, args, timeout):
             "stderr": str(e),
             "duration_s": round(duration, 1),
         }
+
+
+def should_run_strategy_calibrator(backtest_results):
+    """Guard: skip strategy calibration if model is broken or has insufficient data.
+
+    Returns True if strategy calibrator should run.
+    PM rule: do NOT calibrate if strategy Brier > 0.50.
+    """
+    strategy_stats = backtest_results.get("per_bot", {}).get("strategy", {})
+    n = strategy_stats.get("n_evaluated", 0)
+    brier = strategy_stats.get("brier_score", 1.0)
+    if n < STRATEGY_MIN_TRADES:
+        log.info(f"Skipping strategy calibration: only {n} settled trades (need {STRATEGY_MIN_TRADES}+)")
+        return False
+    if brier > STRATEGY_MAX_BRIER:
+        log.warning(f"Skipping strategy calibration: Brier {brier:.3f} > {STRATEGY_MAX_BRIER} (model broken)")
+        return False
+    return True
 
 
 def run_pipeline(skip_stages=None):
@@ -706,8 +729,20 @@ def main():
     log.info("Calibration pipeline starting")
     log.info("=" * 60)
 
+    # 0. Check strategy calibrator guard (uses previous backtest results)
+    skip_stages = set()
+    if RESULTS_PATH.exists():
+        try:
+            prev_results = json.loads(RESULTS_PATH.read_text())
+            if not should_run_strategy_calibrator(prev_results):
+                skip_stages.add("calibrate_strategy")
+        except Exception:
+            skip_stages.add("calibrate_strategy")  # skip if can't read results
+    else:
+        skip_stages.add("calibrate_strategy")  # skip if no previous results
+
     # 1. Run all stages
-    pipeline_result = run_pipeline()
+    pipeline_result = run_pipeline(skip_stages=skip_stages)
     stage_results = pipeline_result["stages"]
     proposed_calibration = pipeline_result["proposed_calibration"]
     any_stage_failed = any(not s["success"] for s in stage_results.values())

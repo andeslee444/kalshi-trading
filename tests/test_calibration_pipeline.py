@@ -528,3 +528,62 @@ class TestFormatWeeklySummary:
         msg = pipeline.format_weekly_summary(stages, drift_findings, {}, False, "no suggestion")
         assert "DRIFT" in msg
         assert "MIA" in msg
+
+
+# ---------------------------------------------------------------------------
+# Strategy Calibrator Guard Tests
+# ---------------------------------------------------------------------------
+
+class TestStrategyCalibrationGuard:
+    """Tests for should_run_strategy_calibrator() -- PM guard for broken models."""
+
+    def test_good_model_runs(self, pipeline):
+        results = {
+            "per_bot": {
+                "strategy": {"brier_score": 0.35, "n_evaluated": 50},
+            },
+        }
+        assert pipeline.should_run_strategy_calibrator(results) is True
+
+    def test_broken_model_skipped(self, pipeline):
+        """Strategy Brier > 0.50 means model is broken -- do not calibrate."""
+        results = {
+            "per_bot": {
+                "strategy": {"brier_score": 0.83, "n_evaluated": 50},
+            },
+        }
+        assert pipeline.should_run_strategy_calibrator(results) is False
+
+    def test_brier_exactly_at_threshold_skipped(self, pipeline):
+        """Brier == 0.50 is at the boundary -- should be skipped (> check)."""
+        results = {
+            "per_bot": {
+                "strategy": {"brier_score": 0.50, "n_evaluated": 50},
+            },
+        }
+        # 0.50 is not > 0.50, so it should run
+        assert pipeline.should_run_strategy_calibrator(results) is True
+
+    def test_brier_just_above_threshold(self, pipeline):
+        results = {
+            "per_bot": {
+                "strategy": {"brier_score": 0.51, "n_evaluated": 50},
+            },
+        }
+        assert pipeline.should_run_strategy_calibrator(results) is False
+
+    def test_insufficient_trades_skipped(self, pipeline):
+        results = {
+            "per_bot": {
+                "strategy": {"brier_score": 0.30, "n_evaluated": 5},
+            },
+        }
+        assert pipeline.should_run_strategy_calibrator(results) is False
+
+    def test_no_strategy_data_skipped(self, pipeline):
+        """No strategy bot in results means no data -- skip."""
+        results = {"per_bot": {"weather": {"brier_score": 0.30, "n_evaluated": 50}}}
+        assert pipeline.should_run_strategy_calibrator(results) is False
+
+    def test_empty_results_skipped(self, pipeline):
+        assert pipeline.should_run_strategy_calibrator({}) is False
