@@ -62,8 +62,24 @@ def save_snapshot(source_name, content, ext="html"):
     return fname
 
 MAX_DATA_AGE_HOURS = 168  # 7 days — same as entertainment-bot
+NWS_MAX_OBS_AGE_MINUTES = 90  # Skip NWS trades if observation is older than this
 
 _compute_data_age_hours = compute_data_age_hours  # backward compat alias
+
+
+def _compute_nws_obs_age_minutes(obs_ts):
+    """Compute age in minutes of an NWS observation timestamp.
+
+    Returns age in minutes, or None if timestamp is missing/unparseable.
+    """
+    if not obs_ts:
+        return None
+    try:
+        obs_dt = datetime.datetime.fromisoformat(obs_ts.replace("Z", "+00:00"))
+        age_seconds = (datetime.datetime.now(datetime.timezone.utc) - obs_dt).total_seconds()
+        return age_seconds / 60
+    except (ValueError, TypeError):
+        return None
 
 def _check_with_retry(check_fn, source_name, prefetched, ss, max_retries=2):
     """Retry a source check with exponential backoff on transient failures."""
@@ -812,17 +828,17 @@ def check_nws(prefetched_markets=None, ss=None):
                     "timestamp": obs_ts,
                 }
                 log.info(f"  {city_code} ({station_id}): {temp_f:.1f}F ({temp_c:.1f}C) @ {obs_ts or '?'}")
-                # Check observation staleness
-                if obs_ts:
-                    try:
-                        obs_dt = datetime.datetime.fromisoformat(obs_ts.replace("Z", "+00:00"))
-                        obs_age_hours = (datetime.datetime.now(datetime.timezone.utc) - obs_dt).total_seconds() / 3600
-                        if obs_age_hours > 2:
-                            log.warning(f"  {city_code}: NWS observation is {obs_age_hours:.1f}h stale — skipping trades")
-                            del actual_temps[city_code]
-                            continue
-                    except (ValueError, TypeError):
-                        pass
+                # Check observation staleness — reject data older than NWS_MAX_OBS_AGE_MINUTES
+                obs_age_minutes = _compute_nws_obs_age_minutes(obs_ts)
+                if obs_age_minutes is not None:
+                    actual_temps[city_code]["obs_age_minutes"] = round(obs_age_minutes, 1)
+                    if obs_age_minutes > NWS_MAX_OBS_AGE_MINUTES:
+                        log.warning(f"  {city_code}: NWS observation is {obs_age_minutes:.0f}min stale (>{NWS_MAX_OBS_AGE_MINUTES}min) — skipping trades")
+                        del actual_temps[city_code]
+                        continue
+                elif not obs_ts:
+                    # No timestamp at all — warn but allow (fail-open for robustness)
+                    log.warning(f"  {city_code}: NWS observation has no timestamp — proceeding with caution")
             else:
                 log.info(f"  {city_code} ({station_id}): No temperature data available")
         except Exception as e:

@@ -510,6 +510,82 @@ class TestPreDawnGate:
         assert "_nws_min_edge(running_high, threshold, city_hour," in source
 
 
+class TestNWSObservationFreshness:
+    """Test NWS observation staleness detection.
+
+    The source-monitor rejects NWS data if the observation timestamp
+    is older than NWS_MAX_OBS_AGE_MINUTES (90 minutes).
+    """
+
+    def test_max_obs_age_constant(self):
+        """NWS_MAX_OBS_AGE_MINUTES should be 90."""
+        sm = _load_source_monitor()
+        assert sm.NWS_MAX_OBS_AGE_MINUTES == 90
+
+    def test_compute_obs_age_recent(self):
+        """A recent observation (10 seconds ago) should return a small age."""
+        sm = _load_source_monitor()
+        recent_ts = (datetime.datetime.now(datetime.timezone.utc) -
+                     datetime.timedelta(seconds=10)).isoformat()
+        age = sm._compute_nws_obs_age_minutes(recent_ts)
+        assert age is not None
+        assert age < 1.0  # Less than 1 minute
+
+    def test_compute_obs_age_stale(self):
+        """A 2-hour-old observation should return ~120 minutes."""
+        sm = _load_source_monitor()
+        old_ts = (datetime.datetime.now(datetime.timezone.utc) -
+                  datetime.timedelta(hours=2)).isoformat()
+        age = sm._compute_nws_obs_age_minutes(old_ts)
+        assert age is not None
+        assert 119 < age < 121
+
+    def test_compute_obs_age_none_timestamp(self):
+        """Missing timestamp should return None."""
+        sm = _load_source_monitor()
+        assert sm._compute_nws_obs_age_minutes(None) is None
+        assert sm._compute_nws_obs_age_minutes("") is None
+
+    def test_compute_obs_age_invalid_timestamp(self):
+        """Invalid timestamp should return None (not raise)."""
+        sm = _load_source_monitor()
+        assert sm._compute_nws_obs_age_minutes("not-a-date") is None
+        assert sm._compute_nws_obs_age_minutes("2026-13-45T99:00:00Z") is None
+
+    def test_compute_obs_age_z_suffix(self):
+        """Timestamps with 'Z' suffix should be handled correctly."""
+        sm = _load_source_monitor()
+        ts = (datetime.datetime.now(datetime.timezone.utc) -
+              datetime.timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        age = sm._compute_nws_obs_age_minutes(ts)
+        assert age is not None
+        assert 29 < age < 31
+
+    def test_compute_obs_age_offset_format(self):
+        """Timestamps with +00:00 offset should work."""
+        sm = _load_source_monitor()
+        ts = (datetime.datetime.now(datetime.timezone.utc) -
+              datetime.timedelta(minutes=45)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        age = sm._compute_nws_obs_age_minutes(ts)
+        assert age is not None
+        assert 44 < age < 46
+
+    def test_staleness_gate_threshold(self):
+        """Observations at exactly 90 minutes should be rejected (> not >=)."""
+        sm = _load_source_monitor()
+        # 91 minutes ago — should be rejected
+        ts_91 = (datetime.datetime.now(datetime.timezone.utc) -
+                 datetime.timedelta(minutes=91)).isoformat()
+        age = sm._compute_nws_obs_age_minutes(ts_91)
+        assert age > sm.NWS_MAX_OBS_AGE_MINUTES
+
+        # 89 minutes ago — should be accepted
+        ts_89 = (datetime.datetime.now(datetime.timezone.utc) -
+                 datetime.timedelta(minutes=89)).isoformat()
+        age = sm._compute_nws_obs_age_minutes(ts_89)
+        assert age < sm.NWS_MAX_OBS_AGE_MINUTES
+
+
 class TestNWSEdgeThresholdBoundaries:
     """Test edge threshold tier boundaries in detail.
 
