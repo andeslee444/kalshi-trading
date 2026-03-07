@@ -214,7 +214,7 @@ class EnsembleModel:
     def _compute_sub_model_probs(self, current_price, threshold, direction="above",
                                   time_horizon_minutes=1440, vol=0.50, regime="normal",
                                   drift_pct=0.0, heston_params=None, use_ou=False,
-                                  ou_half_life_minutes=120):
+                                  ou_half_life_minutes=120, ou_target=None):
         """Compute individual sub-model probabilities.
 
         Returns tuple: (p_gbm, p_jd, p_heston, weights)
@@ -227,6 +227,7 @@ class EnsembleModel:
             direction=direction, time_horizon_minutes=time_horizon_minutes,
             realized_vol_pct=vol, drift_pct=drift_pct,
             use_ou=use_ou, ou_half_life_minutes=ou_half_life_minutes,
+            ou_target=ou_target,
         )
 
         # JD with regime-dependent lambda
@@ -276,7 +277,7 @@ class EnsembleModel:
     def estimate_prob(self, current_price, threshold, direction="above",
                       time_horizon_minutes=1440, vol=0.50, regime="normal",
                       drift_pct=0.0, heston_params=None, use_ou=False,
-                      ou_half_life_minutes=120):
+                      ou_half_life_minutes=120, ou_target=None):
         """Compute ensemble probability via BMA.
 
         Returns float in [0.001, 0.999].
@@ -284,6 +285,7 @@ class EnsembleModel:
         p_gbm, p_jd, p_heston, weights = self._compute_sub_model_probs(
             current_price, threshold, direction, time_horizon_minutes,
             vol, regime, drift_pct, heston_params, use_ou, ou_half_life_minutes,
+            ou_target=ou_target,
         )
 
         # BMA blend

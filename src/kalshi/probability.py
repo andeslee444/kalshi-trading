@@ -1107,7 +1107,7 @@ def kalshi_fee_cents(price_cents):
 def crypto_price_probability(current_price, threshold, direction="above",
                               time_horizon_minutes=1440, realized_vol_pct=None,
                               iv_pct=None, use_ou=False, ou_half_life_minutes=None,
-                              drift_pct=0.0):
+                              drift_pct=0.0, ou_target=None):
     """Log-normal probability for crypto price markets (BTC/ETH).
 
     Uses geometric Brownian motion: ln(S_T/S_0) ~ N((drift-0.5*sigma^2)*T, sigma^2*T)
@@ -1125,6 +1125,8 @@ def crypto_price_probability(current_price, threshold, direction="above",
         iv_pct: implied volatility as decimal. Takes precedence over realized.
         drift_pct: annualized drift rate as decimal (default 0.0 = risk-neutral).
                    Pass positive value for physical measure (e.g. 0.30 = 30% annual).
+        ou_target: OU mean-reversion target price (e.g. trailing VWAP).
+                   If None, OU drift adjustment is skipped even when use_ou=True.
 
     Returns:
         Probability (0-1).
@@ -1147,7 +1149,7 @@ def crypto_price_probability(current_price, threshold, direction="above",
 
     # Ornstein-Uhlenbeck mean-reversion adjustment with smooth blend
     ou_drift_adj = 0.0  # Additional drift from mean-reversion
-    if use_ou:
+    if use_ou and ou_target is not None and ou_target > 0:
         half_life = ou_half_life_minutes or 120  # default 2-hour half-life
         theta_ou = math.log(2) / max(1, half_life)  # mean-reversion speed (per minute)
         two_theta_T = 2 * theta_ou * time_horizon_minutes
@@ -1155,11 +1157,11 @@ def crypto_price_probability(current_price, threshold, direction="above",
             # OU variance adjustment: Var[X_T] = sigma^2 * (1-e^{-2*theta*T}) / (2*theta*T)
             ou_factor = math.sqrt((1 - math.exp(-two_theta_T)) / two_theta_T)
 
-            # OU drift correction: mean-reversion pull toward long-run mean
+            # OU drift correction: mean-reversion pull toward ou_target (e.g. trailing VWAP)
             # For log-price OU: E[X_T] = X_0 * e^{-theta*T} + mu * (1 - e^{-theta*T})
-            # The correction reduces effective drift for deviations from mean
+            # Previously used threshold as target (bug: pulled toward every strike simultaneously)
             theta_T_min = theta_ou * time_horizon_minutes
-            ou_drift_adj = -(1 - math.exp(-theta_T_min)) * math.log(current_price / threshold)
+            ou_drift_adj = (1 - math.exp(-theta_T_min)) * math.log(ou_target / current_price)
 
             # Smooth blend: full OU below 180 min, linear taper to 1.0 at 300 min
             if time_horizon_minutes > 180:

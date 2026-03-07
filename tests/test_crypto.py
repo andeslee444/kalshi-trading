@@ -723,10 +723,11 @@ class TestOUDriftCorrection:
             time_horizon_minutes=60, realized_vol_pct=0.50,
             use_ou=False,
         )
+        # OU requires ou_target to activate drift adjustment
         ou_prob = crypto_price_probability(
             current_price=80000, threshold=80500, direction="above",
             time_horizon_minutes=60, realized_vol_pct=0.50,
-            use_ou=True, ou_half_life_minutes=120,
+            use_ou=True, ou_half_life_minutes=120, ou_target=79000,
         )
         assert abs(ou_prob - gbm_prob) > 0.001
 

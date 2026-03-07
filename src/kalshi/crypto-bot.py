@@ -999,6 +999,8 @@ def scan_and_trade():
             if vov is not None:
                 heston_params["xi"] = max(0.1, min(2.0, vov))
 
+        ou_tgt = compute_ou_target(asset) if USE_OU else None
+
         if direction == "T":
             prob = ensemble_model.estimate_prob(
                 current_price=current_price, threshold=threshold,
@@ -1006,6 +1008,7 @@ def scan_and_trade():
                 vol=vol_to_use, regime=current_regime,
                 drift_pct=drift, heston_params=heston_params,
                 use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
+                ou_target=ou_tgt,
             )
         else:
             # Bracket
