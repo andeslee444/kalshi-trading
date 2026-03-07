@@ -36,6 +36,7 @@
     "sync:down": "bash scripts/s3-sync.sh download",
     "sync:setup": "bash scripts/s3-sync.sh setup",
     "sync:check": "python3 scripts/check-sync-health.py",
+    "sync:full": "bash scripts/sync-full.sh",
     "dashboard": "python3 scripts/dashboard.py",
     "snapshot": "python3 scripts/pnl-snapshot.py",
     "backfill": "python3 scripts/backfill-settlements.py",
