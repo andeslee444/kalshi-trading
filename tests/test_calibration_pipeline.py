@@ -325,3 +325,88 @@ class TestFormatWhatsappSummary:
         assert "FAILED" in msg
         assert "backfill" in msg
         assert len(msg) < 500
+
+
+# ---------------------------------------------------------------------------
+# Regression Gate Tests
+# ---------------------------------------------------------------------------
+
+class TestRegressionGate:
+    """Tests for check_regression_gate() -- per-bot regression safety."""
+
+    def test_all_bots_improved_passes(self, pipeline):
+        before = {
+            "brier_score": 0.30,
+            "per_bot": {
+                "weather": {"brier_score": 0.28, "n_evaluated": 50},
+                "crypto": {"brier_score": 0.35, "n_evaluated": 30},
+            },
+        }
+        after = {
+            "brier_score": 0.27,
+            "per_bot": {
+                "weather": {"brier_score": 0.25, "n_evaluated": 50},
+                "crypto": {"brier_score": 0.33, "n_evaluated": 30},
+            },
+        }
+        safe, reason = pipeline.check_regression_gate(before, after)
+        assert safe, f"Should pass when all improve: {reason}"
+
+    def test_one_bot_regressed_fails(self, pipeline):
+        before = {
+            "brier_score": 0.30,
+            "per_bot": {
+                "weather": {"brier_score": 0.28, "n_evaluated": 50},
+                "crypto": {"brier_score": 0.35, "n_evaluated": 30},
+            },
+        }
+        after = {
+            "brier_score": 0.27,
+            "per_bot": {
+                "weather": {"brier_score": 0.25, "n_evaluated": 50},
+                "crypto": {"brier_score": 0.40, "n_evaluated": 30},  # 14% worse
+            },
+        }
+        safe, reason = pipeline.check_regression_gate(before, after)
+        assert not safe, "Should fail when a bot regresses >5%"
+        assert "crypto" in reason
+
+    def test_small_regression_within_tolerance(self, pipeline):
+        before = {
+            "brier_score": 0.30,
+            "per_bot": {
+                "weather": {"brier_score": 0.28, "n_evaluated": 50},
+            },
+        }
+        after = {
+            "brier_score": 0.29,
+            "per_bot": {
+                "weather": {"brier_score": 0.29, "n_evaluated": 50},  # 3.6% worse -- within 5%
+            },
+        }
+        safe, reason = pipeline.check_regression_gate(before, after)
+        assert safe, f"Small regression within 5% should pass: {reason}"
+
+    def test_insufficient_samples_skips_bot(self, pipeline):
+        before = {
+            "brier_score": 0.30,
+            "per_bot": {
+                "weather": {"brier_score": 0.28, "n_evaluated": 50},
+                "strategy": {"brier_score": 0.80, "n_evaluated": 3},  # too few
+            },
+        }
+        after = {
+            "brier_score": 0.28,
+            "per_bot": {
+                "weather": {"brier_score": 0.26, "n_evaluated": 50},
+                "strategy": {"brier_score": 0.90, "n_evaluated": 3},  # worse but <10 samples
+            },
+        }
+        safe, reason = pipeline.check_regression_gate(before, after)
+        assert safe, f"Bots with <10 samples should be skipped: {reason}"
+
+    def test_no_aggregate_improvement_fails(self, pipeline):
+        before = {"brier_score": 0.30, "per_bot": {}}
+        after = {"brier_score": 0.31, "per_bot": {}}
+        safe, reason = pipeline.check_regression_gate(before, after)
+        assert not safe, "Should fail when aggregate Brier gets worse"

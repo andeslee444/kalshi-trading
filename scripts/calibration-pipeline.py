@@ -286,6 +286,61 @@ def _compare_entity(entity, entity_type, baseline_brier, baseline_n, current_bri
     return finding
 
 
+# ── Per-Bot Regression Gate ──────────────────────────────────────────────────
+
+BOT_REGRESSION_THRESHOLD = 0.05   # 5% -- no bot can get this much worse
+AGGREGATE_IMPROVEMENT_THRESHOLD = 0.0  # aggregate must not get worse
+
+
+def check_regression_gate(before_results, after_results, min_samples=10):
+    """Per-bot regression gate for auto-apply safety.
+
+    Returns (safe: bool, reason: str).
+    Safe = True means auto-apply is OK.
+
+    Rules:
+    1. Aggregate Brier must not increase (after <= before)
+    2. No individual bot's Brier can increase by > BOT_REGRESSION_THRESHOLD (5%)
+    3. Bots with < min_samples are skipped (insufficient data to judge)
+    """
+    before_brier = before_results.get("brier_score")
+    after_brier = after_results.get("brier_score")
+
+    if before_brier is None or after_brier is None:
+        return False, "Missing aggregate Brier score"
+
+    # Rule 1: aggregate must not get worse
+    if after_brier > before_brier:
+        change = (after_brier - before_brier) / before_brier if before_brier > 0 else 0
+        return False, f"Aggregate Brier regressed: {before_brier:.4f} -> {after_brier:.4f} (+{change:.1%})"
+
+    # Rule 2: per-bot regression check
+    before_bots = before_results.get("per_bot", {})
+    after_bots = after_results.get("per_bot", {})
+
+    for bot_name, before_bot in before_bots.items():
+        b_brier = before_bot.get("brier_score")
+        b_n = before_bot.get("n_evaluated", 0)
+
+        if b_brier is None or b_n < min_samples:
+            continue  # skip bots with insufficient data
+
+        after_bot = after_bots.get(bot_name, {})
+        a_brier = after_bot.get("brier_score")
+
+        if a_brier is None:
+            continue
+
+        if b_brier > 0 and (a_brier - b_brier) / b_brier > BOT_REGRESSION_THRESHOLD:
+            change = (a_brier - b_brier) / b_brier
+            return False, (
+                f"{bot_name} regressed: {b_brier:.4f} -> {a_brier:.4f} "
+                f"(+{change:.1%}, threshold {BOT_REGRESSION_THRESHOLD:.0%})"
+            )
+
+    return True, "All checks passed"
+
+
 # ── WhatsApp Summary ─────────────────────────────────────────────────────────
 
 def format_whatsapp_summary(stage_results, drift_findings, any_stage_failed, suggestion_path=None):
