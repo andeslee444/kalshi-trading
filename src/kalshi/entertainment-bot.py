@@ -449,6 +449,7 @@ def evaluate_album_opportunity(market, album, market_price, ss=None):
                 edge=round(edge, 4), price_cents=price, count=count,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
                 units=units, threshold=threshold, source=album.get("source", ""),
+                sizing_method=sizing_method,
             )
             allocator.record_trade("entertainment", ticker, risk, edge=edge)
 
@@ -509,6 +510,7 @@ def evaluate_album_opportunity(market, album, market_price, ss=None):
                 edge=round(edge, 4), price_cents=price, count=count,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
                 units=units, threshold=threshold, source=album.get("source", ""),
+                sizing_method=sizing_method,
             )
             allocator.record_trade("entertainment", ticker, risk, edge=edge)
 
@@ -617,6 +619,7 @@ def evaluate_boxoffice_opportunity(market, movie, market_price, ss=None):
                 edge=round(edge, 4), price_cents=price, count=count,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
                 gross=gross, threshold=threshold, source=movie.get("source", ""),
+                sizing_method=sizing_method,
             )
             allocator.record_trade("entertainment", ticker, risk, edge=edge)
 
@@ -676,6 +679,7 @@ def evaluate_boxoffice_opportunity(market, movie, market_price, ss=None):
                 edge=round(edge, 4), price_cents=price, count=count,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
                 gross=gross, threshold=threshold, source=movie.get("source", ""),
+                sizing_method=sizing_method,
             )
             allocator.record_trade("entertainment", ticker, risk, edge=edge)
 
@@ -732,7 +736,9 @@ def scan():
     elif markets:
         log.info("Markets found but no source data to compare -- will retry next cycle")
 
-    log.info(f"Scan complete.")
+    # Per-scan metrics for observability
+    log.info(f"SCAN METRICS: albums={len(album_data)} boxoffice={len(box_data)} "
+             f"markets={len(markets)}")
     ss.finalize()
 
 def main():
