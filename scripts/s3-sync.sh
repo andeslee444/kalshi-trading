@@ -170,6 +170,10 @@ cmd_download() {
   aws s3 cp "s3://${BUCKET}/config/bayes-params.json" "$PROJECT_DIR/config/bayes-params.json" 2>/dev/null || true
 
   echo "Download complete."
+
+  # Post-download integrity report
+  echo ""
+  python3 "$PROJECT_DIR/scripts/check-sync-health.py" || true
 }
 
 case "${1:-}" in
