@@ -25,6 +25,8 @@ from pnl_snapshot import (
     verify_settlements,
     build_snapshot,
     load_deposits,
+    _infer_bot,
+    _safe_int,
 )
 
 
@@ -333,3 +335,65 @@ class TestBuildSnapshot:
         )
         assert "kalshi_api" in snapshot["sources_used"]
         assert "local_trade_logs" in snapshot["sources_used"]
+
+    def test_by_bot_attribution(self):
+        snapshot = build_snapshot(
+            balance_cents=0, portfolio_value_cents=0,
+            settlements=SAMPLE_SETTLEMENTS, fills=[], positions=[],
+            local_trades=SAMPLE_LOCAL_TRADES, deposits_path=None,
+        )
+        by_bot = snapshot["realized_pnl"]["by_bot"]
+        assert "weather" in by_bot
+        assert by_bot["weather"]["pnl_cents"] == 200  # 400 - 200
+        assert by_bot["crypto"]["pnl_cents"] == -90   # 0 - 90
+        assert by_bot["economics"]["pnl_cents"] == 270  # 300 - 30
+
+    def test_roi_with_deposits(self, tmp_path):
+        import json
+        deposits_file = tmp_path / "deposits.json"
+        deposits_file.write_text(json.dumps([
+            {"date": "2026-02-15", "type": "deposit", "amount_cents": 50000},
+        ]))
+        snapshot = build_snapshot(
+            balance_cents=0, portfolio_value_cents=0,
+            settlements=SAMPLE_SETTLEMENTS, fills=[], positions=[],
+            local_trades=SAMPLE_LOCAL_TRADES, deposits_path=deposits_file,
+        )
+        assert snapshot["deposits"]["tracked"] is True
+        assert snapshot["deposits"]["roi_pct"] == pytest.approx(380 / 50000 * 100, abs=0.01)
+
+
+# ── Tests: helper functions ──
+
+class TestInferBot:
+    def test_weather(self):
+        assert _infer_bot("KXHIGHHOU-26MAR03-T75") == "weather"
+
+    def test_crypto_btc(self):
+        assert _infer_bot("KXBTC-26MAR03-T95000") == "crypto"
+
+    def test_crypto_eth(self):
+        assert _infer_bot("KXETH-26MAR03-T3500") == "crypto"
+
+    def test_economics(self):
+        assert _infer_bot("KXCPI-26MAY-T20") == "economics"
+
+    def test_entertainment(self):
+        assert _infer_bot("KXALBUM-DRAKE-100K") == "entertainment"
+
+    def test_other(self):
+        assert _infer_bot("KXSPORTS-NCAAM") == "other"
+
+
+class TestSafeInt:
+    def test_normal_int(self):
+        assert _safe_int(42) == 42
+
+    def test_string_int(self):
+        assert _safe_int("100") == 100
+
+    def test_none(self):
+        assert _safe_int(None) == 0
+
+    def test_bad_string(self):
+        assert _safe_int("abc") == 0
