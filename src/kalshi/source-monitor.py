@@ -911,16 +911,6 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
 
         log.info(f"  Found {len(today_markets)} temperature markets settling today")
 
-        now = datetime.datetime.now()
-
-        # Pre-dawn gate: running_high is meaningless before 8 AM
-        # The daily high hasn't started building yet
-        if now.hour < 8:
-            log.info(f"  NWS: skipping all cities — pre-dawn ({now.hour}:00), running_high unreliable")
-            if ss:
-                ss.skip("pre_dawn")
-            return
-
         # Group by city for consistency validation
         by_city = {}
         for m, parsed in today_markets:
@@ -933,6 +923,19 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
             if city not in temp_data or "running_high_f" not in temp_data[city]:
                 continue
 
+            # Use city-local hour for pre-dawn gate, sigma model, and edge thresholds
+            city_tz = ZoneInfo(CITY_TIMEZONES.get(city, "America/New_York"))
+            city_now = datetime.datetime.now(city_tz)
+            city_hour = city_now.hour
+
+            # Pre-dawn gate: running_high is meaningless before 8 AM local time
+            # The daily high hasn't started building yet
+            if city_hour < 8:
+                log.info(f"  NWS: skipping {city} — pre-dawn ({city_hour}:00 local), running_high unreliable")
+                if ss:
+                    ss.skip("pre_dawn")
+                continue
+
             running_high = temp_data[city]["running_high_f"]
 
             # Validate threshold market consistency for this city
@@ -940,7 +943,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
             for m, parsed in city_markets:
                 if parsed["direction"] == "T":
                     threshold = parsed["threshold"]
-                    prob = nws_probability(running_high, threshold, "T", now.hour)
+                    prob = nws_probability(running_high, threshold, "T", city_hour)
                     threshold_signals.append((m, threshold, prob))
 
             consistent_tickers = set()
@@ -962,7 +965,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                 max_cost = config["maxTradeAmount"] * 100
                 is_bracket = (direction == "B")
 
-                prob = nws_probability(running_high, threshold, direction, now.hour)
+                prob = nws_probability(running_high, threshold, direction, city_hour)
 
                 yes_ask = m.get("yes_ask", 0)
                 no_ask = m.get("no_ask", 0)
@@ -984,7 +987,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                 if prob > 0.5 and yes_ask and yes_ask < 99:
                     # Buy YES (raw edge, fees handled in Kelly)
                     edge = prob - yes_ask / 100
-                    min_edge = _nws_min_edge(running_high, threshold, now.hour, is_bracket)
+                    min_edge = _nws_min_edge(running_high, threshold, city_hour, is_bracket)
                     if edge <= min_edge:
                         if ss:
                             ss.skip("low_edge")
@@ -992,7 +995,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             ticker, "yes", "skipped", "edge_below_min",
                             edge=round(edge, 4), price_cents=yes_ask, min_edge=min_edge,
                             confidence=round(prob, 4), running_high=round(running_high, 1),
-                            city=city, threshold=threshold, hour=now.hour,
+                            city=city, threshold=threshold, hour=city_hour,
                         )
                         continue
                     budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=prob, source_type="nws")
@@ -1016,7 +1019,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                         )
                         continue
                     if direction == "T":
-                        reasoning = f"NWS {city} running high {running_high:.1f}F > {threshold}F by {margin:.1f}F, prob {prob*100:.0f}% (hour {now.hour})"
+                        reasoning = f"NWS {city} running high {running_high:.1f}F > {threshold}F by {margin:.1f}F, prob {prob*100:.0f}% (hour {city_hour})"
                     else:
                         reasoning = f"NWS {city} running high {running_high:.1f}F in bracket [{threshold}, {threshold+1})F, prob {prob*100:.0f}%"
                     log.info(f"\nARBITRAGE FOUND: NWS {city} high {running_high:.1f}F -> YES on {ticker}")
@@ -1029,7 +1032,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                                                         kelly_fraction=kelly_details.get("kelly_fraction"),
                                                         bankroll_used=kelly_details.get("bankroll_used"),
                                                         running_high=round(running_high, 1),
-                                                        hour_of_day=now.hour,
+                                                        hour_of_day=city_hour,
                                                         city=city, direction=direction, threshold=threshold,
                                                         source_type="nws")
                     if result:
@@ -1039,7 +1042,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             ticker, "yes", "placed", "nws_arb",
                             edge=round(edge, 4), price_cents=price, count=count,
                             confidence=round(prob, 4), running_high=round(running_high, 1),
-                            city=city, threshold=threshold, hour=now.hour,
+                            city=city, threshold=threshold, hour=city_hour,
                         )
                         allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
@@ -1047,7 +1050,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     # Buy NO (raw edge, fees handled in Kelly)
                     no_prob = 1.0 - prob
                     edge = no_prob - no_ask / 100
-                    min_edge = _nws_min_edge(running_high, threshold, now.hour, is_bracket)
+                    min_edge = _nws_min_edge(running_high, threshold, city_hour, is_bracket)
                     if edge <= min_edge:
                         if ss:
                             ss.skip("low_edge")
@@ -1055,7 +1058,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             ticker, "no", "skipped", "edge_below_min",
                             edge=round(edge, 4), price_cents=no_ask, min_edge=min_edge,
                             confidence=round(no_prob, 4), running_high=round(running_high, 1),
-                            city=city, threshold=threshold, hour=now.hour,
+                            city=city, threshold=threshold, hour=city_hour,
                         )
                         continue
                     budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=no_prob, source_type="nws")
@@ -1079,7 +1082,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                         )
                         continue
                     if direction == "T":
-                        reasoning = f"NWS {city} running high {running_high:.1f}F < {threshold}F by {abs(margin):.1f}F, prob NO {no_prob*100:.0f}% (hour {now.hour})"
+                        reasoning = f"NWS {city} running high {running_high:.1f}F < {threshold}F by {abs(margin):.1f}F, prob NO {no_prob*100:.0f}% (hour {city_hour})"
                     else:
                         reasoning = f"NWS {city} running high {running_high:.1f}F outside bracket [{threshold}, {threshold+1})F, prob NO {no_prob*100:.0f}%"
                     log.info(f"\nARBITRAGE FOUND: NWS {city} high {running_high:.1f}F -> NO on {ticker}")
@@ -1092,7 +1095,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                                                         kelly_fraction=kelly_details.get("kelly_fraction"),
                                                         bankroll_used=kelly_details.get("bankroll_used"),
                                                         running_high=round(running_high, 1),
-                                                        hour_of_day=now.hour,
+                                                        hour_of_day=city_hour,
                                                         city=city, direction=direction, threshold=threshold,
                                                         source_type="nws")
                     if result:
@@ -1102,7 +1105,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             ticker, "no", "placed", "nws_arb",
                             edge=round(edge, 4), price_cents=price, count=count,
                             confidence=round(no_prob, 4), running_high=round(running_high, 1),
-                            city=city, threshold=threshold, hour=now.hour,
+                            city=city, threshold=threshold, hour=city_hour,
                         )
                         allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 

@@ -469,20 +469,22 @@ class TestNWSTimezoneCorrectness:
 
 
 class TestPreDawnGate:
-    """Verify the pre-dawn gate prevents NWS trades before 8 AM.
+    """Verify the pre-dawn gate prevents NWS trades before 8 AM local time.
 
-    Before 8 AM, the running high temperature is unreliable because
-    the day hasn't really started. The pre-dawn gate in match_nws_to_markets
-    skips all NWS trade evaluation during this period.
+    Before 8 AM local time in the city, the running high temperature is
+    unreliable because the day hasn't really started. The pre-dawn gate
+    in match_nws_to_markets skips NWS trade evaluation during this period.
     """
 
-    def test_pre_dawn_gate_exists_in_source(self):
-        """match_nws_to_markets should check hour < 8 to gate pre-dawn trades."""
+    def test_pre_dawn_gate_uses_city_local_hour(self):
+        """Pre-dawn gate should use city-local hour, not server-local hour."""
         sm = _load_source_monitor()
         import inspect
         source = inspect.getsource(sm.match_nws_to_markets)
-        # Must have the hour < 8 check
-        assert "hour < 8" in source or "now.hour < 8" in source
+        # Must use city_hour for the pre-dawn check, not now.hour
+        assert "city_hour < 8" in source
+        # Must NOT use naive now.hour for the gate
+        assert "now.hour < 8" not in source
 
     def test_pre_dawn_gate_skips_record(self):
         """When pre-dawn is active, scan summary should record a skip."""
@@ -491,3 +493,59 @@ class TestPreDawnGate:
         source = inspect.getsource(sm.match_nws_to_markets)
         # Should call ss.skip("pre_dawn") when gated
         assert "pre_dawn" in source
+
+    def test_nws_uses_city_hour_for_sigma(self):
+        """NWS probability and edge calculation should use city-local hour.
+
+        This ensures sigma model uses the city's local hour (e.g., LAX at
+        Pacific time, not server time) for accurate uncertainty estimates.
+        """
+        sm = _load_source_monitor()
+        import inspect
+        source = inspect.getsource(sm.match_nws_to_markets)
+        # Should use city_hour in nws_probability calls, not now.hour
+        assert "nws_probability(running_high, threshold, direction, city_hour)" in source
+        assert "nws_probability(running_high, threshold, \"T\", city_hour)" in source
+        # Should use city_hour in _nws_min_edge calls
+        assert "_nws_min_edge(running_high, threshold, city_hour," in source
+
+
+class TestNWSEdgeThresholdBoundaries:
+    """Test edge threshold tier boundaries in detail.
+
+    The CI-based tier system should produce appropriate min-edge
+    requirements based on the margin-to-CI ratio at different hours.
+    """
+
+    def setup_method(self):
+        _reset_calibration()
+
+    def teardown_method(self):
+        _reset_calibration()
+
+    def test_edge_tiers_are_consistent_across_hours(self):
+        """As hours increase (sigma decreases), the same margin should move
+        from uncertain to confident. A 3F margin at hour 8 (sigma~2.65) is
+        uncertain, but at hour 18 (sigma=0.5) it's very confident."""
+        sm = _load_source_monitor()
+        # At hour 8, sigma ~2.65, ci_99 ~6.83, 3F margin < ci_99/2 = uncertain
+        edge_morning = sm._nws_min_edge(83, 80, 8, False)
+        # At hour 18, sigma 0.5, ci_99 ~1.29, 3F margin > ci_99 = very confident
+        edge_evening = sm._nws_min_edge(83, 80, 18, False)
+        assert edge_morning > edge_evening
+        assert edge_morning == 0.15  # uncertain
+        assert edge_evening == 0.05  # very confident
+
+    def test_zero_margin_always_uncertain(self):
+        """When running high equals threshold, should always be uncertain tier."""
+        sm = _load_source_monitor()
+        for hour in [8, 12, 15, 18]:
+            edge = sm._nws_min_edge(80, 80, hour, False)
+            assert edge == 0.15, f"Expected 0.15 at hour {hour} with zero margin"
+
+    def test_large_margin_always_confident(self):
+        """A 10F margin should be in the confident tier at any hour after dawn."""
+        sm = _load_source_monitor()
+        for hour in [8, 12, 15, 18]:
+            edge = sm._nws_min_edge(90, 80, hour, False)
+            assert edge == 0.05, f"Expected 0.05 at hour {hour} with 10F margin"
