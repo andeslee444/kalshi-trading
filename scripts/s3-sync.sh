@@ -18,20 +18,42 @@ usage() {
 # Strategy: exclude everything, then include only what we want
 sync_filters() {
   echo "--exclude=*"
-  # Trade logs (golden records)
+
+  # ── Trade logs (golden records) ──
   echo "--include=kalshi-*-trades.json"
   echo "--include=kalshi-trades.json"
   echo "--include=beatrelease-trades.json"
   echo "--include=beatrelease-state.json"
+
+  # ── Analytics & snapshots ──
   echo "--include=backtest-results.json"
   echo "--include=performance-metrics.json"
   echo "--include=financial-snapshot.json"
-  # Observability state files
+  echo "--include=deposits.json"
+
+  # ── Per-bot metrics (Plans 2-8) ──
+  echo "--include=*-metrics.json"
+
+  # ── Observability state ──
   echo "--include=health-state.json"
   echo "--include=allocator-state.json"
   echo "--include=scan-summaries.json"
-  # Decision logs (every market evaluated with reason)
+  echo "--include=circuit-breaker-state.json"
+  echo "--include=correlation-state.json"
+  echo "--include=regime-state.json"
+  echo "--include=pf-state-crypto.json"
+
+  # ── Decision logs ──
   echo "--include=*-decisions.json"
+
+  # ── Model tracking ──
+  echo "--include=weather-verification.json"
+  echo "--include=nowcast-history.json"
+  echo "--include=crypto-price-history.json"
+
+  # ── Caches (useful for debugging, not critical) ──
+  echo "--include=econ-nowcast-cache.json"
+  echo "--include=macro-cache.json"
 }
 
 acquire_lock() {
@@ -95,9 +117,12 @@ cmd_upload() {
   aws s3 sync "$PROJECT_DIR/data/logs/" "s3://${BUCKET}/data/logs/" \
     --exclude "*" --include "*.log"
 
-  # Sync config/calibration.json
+  # Sync config files
   if [ -f "$PROJECT_DIR/config/calibration.json" ]; then
     aws s3 cp "$PROJECT_DIR/config/calibration.json" "s3://${BUCKET}/config/calibration.json"
+  fi
+  if [ -f "$PROJECT_DIR/config/bayes-params.json" ]; then
+    aws s3 cp "$PROJECT_DIR/config/bayes-params.json" "s3://${BUCKET}/config/bayes-params.json"
   fi
 
   # Verify key files by comparing local vs remote sizes
@@ -129,8 +154,9 @@ cmd_download() {
   aws s3 sync "s3://${BUCKET}/data/logs/" "$PROJECT_DIR/data/logs/" \
     --exclude "*" --include "*.log"
 
-  # Sync config/calibration.json
+  # Sync config files
   aws s3 cp "s3://${BUCKET}/config/calibration.json" "$PROJECT_DIR/config/calibration.json" 2>/dev/null || true
+  aws s3 cp "s3://${BUCKET}/config/bayes-params.json" "$PROJECT_DIR/config/bayes-params.json" 2>/dev/null || true
 
   echo "Download complete."
 }
