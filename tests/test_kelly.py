@@ -7,7 +7,7 @@ conftest.py adds src/kalshi/ to sys.path so direct import works.
 import math
 import pytest
 
-from probability import half_kelly, half_kelly_sell, quarter_kelly, quarter_kelly_sell, apply_kelly_multipliers
+from probability import half_kelly, half_kelly_sell, quarter_kelly, quarter_kelly_sell, apply_kelly_multipliers, uncertainty_kelly
 
 
 # ---------------------------------------------------------------------------
@@ -398,3 +398,59 @@ class TestApplyKellyMultipliers:
         reduced = apply_kelly_multipliers(contracts, [0.7, 0.8, 0.9, 0.85])
         assert reduced >= contracts * 0.25  # floor
         assert reduced <= contracts  # can't increase
+
+
+# ---------------------------------------------------------------------------
+# uncertainty_kelly tests
+# ---------------------------------------------------------------------------
+
+class TestUncertaintyKelly:
+    """Tests for uncertainty_kelly confidence scaling."""
+
+    def test_high_confidence_preserves_kelly(self):
+        """High agreement + tight sigma -> near full quarter_kelly."""
+        count, risk, details = uncertainty_kelly(
+            edge=0.15, price_cents=40, max_cost_cents=500, bankroll_cents=50000,
+            scenario_agreement=1.0, posterior_sigma=0.05,
+        )
+        base, _, _ = quarter_kelly(0.15, 40, 500, 50000, return_details=True)
+        assert base > 0
+        ratio = count / base
+        assert ratio >= 0.8, f"High confidence should keep >=80% of Kelly, got {ratio:.2f}"
+
+    def test_moderate_uncertainty_not_crushed(self):
+        """Moderate model uncertainty should reduce Kelly by ~20-40%, not 60-70%."""
+        count, risk, details = uncertainty_kelly(
+            edge=0.15, price_cents=40, max_cost_cents=500, bankroll_cents=50000,
+            scenario_agreement=0.8, posterior_sigma=0.20,
+        )
+        base, _, _ = quarter_kelly(0.15, 40, 500, 50000, return_details=True)
+        assert base > 0
+        ratio = count / base
+        assert ratio >= 0.30, f"Moderate uncertainty should keep >=30% of Kelly, got {ratio:.2f}"
+
+    def test_low_confidence_still_trades(self):
+        """Even low confidence should produce at least 1 contract."""
+        count, risk, details = uncertainty_kelly(
+            edge=0.15, price_cents=40, max_cost_cents=500, bankroll_cents=50000,
+            scenario_agreement=0.3, posterior_sigma=0.40,
+        )
+        assert count >= 1, "Low confidence should still produce at least 1 contract"
+
+    def test_zero_edge_returns_zero(self):
+        count, risk, details = uncertainty_kelly(
+            edge=0, price_cents=40, max_cost_cents=500, bankroll_cents=50000,
+            scenario_agreement=0.8, posterior_sigma=0.10,
+        )
+        assert count == 0
+
+    def test_confidence_decomposition(self):
+        """Details should expose agreement_mult, sigma_mult, and confidence."""
+        _, _, details = uncertainty_kelly(
+            edge=0.15, price_cents=40, max_cost_cents=500, bankroll_cents=50000,
+            scenario_agreement=0.8, posterior_sigma=0.10,
+        )
+        assert "confidence" in details
+        assert "agreement_mult" in details
+        assert "sigma_mult" in details
+        assert details["sigma_mult"] == 1.0  # 0.10/0.10 = 1.0
