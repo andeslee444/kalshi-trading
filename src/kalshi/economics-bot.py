@@ -11,7 +11,7 @@ Usage:
     python3 src/kalshi/economics-bot.py --once    # single scan
 """
 
-import json, time, datetime, os, sys, re, argparse, traceback, math
+import json, time, datetime, os, sys, re, argparse, math
 import requests
 from bs4 import BeautifulSoup
 from pathlib import Path
@@ -105,7 +105,10 @@ trim_trade_log(TRADES_PATH)
 def _classify_econ_market(ticker):
     """Classify economics market type from ticker."""
     t = ticker.upper()
-    if "CPI" in t or "INFLATION" in t:
+    # Check Core CPI before CPI (more specific match first)
+    if "CORECPI" in t or ("CORE" in t and "CPI" in t):
+        return "CORE_CPI"
+    elif "CPI" in t or "INFLATION" in t:
         return "CPI"
     elif "GDP" in t:
         return "GDP"
@@ -118,8 +121,9 @@ def _classify_econ_market(ticker):
     return "other"
 
 # === Concentration Limits ===
-FAMILY_EXPOSURE_PCT = 0.15   # 15% of bankroll per ticker family
-TOTAL_ECON_PCT = 0.40        # 40% total economics exposure
+FAMILY_EXPOSURE_PCT = 0.10   # 10% of bankroll per ticker family
+TOTAL_ECON_PCT = 0.20        # 20% total economics exposure (was 40% — caused $2.3k on $1.8k bankroll)
+MAX_CONTRACTS_PER_ORDER = 200  # Hard cap: prevent enormous penny-contract positions
 
 def _ticker_family(ticker):
     """Extract ticker family (everything before -T/-B threshold suffix)."""
@@ -205,7 +209,7 @@ class EdgeScaler:
 # Note: KXFED removed — CME FedWatch is a JavaScript SPA, HTML scraper returns garbage.
 # Re-enable when a proper FedWatch data source (JSON API or FRED SOFR futures) is wired up.
 # KXJOBS kept — will skip gracefully when no nowcast source is connected.
-ECON_PREFIXES = ["KXCPI", "KXGDP", "KXJOBS", "KXINFLATION", "KXECON", "KXGAS"]
+ECON_PREFIXES = ["KXCPI", "KXCORECPI", "KXGDP", "KXJOBS", "KXINFLATION", "KXECON", "KXGAS"]
 
 # === Nowcast cache ===
 NOWCAST_CACHE_PATH = PROJECT_DIR / "data" / "econ-nowcast-cache.json"
@@ -861,14 +865,14 @@ def scan_and_trade():
             except Exception:
                 pass
 
-    if macro_signal and macro_signal.confidence > 0.2 and nowcast:
-        if "cpi_yoy" in nowcast:
-            adjusted_cpi = nowcast["cpi_yoy"] + macro_signal.cpi_bias
-            nowcast["cpi_yoy"] = adjusted_cpi
-            log.info(f"  Macro-adjusted CPI nowcast: {adjusted_cpi:.3f}% "
-                     f"(bias={macro_signal.cpi_bias:+.3f}%, conf={macro_signal.confidence:.2f})")
+    # NOTE: Heuristic cpi_bias adjustment removed to prevent double-counting.
+    # Truflation/TIPS data already enters via CPIBeliefFilter Bayesian fusion below.
+    # The macro_signal is still computed for sigma_multiplier and scenario weights.
+    if macro_signal and macro_signal.confidence > 0.2:
+        log.info(f"  Macro signal: bias={macro_signal.cpi_bias:+.3f}%, conf={macro_signal.confidence:.2f} "
+                 f"(not applied — handled by Bayesian fusion)")
 
-    # Bayesian belief filter (replaces heuristic macro bias)
+    # Bayesian belief filter (sole path for Truflation/TIPS adjustments)
     # Sources: Cleveland Fed (prior) + Truflation + TIPS breakeven
     if truflation_cpi is not None:
         log.info(f"  Truflation CPI: {truflation_cpi:.2f}%")
@@ -976,7 +980,10 @@ def scan_and_trade():
 
         # Determine which nowcast value to use
         nowcast_value = None
-        if "CPI" in ticker.upper() or "INFLATION" in ticker.upper():
+        if market_type == "CORE_CPI":
+            # Core CPI markets should use core_cpi_yoy (not headline)
+            nowcast_value = nowcast.get("core_cpi_yoy") or nowcast.get("cpi_yoy")
+        elif "CPI" in ticker.upper() or "INFLATION" in ticker.upper():
             nowcast_value = nowcast.get("cpi_yoy") or nowcast.get("core_cpi_yoy")
         elif "GDP" in ticker.upper():
             # Primary: direct GDPNow fetch. Fallback: Cleveland Fed, then macro engine
@@ -1015,7 +1022,7 @@ def scan_and_trade():
         # Estimate uncertainty — use market-type-specific sigma
         days_to_release = estimate_days_to_release(m)
         ticker_upper = ticker.upper()
-        if "CPI" in ticker_upper:
+        if market_type in ("CPI", "CORE_CPI"):
             sigma = cpi_nowcast_sigma(days_to_release, fed_ci_width=dispersion_ci)
         elif "GAS" in ticker_upper:
             # Gas handled separately via gas_price_probability path
@@ -1037,10 +1044,12 @@ def scan_and_trade():
         belief = CPIBeliefFilter(nowcast_value, sigma)
         if truflation_cpi is not None:
             # Truflation tracks different basket than BLS CPI. Historical RMSE ~0.30pp.
-            belief.update(truflation_cpi, obs_sigma=0.30)
+            # source= enables correlation discount (corr=0.70 with Cleveland Fed).
+            belief.update(truflation_cpi, obs_sigma=0.30, source="truflation")
         if tips_breakeven is not None:
             # TIPS 10Y breakeven is a long-term measure. Mapping to 1-month CPI has ~0.60pp noise.
-            belief.update(tips_breakeven, obs_sigma=0.60)
+            # source= enables correlation discount (corr=0.30 with Cleveland Fed).
+            belief.update(tips_breakeven, obs_sigma=0.60, source="tips_breakeven")
         fused_nowcast, posterior_sigma = belief.posterior
 
         # Compute probability using scenario-weighted mixture
@@ -1268,6 +1277,12 @@ def scan_and_trade():
                                        edge=edge, price_cents=price)
             continue
 
+        # Hard cap on contract count (penny contracts can produce absurd Kelly sizes)
+        if count > MAX_CONTRACTS_PER_ORDER:
+            log.info(f"  Capping {ticker} from {count} to {MAX_CONTRACTS_PER_ORDER} contracts")
+            count = MAX_CONTRACTS_PER_ORDER
+            risk = count * price
+
         # Format gas price markets differently (dollars, not percentages)
         is_gas = ticker.startswith("KXGAS")
         if is_gas:
@@ -1376,8 +1391,7 @@ def main():
             order_monitor.check_orders()
             scan_and_trade()
         except Exception as e:
-            log.error(f"Scan error: {e}")
-            traceback.print_exc()
+            log.error("Scan error: %s", e, exc_info=True)
 
         if is_shutdown_requested():
             log.info("Graceful shutdown requested, exiting.")
