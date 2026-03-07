@@ -126,8 +126,19 @@ cmd_upload() {
   fi
 
   # Verify key files by comparing local vs remote sizes
+  # Generate verify list from trade_files.py (canonical source of truth)
   echo "Verifying upload..."
-  for f in kalshi-trades.json kalshi-monitor-trades.json kalshi-entertainment-trades.json kalshi-economics-trades.json kalshi-crypto-trades.json kalshi-strategy-trades.json kalshi-arb-trades.json kalshi-position-trades.json kalshi-mm-trades.json beatrelease-trades.json health-state.json scan-summaries.json; do
+  verify_files=$(python3 -c "
+import sys; sys.path.insert(0, '$PROJECT_DIR/src/kalshi')
+from trade_files import TRADE_FILES
+for tf in TRADE_FILES:
+    print(tf['filename'])
+# Also verify non-trade critical files
+for f in ['health-state.json', 'scan-summaries.json', 'financial-snapshot.json']:
+    print(f)
+")
+
+  for f in $verify_files; do
     if [ -f "$PROJECT_DIR/data/$f" ]; then
       local_size=$(stat -f%z "$PROJECT_DIR/data/$f" 2>/dev/null || stat -c%s "$PROJECT_DIR/data/$f" 2>/dev/null || echo 0)
       remote_info=$(aws s3 ls "s3://${BUCKET}/data/$f" 2>/dev/null || true)
