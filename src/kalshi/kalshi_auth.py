@@ -1042,6 +1042,10 @@ class TradeManager:
         self._cached_balance_cents = None
         self._balance_fetched_at = 0
 
+        # Write-ahead log for crash recovery
+        self._wal_path = self.trades_path.with_suffix(".wal.json")
+        self._recover_wal()
+
         # Log if percentage-based scaling is active
         if config.get("maxTradeAmountPct") or config.get("maxDailyLossPct"):
             self.log.info("Bankroll-proportional limits active: trade=%.1f%%, daily=%.1f%%",
@@ -1111,6 +1115,65 @@ class TradeManager:
                 dynamic_cents = int(balance * pct)
                 return min(static_cents, dynamic_cents)
         return static_cents
+
+    # ─── Write-Ahead Log ───
+
+    def _write_wal(self, entry):
+        """Write a pending trade entry to the WAL file."""
+        entries = self._read_wal()
+        entries.append(entry)
+        _atomic_write_json(self._wal_path, entries)
+
+    def _read_wal(self):
+        """Read all WAL entries. Returns [] if missing/corrupt."""
+        if not self._wal_path.exists():
+            return []
+        try:
+            data = json.loads(self._wal_path.read_text())
+            return data if isinstance(data, list) else []
+        except (json.JSONDecodeError, OSError):
+            return []
+
+    def _clear_wal(self, order_id):
+        """Remove a confirmed entry from the WAL by order_id."""
+        entries = self._read_wal()
+        entries = [e for e in entries if e.get("order_id") != order_id]
+        if entries:
+            _atomic_write_json(self._wal_path, entries)
+        elif self._wal_path.exists():
+            self._wal_path.unlink()
+
+    def _recover_wal(self):
+        """On startup, check WAL for trades that were sent but not logged."""
+        entries = self._read_wal()
+        if not entries:
+            return
+        self.log.warning("WAL recovery: found %d pending entries", len(entries))
+        for entry in entries:
+            ticker = entry.get("ticker", "?")
+            order_id = entry.get("order_id")
+            if not order_id:
+                self.log.warning("WAL recovery: entry for %s has no order_id, clearing", ticker)
+                continue
+            try:
+                result = self.client.get(f"/portfolio/orders/{order_id}")
+                order = result.get("order", {})
+                status = (order.get("status") or "").lower()
+                if status in ("filled", "complete", "resting"):
+                    self.log.warning("WAL recovery: order %s for %s was %s, writing to trade log",
+                                     order_id, ticker, status)
+                    record = entry.get("record", {})
+                    record["status"] = status
+                    record["wal_recovered"] = True
+                    save_trade(self.trades_path, record)
+                else:
+                    self.log.warning("WAL recovery: order %s for %s status=%s, discarding",
+                                     order_id, ticker, status)
+            except Exception as e:
+                self.log.warning("WAL recovery: failed to check order %s: %s", order_id, e)
+        # Clear all WAL entries after recovery attempt
+        if self._wal_path.exists():
+            self._wal_path.unlink()
 
     @staticmethod
     def _classify_limit_tier(edge):
@@ -1356,6 +1419,19 @@ class TradeManager:
             self.log.error("Order failed for %s: %s", ticker, e)
             return None
 
+        # 9b. WAL: write pending entry with order_id for crash recovery
+        order_id = order_info.get("order_id")
+        extra_fields["caps_applied"] = caps_applied
+        trade_record = self._build_golden_record(
+            ticker, side, price_cents, count, cost_cents,
+            reasoning, order_info, **extra_fields
+        )
+        if order_id:
+            try:
+                self._write_wal({"order_id": order_id, "ticker": ticker, "record": trade_record})
+            except Exception:
+                pass  # WAL write failure should not block the trade
+
         # 10. Update counters and save trade (track risk, not raw cost)
         self._daily_trades += 1
         if side == "no":
@@ -1364,16 +1440,18 @@ class TradeManager:
             self._daily_spend_cents += cost_cents
 
         # 11. Register with order monitor for fill tracking
-        if self.order_monitor and order_info.get("order_id"):
-            self.order_monitor.track(order_info["order_id"], ticker, side, price_cents, count)
+        if self.order_monitor and order_id:
+            self.order_monitor.track(order_id, ticker, side, price_cents, count)
 
-        extra_fields["caps_applied"] = caps_applied
-        trade_record = self._build_golden_record(
-            ticker, side, price_cents, count, cost_cents,
-            reasoning, order_info, **extra_fields
-        )
         save_trade(self.trades_path, trade_record)
         self.tracker.record(ticker)
+
+        # 12. Clear WAL entry (trade is now safely in the trade log)
+        if order_id:
+            try:
+                self._clear_wal(order_id)
+            except Exception:
+                pass  # WAL clear failure is benign — recovery will handle it
 
         self.log.info("Order placed: %dx %s @ %dc on %s (ID: %s, Status: %s)",
                        count, side, price_cents, ticker,

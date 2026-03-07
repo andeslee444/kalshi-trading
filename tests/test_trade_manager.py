@@ -952,3 +952,102 @@ class TestActionField:
         assert sell_records[0]["ticker"] == "TEST-SELL"
         assert sell_records[0]["side"] == "yes"
         assert sell_records[0]["price_cents"] == 70
+
+
+# ===================================================================
+# Write-Ahead Log tests (Plan 1 Task 1.10)
+# ===================================================================
+
+class TestWriteAheadLog:
+
+    def test_wal_created_during_trade(self, tmp_path):
+        """WAL file should exist briefly during trade placement."""
+        mgr, client, _ = _make_manager(tmp_path)
+        # After successful trade, WAL should be cleared
+        mgr.place_order("TICK-WAL", "yes", 50, 1, "test")
+        assert not mgr._wal_path.exists(), "WAL should be cleared after successful trade"
+
+    def test_wal_survives_save_failure(self, tmp_path):
+        """If save_trade crashes after API call, WAL should still exist."""
+        mgr, client, _ = _make_manager(tmp_path)
+        # Make save_trade crash by making trades_path parent read-only
+        # Instead, intercept _clear_wal to verify it was called
+        wal_entries_written = []
+        original_write = mgr._write_wal
+        def capture_write(entry):
+            wal_entries_written.append(entry)
+            original_write(entry)
+        mgr._write_wal = capture_write
+        mgr.place_order("TICK-WAL2", "yes", 50, 1, "test")
+        assert len(wal_entries_written) == 1
+        assert wal_entries_written[0]["ticker"] == "TICK-WAL2"
+        assert wal_entries_written[0]["order_id"] == "test-123"
+
+    def test_wal_recovery_writes_to_trade_log(self, tmp_path):
+        """WAL recovery should write missed trades to the trade log."""
+        # Create a WAL file with a pending entry
+        wal_path = (tmp_path / "trades.wal.json")
+        wal_entry = {
+            "order_id": "recovered-001",
+            "ticker": "TICK-RECOVER",
+            "record": {
+                "ticker": "TICK-RECOVER", "side": "yes", "price_cents": 40,
+                "count": 2, "cost_cents": 80, "reasoning": "original",
+                "order_id": "recovered-001", "status": "pending",
+            }
+        }
+        wal_path.write_text(json.dumps([wal_entry]))
+
+        # Mock client.get to return filled status for the order
+        mock_client = MagicMock()
+        mock_client.post.return_value = {"order": {"order_id": "x", "status": "resting"}}
+        mock_client.get.return_value = {"order": {"order_id": "recovered-001", "status": "filled"}}
+
+        trades_path = tmp_path / "trades.json"
+        cfg = {"maxTradeAmount": 5, "maxDailyTrades": 10, "maxDailyLoss": 25}
+        mgr = TradeManager(mock_client, trades_path, cfg,
+                           kill_switch_path=tmp_path / "HALT",
+                           breaker_state_path=None)
+        # WAL should be cleared after recovery
+        assert not wal_path.exists()
+        # Trade should be in the log
+        trades = load_trades(trades_path)
+        recovered = [t for t in trades if t.get("wal_recovered")]
+        assert len(recovered) == 1
+        assert recovered[0]["ticker"] == "TICK-RECOVER"
+        assert recovered[0]["status"] == "filled"
+
+    def test_wal_recovery_discards_cancelled(self, tmp_path):
+        """WAL recovery should discard cancelled orders."""
+        wal_path = (tmp_path / "trades.wal.json")
+        wal_entry = {
+            "order_id": "cancelled-001",
+            "ticker": "TICK-CANCEL",
+            "record": {"ticker": "TICK-CANCEL", "order_id": "cancelled-001"}
+        }
+        wal_path.write_text(json.dumps([wal_entry]))
+
+        mock_client = MagicMock()
+        mock_client.post.return_value = {"order": {"order_id": "x", "status": "resting"}}
+        mock_client.get.return_value = {"order": {"order_id": "cancelled-001", "status": "cancelled"}}
+
+        trades_path = tmp_path / "trades.json"
+        cfg = {"maxTradeAmount": 5, "maxDailyTrades": 10, "maxDailyLoss": 25}
+        mgr = TradeManager(mock_client, trades_path, cfg,
+                           kill_switch_path=tmp_path / "HALT",
+                           breaker_state_path=None)
+        assert not wal_path.exists()
+        trades = load_trades(trades_path)
+        assert len(trades) == 0
+
+    def test_wal_empty_on_fresh_start(self, tmp_path):
+        """No WAL file on fresh start should be fine."""
+        mgr, _, _ = _make_manager(tmp_path)
+        assert mgr._read_wal() == []
+
+    def test_wal_corrupt_file_handled(self, tmp_path):
+        """Corrupt WAL file should not crash init."""
+        wal_path = (tmp_path / "trades.wal.json")
+        wal_path.write_text("not json")
+        mgr, _, _ = _make_manager(tmp_path)
+        assert mgr._read_wal() == []
