@@ -161,6 +161,37 @@ _load_price_history()
 
 
 
+def compute_ou_target(asset, lookback_hours=24):
+    """Compute OU mean-reversion target from trailing VWAP (volume-weighted average price).
+
+    Uses simple average of recent price observations as a proxy for VWAP
+    (true VWAP requires volume data we don't have at this frequency).
+
+    The OU target should be INDEPENDENT of the strike price being evaluated.
+    Using the strike price as the OU target (the prior bug in probability.py)
+    is mathematically nonsensical — it pulls the price toward every strike
+    simultaneously.
+
+    NOTE: OU is currently disabled (useOrnsteinUhlenbeck: false). This function
+    is ready for when probability.py is updated to accept an ou_target parameter.
+
+    Args:
+        asset: Asset symbol (e.g., "BTC", "ETH").
+        lookback_hours: Hours of price history to use (default 24h).
+
+    Returns:
+        float: Mean price over the lookback period, or None if insufficient data.
+    """
+    history = _price_history.get(asset, [])
+    if len(history) < 5:
+        return None
+    cutoff = time.time() - lookback_hours * 3600
+    recent = [p for t, p in history if t > cutoff]
+    if len(recent) < 3:
+        return None
+    return sum(recent) / len(recent)
+
+
 def compute_trailing_drift(asset):
     """Compute annualized drift from trailing 24h price change.
 
@@ -202,6 +233,94 @@ def fetch_coinbase_spot(asset="BTC"):
         return None
 
 
+# Binance symbol mapping (asset -> Binance trading pair)
+_BINANCE_SYMBOLS = {
+    "BTC": "BTCUSDT",
+    "ETH": "ETHUSDT",
+    "SOL": "SOLUSDT",
+    "DOGE": "DOGEUSDT",
+    "XRP": "XRPUSDT",
+}
+
+
+def fetch_binance_spot(asset="BTC"):
+    """Fetch spot price from Binance public API (no auth required).
+
+    Returns price in USD (float), or None on failure.
+    """
+    try:
+        symbol = _BINANCE_SYMBOLS.get(asset.upper())
+        if not symbol:
+            return None
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+        r = retry_request("GET", url, timeout=10)
+        data = r.json()
+        price = float(data["price"])
+        log.info(f"  Binance {asset}: ${price:,.2f}")
+        return price
+    except Exception as e:
+        log.error(f"  Binance {asset} fetch failed: {e}")
+        return None
+
+
+# Ordered list of price sources for fallback
+PRICE_SOURCES = [
+    ("coinbase", fetch_coinbase_spot),
+    ("binance", fetch_binance_spot),
+]
+
+# Maximum acceptable price divergence between sources (0.5%)
+MAX_PRICE_DIVERGENCE = 0.005
+
+
+def get_spot_price(asset, health_monitor=None):
+    """Fetch spot price with source fallback and cross-validation.
+
+    Tries each price source in order. When multiple sources succeed,
+    flags divergence > 0.5% as potential stale data.
+
+    Args:
+        asset: Asset symbol (e.g., "BTC", "ETH").
+        health_monitor: Optional HealthCheckMonitor for source tracking.
+
+    Returns:
+        tuple: (price, source_name) or raises RuntimeError if all fail.
+    """
+    prices = {}
+    for name, fetcher in PRICE_SOURCES:
+        try:
+            price = fetcher(asset)
+            if price and price > 0:
+                prices[name] = price
+                if health_monitor:
+                    health_monitor.record_source_success(name)
+        except Exception as e:
+            log.warning(f"Price source {name} failed for {asset}: {e}")
+            if health_monitor:
+                health_monitor.record_source_error(name, str(e))
+
+    if not prices:
+        raise RuntimeError(f"All price sources failed for {asset}")
+
+    # Cross-validate: flag divergence
+    if len(prices) >= 2:
+        price_list = list(prices.values())
+        mid = sum(price_list) / len(price_list)
+        for name, p in prices.items():
+            if mid > 0 and abs(p - mid) / mid > MAX_PRICE_DIVERGENCE:
+                log.warning(f"  Price divergence: {name} {asset}=${p:,.2f} vs avg=${mid:,.2f} "
+                           f"({abs(p-mid)/mid*100:.2f}% off)")
+
+    # Return the first successful source (priority order)
+    for name, _ in PRICE_SOURCES:
+        if name in prices:
+            return prices[name], name
+
+    # Shouldn't reach here, but safety
+    name = next(iter(prices))
+    return prices[name], name
+
+
 def fetch_deribit_iv(asset="BTC"):
     """Fetch implied volatility from Deribit DVOL index.
 
@@ -233,6 +352,111 @@ def fetch_deribit_iv(asset="BTC"):
     except Exception as e:
         log.error(f"  Deribit IV fetch failed for {asset}: {e}")
         return None
+
+
+def yang_zhang_vol(price_series, bar_seconds=3600):
+    """Yang-Zhang volatility estimator using synthetic OHLC bars.
+
+    Yang-Zhang is more sample-efficient than close-to-close and less
+    sensitive to microstructure noise (bid-ask bounce, discrete price levels).
+
+    Aggregates (timestamp, price) observations into OHLC bars, then computes:
+        sigma_YZ^2 = sigma_O^2 + k * sigma_C^2 + (1-k) * sigma_RS^2
+
+    where:
+        sigma_O^2 = overnight variance (open-to-open log returns)
+        sigma_C^2 = close-to-close variance
+        sigma_RS^2 = Rogers-Satchell intraday variance
+        k = 0.34 / (1.34 + (n+1)/(n-1))
+
+    Args:
+        price_series: List of (timestamp, price) tuples, sorted by time.
+        bar_seconds: Bar duration in seconds (default 1 hour).
+
+    Returns:
+        float: Annualized volatility as decimal, or None if insufficient data.
+    """
+    if len(price_series) < 6:
+        return None
+
+    # Aggregate into OHLC bars
+    bars = []  # list of (open, high, low, close) dicts
+    current_bar_start = None
+    bar_open = bar_high = bar_low = bar_close = None
+
+    for ts, price in price_series:
+        bar_idx = int(ts // bar_seconds)
+        if current_bar_start is None or bar_idx != current_bar_start:
+            # Save previous bar
+            if current_bar_start is not None and bar_open is not None:
+                bars.append({"open": bar_open, "high": bar_high,
+                            "low": bar_low, "close": bar_close})
+            # Start new bar
+            current_bar_start = bar_idx
+            bar_open = price
+            bar_high = price
+            bar_low = price
+            bar_close = price
+        else:
+            bar_high = max(bar_high, price)
+            bar_low = min(bar_low, price)
+            bar_close = price
+
+    # Save last bar
+    if bar_open is not None:
+        bars.append({"open": bar_open, "high": bar_high,
+                    "low": bar_low, "close": bar_close})
+
+    n = len(bars)
+    if n < 3:
+        return None
+
+    # Compute log returns
+    log_open = [math.log(bars[i]["open"]) for i in range(n)]
+    log_close = [math.log(bars[i]["close"]) for i in range(n)]
+    log_high = [math.log(bars[i]["high"]) for i in range(n)]
+    log_low = [math.log(bars[i]["low"]) for i in range(n)]
+
+    # Overnight returns (open-to-open)
+    o_returns = [log_open[i] - log_open[i-1] for i in range(1, n)]
+    # Close-to-close returns
+    c_returns = [log_close[i] - log_close[i-1] for i in range(1, n)]
+
+    m = len(o_returns)
+    if m < 2:
+        return None
+
+    # Overnight variance
+    o_mean = sum(o_returns) / m
+    sigma_o2 = sum((r - o_mean) ** 2 for r in o_returns) / (m - 1)
+
+    # Close variance
+    c_mean = sum(c_returns) / m
+    sigma_c2 = sum((r - c_mean) ** 2 for r in c_returns) / (m - 1)
+
+    # Rogers-Satchell intraday variance
+    rs_terms = []
+    for i in range(n):
+        h = log_high[i] - log_open[i]
+        l = log_low[i] - log_open[i]
+        c = log_close[i] - log_open[i]
+        rs = h * (h - c) + l * (l - c)
+        rs_terms.append(rs)
+    sigma_rs2 = sum(rs_terms) / n if n > 0 else 0.0
+
+    # Yang-Zhang optimal k
+    k = 0.34 / (1.34 + (m + 1) / max(1, m - 1))
+
+    # Combined Yang-Zhang variance (per bar)
+    sigma_yz2 = sigma_o2 + k * sigma_c2 + (1 - k) * max(0.0, sigma_rs2)
+
+    if sigma_yz2 <= 0:
+        return None
+
+    # Annualize
+    bars_per_year = 365.25 * 86400 / bar_seconds
+    annualized = math.sqrt(sigma_yz2 * bars_per_year)
+    return max(0.10, min(3.0, annualized))
 
 
 def compute_realized_vol(asset, current_price=None, lookback_seconds=86400):
@@ -422,6 +646,160 @@ def apply_drift(drift, minutes_to_settle):
     return drift
 
 
+def get_regime_position_limit(regime, max_position=10):
+    """Compute regime-aware maximum position size.
+
+    Reduces position limits in high-vol and trending regimes where
+    the model is less reliable.
+
+    Args:
+        regime: Current regime string from RegimeDetector.
+        max_position: Base maximum position (contracts).
+
+    Returns:
+        int: Adjusted position limit.
+    """
+    regime_limits = {
+        "low_vol": 1.0,      # Full position in calm markets
+        "normal": 1.0,       # Full position in normal conditions
+        "high_vol": 0.50,    # Half position in high vol
+        "crisis": 0.25,      # Quarter position in crisis
+    }
+    mult = regime_limits.get(regime, 1.0)
+    return max(1, int(max_position * mult))
+
+
+def compute_model_shift(entry_prob, current_prob, shift_threshold=0.20):
+    """Detect significant model probability shift since trade entry.
+
+    A large probability shift suggests the model's assessment has changed
+    materially, potentially invalidating the original trade thesis.
+
+    Args:
+        entry_prob: Model probability at time of entry (0-1).
+        current_prob: Current model probability (0-1).
+        shift_threshold: Minimum shift (in probability points) to flag (default 20pp).
+
+    Returns:
+        dict with keys:
+            'shifted': bool - True if shift exceeds threshold
+            'shift_pp': float - Shift in probability points
+            'direction': str - "favorable" or "adverse" relative to the trade
+    """
+    shift = current_prob - entry_prob
+    abs_shift = abs(shift)
+    # A positive shift is favorable for yes-side trades, adverse for no-side
+    return {
+        "shifted": abs_shift > shift_threshold,
+        "shift_pp": round(shift * 100, 1),
+        "abs_shift_pp": round(abs_shift * 100, 1),
+        "direction": "favorable" if shift > 0 else "adverse" if shift < 0 else "flat",
+    }
+
+
+def select_order_price(side, yes_bid, yes_ask, no_ask, edge, model_fair_value_cents,
+                       max_spread=10):
+    """Select order price based on spread width for better execution.
+
+    For narrow spreads (<=max_spread): use ask price (maximize fill rate).
+    For wide spreads: use model fair value as limit price (avoid overpaying).
+
+    Args:
+        side: "yes" or "no".
+        yes_bid: Current yes bid in cents.
+        yes_ask: Current yes ask in cents.
+        no_ask: Current no ask in cents.
+        edge: Model edge (decimal).
+        model_fair_value_cents: Model's estimate of fair value in cents.
+        max_spread: Maximum spread (cents) for market orders.
+
+    Returns:
+        int: Order price in cents, or None if no valid price.
+    """
+    yes_bid = yes_bid or 0
+    yes_ask = yes_ask or 0
+    no_ask = no_ask or 0
+
+    if side == "yes":
+        if not yes_ask or yes_ask <= 0:
+            return None
+        spread = yes_ask - yes_bid if yes_bid > 0 else 999
+        if spread <= max_spread:
+            # Narrow spread: take the ask for fill rate
+            return yes_ask
+        else:
+            # Wide spread: use limit price at model fair value
+            # Ensure we don't bid above the ask (would be market order)
+            limit = min(model_fair_value_cents, yes_ask)
+            # And not below the bid (would never fill)
+            if yes_bid > 0:
+                limit = max(limit, yes_bid + 1)
+            return max(1, min(99, limit))
+    else:
+        if not no_ask or no_ask <= 0:
+            # Derive from yes side
+            if yes_bid > 0:
+                no_ask = 100 - yes_bid
+            else:
+                return None
+        no_bid = 100 - yes_ask if yes_ask > 0 else 0
+        spread = no_ask - no_bid if no_bid > 0 else 999
+        if spread <= max_spread:
+            return no_ask
+        else:
+            no_fair = 100 - model_fair_value_cents
+            limit = min(no_fair, no_ask)
+            if no_bid > 0:
+                limit = max(limit, no_bid + 1)
+            return max(1, min(99, limit))
+
+
+def apply_kelly_multipliers(base_count, multipliers, floor_pct=0.25):
+    """Apply multiple Kelly fraction multipliers with a floor to prevent stack crushing.
+
+    The crypto bot applies several multiplicative reductions to base Kelly:
+    CI multiplier, regime multiplier, correlation multiplier. Without a floor,
+    the product can crush positions to <1/64th of optimal.
+
+    Args:
+        base_count: Base contract count from Kelly sizing.
+        multipliers: List of multiplier floats (each in [0, 1+]).
+        floor_pct: Minimum combined multiplier as fraction of base (default 25%).
+
+    Returns:
+        int: Adjusted contract count, at least floor_pct * base_count (if base > 0).
+    """
+    combined = 1.0
+    for m in multipliers:
+        combined *= m
+    # Floor: never crush below floor_pct of the base
+    combined = max(floor_pct, combined)
+    result = int(base_count * combined)
+    return max(0, result)
+
+
+def compute_correlation_multiplier(max_positive_corr):
+    """Compute Kelly multiplier based on maximum positive cross-asset correlation.
+
+    Only POSITIVE correlation (concentration risk) should reduce position size.
+    Negative correlation is a diversification benefit and should not be penalized.
+
+    Args:
+        max_positive_corr: Maximum positive pairwise correlation with other assets.
+            Should be >= 0 (negative correlations are filtered out before calling).
+
+    Returns:
+        float: Multiplier in [0.1, 1.0]. Applied to Kelly fraction.
+            corr <= 0.5 -> 1.0 (no reduction)
+            corr = 0.75 -> 0.85
+            corr = 1.0  -> 0.70
+    """
+    if max_positive_corr <= 0.5:
+        return 1.0
+    raw = 1.0 - 0.3 * (max_positive_corr - 0.5) / 0.5
+    return max(0.1, min(1.0, raw))
+
+
 # === Scanning ===
 
 def scan_and_trade():
@@ -440,20 +818,21 @@ def scan_and_trade():
         ss.finalize()
         return
 
-    # Fetch spot prices
+    # Fetch spot prices (with fallback to Binance if Coinbase fails)
     log.info("\nFetching crypto prices...")
     spot_prices = {}
     for asset in ["BTC", "ETH", "SOL", "DOGE", "XRP"]:
-        price = fetch_coinbase_spot(asset)
-        if price:
+        try:
+            price, source = get_spot_price(asset, health_monitor=health)
             spot_prices[asset] = price
-            health.record_source_success("coinbase")
-        else:
+            log.debug(f"  {asset} spot from {source}: ${price:,.2f}")
+        except RuntimeError:
             health.record_source_error("coinbase", f"{asset} spot unavailable")
+            health.record_source_error("binance", f"{asset} spot unavailable")
 
     if not spot_prices:
         log.info("No spot prices available, skipping scan.")
-        ss.source_fail("coinbase", "no spot prices")
+        ss.source_fail("all_price_sources", "no spot prices")
         ss.finalize()
         return
 
@@ -648,7 +1027,6 @@ def scan_and_trade():
         prob = filtered_est.prob  # use filtered probability for edge computation
 
         yes_ask = m.get("yes_ask", 0) or 0
-        yes_ask = m.get("yes_ask", 0) or 0
         no_ask = m.get("no_ask", 0) or 0
         yes_bid = m.get("yes_bid", 0) or 0
 
@@ -772,20 +1150,20 @@ def scan_and_trade():
         regime_mult = regime_kelly_multiplier(regime_detector)
 
         # Correlation adjustment: reduce if heavily correlated with existing positions
+        # Only penalize POSITIVE correlation (concentration risk).
+        # Negative correlation = diversification benefit, not penalized.
         corr_mult = 1.0
         corr_matrix = dcc_tracker.correlation_matrix()
         if corr_matrix is not None:
-            max_corr = 0.0
+            max_pos_corr = 0.0
             for other_asset in spot_prices:
                 if other_asset != opp["asset"]:
                     rho = dcc_tracker.pair_correlation(opp["asset"], other_asset)
-                    if rho is not None:
-                        max_corr = max(max_corr, abs(rho))
-            if max_corr > 0.5:
-                corr_mult = 1.0 - 0.3 * (max_corr - 0.5) / 0.5
+                    if rho is not None and rho > 0:  # Only positive correlation = risk
+                        max_pos_corr = max(max_pos_corr, rho)
+            corr_mult = compute_correlation_multiplier(max_pos_corr)
 
-        combined_mult = kelly_mult * regime_mult * corr_mult
-        count = max(0, int(count * combined_mult))
+        count = apply_kelly_multipliers(count, [kelly_mult, regime_mult, corr_mult], floor_pct=0.25)
 
         if count <= 0:
             ss.skip("kelly_zero")

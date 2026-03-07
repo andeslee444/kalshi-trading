@@ -450,3 +450,47 @@ class TestAR1NegativeVol:
         forecast = ar1.forecast()
         # Should return long_run (0.50) since all identical -> den=0
         assert forecast == 0.50
+
+
+class TestNoOpinionDetection:
+    """Ensemble model should detect when all sub-models hit the floor/ceiling."""
+
+    def test_deep_otm_is_no_opinion(self):
+        """BTC at 80k, threshold 200k (far OTM) -> all models hit floor -> no opinion."""
+        from crypto_models import EnsembleModel
+        model = EnsembleModel()
+        result = model.is_no_opinion(
+            current_price=80000, threshold=200000, direction="above",
+            time_horizon_minutes=60, vol=0.50,
+        )
+        assert result is True, "Far OTM should be no-opinion"
+
+    def test_deep_itm_is_no_opinion(self):
+        """BTC at 80k, threshold 40k (deep ITM) -> all models hit ceiling -> no opinion."""
+        from crypto_models import EnsembleModel
+        model = EnsembleModel()
+        result = model.is_no_opinion(
+            current_price=80000, threshold=40000, direction="above",
+            time_horizon_minutes=60, vol=0.50,
+        )
+        assert result is True, "Deep ITM should be no-opinion"
+
+    def test_atm_is_not_no_opinion(self):
+        """ATM market should have a real opinion."""
+        from crypto_models import EnsembleModel
+        model = EnsembleModel()
+        result = model.is_no_opinion(
+            current_price=80000, threshold=80000, direction="above",
+            time_horizon_minutes=1440, vol=0.50,
+        )
+        assert result is False, "ATM should have an opinion"
+
+    def test_moderately_otm_is_not_no_opinion(self):
+        """Moderately OTM should still have an opinion."""
+        from crypto_models import EnsembleModel
+        model = EnsembleModel()
+        result = model.is_no_opinion(
+            current_price=80000, threshold=85000, direction="above",
+            time_horizon_minutes=1440, vol=0.50,
+        )
+        assert result is False, "Moderate OTM should have an opinion"

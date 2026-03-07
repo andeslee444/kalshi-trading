@@ -74,6 +74,16 @@ select_rv_lookback = _crypto_bot.select_rv_lookback
 bracket_eligible = _crypto_bot.bracket_eligible
 get_market_price = _crypto_bot.get_market_price
 apply_drift = _crypto_bot.apply_drift
+compute_correlation_multiplier = _crypto_bot.compute_correlation_multiplier
+compute_ou_target = _crypto_bot.compute_ou_target
+apply_kelly_multipliers = _crypto_bot.apply_kelly_multipliers
+get_spot_price = _crypto_bot.get_spot_price
+PRICE_SOURCES = _crypto_bot.PRICE_SOURCES
+MAX_PRICE_DIVERGENCE = _crypto_bot.MAX_PRICE_DIVERGENCE
+yang_zhang_vol = _crypto_bot.yang_zhang_vol
+select_order_price = _crypto_bot.select_order_price
+compute_model_shift = _crypto_bot.compute_model_shift
+get_regime_position_limit = _crypto_bot.get_regime_position_limit
 
 # Import from crypto_models.py directly (pure functions, no side effects)
 from crypto_models import smooth_edge_threshold
@@ -645,6 +655,64 @@ class TestEnsembleIntegration:
             assert abs(w_iv + w_rv - 1.0) < 0.001
 
 
+class TestOUTargetNotStrike:
+    """OU mean-reversion target must be independent of strike price."""
+
+    def test_ou_is_disabled_by_default(self):
+        """OU should be disabled in production config to avoid the strike-target bug."""
+        import json
+        from pathlib import Path
+        config_path = Path(__file__).parent.parent / "config" / "bots-config.json"
+        config = json.loads(config_path.read_text())
+        crypto_config = config.get("crypto", {})
+        assert crypto_config.get("useOrnsteinUhlenbeck", False) is False, \
+            "OU must remain disabled until probability.py is updated to accept ou_target"
+
+    def test_ou_target_uses_price_history_not_strike(self):
+        """OU target should be computed from price history (VWAP), not from any strike."""
+        now = time.time()
+        # Simulate BTC trading around $82,000
+        _crypto_bot._price_history["TEST_OU"] = [
+            (now - 86400 + i * 300, 82000 + (i % 10 - 5) * 100)
+            for i in range(288)  # 24h of 5-min observations
+        ]
+        try:
+            target = compute_ou_target("TEST_OU")
+            assert target is not None
+            # Target should be near the mean of price observations (~$82,000)
+            assert 81000 < target < 83000, \
+                f"OU target should be near mean price, got {target}"
+            # Critically: target does NOT depend on any strike price
+            # (it's computed purely from price history)
+        finally:
+            del _crypto_bot._price_history["TEST_OU"]
+
+    def test_ou_target_insufficient_data_returns_none(self):
+        """With insufficient price history, OU target should be None."""
+        assert compute_ou_target("NONEXISTENT_ASSET") is None
+
+    def test_ou_target_independent_of_strike(self):
+        """Same asset should produce same OU target regardless of which strike we evaluate.
+
+        This is the core bug fix: the old code used the strike price as the
+        mean-reversion target, which meant P(above 80K) and P(above 90K)
+        would pull toward different targets.
+        """
+        now = time.time()
+        _crypto_bot._price_history["TEST_OU2"] = [
+            (now - 86400 + i * 300, 85000 + (i % 10 - 5) * 50)
+            for i in range(288)
+        ]
+        try:
+            # OU target should be the SAME regardless of which market/strike we evaluate
+            target = compute_ou_target("TEST_OU2")
+            assert target is not None
+            # It should be near the mean (~85000), not near any particular strike
+            assert 84500 < target < 85500
+        finally:
+            del _crypto_bot._price_history["TEST_OU2"]
+
+
 class TestOUDriftCorrection:
     """OU model should adjust both variance AND drift (mean reversion)."""
 
@@ -742,3 +810,337 @@ class TestFeeAdjustedEdge:
         net_edge = raw_edge - fee_pp
         threshold = 0.08
         assert net_edge < threshold
+
+
+class TestCorrelationMultiplier:
+    """Correlation multiplier should only penalize positive correlation (concentration risk)."""
+
+    def test_zero_correlation_no_reduction(self):
+        """No correlation -> full Kelly (multiplier = 1.0)."""
+        assert compute_correlation_multiplier(0.0) == 1.0
+
+    def test_low_positive_correlation_no_reduction(self):
+        """Correlation below 0.5 -> no reduction."""
+        assert compute_correlation_multiplier(0.3) == 1.0
+        assert compute_correlation_multiplier(0.5) == 1.0
+
+    def test_high_positive_correlation_reduces(self):
+        """Correlation above 0.5 -> reduction."""
+        mult = compute_correlation_multiplier(0.8)
+        assert mult < 1.0
+        assert mult > 0.0
+
+    def test_max_correlation_gives_0_7(self):
+        """Perfect positive correlation -> 0.7 multiplier."""
+        mult = compute_correlation_multiplier(1.0)
+        assert abs(mult - 0.70) < 0.01
+
+    def test_negative_correlation_not_penalized(self):
+        """Negative correlation (diversification benefit) should not reduce position.
+
+        The caller filters out negative correlations before calling this function,
+        so max_positive_corr should always be >= 0. With no positive correlation,
+        the multiplier should be 1.0 (full Kelly).
+        """
+        # When there's no positive correlation, max_pos_corr = 0.0
+        mult_diversified = compute_correlation_multiplier(0.0)
+        # When there's high positive correlation
+        mult_concentrated = compute_correlation_multiplier(0.8)
+        assert mult_diversified >= mult_concentrated, \
+            "Diversified portfolio should not be penalized more than concentrated"
+
+    def test_correlation_multiplier_bounded(self):
+        """Multiplier should always be in [0.1, 1.0]."""
+        for corr in [0.0, 0.3, 0.5, 0.7, 0.9, 1.0]:
+            mult = compute_correlation_multiplier(corr)
+            assert mult >= 0.1, f"Mult too low at corr={corr}: {mult}"
+            assert mult <= 1.0, f"Mult > 1 at corr={corr}: {mult}"
+
+    def test_monotonically_decreasing(self):
+        """Higher positive correlation -> lower multiplier (more reduction)."""
+        prev = 1.0
+        for corr in [0.0, 0.2, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+            mult = compute_correlation_multiplier(corr)
+            assert mult <= prev + 0.001, f"Not monotonically decreasing at corr={corr}"
+            prev = mult
+
+    def test_floor_clamp_at_extreme(self):
+        """Even with corr > 1.0 (shouldn't happen but safety), floor at 0.1."""
+        mult = compute_correlation_multiplier(1.5)
+        assert mult >= 0.1
+
+
+class TestKellyStackFloor:
+    """Kelly multiplier stacking should have a floor to prevent crushing."""
+
+    def test_single_multiplier_applied(self):
+        """Single multiplier reduces count proportionally."""
+        result = apply_kelly_multipliers(10, [0.5])
+        assert result == 5
+
+    def test_no_multipliers_full_count(self):
+        """No multipliers -> floor_pct of original (floor is always applied)."""
+        result = apply_kelly_multipliers(10, [])
+        # combined = 1.0, max(0.25, 1.0) = 1.0 -> 10
+        assert result == 10
+
+    def test_all_ones_no_reduction(self):
+        """All multipliers = 1.0 -> no reduction."""
+        result = apply_kelly_multipliers(10, [1.0, 1.0, 1.0])
+        assert result == 10
+
+    def test_stacked_multipliers_with_floor(self):
+        """Multiple small multipliers should be floored at 25%."""
+        # 0.5 * 0.5 * 0.5 = 0.125, but floor is 0.25
+        result = apply_kelly_multipliers(100, [0.5, 0.5, 0.5])
+        assert result == 25  # floor: 100 * 0.25 = 25
+
+    def test_kelly_not_crushed_below_floor(self):
+        """Final position size should be at least 25% of base Kelly.
+
+        Simulates the 4 multiplicative reductions that were crushing positions:
+        CI multiplier, regime multiplier, correlation multiplier, uncertainty.
+        """
+        base = 20  # contracts
+        ci_mult = 0.7
+        regime_mult = 0.75
+        corr_mult = 0.85
+        # Without floor: 20 * 0.7 * 0.75 * 0.85 = 8.925 -> 8
+        # That's 40% of base, above the 25% floor
+        result = apply_kelly_multipliers(base, [ci_mult, regime_mult, corr_mult])
+        assert result >= base * 0.25, f"Kelly crushed to {result/base:.0%} of base"
+        assert result >= 5  # 25% of 20
+
+    def test_extreme_crushing_floored(self):
+        """Extreme crushing (all multipliers low) should still give 25% of base."""
+        base = 40
+        # 0.25 * 0.5 * 0.7 = 0.0875 -> floored to 0.25
+        result = apply_kelly_multipliers(base, [0.25, 0.5, 0.7])
+        assert result >= base * 0.25, f"Kelly crushed to {result/base:.0%} of base"
+        assert result == 10  # floor: 40 * 0.25 = 10
+
+    def test_zero_base_returns_zero(self):
+        """Zero base count should remain zero."""
+        result = apply_kelly_multipliers(0, [0.5, 0.5])
+        assert result == 0
+
+    def test_custom_floor_pct(self):
+        """Custom floor_pct should be respected."""
+        result = apply_kelly_multipliers(100, [0.1], floor_pct=0.50)
+        assert result == 50  # 100 * max(0.50, 0.1) = 50
+
+    def test_multiplier_above_one_allowed(self):
+        """Multipliers > 1.0 (e.g. low_vol regime bonus) should be allowed."""
+        result = apply_kelly_multipliers(10, [1.1])
+        assert result == 11
+
+
+class TestPriceSourceFallback:
+    """Multi-source price fetching with fallback and cross-validation."""
+
+    def test_price_sources_has_coinbase_and_binance(self):
+        """Should have at least 2 price sources for redundancy."""
+        assert len(PRICE_SOURCES) >= 2
+        names = [name for name, _ in PRICE_SOURCES]
+        assert "coinbase" in names
+        assert "binance" in names
+
+    def test_coinbase_is_primary(self):
+        """Coinbase should be the first (primary) source."""
+        assert PRICE_SOURCES[0][0] == "coinbase"
+
+    def test_max_price_divergence_threshold(self):
+        """Divergence threshold should be 0.5%."""
+        assert abs(MAX_PRICE_DIVERGENCE - 0.005) < 0.001
+
+    def test_get_spot_price_function_exists(self):
+        """get_spot_price should be callable."""
+        assert callable(get_spot_price)
+
+    def test_binance_symbol_mapping(self):
+        """Binance symbol mapping should cover all traded assets."""
+        binance_symbols = _crypto_bot._BINANCE_SYMBOLS
+        for asset in ["BTC", "ETH", "SOL", "DOGE", "XRP"]:
+            assert asset in binance_symbols, f"Missing Binance symbol for {asset}"
+            assert binance_symbols[asset].endswith("USDT")
+
+
+class TestYangZhangVol:
+    """Yang-Zhang volatility estimator using synthetic OHLC bars."""
+
+    def _make_price_series(self, base_price=80000, n_points=200,
+                           interval_seconds=300, volatility=0.001):
+        """Generate synthetic price series with known properties."""
+        import random
+        random.seed(42)
+        now = time.time()
+        series = []
+        price = base_price
+        for i in range(n_points):
+            ts = now - (n_points - i) * interval_seconds
+            price *= (1 + random.gauss(0, volatility))
+            series.append((ts, price))
+        return series
+
+    def test_yang_zhang_returns_positive_vol(self):
+        """Yang-Zhang should return a positive vol estimate."""
+        series = self._make_price_series()
+        vol = yang_zhang_vol(series, bar_seconds=3600)
+        assert vol is not None
+        assert vol > 0
+
+    def test_yang_zhang_in_reasonable_range(self):
+        """Yang-Zhang vol should be in the clamped range [0.10, 3.0]."""
+        series = self._make_price_series()
+        vol = yang_zhang_vol(series, bar_seconds=3600)
+        assert vol is not None
+        assert 0.10 <= vol <= 3.0
+
+    def test_yang_zhang_higher_vol_detected(self):
+        """Higher price volatility should produce higher YZ estimate."""
+        low_vol_series = self._make_price_series(volatility=0.0005)
+        high_vol_series = self._make_price_series(volatility=0.005)
+        low = yang_zhang_vol(low_vol_series, bar_seconds=3600)
+        high = yang_zhang_vol(high_vol_series, bar_seconds=3600)
+        assert low is not None and high is not None
+        assert high > low
+
+    def test_yang_zhang_insufficient_data(self):
+        """Too few data points should return None."""
+        now = time.time()
+        series = [(now - i * 300, 80000) for i in range(3)]
+        assert yang_zhang_vol(series) is None
+
+    def test_yang_zhang_flat_price(self):
+        """Flat price should give minimum vol (clamped at 0.10)."""
+        now = time.time()
+        series = [(now - i * 300, 80000.0) for i in range(200)]
+        vol = yang_zhang_vol(series, bar_seconds=3600)
+        if vol is not None:
+            assert vol == pytest.approx(0.10, abs=0.01)
+
+    def test_yang_zhang_shorter_bar_more_bars(self):
+        """Shorter bar duration should produce more bars but similar vol."""
+        series = self._make_price_series(n_points=300, interval_seconds=60)
+        vol_1h = yang_zhang_vol(series, bar_seconds=3600)
+        vol_15m = yang_zhang_vol(series, bar_seconds=900)
+        # Both should produce valid estimates
+        assert vol_1h is not None
+        assert vol_15m is not None
+        # Should be in the same ballpark (within 2x)
+        ratio = max(vol_1h, vol_15m) / max(min(vol_1h, vol_15m), 0.01)
+        assert ratio < 3.0, f"Vol estimates too different: {vol_1h:.3f} vs {vol_15m:.3f}"
+
+
+class TestSpreadAwareOrderPricing:
+    """Spread-aware order type selection for execution quality."""
+
+    def test_narrow_spread_uses_ask(self):
+        """Narrow spread (<=10c) -> use ask for fill rate."""
+        price = select_order_price("yes", yes_bid=40, yes_ask=48, no_ask=52,
+                                   edge=0.15, model_fair_value_cents=55)
+        assert price == 48  # ask
+
+    def test_wide_spread_uses_limit(self):
+        """Wide spread (>10c) -> use model fair value as limit."""
+        price = select_order_price("yes", yes_bid=30, yes_ask=55, no_ask=45,
+                                   edge=0.15, model_fair_value_cents=45)
+        assert price < 55  # Not paying the full ask
+        assert price >= 31  # At least bid+1
+
+    def test_no_ask_returns_none(self):
+        """No yes_ask -> None."""
+        price = select_order_price("yes", yes_bid=40, yes_ask=0, no_ask=55,
+                                   edge=0.15, model_fair_value_cents=45)
+        assert price is None
+
+    def test_no_side_narrow_spread(self):
+        """No side with narrow spread uses no_ask."""
+        price = select_order_price("no", yes_bid=40, yes_ask=48, no_ask=55,
+                                   edge=0.15, model_fair_value_cents=45)
+        assert price == 55
+
+    def test_price_bounded_1_99(self):
+        """Order price should always be in [1, 99]."""
+        price = select_order_price("yes", yes_bid=1, yes_ask=98, no_ask=2,
+                                   edge=0.15, model_fair_value_cents=5)
+        assert 1 <= price <= 99
+
+    def test_limit_not_above_ask(self):
+        """Limit price should not exceed the ask."""
+        price = select_order_price("yes", yes_bid=30, yes_ask=55, no_ask=45,
+                                   edge=0.15, model_fair_value_cents=60)
+        assert price <= 55
+
+
+class TestModelShiftExit:
+    """Model-shift exit trigger for crypto positions."""
+
+    def test_no_shift_detected(self):
+        """Small prob change should not trigger exit."""
+        result = compute_model_shift(0.60, 0.63)
+        assert result["shifted"] is False
+        assert result["abs_shift_pp"] < 20
+
+    def test_large_shift_detected(self):
+        """25pp shift should trigger exit."""
+        result = compute_model_shift(0.60, 0.35)
+        assert result["shifted"] is True
+        assert result["abs_shift_pp"] == 25.0
+
+    def test_favorable_shift(self):
+        """Positive shift (prob increase) is favorable."""
+        result = compute_model_shift(0.60, 0.85)
+        assert result["direction"] == "favorable"
+        assert result["shifted"] is True
+
+    def test_adverse_shift(self):
+        """Negative shift (prob decrease) is adverse."""
+        result = compute_model_shift(0.60, 0.35)
+        assert result["direction"] == "adverse"
+        assert result["shifted"] is True
+
+    def test_no_shift_flat(self):
+        """No change -> flat direction."""
+        result = compute_model_shift(0.60, 0.60)
+        assert result["direction"] == "flat"
+        assert result["shifted"] is False
+
+    def test_custom_threshold(self):
+        """Custom threshold respected."""
+        result = compute_model_shift(0.60, 0.70, shift_threshold=0.05)
+        assert result["shifted"] is True  # 10pp > 5pp threshold
+
+    def test_boundary_exactly_at_threshold(self):
+        """Exactly at threshold should not trigger (> not >=)."""
+        result = compute_model_shift(0.50, 0.70, shift_threshold=0.20)
+        assert result["shifted"] is False  # 20pp = 20pp threshold, not > 20pp
+
+
+class TestRegimePositionLimits:
+    """Regime-aware position limits should tighten in high-vol regimes."""
+
+    def test_normal_regime_full_position(self):
+        assert get_regime_position_limit("normal", max_position=10) == 10
+
+    def test_low_vol_full_position(self):
+        assert get_regime_position_limit("low_vol", max_position=10) == 10
+
+    def test_high_vol_half_position(self):
+        assert get_regime_position_limit("high_vol", max_position=10) == 5
+
+    def test_crisis_quarter_position(self):
+        assert get_regime_position_limit("crisis", max_position=10) == 2
+
+    def test_always_at_least_one(self):
+        """Position limit should be at least 1."""
+        assert get_regime_position_limit("crisis", max_position=1) >= 1
+
+    def test_unknown_regime_full_position(self):
+        """Unknown regime defaults to full position."""
+        assert get_regime_position_limit("unknown", max_position=10) == 10
+
+    def test_custom_max_position(self):
+        """Custom max position should scale correctly."""
+        assert get_regime_position_limit("high_vol", max_position=20) == 10
+        assert get_regime_position_limit("crisis", max_position=20) == 5

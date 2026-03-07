@@ -86,7 +86,13 @@ class GARCHForecaster:
     sigma^2_{t+1} = omega + alpha * epsilon^2_t + beta * sigma^2_t
 
     Uses simple recursive updates (no MLE fitting — that's in calibrate-crypto.py).
+    Includes a variance ceiling to prevent post-crash vol explosion.
     """
+
+    # Maximum annualized vol (200%). Prevents GARCH from producing
+    # unreasonably high vol after flash crashes, which would cause the
+    # model to skip all trades for hours.
+    MAX_ANNUALIZED_VOL = 2.0
 
     def __init__(self, omega=0.000002, alpha=0.10, beta=0.85, min_observations=10):
         self._omega = omega
@@ -97,6 +103,20 @@ class GARCHForecaster:
         self._intervals = []  # observation intervals in seconds
         self._sigma2 = None  # Current conditional variance
         self._sigma2_history = []  # For vol-of-vol computation
+
+    def _max_sigma2(self):
+        """Compute maximum per-observation variance from the annualized vol ceiling.
+
+        Returns the per-step variance ceiling. Uses median interval to convert
+        from annualized to per-step, or falls back to assuming 5-min intervals.
+        """
+        median_dt = self._median_interval_seconds()
+        if median_dt and median_dt > 0:
+            intervals_per_year = 365.25 * 86400 / median_dt
+        else:
+            # Assume 5-min intervals (crypto default scan) as fallback
+            intervals_per_year = 365.25 * 24 * 12
+        return (self.MAX_ANNUALIZED_VOL ** 2) / intervals_per_year
 
     def update(self, log_return, interval_seconds=None):
         """Update with a new log return observation.
@@ -115,6 +135,9 @@ class GARCHForecaster:
             # Initialize with sample variance — do NOT apply recursion yet
             self._sigma2 = sum(r ** 2 for r in self._returns) / len(self._returns)
             self._sigma2 = max(1e-10, self._sigma2)
+            # Apply ceiling only if we have interval data to properly calibrate it
+            if self._intervals:
+                self._sigma2 = min(self._sigma2, self._max_sigma2())
             self._sigma2_history.append(self._sigma2)
             return
 
@@ -125,6 +148,9 @@ class GARCHForecaster:
             + self._beta * self._sigma2
         )
         self._sigma2 = max(1e-10, self._sigma2)  # floor
+        # Ceiling: prevent post-crash vol explosion (only when interval tracked)
+        if self._intervals:
+            self._sigma2 = min(self._sigma2, self._max_sigma2())
         self._sigma2_history.append(self._sigma2)
         if len(self._sigma2_history) > 500:
             self._sigma2_history = self._sigma2_history[-500:]
@@ -147,21 +173,30 @@ class GARCHForecaster:
                 intervals tracked.
 
         Returns:
-            float (annualized vol) or None if insufficient data.
+            float (annualized vol capped at MAX_ANNUALIZED_VOL, or per-obs vol)
+            or None if insufficient data.
         """
         if self._sigma2 is None:
             return None
         vol = math.sqrt(self._sigma2)
 
+        annualized = False
         if use_actual_interval:
             median_dt = self._median_interval_seconds()
             if median_dt and median_dt > 0:
                 intervals_per_year = 365.25 * 86400 / median_dt
                 vol *= math.sqrt(intervals_per_year)
+                annualized = True
             elif annualize_factor is not None:
                 vol *= math.sqrt(annualize_factor)
+                annualized = True
         elif annualize_factor is not None:
             vol *= math.sqrt(annualize_factor)
+            annualized = True
+
+        # Cap annualized vol to prevent post-crash explosion
+        if annualized:
+            vol = min(vol, self.MAX_ANNUALIZED_VOL)
 
         return vol
 
