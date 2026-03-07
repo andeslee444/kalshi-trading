@@ -996,11 +996,12 @@ def cpi_nowcast_sigma(days_to_release, fed_ci_width=None):
 def gdp_nowcast_sigma(days_to_release):
     """Exponential decay for GDP nowcast uncertainty based on time to release.
 
-    Returns sigma in percentage points. Wider range than CPI (GDP is noisier).
-    floor=0.05 at release, range=0.15, k=0.12.
+    Returns sigma in percentage points. GDP is much noisier than CPI —
+    actual GDP forecast RMSE is 0.5-1.0 pp even close to release.
+    floor=0.15 at release, range=0.45, k=0.12.
 
-    sigma = 0.05 + 0.15 * (1 - exp(-0.12 * d))
-    d=0: 0.05, d=7: ~0.107, d=14: ~0.131, d=30: ~0.172
+    sigma = 0.15 + 0.45 * (1 - exp(-0.12 * d))
+    d=0: 0.15, d=7: ~0.41, d=14: ~0.52, d=30: ~0.59
     """
     cal = _load_calibration()
     gdp_cal = cal.get("gdp", {}).get("sigma_by_days", {})
@@ -1010,7 +1011,7 @@ def gdp_nowcast_sigma(days_to_release):
             return gdp_cal[key]
 
     d = max(0, days_to_release)
-    return 0.05 + 0.15 * (1 - math.exp(-0.12 * d))
+    return 0.15 + 0.45 * (1 - math.exp(-0.12 * d))
 
 
 def boxoffice_data_sigma(day_of_week, hours_since_publication=0):

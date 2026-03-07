@@ -624,8 +624,8 @@ class TestGdpNowcastSigma:
         _reset_calibration()
 
     def test_release_day_floor(self):
-        """At release day (d=0), sigma should be 0.05."""
-        assert gdp_nowcast_sigma(0) == 0.05
+        """At release day (d=0), sigma should be 0.15 (GDP is noisier than CPI)."""
+        assert gdp_nowcast_sigma(0) == pytest.approx(0.15, abs=0.01)
 
     def test_monotonically_increasing(self):
         """Sigma should increase with days to release."""
@@ -633,14 +633,24 @@ class TestGdpNowcastSigma:
         for i in range(len(sigmas) - 1):
             assert sigmas[i] <= sigmas[i + 1]
 
+    def test_day_7_range(self):
+        """At 7 days out, sigma should be ~0.40 pp (GDP forecast RMSE)."""
+        sigma = gdp_nowcast_sigma(7)
+        assert sigma >= 0.25, f"d=7 sigma={sigma} too tight, need >=0.25"
+
     def test_day_14_range(self):
-        """At 14 days out, sigma should be reasonable."""
+        """At 14 days out, sigma should be ~0.52 pp (GDP is noisy at 2 weeks)."""
         sigma = gdp_nowcast_sigma(14)
-        assert 0.10 <= sigma <= 0.18
+        assert sigma >= 0.40, f"d=14 sigma={sigma} too tight, need >=0.40"
+
+    def test_day_30_range(self):
+        """At 30 days out, sigma should approach ~0.57 pp."""
+        sigma = gdp_nowcast_sigma(30)
+        assert sigma >= 0.50, f"d=30 sigma={sigma} too tight, need >=0.50"
 
     def test_negative_days_use_floor(self):
         """Negative days should return the floor."""
-        assert gdp_nowcast_sigma(-1) == 0.05
+        assert gdp_nowcast_sigma(-1) == gdp_nowcast_sigma(0)
 
 
 # ===================================================================
@@ -752,3 +762,32 @@ class TestFedCiWidth:
         sigma = cpi_nowcast_sigma(0, fed_ci_width=0.05)
         # 0.05 / 3.29 ~ 0.0152, which is below the floor of 0.03
         assert sigma == pytest.approx(0.03, abs=0.001)
+
+
+# ===================================================================
+# Calibration Load Logging tests (Plan 1 Task 3)
+# ===================================================================
+
+class TestCalibrationLoadLogging:
+    def setup_method(self):
+        _reset_calibration()
+
+    def teardown_method(self):
+        _reset_calibration()
+
+    def test_corrupt_calibration_logs_actual_error(self, tmp_path, caplog):
+        import probability
+        import logging
+        original = probability._CALIBRATION_PATH
+        corrupt = tmp_path / "calibration.json"
+        corrupt.write_text("{invalid json")
+        probability._CALIBRATION_PATH = corrupt
+        probability._calibration = None
+        try:
+            with caplog.at_level(logging.WARNING):
+                probability._load_calibration()
+            assert any("calibration" in r.message.lower() for r in caplog.records
+                       if r.levelno >= logging.WARNING), \
+                "Should log WARNING with the actual parse error"
+        finally:
+            probability._CALIBRATION_PATH = original
