@@ -54,6 +54,7 @@
     }
   },
   "strategy": {
+    "enabled": false,
     "maxTradeAmount": 10,
     "maxTradeAmountPct": 0.02,
     "maxDailyTrades": 20,
