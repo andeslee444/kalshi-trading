@@ -25,6 +25,7 @@ sync_filters() {
   echo "--include=beatrelease-state.json"
   echo "--include=backtest-results.json"
   echo "--include=performance-metrics.json"
+  echo "--include=financial-snapshot.json"
   # Observability state files
   echo "--include=health-state.json"
   echo "--include=allocator-state.json"

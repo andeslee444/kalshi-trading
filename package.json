@@ -36,6 +36,7 @@
     "sync:down": "bash scripts/s3-sync.sh download",
     "sync:setup": "bash scripts/s3-sync.sh setup",
     "dashboard": "python3 scripts/dashboard.py",
+    "snapshot": "python3 scripts/pnl-snapshot.py",
     "backfill": "python3 scripts/backfill-settlements.py",
     "skip-audit": "python3 scripts/skip-audit.py",
     "daily": "bash scripts/daily-automation.sh",

@@ -53,11 +53,15 @@ python3 scripts/backfill-settlements.py >> "$LOG_FILE" 2>&1 || true
 echo "$(date): Running trade reconciliation..." >> "$LOG_FILE"
 python3 scripts/reconcile-trades.py >> "$LOG_FILE" 2>&1 || true
 
-# Step 3: Run daily report with WhatsApp notification
+# Step 3: Generate verified P&L snapshot
+echo "$(date): Generating P&L snapshot..." >> "$LOG_FILE"
+python3 scripts/pnl-snapshot.py >> "$LOG_FILE" 2>&1 || true
+
+# Step 4: Run daily report with WhatsApp notification
 echo "$(date): Running daily report..." >> "$LOG_FILE"
 python3 scripts/daily-report.py --notify --with-backtest >> "$LOG_FILE" 2>&1
 
-# Step 4: Run daily backtest with drift detection
+# Step 5: Run daily backtest with drift detection
 echo "$(date): Running daily backtest..." >> "$LOG_FILE"
 python3 scripts/daily-backtest.py >> "$LOG_FILE" 2>&1 || true
 
