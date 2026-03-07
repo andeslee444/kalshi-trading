@@ -77,6 +77,16 @@ cmd_upload() {
   acquire_lock
   echo "Uploading trade data to s3://${BUCKET}..."
 
+  # Pre-upload validation
+  echo "Running pre-upload validation..."
+  if ! python3 "$PROJECT_DIR/scripts/validate-sync-data.py"; then
+    echo "Upload blocked by validation. Use --force to override."
+    if [ "${2:-}" != "--force" ]; then
+      exit 1
+    fi
+    echo "WARNING: --force flag set, uploading despite validation failures"
+  fi
+
   # Sync data/ trade logs
   aws s3 sync "$PROJECT_DIR/data/" "s3://${BUCKET}/data/" \
     $(sync_filters)
