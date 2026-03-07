@@ -719,6 +719,8 @@ def calibrate_ensemble_weights(trades, settlement_map):
     model_errors = defaultdict(list)  # model_name -> [abs_error, ...]
     for m in matched:
         for model_name, temp in m["ensemble"].items():
+            if temp is None:
+                continue
             prob = weather_prob_with_sigma(temp, m["threshold"], m["direction"],
                                            sigma=2.0 + 0.5 * math.sqrt(m["days_out"]))
             error = abs(prob - m["actual"])

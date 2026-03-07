@@ -93,7 +93,7 @@
     "edgeThreshold": 0.08,
     "driftPct": 0.0,
     "settlementBufferMinutes": 1,
-    "useOrnsteinUhlenbeck": true,
+    "useOrnsteinUhlenbeck": false,
     "ouHalfLifeMinutes": 120,
     "enableBrackets": true,
     "pfProcessNoise": 0.005,
@@ -110,11 +110,11 @@
     }
   },
   "economics": {
-    "maxTradeAmount": 15,
-    "maxTradeAmountPct": 0.02,
+    "maxTradeAmount": 50,
+    "maxTradeAmountPct": 0.05,
     "maxDailyTrades": 15,
-    "maxDailyLoss": 75,
-    "maxDailyLossPct": 0.05,
+    "maxDailyLoss": 300,
+    "maxDailyLossPct": 0.15,
     "scanIntervalMinutes": 360,
     "edgeThreshold": 0.08,
     "gasEdgeThreshold": 0.04,
@@ -164,7 +164,7 @@
     "absoluteDailyLossCapPct": 0.15,
     "perBotDailyLimit": {
       "weather": 200,
-      "economics": 100,
+      "economics": 300,
       "crypto": 150,
       "strategy": 150,
       "monitor": 100,
