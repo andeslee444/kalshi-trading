@@ -6,7 +6,7 @@ Strategies: Longshot bias selling, maker-only limit orders, info arbitrage near 
 import json, time, datetime, os, sys, math, argparse, statistics
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log, _atomic_write_json, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log, _atomic_write_json, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
 from probability import quarter_kelly_sell, quarter_kelly, half_kelly, longshot_edge, compute_limit_price, kalshi_fee_cents, classify_ticker_category
 from capital_allocator import PortfolioAllocator
 from strategy_engine import (

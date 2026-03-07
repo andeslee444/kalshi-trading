@@ -54,8 +54,35 @@ BOT_COMMANDS = {
 DAEMON_BOTS = {"weather", "crypto", "economics", "positions", "monitor", "beatrelease", "arb", "entertainment"}
 ONESHOT_BOTS = {"strategy", "hdd"}
 
-# Disabled by default (can be started explicitly)
-DISABLED_BY_DEFAULT = {"mm", "demo", "entertainment", "beatrelease", "arb", "strategy"}
+# Bots that are always disabled (no config entry, experimental, or unsafe)
+_ALWAYS_DISABLED = {"mm", "demo"}
+
+def _load_disabled_bots():
+    """Read bots-config.json to determine which bots are disabled.
+
+    Bots with "enabled": false are disabled. Bots without an "enabled" field
+    are assumed enabled (core bots like weather/crypto don't have one).
+    Falls back to a safe default set if config is unreadable.
+    """
+    # Config key mapping (some config keys differ from bot names)
+    CONFIG_KEY = {"arb": "cross_platform_arb", "mm": "market_maker"}
+    config_path = PROJECT_DIR / "config" / "bots-config.json"
+    fallback = {"mm", "demo", "entertainment", "beatrelease", "arb", "strategy"}
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+        disabled = set(_ALWAYS_DISABLED)
+        for name in BOT_COMMANDS:
+            cfg_key = CONFIG_KEY.get(name, name)
+            bot_cfg = config.get(cfg_key, {})
+            if isinstance(bot_cfg, dict) and "enabled" in bot_cfg and not bot_cfg["enabled"]:
+                disabled.add(name)
+        return disabled
+    except Exception as e:
+        log.warning(f"Could not read bots-config.json: {e} — using fallback disabled set")
+        return fallback
+
+DISABLED_BY_DEFAULT = _load_disabled_bots()
 
 # Crash rate limiting
 MAX_CRASHES = 5
@@ -594,8 +621,17 @@ class Supervisor:
             if kill_switch_active:
                 continue
 
-            # SIGHUP reload — restart all bots with new code
+            # SIGHUP reload — re-read config and restart all bots with new code
             if self._reload_requested:
+                global DISABLED_BY_DEFAULT
+                old_disabled = DISABLED_BY_DEFAULT
+                DISABLED_BY_DEFAULT = _load_disabled_bots()
+                newly_enabled = old_disabled - DISABLED_BY_DEFAULT
+                newly_disabled = DISABLED_BY_DEFAULT - old_disabled
+                if newly_enabled:
+                    log.info(f"Config reload: newly enabled bots: {', '.join(sorted(newly_enabled))}")
+                if newly_disabled:
+                    log.info(f"Config reload: newly disabled bots: {', '.join(sorted(newly_disabled))}")
                 log.info("Reloading: stopping all bots...")
                 self.stop_bots()
                 log.info("Reloading: starting all bots with new code...")
