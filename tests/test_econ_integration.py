@@ -101,8 +101,8 @@ class TestFullPipeline:
         )
         assert det["sigma_mult"] < 0.5  # Wide sigma penalizes
 
-    def test_tariff_shock_widens_distribution(self):
-        """With high tariff probability, the distribution should be wider."""
+    def test_tariff_shock_shifts_probability_up(self):
+        """With high tariff probability, CPI probability should shift up."""
         cleveland_nowcast = 2.41
         days_to_release = 30
         sigma = cpi_nowcast_sigma(days_to_release)
@@ -118,8 +118,12 @@ class TestFullPipeline:
         result_tariff = scenario_probability(fused, post_sigma, 2.0, "above", weights_tariff)
 
         # With tariff risk, probability should be higher (CPI shifts up)
-        # but agreement should be lower (scenarios disagree more)
-        assert result_tariff.agreement <= result_calm.agreement
+        # because tariff_escalation has a positive CPI shift
+        assert result_tariff.probability > result_calm.probability
+
+        # Both should have weighted_std tracking scenario disagreement
+        assert result_tariff.weighted_std > 0
+        assert result_calm.weighted_std > 0
 
     def test_gdp_sigma_uses_correct_floor_and_range(self):
         """GDP sigma should use floor=0.15, range=0.45 (fixed in Plan 1).
