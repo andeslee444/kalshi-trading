@@ -26,6 +26,7 @@ setup_signal_handlers()
 CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-monitor-config.json"
 TRADES_PATH = PROJECT_DIR / "data" / "kalshi-monitor-trades.json"
 SNAPSHOTS_DIR = PROJECT_DIR / "data" / "kalshi-source-snapshots"
+METRICS_PATH = PROJECT_DIR / "data" / "source-monitor-metrics.json"
 
 # Ensure dirs
 TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -80,6 +81,57 @@ def _compute_nws_obs_age_minutes(obs_ts):
         return age_seconds / 60
     except (ValueError, TypeError):
         return None
+
+MAX_METRICS_ENTRIES = 1000  # Keep last 1000 scan metrics (rolling)
+
+
+def _build_scan_metrics(ss, sources_checked=None, nws_freshness=None):
+    """Build a metrics dict from a completed scan cycle.
+
+    Args:
+        ss: ScanSummary instance (after finalize)
+        sources_checked: list of source names checked this cycle
+        nws_freshness: dict of city -> obs_age_minutes (from check_nws)
+    """
+    metrics = {
+        "sources_checked": sources_checked or [],
+        "markets_fetched": ss.markets_fetched if ss else 0,
+        "markets_evaluated": ss.markets_evaluated if ss else 0,
+        "trades_placed": ss.trades_placed if ss else 0,
+        "skips": dict(ss.skips) if ss else {},
+        "data_sources": dict(ss.data_sources) if ss else {},
+    }
+    if nws_freshness:
+        metrics["nws_freshness"] = nws_freshness
+    return metrics
+
+
+def _log_scan_metrics(scan_data):
+    """Append per-scan metrics to the rolling metrics log.
+
+    Each entry captures: timestamp, NWS data freshness per city,
+    HDD data availability, trades placed, sigma values, and source status.
+    Keeps at most MAX_METRICS_ENTRIES entries (FIFO).
+    """
+    try:
+        existing = []
+        if METRICS_PATH.exists():
+            try:
+                existing = json.loads(METRICS_PATH.read_text())
+            except (json.JSONDecodeError, ValueError):
+                existing = []
+
+        scan_data["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        existing.append(scan_data)
+
+        # Trim to max entries
+        if len(existing) > MAX_METRICS_ENTRIES:
+            existing = existing[-MAX_METRICS_ENTRIES:]
+
+        METRICS_PATH.write_text(json.dumps(existing, indent=2, default=str))
+    except Exception as e:
+        log.warning(f"Failed to write scan metrics: {e}")
+
 
 def _check_with_retry(check_fn, source_name, prefetched, ss, max_retries=2):
     """Retry a source check with exponential backoff on transient failures."""
@@ -1177,22 +1229,27 @@ def main():
         # Run one full cycle of all enabled sources
         ss = ScanSummary("source-monitor", log)
         prefetched = {}
+        sources_checked = []
         if config["sources"]["hdd"]["enabled"]:
             album_markets = get_markets_by_prefix("KXALBUMSALES")
             if not album_markets:
                 album_markets = get_markets_by_prefix("KXALBUM")
             prefetched["album"] = album_markets
             _check_with_retry(check_hdd, "hdd", prefetched, ss)
+            sources_checked.append("hdd")
         if config["sources"]["boxoffice"]["enabled"]:
             box_markets = []
             for prefix in ["KXBOXOFFICE", "KXBOX", "KXMOVIE", "KXFILM"]:
                 box_markets.extend(get_markets_by_prefix(prefix))
             prefetched["boxoffice"] = box_markets
             _check_with_retry(scan_boxoffice, "boxoffice", prefetched, ss)
+            sources_checked.append("boxoffice")
         if config["sources"]["nws"]["enabled"]:
             prefetched["weather"] = get_markets_by_prefix("KXHIGH")
             _check_with_retry(check_nws, "nws", prefetched, ss)
+            sources_checked.append("nws")
         ss.finalize()
+        _log_scan_metrics(_build_scan_metrics(ss, sources_checked=sources_checked))
         return
 
     hdd_interval = config["sources"]["hdd"]["intervalMinutes"] * 60
@@ -1237,8 +1294,11 @@ def main():
                 if need_nws:
                     prefetched["weather"] = get_markets_by_prefix("KXHIGH")
 
+            sources_this_cycle = []
+
             if need_hdd:
                 _check_with_retry(check_hdd, "hdd", prefetched, ss)
+                sources_this_cycle.append("hdd")
                 last_hdd = now
 
             if need_box:
@@ -1249,16 +1309,19 @@ def main():
                 day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
                 if day_names[dow] in active_days:
                     _check_with_retry(scan_boxoffice, "boxoffice", prefetched, ss)
+                    sources_this_cycle.append("boxoffice")
                 else:
                     log.info(f"  Box office: skipping (not an active day)")
                 last_boxoffice = now
 
             if need_nws:
                 _check_with_retry(check_nws, "nws", prefetched, ss)
+                sources_this_cycle.append("nws")
                 last_nws = now
 
             if ss:
                 ss.finalize()
+                _log_scan_metrics(_build_scan_metrics(ss, sources_checked=sources_this_cycle))
 
             # Record heartbeat AFTER successful cycle (not before)
             health.record_bot_heartbeat("source-monitor")

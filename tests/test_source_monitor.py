@@ -625,3 +625,124 @@ class TestNWSEdgeThresholdBoundaries:
         for hour in [8, 12, 15, 18]:
             edge = sm._nws_min_edge(90, 80, hour, False)
             assert edge == 0.05, f"Expected 0.05 at hour {hour} with 10F margin"
+
+
+class TestScanMetrics:
+    """Test the per-scan measurement framework.
+
+    Metrics are logged to data/source-monitor-metrics.json for
+    observability of NWS freshness, source availability, and trade activity.
+    """
+
+    def test_build_scan_metrics_basic(self):
+        """_build_scan_metrics should produce a dict with expected keys."""
+        sm = _load_source_monitor()
+        mock_ss = MagicMock()
+        mock_ss.markets_fetched = 10
+        mock_ss.markets_evaluated = 5
+        mock_ss.trades_placed = 2
+        mock_ss.skips = {"low_edge": 3}
+        mock_ss.data_sources = {"nws": "ok"}
+
+        metrics = sm._build_scan_metrics(mock_ss, sources_checked=["nws", "hdd"])
+        assert metrics["sources_checked"] == ["nws", "hdd"]
+        assert metrics["markets_fetched"] == 10
+        assert metrics["markets_evaluated"] == 5
+        assert metrics["trades_placed"] == 2
+        assert metrics["skips"] == {"low_edge": 3}
+        assert metrics["data_sources"] == {"nws": "ok"}
+
+    def test_build_scan_metrics_with_nws_freshness(self):
+        """NWS freshness data should be included when provided."""
+        sm = _load_source_monitor()
+        mock_ss = MagicMock()
+        mock_ss.markets_fetched = 0
+        mock_ss.markets_evaluated = 0
+        mock_ss.trades_placed = 0
+        mock_ss.skips = {}
+        mock_ss.data_sources = {}
+
+        freshness = {"MIA": 12.5, "LAX": 45.0}
+        metrics = sm._build_scan_metrics(mock_ss, nws_freshness=freshness)
+        assert metrics["nws_freshness"] == {"MIA": 12.5, "LAX": 45.0}
+
+    def test_build_scan_metrics_no_nws_freshness(self):
+        """When no NWS freshness, key should be absent."""
+        sm = _load_source_monitor()
+        mock_ss = MagicMock()
+        mock_ss.markets_fetched = 0
+        mock_ss.markets_evaluated = 0
+        mock_ss.trades_placed = 0
+        mock_ss.skips = {}
+        mock_ss.data_sources = {}
+
+        metrics = sm._build_scan_metrics(mock_ss)
+        assert "nws_freshness" not in metrics
+
+    def test_build_scan_metrics_none_ss(self):
+        """With ss=None, should return safe defaults."""
+        sm = _load_source_monitor()
+        metrics = sm._build_scan_metrics(None)
+        assert metrics["markets_fetched"] == 0
+        assert metrics["trades_placed"] == 0
+        assert metrics["skips"] == {}
+
+    def test_log_scan_metrics_creates_file(self):
+        """_log_scan_metrics should create the metrics file if absent."""
+        sm = _load_source_monitor()
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_path = sm.METRICS_PATH
+            sm.METRICS_PATH = Path(tmpdir) / "test-metrics.json"
+            try:
+                sm._log_scan_metrics({"test": True})
+                assert sm.METRICS_PATH.exists()
+                data = json.loads(sm.METRICS_PATH.read_text())
+                assert len(data) == 1
+                assert data[0]["test"] is True
+                assert "timestamp" in data[0]
+            finally:
+                sm.METRICS_PATH = original_path
+
+    def test_log_scan_metrics_appends(self):
+        """_log_scan_metrics should append to existing entries."""
+        sm = _load_source_monitor()
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_path = sm.METRICS_PATH
+            sm.METRICS_PATH = Path(tmpdir) / "test-metrics.json"
+            try:
+                sm._log_scan_metrics({"scan": 1})
+                sm._log_scan_metrics({"scan": 2})
+                data = json.loads(sm.METRICS_PATH.read_text())
+                assert len(data) == 2
+                assert data[0]["scan"] == 1
+                assert data[1]["scan"] == 2
+            finally:
+                sm.METRICS_PATH = original_path
+
+    def test_log_scan_metrics_trims_to_max(self):
+        """_log_scan_metrics should trim to MAX_METRICS_ENTRIES."""
+        sm = _load_source_monitor()
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_path = sm.METRICS_PATH
+            original_max = sm.MAX_METRICS_ENTRIES
+            sm.METRICS_PATH = Path(tmpdir) / "test-metrics.json"
+            sm.MAX_METRICS_ENTRIES = 5  # Small for testing
+            try:
+                for i in range(10):
+                    sm._log_scan_metrics({"scan": i})
+                data = json.loads(sm.METRICS_PATH.read_text())
+                assert len(data) == 5
+                # Should keep the last 5
+                assert data[0]["scan"] == 5
+                assert data[4]["scan"] == 9
+            finally:
+                sm.METRICS_PATH = original_path
+                sm.MAX_METRICS_ENTRIES = original_max
+
+    def test_metrics_path_constant(self):
+        """METRICS_PATH should point to data/source-monitor-metrics.json."""
+        sm = _load_source_monitor()
+        assert sm.METRICS_PATH.name == "source-monitor-metrics.json"
