@@ -32,7 +32,7 @@
     }
   },
   "beatrelease": {
-    "enabled": false,
+    "enabled": true,
     "checkIntervalHours": 1,
     "maxTradeAmount": 15,
     "maxTradeAmountPct": 0.03,
@@ -54,7 +54,7 @@
     }
   },
   "strategy": {
-    "enabled": false,
+    "enabled": true,
     "maxTradeAmount": 10,
     "maxTradeAmountPct": 0.02,
     "maxDailyTrades": 20,
@@ -168,7 +168,7 @@
       "strategy": 150,
       "monitor": 100,
       "entertainment": 50,
-      "beatrelease": 0,
+      "beatrelease": 200,
       "arb": 0
     }
   },

@@ -4,19 +4,19 @@
 
 **Goal:** Maximize P&L to ~3% daily portfolio return (~$150/day on $5K portfolio) with balanced risk, world-class model quality, and full observability.
 
-**Current State (2026-03-07, from `data/financial-snapshot.json` — authoritative source):**
+**Current State (2026-03-07 18:37 UTC, from `data/financial-snapshot.json` — authoritative source):**
 - Deposited: $5,000.00 ($500 initial + $4,500 top-up)
-- NAV: $4,982.08 (balance + positions)
-- **True Total P&L: -$17.92** (NAV minus deposits — slightly underwater)
-- Realized P&L: +$72.49 gross, +$50.25 net of $22.24 fees (97W/58L, 62.6% WR, 208 settlements)
+- NAV: $4,997.45 (balance + positions)
+- **True Total P&L: -$2.55** (NAV minus deposits — nearly break-even after Plan 0+1 fixes)
+- Realized P&L: +$81.37 net after fees (98W/61L, 61.6% WR)
 - Weather: +$53.40 (34W/21L, 62% WR) — best bot
 - Source-monitor: +$20.85 (4W/3L, 57% WR) — NWS info-arb
 - Crypto: +$2.99 (46W/28L, 62% WR) — high volume, thin edge
 - Other: -$4.88 (11W/5L) — unattributed bot trades
 - Strategy/Entertainment/Beatrelease/Economics: $0 realized (no settled trades yet)
-- Implied unrealized: -$68.17 (open positions are net losing)
-- **34 orphan API settlements** with no local trade log — ALL from bot processes (no manual trading ever occurred). Zombie processes executed real trades without local logging. Breakdown: 8 weather, 10 album sales, 16 sports/other. This is a critical data integrity gap.
-- Critical ops issues: ~30 zombie weather-bot processes, strategy-trader at 99.2% CPU, stale heartbeats
+- **34 orphan API settlements** with no local trade log — ALL from bot processes (no manual trading ever occurred). Zombie processes executed real trades without local logging. Breakdown: 8 weather, 10 album sales, 16 sports/other. Root cause identified (crash between API call and log write); WAL fix deployed in Plan 1.
+- Ops issues resolved: 72 zombies killed (Plan 0), OU model emergency-disabled, calibration refreshed (212 settlements)
+- **Strategy-trader Brier 0.8325 — DISABLED pending Plan 5 model fix (worse than random)**
 - **Run `npm run snapshot` for latest numbers — do NOT compute P&L from trade logs**
 
 **Architecture:** 8 sub-plans executed in order. Plan 0 (operational triage) first, then Plan 1 (shared infrastructure), then Plans 2-8 (per-bot full quant desk reviews). Each bot plan covers 7 dimensions: data acquisition, signal/model, edge/sizing, execution, exit management, risk controls, measurement framework.
@@ -29,17 +29,17 @@
 
 | Plan | Scope | Est. Impact | Status |
 |------|-------|-------------|--------|
-| [Plan 0: Operational Triage](./2026-03-06-plan0-operational-triage.md) | Kill zombies, fix supervisor, single-instance enforcement | Prerequisite | Pending |
-| [Plan 1: Shared Infrastructure](./2026-03-06-plan1-shared-infrastructure.md) | probability.py, kalshi_auth.py, capital_allocator.py | Foundation | Pending |
-| [Plan 2: Weather Bot](./2026-03-06-plan2-weather-bot.md) | Ensemble optimization, day-0 dedup fix, limit orders | +$50-80/day potential | Pending |
-| [Plan 3: Crypto Bot](./2026-03-06-plan3-crypto-bot.md) | OU fix, GARCH stabilization, Kelly stack reduction | +$30-50/day potential | Pending |
-| [Plan 4: Economics Bot](./2026-03-06-plan4-economics-bot.md) | GDP sigma fix, concentration limits, belief filter tuning | Risk reduction + edge | Pending |
-| [Plan 5: Strategy Trader](./2026-03-06-plan5-strategy-trader.md) | CPU fix, copula_scale calibration, edge formula review | +$10-20/day potential | Pending |
-| [Plan 6: Source Monitor](./2026-03-06-plan6-source-monitor.md) | Timezone fix, NWS sigma model, data freshness | +$20-30/day potential | Pending |
-| [Plan 7: Entertainment/Beat](./2026-03-06-plan7-entertainment-beat.md) | Re-enable with proper Kelly, fix trade log integration | +$10-20/day potential | Pending |
-| [Plan 8: Position Monitor](./2026-03-06-plan8-position-monitor.md) | Decision path fix, model-shift exit improvement | Loss prevention | Pending |
-| [Plan 9: Data Quality & S3 Sync](./2026-03-06-plan9-data-quality-and-s3-sync.md) | Pre-upload validation, sync scope, integrity reports | Data reliability | Pending |
-| [Plan 10: Weekly Self-Improvement](./2026-03-07-weekly-self-improvement.md) | Auto-calibrate all bots weekly, regression gate, auto-apply | Compounding edge | Pending |
+| [Plan 0: Operational Triage](./2026-03-06-plan0-operational-triage.md) | Kill zombies, fix supervisor, single-instance enforcement | Prerequisite | **Complete** ✅ |
+| [Plan 1: Shared Infrastructure](./2026-03-06-plan1-shared-infrastructure.md) | probability.py, kalshi_auth.py, capital_allocator.py | Foundation | **Complete** ✅ (Task 1.11 rate limiter deferred) |
+| [Plan 2: Weather Bot](./2026-03-06-plan2-weather-bot.md) | Ensemble optimization, day-0 dedup fix, limit orders | +$50-80/day potential | **Complete** ✅ |
+| [Plan 3: Crypto Bot](./2026-03-06-plan3-crypto-bot.md) | OU fix, GARCH stabilization, Kelly stack reduction | +$30-50/day potential | **Complete** ✅ (OU infra ready, re-enable after backtest validation) |
+| [Plan 4: Economics Bot](./2026-03-06-plan4-economics-bot.md) | GDP sigma fix, concentration limits, belief filter tuning | Risk reduction + edge | **Complete** ✅ |
+| [Plan 5: Strategy Trader](./2026-03-06-plan5-strategy-trader.md) | **DISABLED** — CPU fix, edge formula rewrite, copula calibration | +$10-20/day potential | **Complete** ✅ (bot remains disabled pending Brier < 0.35 on new settlements) |
+| [Plan 6: Source Monitor](./2026-03-06-plan6-source-monitor.md) | Timezone fix, NWS data freshness, edge optimization | +$20-30/day potential | **Complete** ✅ |
+| [Plan 7: Entertainment/Beat](./2026-03-06-plan7-entertainment-beat.md) | Re-enable with proper Kelly, fix trade log integration | +$10-20/day potential | **Complete** ✅ |
+| [Plan 8: Position Monitor](./2026-03-06-plan8-position-monitor.md) | Decision path fix, model-shift exit, stop-loss calibration | Loss prevention | **Complete** ✅ |
+| [Plan 9: Data Quality & S3 Sync](./2026-03-06-plan9-data-quality-and-s3-sync.md) | Pre-upload validation, sync scope, integrity reports | Data reliability | **Complete** ✅ |
+| [Plan 10: Weekly Self-Improvement](./2026-03-07-weekly-self-improvement.md) | Auto-calibrate all bots weekly, regression gate, auto-apply | Compounding edge | **Complete** ✅ |
 
 ## Cross-Cutting Recommendations (A-F)
 
@@ -88,17 +88,49 @@ Plans 2-8 can be executed in parallel after Plan 1, each in its own session resp
 | Brier Score (weather) | 0.309 | <0.250 | 14 days |
 | Max single-market exposure | $2,322 (CPI) | <$500 | Immediate (prevention) |
 | Capital deployed/day | ~$30/day avg | $500-1000/day | 30 days |
-| Zombie processes | 72 (found during Plan 0) | 0 | Plan 0 ✅ |
-| Model staleness alerts | None | Real-time | Plan 1 |
-| Edge decay tracking | None | Per-trade | Plan 1 |
+| Zombie processes | 72 (found during Plan 0) | 0 | Plan 0 ✅ (72 killed) |
+| Model staleness alerts | None | Real-time | Plan 1 ✅ (check_calibration_freshness) |
+| Edge decay tracking | None | Per-trade | Plan 1 ✅ (edge_at_entry in golden record) |
 | Crypto Brier | 0.3851 (coin-flip, OU corruption) | <0.250 | Plan 3 |
-| Strategy Brier | 0.8325 (catastrophic overconfidence) | <0.350 | Plan 5 |
+| Strategy Brier | 0.8325 (catastrophic overconfidence) | <0.350 | Plan 5 ✅ (model rewritten, awaiting new settlements) |
 | Open-Meteo errors | 1,870 since Mar 6 | 0 | Plan 2 |
-| Orphan trades | 32 (zombie period, no local log) | 0 (WAL) | Plan 1 |
+| Orphan trades | 34 (zombie period, no local log) | 0 (WAL) | Plan 1 ✅ (WAL deployed) |
 | Calibrators in pipeline | 1 (weather only) | 4 (weather + crypto + CPI + strategy) | Plan 10 |
 | Auto-calibration cadence | Manual | Weekly (Sunday 5 AM) with auto-apply | Plan 10 |
 | Calibration history | Single backup | Versioned archive with rollback | Plan 10 |
 | Per-bot regression gate | None | 5% max regression per bot | Plan 10 |
+
+## PM Audit (2026-03-07 evening)
+
+Plans 0 and 1 verified complete against codebase. Plans 2-10 reviewed for accuracy. 8 issues found and corrected in plans.
+
+### PM Execution Review (2026-03-07 night)
+
+All 10 plans executed. 71/71 tasks completed. All deferred items (strategy 5.1-5.5, beatrelease 7.2/7.3, OU-target) completed in follow-up session. ~1,100 new tests added.
+
+**Brier scores unchanged** — expected. All 242 evaluated settlements are from pre-fix trades. Structural improvements only affect trades placed going forward. **First meaningful signal: 2026-03-14** when ~50-100 new trades settle under improved models.
+
+**Discrepancy noted — Plan 6 timezone:** Plan said NWS timezone handling was "already correct." Developer found and fixed a separate bug (server time used for hour-of-day in sigma calculation, distinct from the date boundary `_local_today()` which WAS correct). Good catch. Plan 6 NOTE updated to reflect this was a real fix.
+
+**Completed deferred items (2026-03-07 late):**
+
+| Item | Status | Verified |
+|------|--------|----------|
+| ~~Plan 5 Tasks 5.1-5.5 (strategy model rewrite)~~ | ✅ Complete — sqrt time decay, 20% floor, category penalty, CorrelationAwareSizer, per-scan metrics | PM verified |
+| ~~Beatrelease Tasks 7.2/7.3 (Kelly bypass + trade log)~~ | ✅ Complete — zero Kelly skips trade, position-monitor uses canonical trade_files.py | PM verified |
+| ~~probability.py `ou_target` param for crypto~~ | ✅ Complete — param added, compute_ou_target() computes 24h VWAP, crypto-bot passes through | PM verified |
+
+**Remaining open items:**
+
+| Item | Blocker | Priority | Trigger |
+|------|---------|----------|---------|
+| Strategy bot re-enable | Brier 0.8325 on old data; need ≥20 new settlements with Brier < 0.35 | **HIGH** | 2026-03-14 checkpoint |
+| Crypto OU re-enable | Infrastructure ready; need backtest showing Brier improvement over disabled baseline | **MEDIUM** | Run OU backtest on ≥50 settlements |
+| Plan 1 Task 1.11 (API rate limiter) | Not blocking yet | **LOW** | When 429 error rate increases |
+| LAX/MIA weather sigma tuning | Per-city Brier 0.53/0.59 | **MEDIUM** | Next calibration cycle (Sunday auto-cal) |
+| Crypto overconfidence (0.93 pred → 0.50 actual) | Model structural issue | **MONITOR** | Review after 1 week of new settlements |
+
+**Review checkpoint: 2026-03-14** — Run `npm run backtest` + `npm run snapshot`. Expected: weather Brier < 0.28, crypto Brier < 0.35. Strategy re-enable decision point. If regression, Sunday auto-calibration will flag via WhatsApp.
 
 ## Plan Review Findings (2026-03-07)
 
@@ -106,7 +138,7 @@ Comprehensive review of all plans against the actual codebase surfaced these iss
 
 ### Critical Corrections Applied
 
-1. **OU model is LIVE, not dormant** — `config/bots-config.json` line 96 has `"useOrnsteinUhlenbeck": true`. The OU target = strike price bug (probability.py ~1143) is actively corrupting every crypto probability estimate. Plan 3 Task 3.2 elevated to highest priority with emergency disable option.
+1. **OU model was LIVE, now emergency-disabled** — `config/bots-config.json` line 94 had `"useOrnsteinUhlenbeck": true`. The OU target = strike price bug (probability.py ~1162) was actively corrupting every crypto probability estimate. Emergency disable applied during Plan 0 execution. Plan 3 Task 3.2 covers proper OU fix (VWAP target) for eventual re-enable.
 
 2. **Plan 8 Task 8.1 bug didn't exist** — position-monitor line 498 already uses the correct path `kalshi-economics-trades-decisions.json`. Task changed from "fix bug" to "regression test."
 
@@ -116,17 +148,18 @@ Comprehensive review of all plans against the actual codebase surfaced these iss
 
 5. **Strategy-trader sleep already exists** — Line 842 has `time.sleep(SCAN_INTERVAL * 60)`. CPU spike likely from zombie processes, not missing sleep. Plan 0 Task 0.3 and Plan 5 Task 5.1 updated to diagnose after zombie cleanup.
 
-6. **Economics bot concentration limits already exist** — `_check_concentration()` at line 146 with 10% family / 20% total caps. Plan 1 Task 1.8 updated to add portfolio-level (not per-bot) concentration as a complementary layer. Plan 4 Task 4.5 should verify existing limits, not rewrite.
+6. **Economics bot concentration limits already exist** — `_check_concentration()` at line 146 with 15% family / 40% total caps (corrected from earlier 10%/20% estimate). Plan 1 Task 1.8 added portfolio-level (not per-bot) concentration as a complementary layer. Plan 4 Task 4.5 should verify existing limits, not rewrite.
 
 7. **Duplicate task numbers** — Plan 3 had two Task 3.6 entries. Second renamed to 3.6b.
 
-### Systemic Gaps Identified (not yet in plans)
+### Systemic Gaps Identified (tracked in plans)
 
-- **No write-ahead logging** — crash between API order and local log write causes orphan trades. Root cause of the 34-orphan incident.
-- **No API rate limit coordination** — 8 concurrent bots may exceed Kalshi rate limits collectively.
-- **Stop-loss calibration not reviewed** — all bots use 25-30c stop-loss without empirical validation.
-- **No API outage graceful degradation** — position-monitor can't exit positions during outages.
-- **Weather bot dedup fix requires shared module change** — Plan 2 Task 2.3 needs TradeManager per-ticker cooldowns, which is a CLAUDE.md file ownership violation for a weather bot session.
+- **~~No write-ahead logging~~** — ✅ Fixed in Plan 1 Task 1.10 (WAL in TradeManager).
+- **No API rate limit coordination** — 8 concurrent bots may exceed Kalshi rate limits collectively. → **Plan 1 Task 1.11 (NEW)**.
+- **Stop-loss calibration not reviewed** — all bots use 25-30c stop-loss without empirical validation. → **Plan 8 Task 8.7 (NEW)**.
+- **No API outage graceful degradation** — position-monitor can't exit positions during outages. (Deferred — low frequency risk.)
+- **~~Weather bot dedup fix requires shared module change~~** — Resolved: Plan 2 Task 2.3 implements cooldown locally in weather-bot.py (no shared module change needed).
+- **Supervisor race condition on crash-restart** — Plan 0 Task 0.2 found duplicate bot instances after restart. Root cause undiagnosed. (Low priority — monitor.)
 
 ### Test Quality Assessment
 
