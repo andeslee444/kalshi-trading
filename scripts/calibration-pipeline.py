@@ -43,15 +43,24 @@ MIN_SAMPLES = 10         # minimum trades before drift detection activates
 SUGGESTION_IMPROVEMENT_THRESHOLD = 0.05  # 5% Brier improvement required to generate suggestion
 
 # Calibration sections that may contain Brier scores
-CALIBRATION_SECTIONS = ["weather", "nws", "album_sales", "box_office", "ensemble"]
+CALIBRATION_SECTIONS = ["weather", "nws", "album_sales", "box_office", "ensemble", "cpi"]
 
 # (name, script_path, args, timeout_seconds)
-STAGES = [
+# Core stages run first and are required for the pipeline to proceed.
+STAGES_CORE = [
     ("reconcile", SCRIPTS_DIR / "reconcile-trades.py", [], 120),
     ("backfill",  SCRIPTS_DIR / "backfill-settlements.py", [], 180),
     ("backtest",  SCRIPTS_DIR / "backtest.py", ["--save"], 120),
-    ("calibrate", SCRIPTS_DIR / "calibrate-sigma.py", ["--json"], 300),
 ]
+
+# Calibration stages run independently -- if one fails, others still proceed.
+STAGES_CALIBRATE = [
+    ("calibrate_weather", SCRIPTS_DIR / "calibrate-sigma.py", ["--json"], 300),
+    ("calibrate_crypto",  SCRIPTS_DIR / "calibrate-crypto.py", ["--dry-run"], 300),
+    ("calibrate_cpi",     SCRIPTS_DIR / "calibrate-cpi-sigma.py", ["--json"], 120),
+]
+
+STAGES = STAGES_CORE + STAGES_CALIBRATE
 
 
 # ── Stage Runner ─────────────────────────────────────────────────────────────
@@ -92,15 +101,29 @@ def run_stage(name, script, args, timeout):
         }
 
 
-def run_pipeline():
+def run_pipeline(skip_stages=None):
     """Run all pipeline stages sequentially.
 
-    Returns dict with stages results and proposed_calibration (if available).
+    Returns dict with stages results, proposed_calibration (weather, backward compat),
+    and all_calibrations (all calibrate_* stage outputs).
+
+    skip_stages: optional set of stage names to skip (e.g., {"calibrate_strategy"}).
     """
     stages = {}
-    proposed_calibration = None
+    proposed_calibrations = {}
+    skip_stages = skip_stages or set()
 
     for name, script, args, timeout in STAGES:
+        if name in skip_stages:
+            log.info(f"Skipping stage: {name}")
+            stages[name] = {
+                "success": True,
+                "stdout": "",
+                "stderr": "skipped",
+                "duration_s": 0.0,
+            }
+            continue
+
         log.info(f"Running stage: {name}")
         result = run_stage(name, script, args, timeout)
         stages[name] = result
@@ -110,14 +133,21 @@ def run_pipeline():
         if not result["success"]:
             log.warning(f"  {name} stderr: {result['stderr'][:300]}")
 
-        # Parse calibrate stage JSON output
-        if name == "calibrate" and result["success"] and result["stdout"].strip():
+        # Parse JSON output from calibration stages
+        if name.startswith("calibrate_") and result["success"] and result["stdout"].strip():
             try:
-                proposed_calibration = json.loads(result["stdout"])
+                proposed_calibrations[name] = json.loads(result["stdout"])
             except (json.JSONDecodeError, ValueError):
-                log.warning("Could not parse calibrate JSON output")
+                log.warning(f"Could not parse {name} JSON output")
 
-    return {"stages": stages, "proposed_calibration": proposed_calibration}
+    # Merge weather calibration as the primary proposed_calibration (backward compat)
+    proposed_calibration = proposed_calibrations.get("calibrate_weather")
+
+    return {
+        "stages": stages,
+        "proposed_calibration": proposed_calibration,
+        "all_calibrations": proposed_calibrations,
+    }
 
 
 # ── Baseline Management ─────────────────────────────────────────────────────
