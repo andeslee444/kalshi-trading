@@ -456,3 +456,75 @@ class TestCalibrationHistory:
             assert len(list(history_dir.iterdir())) == 2
         finally:
             pipeline._atomic_write_json = orig
+
+
+# ---------------------------------------------------------------------------
+# Auto-Apply Decision Tests
+# ---------------------------------------------------------------------------
+
+class TestAutoApplyDecision:
+    """Tests for should_auto_apply() -- combined gate logic."""
+
+    def test_auto_apply_passes_all_gates(self, pipeline):
+        before = {"brier_score": 0.30, "per_bot": {"weather": {"brier_score": 0.28, "n_evaluated": 50}}}
+        after = {"brier_score": 0.27, "per_bot": {"weather": {"brier_score": 0.25, "n_evaluated": 50}}}
+        suggestion_eval = {"should_suggest": True, "aggregate_improvement_pct": 0.10}
+        should, reason = pipeline.should_auto_apply(before, after, suggestion_eval)
+        assert should, f"Should auto-apply when all gates pass: {reason}"
+
+    def test_auto_apply_blocked_by_regression(self, pipeline):
+        before = {"brier_score": 0.30, "per_bot": {"crypto": {"brier_score": 0.35, "n_evaluated": 30}}}
+        after = {"brier_score": 0.28, "per_bot": {"crypto": {"brier_score": 0.45, "n_evaluated": 30}}}
+        suggestion_eval = {"should_suggest": True, "aggregate_improvement_pct": 0.10}
+        should, reason = pipeline.should_auto_apply(before, after, suggestion_eval)
+        assert not should, "Should block when a bot regresses"
+
+    def test_auto_apply_blocked_by_no_suggestion(self, pipeline):
+        before = {"brier_score": 0.30, "per_bot": {}}
+        after = {"brier_score": 0.29, "per_bot": {}}
+        suggestion_eval = {"should_suggest": False, "aggregate_improvement_pct": 0.02}
+        should, reason = pipeline.should_auto_apply(before, after, suggestion_eval)
+        assert not should, "Should block when suggestion eval says no"
+
+
+# ---------------------------------------------------------------------------
+# Weekly Summary Tests
+# ---------------------------------------------------------------------------
+
+class TestFormatWeeklySummary:
+    """Tests for format_weekly_summary() -- weekly WhatsApp message format."""
+
+    def _make_stage_results(self):
+        return {
+            "reconcile": {"success": True, "duration_s": 1.0},
+            "backfill": {"success": True, "duration_s": 1.5},
+            "backtest": {"success": True, "duration_s": 0.5},
+            "calibrate_weather": {"success": True, "duration_s": 18.0},
+            "calibrate_crypto": {"success": False, "duration_s": 5.0},
+            "calibrate_cpi": {"success": True, "duration_s": 3.0},
+        }
+
+    def test_weekly_summary_auto_applied(self, pipeline):
+        stages = self._make_stage_results()
+        drift_findings = []
+        msg = pipeline.format_weekly_summary(stages, drift_findings, {}, True, "applied")
+        assert "Weekly Calibration" in msg
+        assert "AUTO-APPLIED" in msg
+        assert "weather: OK" in msg
+        assert "crypto: FAIL" in msg
+
+    def test_weekly_summary_skipped(self, pipeline):
+        stages = self._make_stage_results()
+        drift_findings = []
+        msg = pipeline.format_weekly_summary(stages, drift_findings, {}, False, "regression gate failed")
+        assert "skipped" in msg
+        assert "regression gate failed" in msg
+
+    def test_weekly_summary_with_drift(self, pipeline):
+        stages = self._make_stage_results()
+        drift_findings = [
+            {"entity": "MIA", "drifted": True, "baseline_brier": 0.25, "current_brier": 0.40},
+        ]
+        msg = pipeline.format_weekly_summary(stages, drift_findings, {}, False, "no suggestion")
+        assert "DRIFT" in msg
+        assert "MIA" in msg

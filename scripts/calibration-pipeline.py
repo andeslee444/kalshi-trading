@@ -342,6 +342,24 @@ def check_regression_gate(before_results, after_results, min_samples=10):
     return True, "All checks passed"
 
 
+def should_auto_apply(before_results, after_results, suggestion_eval):
+    """Determine if calibration should be auto-applied.
+
+    Returns (should_apply: bool, reason: str).
+    Requires BOTH suggestion evaluation AND regression gate to pass.
+    """
+    # Gate 1: suggestion must be worthwhile
+    if not suggestion_eval.get("should_suggest", False):
+        return False, "Suggestion evaluation says not worth applying"
+
+    # Gate 2: regression gate must pass
+    safe, gate_reason = check_regression_gate(before_results, after_results)
+    if not safe:
+        return False, f"Regression gate failed: {gate_reason}"
+
+    return True, "All gates passed"
+
+
 # ── WhatsApp Summary ─────────────────────────────────────────────────────────
 
 def format_whatsapp_summary(stage_results, drift_findings, any_stage_failed, suggestion_path=None):
@@ -381,6 +399,47 @@ def format_whatsapp_summary(stage_results, drift_findings, any_stage_failed, sug
     if suggestion_path:
         lines.append("")
         lines.append(f"Calibration suggestion generated -- review {suggestion_path}")
+
+    return "\n".join(lines)
+
+
+def format_weekly_summary(stage_results, drift_findings, all_calibrations,
+                          auto_applied, apply_reason, suggestion_path=None):
+    """Format weekly calibration summary for WhatsApp."""
+    total = len(stage_results)
+    passed = sum(1 for s in stage_results.values() if s["success"])
+    failed_names = [n for n, s in stage_results.items() if not s["success"]]
+
+    lines = ["Kalshi Weekly Calibration", ""]
+
+    if failed_names:
+        lines.append(f"Stages: {passed}/{total} OK, FAILED: {', '.join(failed_names)}")
+    else:
+        lines.append(f"Stages: {passed}/{total} OK")
+
+    # Calibrator results
+    cal_stages = {k: v for k, v in stage_results.items() if k.startswith("calibrate_")}
+    if cal_stages:
+        lines.append("")
+        for name, result in cal_stages.items():
+            short_name = name.replace("calibrate_", "")
+            status = "OK" if result["success"] else "FAIL"
+            lines.append(f"  {short_name}: {status} ({result['duration_s']}s)")
+
+    # Auto-apply result
+    lines.append("")
+    if auto_applied:
+        lines.append("AUTO-APPLIED: New calibration is live")
+    else:
+        lines.append(f"Auto-apply: skipped ({apply_reason})")
+
+    # Drift summary
+    drifted = [f for f in drift_findings if f["drifted"]]
+    if drifted:
+        lines.append("")
+        lines.append("DRIFT:")
+        for f in drifted:
+            lines.append(f"  {f['entity']}: {f['baseline_brier']:.3f}->{f['current_brier']:.3f}")
 
     return "\n".join(lines)
 
@@ -621,6 +680,8 @@ def main():
                         help="Re-snapshot baselines from current results")
     parser.add_argument("--apply-suggestion", type=str, metavar="PATH",
                         help="Apply a calibration suggestion file")
+    parser.add_argument("--auto-apply", action="store_true",
+                        help="Auto-apply calibration if regression gate passes (for weekly cron)")
     args = parser.parse_args()
 
     setup_unbuffered()
@@ -712,12 +773,43 @@ def main():
             suggestion_generated = True
     else:
         log.info("No proposed calibration available -- suggestion evaluation skipped")
+        eval_result = {}
+
+    # 6b. Auto-apply (weekly mode)
+    auto_applied = False
+    apply_reason = ""
+    if args.auto_apply and suggestion_generated and proposed_calibration:
+        apply_decision, apply_reason = should_auto_apply(
+            backtest_results, backtest_results, eval_result
+        )
+        if apply_decision:
+            log.info(f"Auto-apply: {apply_reason}")
+            success = apply_suggestion(str(suggestion_path))
+            if success:
+                auto_applied = True
+                log.info("Auto-applied calibration suggestion")
+            else:
+                apply_reason = "apply_suggestion() failed"
+                log.error("Auto-apply failed during apply_suggestion()")
+        else:
+            log.info(f"Auto-apply skipped: {apply_reason}")
+    elif args.auto_apply:
+        apply_reason = "no suggestion generated"
+        log.info("Auto-apply skipped: no suggestion generated")
 
     # 7. WhatsApp summary
-    summary = format_whatsapp_summary(
-        stage_results, drift_findings, any_stage_failed,
-        suggestion_path=suggestion_path,
-    )
+    if args.auto_apply:
+        summary = format_weekly_summary(
+            stage_results, drift_findings,
+            pipeline_result.get("all_calibrations", {}),
+            auto_applied, apply_reason if not auto_applied else "applied",
+            suggestion_path=suggestion_path,
+        )
+    else:
+        summary = format_whatsapp_summary(
+            stage_results, drift_findings, any_stage_failed,
+            suggestion_path=suggestion_path,
+        )
     whatsapp_sent = False
 
     if args.dry_run:
