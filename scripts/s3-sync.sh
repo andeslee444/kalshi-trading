@@ -156,10 +156,37 @@ cmd_download() {
   acquire_lock
   echo "Downloading trade data from s3://${BUCKET}..."
 
-  # Sync data/ trade logs (--size-only prevents overwriting newer local files
-  # when sizes match; for trade logs, more trades = larger file = newer)
+  # Check for local modifications that would be overwritten
+  echo "Checking for local changes..."
+  for f in $(python3 -c "
+import sys; sys.path.insert(0, '$PROJECT_DIR/src/kalshi')
+from trade_files import TRADE_FILES
+for tf in TRADE_FILES: print(tf['filename'])
+"); do
+    local_file="$PROJECT_DIR/data/$f"
+    if [ -f "$local_file" ]; then
+      local_mod=$(stat -f%m "$local_file" 2>/dev/null || stat -c%Y "$local_file" 2>/dev/null || echo 0)
+      remote_info=$(aws s3api head-object --bucket "$BUCKET" --key "data/$f" 2>/dev/null || true)
+      if [ -n "$remote_info" ]; then
+        remote_mod=$(echo "$remote_info" | python3 -c "
+import sys,json
+from datetime import datetime
+info = json.load(sys.stdin)
+dt = datetime.fromisoformat(info['LastModified'].replace('+00:00',''))
+print(int(dt.timestamp()))
+" 2>/dev/null || echo 0)
+        if [ "$local_mod" -gt "$remote_mod" ] 2>/dev/null; then
+          echo "WARNING: Local $f is newer than S3 — local changes will be preserved"
+        fi
+      fi
+    fi
+  done
+
+  # Sync data/ trade logs using --exact-timestamps for safer comparison
+  # (--size-only is fragile: truncation or reconciliation changes size without
+  # adding new trades, causing incorrect overwrite decisions)
   aws s3 sync "s3://${BUCKET}/data/" "$PROJECT_DIR/data/" \
-    $(sync_filters) --size-only
+    $(sync_filters) --exact-timestamps
 
   # Sync bot log files
   aws s3 sync "s3://${BUCKET}/data/logs/" "$PROJECT_DIR/data/logs/" \
