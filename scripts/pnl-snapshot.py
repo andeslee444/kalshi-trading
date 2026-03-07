@@ -87,8 +87,9 @@ def compute_realized_pnl(settlements):
 def compute_unrealized_pnl(positions, fills):
     """Compute unrealized P&L from open positions and historical fills.
 
-    Positions provide current market_exposure (value at current prices).
-    Fills provide cost basis (what was paid to enter).
+    WARNING: This calculation is unreliable. Kalshi's market_exposure field
+    returns cost basis, not current market value, so most positions show
+    unrealized = $0. Use balance_check.implied_unrealized_cents instead.
 
     Returns dict with total unrealized and per-position breakdown.
     """
@@ -170,14 +171,21 @@ def verify_settlements(api_settlements, local_trades):
         cost = _safe_int(s.get("yes_total_cost", 0)) + _safe_int(s.get("no_total_cost", 0))
         api_pnl_by_ticker[ticker] = revenue - cost
 
-    # Build local P&L by ticker (only where settlement_revenue_cents exists)
-    local_pnl_by_ticker = {}
+    # Build local P&L by ticker from settlement_result + cost_cents + count.
+    # NOTE: Do NOT use settlement_revenue_cents — it has inconsistent semantics
+    # (reconcile-trades.py stores gross payout, backfill-settlements.py stores
+    # net profit). Instead, derive P&L from settlement outcome directly.
+    local_pnl_by_ticker = defaultdict(int)
     for t in local_buy_trades:
         ticker = t.get("ticker", "")
-        sr = t.get("settlement_revenue_cents")
-        cost = t.get("cost_cents", 0) or 0
-        if sr is not None and ticker:
-            local_pnl_by_ticker[ticker] = sr - cost
+        result = t.get("settlement_result")
+        if result is not None and ticker:
+            count = t.get("count", 1) or 1
+            cost = t.get("cost_cents", 0) or 0
+            if result == "won":
+                local_pnl_by_ticker[ticker] += 100 * count - cost
+            elif result == "lost":
+                local_pnl_by_ticker[ticker] += -cost
 
     # Compare where both exist
     common_tickers = set(api_pnl_by_ticker) & set(local_pnl_by_ticker)
@@ -304,11 +312,18 @@ def build_snapshot(balance_cents, portfolio_value_cents, settlements, fills,
 
     realized["by_bot"] = dict(by_bot)
 
-    # ROI calculation if deposits tracked
+    nav_cents = balance_cents + portfolio_value_cents
+
+    # Balance check: derive true P&L from NAV vs deposits (ground truth).
+    # Kalshi's market_exposure field returns cost basis, not current value,
+    # so compute_unrealized_pnl is unreliable. The balance equation is authoritative.
+    balance_check = _build_balance_check(nav_cents, realized, deposits)
+
+    # ROI: use true total P&L (NAV - deposits) when available, not just realized
     if deposits.get("tracked") and deposits.get("net_funded_cents", 0) > 0:
-        deposits["roi_pct"] = round(
-            realized["total_cents"] / deposits["net_funded_cents"] * 100, 2
-        )
+        net_funded = deposits["net_funded_cents"]
+        true_total_pnl = nav_cents - net_funded
+        deposits["roi_pct"] = round(true_total_pnl / net_funded * 100, 2)
 
     return {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -316,12 +331,39 @@ def build_snapshot(balance_cents, portfolio_value_cents, settlements, fills,
         "account": {
             "balance_cents": balance_cents,
             "portfolio_value_cents": portfolio_value_cents,
-            "nav_cents": balance_cents + portfolio_value_cents,
+            "nav_cents": nav_cents,
         },
         "realized_pnl": realized,
         "unrealized_pnl": unrealized,
+        "balance_check": balance_check,
         "verification": verification,
         "deposits": deposits,
+    }
+
+
+def _build_balance_check(nav_cents, realized, deposits):
+    """Cross-check P&L using the balance equation: true_pnl = NAV - deposits.
+
+    Kalshi's market_exposure field returns cost basis, not current market value,
+    so compute_unrealized_pnl is unreliable. This function derives the true
+    unrealized P&L from the authoritative NAV and deposit data.
+    """
+    if not deposits.get("tracked"):
+        return {"available": False, "reason": "deposits not tracked"}
+
+    net_funded = deposits.get("net_funded_cents", 0)
+    realized_net = realized.get("net_after_fees_cents", 0)
+
+    true_total_pnl = nav_cents - net_funded
+    implied_unrealized = true_total_pnl - realized_net
+
+    return {
+        "available": True,
+        "nav_cents": nav_cents,
+        "net_funded_cents": net_funded,
+        "true_total_pnl_cents": true_total_pnl,
+        "realized_net_cents": realized_net,
+        "implied_unrealized_cents": implied_unrealized,
     }
 
 
@@ -332,7 +374,7 @@ def _infer_bot(ticker):
         return "weather"
     if t.startswith(("KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXXRP")):
         return "crypto"
-    if t.startswith(("KXCPI", "KXGDP", "KXJOBS", "KXFED")):
+    if t.startswith(("KXCPI", "KXGDP", "KXJOBS", "KXFED", "KXECONSTAT")):
         return "economics"
     if t.startswith(("KXALBUM", "KX1ALBUM")):
         return "entertainment"
@@ -372,11 +414,15 @@ def _load_local_trades():
 
 
 def _fetch_api_data():
-    """Fetch all required data from Kalshi API."""
+    """Fetch all required data from Kalshi API.
+
+    Raises RuntimeError if balance fetch fails (cannot produce valid snapshot).
+    Settlement/fill/position fetches log warnings on failure but continue.
+    """
     from kalshi_auth import KalshiClient, _atomic_write_json
     client = KalshiClient()
 
-    # Balance
+    # Balance (required — cannot produce snapshot without it)
     balance_data = client.get("/portfolio/balance")
     balance_cents = balance_data.get("balance", 0)
     portfolio_value_cents = balance_data.get("portfolio_value", 0)
@@ -388,7 +434,11 @@ def _fetch_api_data():
         path = "/portfolio/settlements?limit=100"
         if cursor:
             path += f"&cursor={cursor}"
-        data = client.get(path)
+        try:
+            data = client.get(path)
+        except Exception as e:
+            print(f"  WARNING: settlement fetch failed: {e}")
+            break
         batch = data.get("settlements", [])
         settlements.extend(batch)
         cursor = data.get("cursor")
@@ -402,7 +452,11 @@ def _fetch_api_data():
         path = "/portfolio/fills?limit=100"
         if cursor:
             path += f"&cursor={cursor}"
-        data = client.get(path)
+        try:
+            data = client.get(path)
+        except Exception as e:
+            print(f"  WARNING: fills fetch failed: {e}")
+            break
         batch = data.get("fills", [])
         fills.extend(batch)
         cursor = data.get("cursor")
@@ -410,9 +464,13 @@ def _fetch_api_data():
             break
 
     # Positions
-    pos_data = client.get("/portfolio/positions")
-    positions = [p for p in pos_data.get("market_positions", [])
-                 if p.get("position", 0) != 0]
+    try:
+        pos_data = client.get("/portfolio/positions")
+        positions = [p for p in pos_data.get("market_positions", [])
+                     if p.get("position", 0) != 0]
+    except Exception as e:
+        print(f"  WARNING: positions fetch failed: {e}")
+        positions = []
 
     return balance_cents, portfolio_value_cents, settlements, fills, positions
 
@@ -477,6 +535,16 @@ def main():
               f"{pnl['win_rate'] * 100:.1f}% WR)")
         print(f"Fees: ${pnl['total_fees_cents'] / 100:.2f}")
         print(f"NAV: ${snapshot['account']['nav_cents'] / 100:.2f}")
+
+        bc = snapshot.get("balance_check", {})
+        if bc.get("available"):
+            print(f"\nBalance Check (ground truth):")
+            print(f"  Deposits: ${bc['net_funded_cents'] / 100:.2f}")
+            print(f"  True Total P&L: ${bc['true_total_pnl_cents'] / 100:+.2f}")
+            print(f"  Realized (net): ${bc['realized_net_cents'] / 100:+.2f}")
+            print(f"  Implied Unrealized: ${bc['implied_unrealized_cents'] / 100:+.2f}")
+            if snapshot["deposits"].get("roi_pct") is not None:
+                print(f"  ROI: {snapshot['deposits']['roi_pct']:+.2f}%")
 
 
 if __name__ == "__main__":

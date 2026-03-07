@@ -25,6 +25,7 @@ from pnl_snapshot import (
     verify_settlements,
     build_snapshot,
     load_deposits,
+    _build_balance_check,
     _infer_bot,
     _safe_int,
 )
@@ -228,12 +229,12 @@ class TestVerifySettlements:
         )
         assert "KXLOCAL-999" in result["unmatched_local_trades"]
 
-    def test_pnl_agreement_check(self):
-        """API P&L matches local P&L when settlement_revenue_cents is set."""
+    def test_pnl_agreement_from_settlement_result(self):
+        """P&L computed from settlement_result + cost matches API P&L."""
+        # Won: payout = 100 * 4 = 400, cost = 200, P&L = +200
         local = [
             _make_local_trade(ticker="KXHIGHHOU-26MAR03-T75", cost_cents=200,
-                              settlement_result="won", settlement_revenue_cents=400,
-                              order_id="ord-1"),
+                              count=4, settlement_result="won", order_id="ord-1"),
         ]
         api = [
             _make_settlement(ticker="KXHIGHHOU-26MAR03-T75", revenue=400,
@@ -245,12 +246,59 @@ class TestVerifySettlements:
         assert pnl_check["status"] == "ok"
         assert pnl_check["delta_cents"] == 0
 
-    def test_pnl_disagreement_flagged(self):
-        """Mismatch between API and local P&L is flagged."""
+    def test_pnl_agreement_losing_trade(self):
+        """Lost trade: local P&L = -cost matches API P&L = 0 - cost."""
         local = [
-            _make_local_trade(ticker="KXHIGHHOU-26MAR03-T75", cost_cents=200,
-                              settlement_result="won", settlement_revenue_cents=350,
-                              order_id="ord-1"),
+            _make_local_trade(ticker="KXBTC-26MAR03-T95000", cost_cents=90,
+                              count=1, settlement_result="lost", order_id="ord-2"),
+        ]
+        api = [
+            _make_settlement(ticker="KXBTC-26MAR03-T95000", revenue=0,
+                             yes_total_cost=90, no_total_cost=0),
+        ]
+        result = verify_settlements(api, local)
+        pnl_check = next(c for c in result["checks"]
+                         if c["check"] == "pnl_agreement")
+        assert pnl_check["status"] == "ok"
+        assert pnl_check["delta_cents"] == 0
+
+    def test_pnl_ignores_settlement_revenue_cents_semantic(self):
+        """P&L comparison must not depend on settlement_revenue_cents.
+
+        backfill-settlements.py stores net profit there, while
+        reconcile-trades.py stores gross payout — verify both produce
+        the same P&L comparison result.
+        """
+        # API: revenue=100, cost=90, P&L=+10
+        api = [_make_settlement(ticker="T1", revenue=100, yes_total_cost=90,
+                                no_total_cost=0)]
+        # backfill semantic: settlement_revenue_cents=10 (net profit)
+        local_backfill = [
+            _make_local_trade(ticker="T1", cost_cents=90, count=1,
+                              settlement_result="won",
+                              settlement_revenue_cents=10, order_id="o1"),
+        ]
+        # reconcile semantic: settlement_revenue_cents=100 (gross payout)
+        local_reconcile = [
+            _make_local_trade(ticker="T1", cost_cents=90, count=1,
+                              settlement_result="won",
+                              settlement_revenue_cents=100, order_id="o1"),
+        ]
+        # Both should produce delta=0 since we derive from settlement_result
+        for local in [local_backfill, local_reconcile]:
+            result = verify_settlements(api, local)
+            pnl_check = next(c for c in result["checks"]
+                             if c["check"] == "pnl_agreement")
+            assert pnl_check["delta_cents"] == 0, (
+                f"P&L comparison should not depend on settlement_revenue_cents"
+            )
+
+    def test_pnl_disagreement_flagged(self):
+        """Mismatch between API cost and local cost is flagged."""
+        # API says cost=200 but local says cost=180 (different fill price)
+        local = [
+            _make_local_trade(ticker="KXHIGHHOU-26MAR03-T75", cost_cents=180,
+                              count=4, settlement_result="won", order_id="ord-1"),
         ]
         api = [
             _make_settlement(ticker="KXHIGHHOU-26MAR03-T75", revenue=400,
@@ -260,7 +308,25 @@ class TestVerifySettlements:
         pnl_check = next(c for c in result["checks"]
                          if c["check"] == "pnl_agreement")
         assert pnl_check["status"] == "warning"
-        assert pnl_check["delta_cents"] != 0
+        assert pnl_check["delta_cents"] == 20  # API: +200, local: +220
+
+    def test_pnl_multiple_trades_same_ticker(self):
+        """Multiple local trades for same ticker are summed correctly."""
+        local = [
+            _make_local_trade(ticker="T1", cost_cents=50, count=1,
+                              settlement_result="won", order_id="o1"),
+            _make_local_trade(ticker="T1", cost_cents=60, count=1,
+                              settlement_result="won", order_id="o2"),
+        ]
+        # API: revenue=200 (2 contracts), total_cost=110
+        api = [_make_settlement(ticker="T1", revenue=200,
+                                yes_total_cost=110, no_total_cost=0)]
+        result = verify_settlements(api, local)
+        pnl_check = next(c for c in result["checks"]
+                         if c["check"] == "pnl_agreement")
+        # API P&L: 200 - 110 = 90
+        # Local P&L: (100-50) + (100-60) = 50 + 40 = 90
+        assert pnl_check["delta_cents"] == 0
 
     def test_overall_status_ok_when_all_pass(self):
         result = verify_settlements(SAMPLE_SETTLEMENTS, SAMPLE_LOCAL_TRADES)
@@ -293,6 +359,18 @@ class TestLoadDeposits:
         assert result["tracked"] is True
         assert result["total_deposited_cents"] == 50000
         assert result["total_withdrawn_cents"] == 5000
+
+    def test_net_funded_with_withdrawals(self, tmp_path):
+        """net_funded = deposits - withdrawals, used for ROI."""
+        import json
+        deposits_file = tmp_path / "deposits.json"
+        deposits_file.write_text(json.dumps([
+            {"date": "2026-02-15", "type": "deposit", "amount_cents": 50000},
+            {"date": "2026-03-01", "type": "deposit", "amount_cents": 10000},
+            {"date": "2026-03-05", "type": "withdrawal", "amount_cents": 20000},
+        ]))
+        result = load_deposits(deposits_file)
+        assert result["net_funded_cents"] == 40000  # 60000 - 20000
 
 
 # ── Tests: build_snapshot (integration of all pieces) ──
@@ -348,19 +426,86 @@ class TestBuildSnapshot:
         assert by_bot["crypto"]["pnl_cents"] == -90   # 0 - 90
         assert by_bot["economics"]["pnl_cents"] == 270  # 300 - 30
 
-    def test_roi_with_deposits(self, tmp_path):
+    def test_roi_uses_nav_based_total_pnl(self, tmp_path):
+        """ROI = (NAV - deposits) / deposits, NOT realized / deposits."""
         import json
         deposits_file = tmp_path / "deposits.json"
         deposits_file.write_text(json.dumps([
             {"date": "2026-02-15", "type": "deposit", "amount_cents": 50000},
         ]))
         snapshot = build_snapshot(
-            balance_cents=0, portfolio_value_cents=0,
+            balance_cents=48000, portfolio_value_cents=1500,
             settlements=SAMPLE_SETTLEMENTS, fills=[], positions=[],
             local_trades=SAMPLE_LOCAL_TRADES, deposits_path=deposits_file,
         )
+        # NAV = 48000 + 1500 = 49500, deposits = 50000
+        # true_total_pnl = 49500 - 50000 = -500
+        # ROI = -500 / 50000 * 100 = -1.0%
         assert snapshot["deposits"]["tracked"] is True
-        assert snapshot["deposits"]["roi_pct"] == pytest.approx(380 / 50000 * 100, abs=0.01)
+        assert snapshot["deposits"]["roi_pct"] == pytest.approx(-1.0, abs=0.01)
+
+    def test_balance_check_section_present(self, tmp_path):
+        import json
+        deposits_file = tmp_path / "deposits.json"
+        deposits_file.write_text(json.dumps([
+            {"date": "2026-02-15", "type": "deposit", "amount_cents": 50000},
+        ]))
+        snapshot = build_snapshot(
+            balance_cents=48000, portfolio_value_cents=1500,
+            settlements=SAMPLE_SETTLEMENTS, fills=[], positions=[],
+            local_trades=SAMPLE_LOCAL_TRADES, deposits_path=deposits_file,
+        )
+        bc = snapshot["balance_check"]
+        assert bc["available"] is True
+        assert bc["nav_cents"] == 49500
+        assert bc["net_funded_cents"] == 50000
+        assert bc["true_total_pnl_cents"] == -500
+        # realized_net = 380 - 7 = 373
+        assert bc["realized_net_cents"] == 373
+        # implied_unrealized = -500 - 373 = -873
+        assert bc["implied_unrealized_cents"] == -873
+
+    def test_balance_check_unavailable_without_deposits(self):
+        snapshot = build_snapshot(
+            balance_cents=48000, portfolio_value_cents=1500,
+            settlements=[], fills=[], positions=[],
+            local_trades=[], deposits_path=None,
+        )
+        bc = snapshot["balance_check"]
+        assert bc["available"] is False
+
+
+# ── Tests: _build_balance_check ──
+
+class TestBuildBalanceCheck:
+    def test_basic_balance_check(self):
+        realized = {"net_after_fees_cents": 500}
+        deposits = {"tracked": True, "net_funded_cents": 10000}
+        result = _build_balance_check(nav_cents=10200, realized=realized, deposits=deposits)
+        assert result["available"] is True
+        assert result["true_total_pnl_cents"] == 200  # 10200 - 10000
+        assert result["implied_unrealized_cents"] == -300  # 200 - 500
+
+    def test_negative_pnl(self):
+        realized = {"net_after_fees_cents": 100}
+        deposits = {"tracked": True, "net_funded_cents": 50000}
+        result = _build_balance_check(nav_cents=49800, realized=realized, deposits=deposits)
+        assert result["true_total_pnl_cents"] == -200
+        assert result["implied_unrealized_cents"] == -300  # -200 - 100
+
+    def test_deposits_not_tracked(self):
+        result = _build_balance_check(nav_cents=5000, realized={}, deposits={"tracked": False})
+        assert result["available"] is False
+
+    def test_all_fields_present(self):
+        realized = {"net_after_fees_cents": 0}
+        deposits = {"tracked": True, "net_funded_cents": 5000}
+        result = _build_balance_check(nav_cents=5000, realized=realized, deposits=deposits)
+        assert "nav_cents" in result
+        assert "net_funded_cents" in result
+        assert "true_total_pnl_cents" in result
+        assert "realized_net_cents" in result
+        assert "implied_unrealized_cents" in result
 
 
 # ── Tests: helper functions ──
@@ -378,8 +523,17 @@ class TestInferBot:
     def test_economics(self):
         assert _infer_bot("KXCPI-26MAY-T20") == "economics"
 
+    def test_economics_econstat_cpi(self):
+        assert _infer_bot("KXECONSTATCPIYOY-26JUN-T2.0") == "economics"
+
+    def test_economics_econstat_core(self):
+        assert _infer_bot("KXECONSTATCORECPIYOY-26JUN-T2.3") == "economics"
+
     def test_entertainment(self):
         assert _infer_bot("KXALBUM-DRAKE-100K") == "entertainment"
+
+    def test_entertainment_albumsales(self):
+        assert _infer_bot("KXALBUMSALES-LUC-15000") == "entertainment"
 
     def test_other(self):
         assert _infer_bot("KXSPORTS-NCAAM") == "other"
