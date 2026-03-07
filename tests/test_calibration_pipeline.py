@@ -1,11 +1,13 @@
 """Tests for the calibration pipeline core logic.
 
 Tests pure functions from calibration-pipeline.py: drift detection,
-baseline management, suggestion evaluation, and WhatsApp formatting.
+baseline management, suggestion evaluation, WhatsApp formatting,
+regression gate, calibration history, and auto-apply decision.
 Uses importlib to load the hyphenated script file.
 """
 
 import importlib.util
+import json
 import logging
 import sys
 import types
@@ -410,3 +412,47 @@ class TestRegressionGate:
         after = {"brier_score": 0.31, "per_bot": {}}
         safe, reason = pipeline.check_regression_gate(before, after)
         assert not safe, "Should fail when aggregate Brier gets worse"
+
+
+# ---------------------------------------------------------------------------
+# Calibration History Tests
+# ---------------------------------------------------------------------------
+
+def _real_atomic_write(path, data):
+    """Actual file writer for tests (replaces mocked _atomic_write_json)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2))
+
+
+class TestCalibrationHistory:
+    """Tests for archive_calibration() -- versioned calibration storage."""
+
+    def test_archive_creates_versioned_file(self, pipeline, tmp_path):
+        # Patch _atomic_write_json to actually write files in tests
+        orig = pipeline._atomic_write_json
+        pipeline._atomic_write_json = _real_atomic_write
+        try:
+            history_dir = tmp_path / "calibration-history"
+            cal = {"weather": {"global_brier": 0.30}, "generated_at": "2026-03-07T06:00:00"}
+            path = pipeline.archive_calibration(cal, history_dir=history_dir)
+            assert path.exists()
+            assert "calibration-" in path.name
+            # Verify content
+            saved = json.loads(path.read_text())
+            assert saved["calibration"]["weather"]["global_brier"] == 0.30
+            assert "archived_at" in saved
+        finally:
+            pipeline._atomic_write_json = orig
+
+    def test_archive_deduplicates_same_day(self, pipeline, tmp_path):
+        orig = pipeline._atomic_write_json
+        pipeline._atomic_write_json = _real_atomic_write
+        try:
+            history_dir = tmp_path / "calibration-history"
+            cal = {"weather": {"global_brier": 0.30}}
+            path1 = pipeline.archive_calibration(cal, history_dir=history_dir)
+            path2 = pipeline.archive_calibration(cal, history_dir=history_dir)
+            assert path1 != path2  # Different filenames (appends -2, -3, etc.)
+            assert len(list(history_dir.iterdir())) == 2
+        finally:
+            pipeline._atomic_write_json = orig

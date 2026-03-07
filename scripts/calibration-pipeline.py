@@ -36,6 +36,7 @@ RESULTS_PATH = DATA_DIR / "backtest-results.json"
 SUGGESTION_DIR = DATA_DIR / "calibration-suggestions"
 CALIBRATION_PATH = PROJECT_DIR / "config" / "calibration.json"
 CALIBRATION_BACKUP_PATH = PROJECT_DIR / "config" / "calibration-backup.json"
+HISTORY_DIR = DATA_DIR / "calibration-history"
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DRIFT_THRESHOLD = 0.10   # 10% degradation triggers drift alert
@@ -492,11 +493,38 @@ def generate_suggestion(proposed_calibration, current_calibration, improvements)
     return suggestion_path
 
 
+def archive_calibration(calibration_data, history_dir=None):
+    """Save a versioned copy of calibration to the history directory.
+
+    Filenames: calibration-YYYY-MM-DD.json (appends -N if same-day exists).
+    Returns the path of the saved file.
+    """
+    hdir = history_dir or HISTORY_DIR
+    hdir.mkdir(parents=True, exist_ok=True)
+
+    now = datetime.now(timezone.utc)
+    date_str = now.strftime("%Y-%m-%d")
+    base_name = f"calibration-{date_str}"
+    path = hdir / f"{base_name}.json"
+    counter = 2
+    while path.exists():
+        path = hdir / f"{base_name}-{counter}.json"
+        counter += 1
+
+    archive_entry = {
+        "archived_at": now.isoformat(),
+        "calibration": calibration_data,
+    }
+    _atomic_write_json(path, archive_entry)
+    log.info(f"Calibration archived: {path}")
+    return path
+
+
 def apply_suggestion(suggestion_path):
     """Apply a calibration suggestion file.
 
-    Backs up current config/calibration.json, writes proposed calibration,
-    then re-snapshots baselines from current backtest results.
+    Archives current calibration to history, backs up to calibration-backup.json,
+    writes proposed calibration, then re-snapshots baselines.
     Returns True on success.
     """
     suggestion_path = Path(suggestion_path)
@@ -515,8 +543,13 @@ def apply_suggestion(suggestion_path):
         log.error("Suggestion file missing proposed_calibration")
         return False
 
-    # Backup current calibration
+    # Archive current calibration before overwriting
     if CALIBRATION_PATH.exists():
+        try:
+            current_cal = json.loads(CALIBRATION_PATH.read_text())
+            archive_calibration(current_cal)
+        except Exception as e:
+            log.warning(f"Could not archive current calibration: {e}")
         shutil.copy2(str(CALIBRATION_PATH), str(CALIBRATION_BACKUP_PATH))
         log.info(f"Backed up current calibration to {CALIBRATION_BACKUP_PATH}")
 
