@@ -711,7 +711,14 @@ def scan_cycle():
                 bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True,
             )
             # Use the lesser of LLM-recommended and Kelly-bounded quantity
-            bounded_qty = min(t["quantity"], kelly_count) if kelly_count > 0 else t["quantity"]
+            if kelly_count <= 0:
+                log.info(f"  Skipping {ticker}: Kelly sizing returned 0 (edge {edge*100:.1f}% insufficient at {limit_price}c)")
+                ss.skip("kelly_zero")
+                trade_manager.log_decision(ticker, side, "skipped", "kelly_zero",
+                                           edge=round(edge, 4), price_cents=limit_price,
+                                           kelly_count=kelly_count)
+                continue
+            bounded_qty = min(t["quantity"], kelly_count)
 
             result = trade_manager.place_order(
                 ticker, side, limit_price, bounded_qty,
