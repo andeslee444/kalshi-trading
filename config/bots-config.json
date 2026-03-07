@@ -11,14 +11,14 @@
     }
   },
   "entertainment": {
-    "enabled": false,
+    "enabled": true,
     "sanityProject": "8aky18h3",
     "sanityApiVersion": "2021-10-21",
-    "maxTradeAmount": 15,
-    "maxTradeAmountPct": 0.03,
-    "maxDailyTrades": 10,
-    "maxDailyLoss": 50,
-    "maxDailyLossPct": 0.05,
+    "maxTradeAmount": 5,
+    "maxTradeAmountPct": 0.02,
+    "maxDailyTrades": 5,
+    "maxDailyLoss": 10,
+    "maxDailyLossPct": 0.03,
     "confidenceThreshold": 0.70,
     "scanIntervalMinutes": 15,
     "tickers": ["ALBUM", "BOX", "MOVIE", "STREAM", "MUSIC", "BILLBOARD", "OSCAR", "GRAMMY", "SPOTIFY", "FILM", "ENTERTAIN"],
@@ -167,7 +167,7 @@
       "crypto": 150,
       "strategy": 150,
       "monitor": 100,
-      "entertainment": 0,
+      "entertainment": 50,
       "beatrelease": 0,
       "arb": 0
     }
