@@ -35,7 +35,6 @@
     "enabled": false,
     "checkIntervalHours": 1,
     "maxTradeAmount": 15,
-    "maxTradeCents": 1500,
     "maxTradeAmountPct": 0.03,
     "maxDailyTrades": 10,
     "maxDailyLoss": 50,
@@ -56,8 +55,7 @@
   },
   "strategy": {
     "maxTradeAmount": 10,
-    "maxBetCents": 1000,
-    "maxBetPct": 0.02,
+    "maxTradeAmountPct": 0.02,
     "maxDailyTrades": 20,
     "maxDailyLoss": 100,
     "maxDailyLossPct": 0.10,

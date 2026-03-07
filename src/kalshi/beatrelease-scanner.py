@@ -34,7 +34,7 @@ LLM_LOG_PATH = PROJECT_DIR / "data" / "beatrelease-llm-log.json"
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
 _bots_cfg = json.loads(BOTS_CONFIG_PATH.read_text())["beatrelease"]
 CHECK_INTERVAL_HOURS = _bots_cfg["checkIntervalHours"]
-MAX_TRADE_CENTS = _bots_cfg["maxTradeCents"]
+MAX_TRADE_CENTS = _bots_cfg.get("maxTradeAmount", 15) * 100  # dollars → cents
 BLOG_URLS = _bots_cfg["blogUrls"]
 
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -777,9 +777,7 @@ def run_daemon():
             health.record_bot_heartbeat("beatrelease")
             scan_cycle()
         except Exception as e:
-            log.error(f"Scan cycle error: {e}")
-            import traceback
-            traceback.print_exc()
+            log.error("Scan cycle error: %s", e, exc_info=True)
 
         if is_shutdown_requested():
             log.info("Graceful shutdown requested, exiting.")
@@ -794,9 +792,7 @@ if __name__ == "__main__":
         try:
             scan_cycle()
         except Exception as e:
-            log.error(f"Error: {e}")
-            import traceback
-            traceback.print_exc()
+            log.error("Error: %s", e, exc_info=True)
             sys.exit(1)
     else:
         run_daemon()

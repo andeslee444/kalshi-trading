@@ -95,7 +95,7 @@ class TestBug3DeadCodeRemoval:
         (_fake_project / "data").mkdir(parents=True, exist_ok=True)
         (_fake_project / "config" / "bots-config.json").write_text(json.dumps({
             "strategy": {
-                "maxBetCents": 500,
+                "maxTradeAmount": 5,
                 "scanIntervalMinutes": 15,
                 "maxDailyTrades": 20,
                 "maxDailyLoss": 50,

@@ -3,7 +3,7 @@
 Strategies: Longshot bias selling, maker-only limit orders, info arbitrage near settlement.
 """
 
-import json, time, datetime, os, sys, math, argparse, traceback
+import json, time, datetime, os, sys, math, argparse
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log, _atomic_write_json, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary
@@ -24,7 +24,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
 _bots_cfg = json.loads(BOTS_CONFIG_PATH.read_text())["strategy"]
-MAX_BET = _bots_cfg["maxBetCents"]
+MAX_BET = _bots_cfg.get("maxTradeAmount", 10) * 100  # dollars → cents
 
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
@@ -72,7 +72,7 @@ SPORTS_PREFIXES = ["KXNBA", "KXNFL", "KXNHL", "KXMLB", "KXUFC", "KXNCAA", "KXSPO
 TRADES_JSON_PATH = DATA_DIR / "kalshi-strategy-trades.json"
 trade_manager = TradeManager(client, TRADES_JSON_PATH, {
     "maxTradeAmount": MAX_BET / 100,
-    "maxTradeAmountPct": _bots_cfg.get("maxBetPct"),
+    "maxTradeAmountPct": _bots_cfg.get("maxTradeAmountPct"),
     "maxDailyTrades": _bots_cfg.get("maxDailyTrades", 20),
     "maxDailyLoss": _bots_cfg.get("maxDailyLoss", 50),
     "maxDailyLossPct": _bots_cfg.get("maxDailyLossPct"),
@@ -407,6 +407,15 @@ def check_settled_trades():
             settled_list = settlements.get("settlements", [])
             # Update Bayesian edge model with settlement outcomes
             if settled_list and _bayesian_edge_enabled:
+                # Load our trade records to determine strategy (buy vs sell side)
+                our_trades = {}
+                try:
+                    from kalshi_auth import load_trades
+                    for t in load_trades(TRADES_JSON_PATH):
+                        our_trades[t.get("ticker", "")] = t
+                except Exception:
+                    pass
+
                 for s in settled_list:
                     ticker = s.get("ticker", "")
                     if not ticker:
@@ -414,8 +423,21 @@ def check_settled_trades():
                     category = classify_ticker_category(ticker)
                     # Determine if seller won (YES expired worthless)
                     won = s.get("settlement_result") == "won" or s.get("revenue", 0) > 0
-                    # Estimate price from trade data (fallback to 5c)
-                    price_cents = s.get("yes_price_at_entry", 5)
+                    # Look up original trade to determine side
+                    trade_rec = our_trades.get(ticker, {})
+                    strategy = trade_rec.get("strategy", "")
+                    price_cents = s.get("yes_price_at_entry") or trade_rec.get("yes_price_at_entry", 5)
+
+                    # Fix side conflation: for buy-side trades (YES 70-99c),
+                    # convert to NO-equivalent price (1-30c) before bucketing
+                    if strategy == "longshot_buy" and price_cents > 30:
+                        price_cents = 100 - price_cents  # NO-equivalent for bucketing
+                        # For buy-side: "won" means YES resolved (buyer wins)
+                        # For the Becker model, this means the longshot (NO side) LOST
+                        won = not won  # flip: buyer winning = seller losing
+
+                    # Clamp to valid bucket range
+                    price_cents = max(1, min(30, price_cents))
                     edge_estimator.update_posterior(category, price_cents, won)
                 try:
                     edge_estimator.save_params(BAYES_PARAMS_PATH)
@@ -430,16 +452,16 @@ def check_settled_trades():
 
 def run_scan():
     """Run a single strategy scan cycle."""
+    # Reset daily caps at start of scan (idempotent — safe to call every scan)
+    correlation_sizer.reset_daily()
+    if scheduler:
+        scheduler.reset_daily()
+
     ss = ScanSummary("strategy", log)
     log.info("=" * 70)
     log.info("KALSHI STRATEGY TRADER")
     log.info(f"   {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log.info("=" * 70)
-
-    # Reset daily correlation sizer caps
-    correlation_sizer.reset_daily()
-    if scheduler:
-        scheduler.reset_daily()
 
     # Balance
     balance, avail = client.get_balance()
@@ -518,6 +540,8 @@ def run_scan():
             result = trade_manager.place_order(
                 ticker, "yes", buy_price, contracts, reasoning,
                 strategy="info_arb", est_edge=f"{info_edge.edge*100:.0f}%",
+                edge=round(info_edge.edge, 4),
+                raw_edge=round(info_edge.edge, 4),
                 risk_cents=risk, title=m.get("title", "")[:80],
                 market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                 sizing_method="half_kelly",
@@ -572,6 +596,7 @@ def run_scan():
         result = trade_manager.place_order(
             ticker, "no", no_price, contracts, c["reasoning"],
             strategy="longshot_sell", est_edge=f"{c['est_edge']*100:.2f}%",
+            edge=round(c["est_edge"], 4),
             risk_cents=c["risk_cents"], title=c["title"],
             subtitle=c.get("subtitle", ""),
             yes_price_at_entry=c["yes_price"],
@@ -643,6 +668,7 @@ def run_scan():
         result = trade_manager.place_order(
             ticker, "yes", buy_price, contracts, c["reasoning"],
             strategy="longshot_buy", est_edge=f"{c['est_edge']*100:.2f}%",
+            edge=round(c["est_edge"], 4),
             risk_cents=c["risk_cents"], title=c["title"],
             subtitle=c.get("subtitle", ""),
             yes_price_at_entry=c["yes_price"],
@@ -806,8 +832,11 @@ def main():
             else:
                 run_scan()
         except Exception as e:
-            log.error(f"Scan error: {e}")
-            traceback.print_exc()
+            log.error("Scan error: %s", e, exc_info=True)
+
+        if is_shutdown_requested():
+            log.info("Graceful shutdown requested, exiting.")
+            break
 
         log.info(f"\nNext scan in {SCAN_INTERVAL} minutes...")
         time.sleep(SCAN_INTERVAL * 60)

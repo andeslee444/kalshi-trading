@@ -489,7 +489,7 @@ class AuditEngine:
         if bots_cfg:
             expected_bot_sections = [
                 ("entertainment", ["maxTradeAmount", "maxDailyTrades", "maxDailyLoss"]),
-                ("strategy", ["maxBetCents", "maxDailyTrades", "maxDailyLoss"]),
+                ("strategy", ["maxTradeAmount", "maxDailyTrades", "maxDailyLoss"]),
                 ("crypto", ["maxTradeAmount", "maxDailyTrades", "maxDailyLoss"]),
                 ("economics", ["maxTradeAmount", "maxDailyTrades", "maxDailyLoss"]),
                 ("position_monitor", ["scanIntervalMinutes", "takeProfitThreshold", "stopLossThreshold"]),

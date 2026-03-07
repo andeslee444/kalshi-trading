@@ -75,7 +75,7 @@ def _load_beatrelease_scanner():
     (config_dir / "bots-config.json").write_text(json.dumps({
         "beatrelease": {
             "checkIntervalHours": 1,
-            "maxTradeCents": 500,
+            "maxTradeAmount": 5,
             "maxDailyTrades": 10,
             "maxDailyLoss": 25,
             "blogUrls": ["https://www.beatrelease.com/blog"],
