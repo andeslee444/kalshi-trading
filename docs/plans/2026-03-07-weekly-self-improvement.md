@@ -987,7 +987,9 @@ git commit -m "feat(ops): add weekly calibration cron (Sunday 5 AM) and npm run 
 
 **Context:** Now that `calibrate-strategy.py` exists, add it as a pipeline stage so the weekly run also recalibrates longshot bias.
 
-**Step 1: Add strategy stage to `STAGES_CALIBRATE`**
+**Step 1: Add strategy stage to `STAGES_CALIBRATE` with safety guard**
+
+The strategy calibrator should ONLY run if the strategy model has been validated (Plan 5 Task 5.3). Calibrating against a broken model (Brier 0.8325) would just optimize bad parameters. Guard: skip if fewer than 20 settled strategy trades exist OR if strategy Brier > 0.50.
 
 ```python
 STAGES_CALIBRATE = [
@@ -996,6 +998,20 @@ STAGES_CALIBRATE = [
     ("calibrate_cpi",      SCRIPTS_DIR / "calibrate-cpi-sigma.py", ["--json"], 120),
     ("calibrate_strategy", SCRIPTS_DIR / "calibrate-strategy.py", ["--json"], 120),
 ]
+
+# In run_pipeline(), before running calibrate_strategy:
+def should_run_strategy_calibrator(backtest_results):
+    """Guard: skip strategy calibration if model is broken."""
+    strategy_stats = backtest_results.get("per_bot", {}).get("strategy", {})
+    n = strategy_stats.get("n_evaluated", 0)
+    brier = strategy_stats.get("brier_score", 1.0)
+    if n < 20:
+        log.info(f"Skipping strategy calibration: only {n} settled trades (need 20+)")
+        return False
+    if brier > 0.50:
+        log.warning(f"Skipping strategy calibration: Brier {brier:.3f} > 0.50 (model broken)")
+        return False
+    return True
 ```
 
 **Step 2: Commit**
@@ -1129,3 +1145,22 @@ Task 10.6 (cron + npm)              ──> Task 10.8 (weekly WhatsApp)
 ```
 
 Tasks 10.1, 10.2, 10.3, and 10.5 can be executed in parallel. Tasks 10.4, 10.6, 10.7, 10.8 must follow their dependencies.
+
+---
+
+## Execution Report (2026-03-07)
+
+**Status:** Complete
+
+**Tasks completed:** 8/8
+
+**Summary:** Multi-calibrator pipeline (weather+crypto+CPI+strategy), regression gate (5% max), calibration history/versioning, auto-apply with --auto-apply flag, strategy calibrator with Brier>0.50 guard, weekly cron Sunday 5AM, pipeline wiring, WhatsApp summary.
+
+**Backtest results (post-implementation):**
+- Aggregate Brier: 0.4242
+- Weather Brier: 0.3143 (81 settlements)
+- Crypto Brier: 0.3851 (127 settlements)
+- Strategy Brier: 0.8325 (34 settlements) -- strategy calibrator correctly refuses to recalibrate (Brier > 0.50 guard active)
+- Economics/Entertainment: N/A (0 settlements)
+
+**Next steps:** Weekly cron runs Sunday 5AM. Monitor calibration drift reports via WhatsApp. Strategy calibrator will auto-engage once Tasks 5.1-5.5 bring Brier below 0.50.

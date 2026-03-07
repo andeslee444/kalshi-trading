@@ -10,6 +10,42 @@
 
 ---
 
+### Task 5.0: DISABLE Strategy-Trader Immediately (NEW — PM audit, HIGHEST PRIORITY)
+
+**Files:**
+- Modify: `config/bots-config.json` (strategy section)
+
+**Context (PM audit):** With a Brier score of 0.8325 — literally worse than a coin flip — the strategy-trader is actively destroying capital. The calibration curve shows 98.9% predicted probability → 14.7% actual outcome. Every trade placed by this bot has negative expected value. The 16 orphan trades from the zombie period (11 sports, 2 politics, 2 quick-settle, 1 forex) confirm losses across diverse categories.
+
+**This bot must be disabled BEFORE any model work begins.** Calibrating or optimizing a model that is catastrophically wrong just makes it confidently wrong. Fix the model first (Task 5.3), validate with backtest, THEN re-enable.
+
+**Step 1: Disable in config**
+
+```json
+{
+  "strategy": {
+    "enabled": false,
+    "_disabled_reason": "Brier 0.8325 — catastrophic overconfidence. Re-enable after Plan 5 Task 5.3 validates edge formula."
+  }
+}
+```
+
+**Step 2: Verify supervisor stops launching it**
+
+```bash
+npm run supervisor:status
+# Strategy-trader should show "disabled" not "running"
+```
+
+**Step 3: Commit**
+
+```bash
+git add config/bots-config.json
+git commit -m "ops: disable strategy-trader — Brier 0.8325 is worse than random"
+```
+
+---
+
 ### Task 5.1: Fix CPU Spin — Defer Allocator Calls Until After Sorting
 
 **Files:**
@@ -103,9 +139,27 @@ The 16 orphan strategy-trader trades from the zombie period (11 sports, 2 politi
 | copula_scale | Hardcoded 1.0 | Data-driven | Config |
 | Longshot edge at 5c | ~27% (default params, pre-time-decay) | Validate with backtest | Backtest |
 | Time decay floor | 50% | 20% | Unit test |
-| Daily P&L | -$0.36 total | +$10-20/day | Trade log |
+| Bot status | Running (losing money) | **Disabled** until model validated | Config check |
+| Daily P&L | -$0.36 total | +$10-20/day (after re-enable) | Trade log |
 | Strategy Brier (backtest) | 0.8325 (catastrophic: 98.9% pred → 14.7% actual) | <0.350 | npm run backtest |
 | Orphan strategy trades | 16 from zombie period (unlogged) | 0 (WAL from Plan 1) | snapshot |
 | Longshot bias calibration | Manual (bayes-params.json) | Automated weekly (Plan 10 Task 10.5) | calibrate-strategy.py |
 
 **Note:** Plan 10 (Weekly Self-Improvement) creates `calibrate-strategy.py` which recalibrates longshot bias parameters from settled trades. Task 5.3 (fix the edge formula) should be completed BEFORE enabling the calibrator — calibrating against a broken formula is pointless.
+
+---
+
+## Execution Report (2026-03-07)
+
+**Status:** Task 5.0 complete (disabled). Tasks 5.1-5.5 pending.
+
+**Tasks completed:** 1/6
+
+**Summary:** Strategy trader disabled due to catastrophic Brier score. Do not re-enable until Tasks 5.1-5.5 are completed and Brier < 0.35. Strategy calibrator (Plan 10) has Brier > 0.50 guard to prevent auto-recalibration on a broken model.
+
+**Backtest results (post-implementation):**
+- Strategy Brier: 0.8325 (34 settlements)
+- Catastrophic: 98.9% predicted probability vs 14.7% actual win rate
+- Longshot bias model fundamentally miscalibrated
+
+**Next steps:** Complete Tasks 5.1-5.5 (fix edge formula, add time decay, validate with backtest) before re-enabling. Brier must drop below 0.35.

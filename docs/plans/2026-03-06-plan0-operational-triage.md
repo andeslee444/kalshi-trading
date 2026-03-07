@@ -335,3 +335,22 @@ All from Feb 14 - Mar 4 (zombie period). Root cause: zombie processes executed A
 | open-meteo errors | 1,870 | Flagged for Plan 2 | health-state.json |
 | Crypto calibration | Random (OU corruption) | OU disabled (emergency fix) | backtest |
 | Strategy calibration | 0.8325 Brier (catastrophic) | Flagged for Plan 5 | backtest |
+
+---
+
+## Execution Report (2026-03-07)
+
+**Status:** Complete
+
+**Tasks completed:** All
+
+**Summary:** All zombies killed, supervisor enforces single-instance. WAL prevents future orphans.
+
+**Backtest results (post-implementation):**
+- Aggregate Brier: 0.4242
+- Realized P&L: +$81.37 (98W/61L, 61.6% WR), net of fees: +$58.76
+- NAV: $4,997.45, True Total P&L: -$2.55
+- Implied Unrealized: -$61.31
+- 34 orphan settlements still unmatched (pre-WAL era)
+
+**Next steps:** None. Operational triage is complete. WAL and single-instance enforcement are in production.

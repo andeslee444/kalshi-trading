@@ -82,6 +82,8 @@ When both are available, flag if they disagree by >3F — suggests one source ma
 
 **Context:** 12-hour dedup cooldown is too long for day-0 markets. When a market settles same-day, the bot should be able to re-evaluate as new data arrives (NWS updates every 1-2 hours).
 
+**Scope clarification (PM audit):** This is implemented LOCALLY in weather-bot.py using a bot-specific cooldown dict keyed by `(ticker, days_out)`. No shared module (`TradeManager`) change is required. The existing `RecentTradeTracker` in `kalshi_auth.py` stays as-is for cross-scan dedup; this adds a days-out-aware layer on top within the bot.
+
 **Step 1: Write failing test**
 
 ```python
@@ -293,3 +295,20 @@ Append to `data/weather-metrics.json` (capped at last 1000 entries).
 | Dedup cooldown (day-0) | 12h | 30min | Config check |
 | Forecast MAE | Unknown | Track | forecast_verifier |
 | Per-city edge threshold | Uniform 8% | Per-city optimized | Config |
+
+---
+
+## Execution Report (2026-03-07)
+
+**Status:** Complete
+
+**Tasks completed:** 4/4
+
+**Summary:** Ensemble circuit breakers separated, NWS fallback added, day-0 dedup 30min, limit orders. Weather Brier 0.3143 (target <0.250). PHIL/CHI strong, LAX/MIA weak.
+
+**Backtest results (post-implementation):**
+- Weather Brier: 0.3143 (81 settlements)
+- Per-city: PHIL 0.13, CHI 0.21, DEN 0.25, NY 0.30, LAX 0.53, MIA 0.59
+- PHIL and CHI are well-calibrated; LAX and MIA need further sigma tuning
+
+**Next steps:** Per-city sigma optimization for LAX/MIA to bring overall Weather Brier below 0.250 target.
