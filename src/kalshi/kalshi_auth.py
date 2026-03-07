@@ -11,7 +11,7 @@ Usage:
     client.post("/portfolio/orders", body={...})
 """
 
-import json, time, base64, os, sys, signal, logging, datetime, tempfile, fcntl
+import json, time, base64, os, sys, signal, logging, datetime, tempfile, fcntl, threading
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 from logging.handlers import RotatingFileHandler
@@ -37,12 +37,12 @@ RETRY_BACKOFF_BASE = 1.0  # seconds
 KILL_SWITCH_PATH = PROJECT_DIR / "data" / "HALT_TRADING"
 PER_BOT_HALT_PREFIX = "HALT_bot_"
 BOT_SOURCE_MAP = {
-    "weather": ["NWS", "OpenMeteo"],
-    "crypto": ["Coinbase", "Deribit"],
-    "economics": ["ClevelandFed", "Truflation"],
-    "entertainment": ["HDD"],
-    "source-monitor": ["NWS", "HDD", "BoxOfficeMojo"],
-    "beatrelease": ["BeatRelease"],
+    "weather": ["open-meteo"],
+    "crypto": ["coinbase"],
+    "economics": ["cleveland-fed", "gdpnow", "cme-fedwatch"],
+    "entertainment": ["hdd", "boxoffice"],
+    "source-monitor": ["hdd", "boxoffice"],
+    "beatrelease": ["beatrelease"],
 }
 SCAN_SUMMARIES_PATH = PROJECT_DIR / "data" / "scan-summaries.json"
 
@@ -1188,6 +1188,12 @@ class TradeManager:
         # Caps applied tracking
         record["caps_applied"] = extra_fields.get("caps_applied", [])
 
+        # Edge decay tracking (canonical fields derived from bot-provided extras)
+        record["edge_at_entry"] = extra_fields.get("raw_edge")
+        model_prob = extra_fields.get("model_prob")
+        record["model_fair_value_cents"] = round(model_prob * 100, 1) if model_prob is not None else None
+        record["model_name"] = extra_fields.get("model_name") or extra_fields.get("sizing_method")
+
         # Settlement placeholders (filled by reconcile script)
         record.setdefault("settlement_result", None)
         record.setdefault("settlement_revenue_cents", None)
@@ -1556,7 +1562,8 @@ class HealthCheckMonitor:
     """
 
     def __init__(self, state_path=None, staleness_minutes=60, auto_halt=False, logger=None,
-                 alert_cooldown_minutes=30, per_bot_halt_cooldown_seconds=600):
+                 alert_cooldown_minutes=30, per_bot_halt_cooldown_seconds=600,
+                 source_breaker_threshold=5, source_breaker_cooldown_seconds=600):
         self.state_path = Path(state_path) if state_path else HEALTH_STATE_PATH
         self.staleness_minutes = staleness_minutes
         self.auto_halt = auto_halt
@@ -1565,6 +1572,8 @@ class HealthCheckMonitor:
         self._alerts_sent = {}  # key -> datetime of last alert
         self._per_bot_halt_cooldown = per_bot_halt_cooldown_seconds
         self._halt_transitions = {}  # bot_name -> timestamp of last halt/unhalt
+        self.source_breaker_threshold = source_breaker_threshold
+        self.source_breaker_cooldown_seconds = source_breaker_cooldown_seconds
         self._state = {
             "sources": {},      # source -> {"last_success": ts, "last_error": ts, "error_count": int}
             "bots": {},         # bot -> {"last_heartbeat": ts}
@@ -1605,20 +1614,49 @@ class HealthCheckMonitor:
             self.log.warning("Failed to save health state: %s", e)
 
     def record_source_success(self, source):
-        """Record a successful data source fetch."""
+        """Record a successful data source fetch. Clears circuit breaker if open."""
         if source not in self._state["sources"]:
             self._state["sources"][source] = {"last_success": None, "last_error": None, "error_count": 0}
         self._state["sources"][source]["last_success"] = _utc_now_iso()
         self._state["sources"][source]["error_count"] = 0
+        self._state["sources"][source]["opened_at"] = None
         self._save()
 
     def record_source_error(self, source, msg=""):
-        """Record a data source error."""
+        """Record a data source error. Opens circuit breaker after threshold consecutive errors."""
         if source not in self._state["sources"]:
             self._state["sources"][source] = {"last_success": None, "last_error": None, "error_count": 0}
-        self._state["sources"][source]["last_error"] = _utc_now_iso()
-        self._state["sources"][source]["error_count"] = self._state["sources"][source].get("error_count", 0) + 1
+        data = self._state["sources"][source]
+        data["last_error"] = _utc_now_iso()
+        data["error_count"] = data.get("error_count", 0) + 1
+        if data["error_count"] >= self.source_breaker_threshold and data.get("opened_at") is None:
+            data["opened_at"] = time.time()
+            self.log.warning("Source circuit breaker opened for %s after %d errors", source, data["error_count"])
+            alert_msg = f"Source circuit breaker opened: {source} ({data['error_count']} consecutive errors)"
+            notify_webhook(alert_msg, level="warning", logger=self.log)
+            notify_imessage(alert_msg, logger=self.log)
         self._save()
+
+    def is_source_open(self, source):
+        """Return True if source has tripped the circuit breaker (callers should skip).
+
+        Opens after source_breaker_threshold consecutive errors.
+        Auto-resets (half-open) after source_breaker_cooldown_seconds.
+        """
+        data = self._state.get("sources", {}).get(source, {})
+        if data.get("error_count", 0) < self.source_breaker_threshold:
+            return False
+        opened_at = data.get("opened_at")
+        if opened_at is None:
+            return True
+        elapsed = time.time() - opened_at
+        if elapsed >= self.source_breaker_cooldown_seconds:
+            # Half-open: reset error_count so one retry is allowed
+            data["error_count"] = 0
+            data["opened_at"] = None
+            self._save()
+            return False
+        return True
 
     def record_bot_heartbeat(self, bot):
         """Record a bot heartbeat (proves the bot loop is running)."""
@@ -1661,8 +1699,10 @@ class HealthCheckMonitor:
             stale = False
             if last_hb:
                 try:
-                    age_min = (datetime.datetime.now(datetime.timezone.utc) -
-                               datetime.datetime.fromisoformat(last_hb)).total_seconds() / 60
+                    hb_dt = datetime.datetime.fromisoformat(last_hb)
+                    if hb_dt.tzinfo is None:
+                        hb_dt = hb_dt.replace(tzinfo=datetime.timezone.utc)
+                    age_min = (datetime.datetime.now(datetime.timezone.utc) - hb_dt).total_seconds() / 60
                     stale = age_min > self.staleness_minutes
                 except (ValueError, TypeError):
                     pass
@@ -1698,6 +1738,8 @@ class HealthCheckMonitor:
             if hb:
                 try:
                     hb_dt = datetime.datetime.fromisoformat(hb)
+                    if hb_dt.tzinfo is None:
+                        hb_dt = hb_dt.replace(tzinfo=datetime.timezone.utc)
                     age_min = (now - hb_dt).total_seconds() / 60
                     if age_min > stale_min:
                         issues.append(f"bot/{bot} stale: last heartbeat {age_min:.0f}min ago")
@@ -1885,3 +1927,62 @@ def notify_webhook(message, level="info", logger=None):
     except Exception as e:
         log.warning("Webhook error: %s", e)
         return False
+
+
+# === iMessage Alerting (BlueBubbles) ===
+
+_imessage_rate_limiter = {}
+_IMESSAGE_COOLDOWN_SECONDS = 1800  # 30 min
+
+
+def _reset_imessage_rate_limiter():
+    """Reset the iMessage rate limiter (for testing)."""
+    _imessage_rate_limiter.clear()
+
+
+def _send_imessage_blocking(message, prefix, logger):
+    """Blocking iMessage send (runs in background thread)."""
+    log = logger or _log
+    bb_url = os.environ.get("BLUEBUBBLES_URL", "")
+    bb_password = os.environ.get("BLUEBUBBLES_PASSWORD", "")
+    bb_chat = os.environ.get("BLUEBUBBLES_CHAT_GUID", "")
+    try:
+        r = requests.post(
+            f"{bb_url}/api/v1/message/text",
+            params={"password": bb_password},
+            json={"chatGuid": bb_chat, "message": message},
+            timeout=10,
+        )
+        r.raise_for_status()
+        _imessage_rate_limiter[prefix] = time.time()
+        log.info("iMessage sent: %s", prefix)
+    except Exception as e:
+        log.warning("iMessage send failed: %s", e)
+
+
+def notify_imessage(message, logger=None):
+    """Send an iMessage via BlueBubbles API (fire-and-forget).
+
+    Requires BLUEBUBBLES_URL, BLUEBUBBLES_PASSWORD, BLUEBUBBLES_CHAT_GUID env vars.
+    Rate-limits duplicate messages (same first 80 chars) to once per 30 minutes.
+    Sends in a daemon thread so callers are never blocked by network latency.
+
+    Returns:
+        True if dispatched, False if skipped (missing config or rate-limited).
+    """
+    bb_url = os.environ.get("BLUEBUBBLES_URL", "")
+    bb_password = os.environ.get("BLUEBUBBLES_PASSWORD", "")
+    bb_chat = os.environ.get("BLUEBUBBLES_CHAT_GUID", "")
+    if not bb_url or not bb_password or not bb_chat:
+        return False
+
+    prefix = message[:80]
+    now = time.time()
+    if now - _imessage_rate_limiter.get(prefix, 0) < _IMESSAGE_COOLDOWN_SECONDS:
+        return False
+
+    # Optimistically mark as sent to prevent duplicate dispatches
+    _imessage_rate_limiter[prefix] = now
+    t = threading.Thread(target=_send_imessage_blocking, args=(message, prefix, logger), daemon=True)
+    t.start()
+    return True

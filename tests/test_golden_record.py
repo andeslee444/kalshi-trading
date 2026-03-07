@@ -167,6 +167,85 @@ class TestGoldenRecordBuild:
         assert record["limit_price_rule"] == "balanced"
 
 
+class TestEdgeDecayTracking:
+    """Test edge_at_entry, model_fair_value_cents, model_name in golden record."""
+
+    def _make_tm(self):
+        from kalshi_auth import TradeManager
+        mock_client = MagicMock()
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            f.write(b"[]")
+            trades_path = Path(f.name)
+        tm = TradeManager.__new__(TradeManager)
+        tm.client = mock_client
+        tm.trades_path = trades_path
+        tm.config = {"maxTradeAmount": 10, "maxDailyTrades": 10, "maxDailyLoss": 50}
+        tm.log = MagicMock()
+        tm.log.name = "test-bot"
+        tm.kill_switch_path = Path("/tmp/nonexistent_halt")
+        tm.tracker = MagicMock()
+        tm.breaker = MagicMock()
+        tm._daily_trades = 0
+        tm._daily_spend_cents = 0
+        tm._daily_date = None
+        return tm
+
+    def test_edge_at_entry_from_raw_edge(self):
+        tm = self._make_tm()
+        record = tm._build_golden_record(
+            "KXHIGHMIA-26FEB16-T86", "no", 70, 3, 210,
+            "test", {"order_id": "abc", "status": "ok"},
+            raw_edge=0.15, model_prob=0.35,
+        )
+        assert record["edge_at_entry"] == 0.15
+
+    def test_model_fair_value_cents_computed(self):
+        tm = self._make_tm()
+        record = tm._build_golden_record(
+            "KXHIGHMIA-26FEB16-T86", "no", 70, 3, 210,
+            "test", {"order_id": "abc", "status": "ok"},
+            raw_edge=0.15, model_prob=0.35,
+        )
+        assert record["model_fair_value_cents"] == 35.0
+
+    def test_model_fair_value_cents_rounds(self):
+        tm = self._make_tm()
+        record = tm._build_golden_record(
+            "KXHIGHMIA-26FEB16-T86", "no", 70, 3, 210,
+            "test", {"order_id": "abc", "status": "ok"},
+            model_prob=0.123456,
+        )
+        assert record["model_fair_value_cents"] == 12.3
+
+    def test_model_name_from_model_name(self):
+        tm = self._make_tm()
+        record = tm._build_golden_record(
+            "KXHIGHMIA-26FEB16-T86", "no", 70, 3, 210,
+            "test", {"order_id": "abc", "status": "ok"},
+            model_name="ensemble_weather",
+        )
+        assert record["model_name"] == "ensemble_weather"
+
+    def test_model_name_falls_back_to_sizing_method(self):
+        tm = self._make_tm()
+        record = tm._build_golden_record(
+            "KXHIGHMIA-26FEB16-T86", "no", 70, 3, 210,
+            "test", {"order_id": "abc", "status": "ok"},
+            sizing_method="half_kelly",
+        )
+        assert record["model_name"] == "half_kelly"
+
+    def test_none_when_no_edge_data(self):
+        tm = self._make_tm()
+        record = tm._build_golden_record(
+            "KXHIGHMIA-26FEB16-T86", "no", 70, 3, 210,
+            "test", {"order_id": "abc", "status": "ok"},
+        )
+        assert record["edge_at_entry"] is None
+        assert record["model_fair_value_cents"] is None
+        assert record["model_name"] is None
+
+
 class TestReconcileAnnotation:
     """Test _annotate_trade logic from reconcile script."""
 
