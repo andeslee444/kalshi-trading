@@ -12,7 +12,7 @@ Usage:
     python3 src/kalshi/position-monitor.py --once    # single scan
 """
 
-import json, time, datetime, os, sys, re, argparse, traceback
+import json, time, datetime, os, sys, re, argparse
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from kalshi_auth import (
@@ -79,14 +79,8 @@ def _get_exit_config(source_bot):
 
 # === Entry Record Lookup (for 4.1 entry-price stop, 4.3 info-arb gate) ===
 
-ALL_TRADE_LOGS = [
-    PROJECT_DIR / "data" / "kalshi-trades.json",
-    PROJECT_DIR / "data" / "kalshi-monitor-trades.json",
-    PROJECT_DIR / "data" / "kalshi-entertainment-trades.json",
-    PROJECT_DIR / "data" / "kalshi-economics-trades.json",
-    PROJECT_DIR / "data" / "kalshi-crypto-trades.json",
-    PROJECT_DIR / "data" / "kalshi-strategy-trades.json",
-]
+from trade_files import ALL_TRADE_PATHS
+ALL_TRADE_LOGS = ALL_TRADE_PATHS
 
 
 def _load_entry_records():
@@ -495,7 +489,7 @@ def _compute_current_probability(ticker, source_bot, entry_side):
 
     # Economics: read latest model probability from economics bot decision log
     if source_bot == "economics":
-        decisions_path = PROJECT_DIR / "data" / "economics-decisions.json"
+        decisions_path = PROJECT_DIR / "data" / "kalshi-economics-trades-decisions.json"
         try:
             if not decisions_path.exists():
                 return None, None
@@ -675,6 +669,9 @@ def _count_exits_today():
 
 def scan_positions():
     """Scan all open positions and evaluate exit opportunities."""
+    # Record heartbeat at scan START (not just end) to prevent supervisor staleness kills
+    health.record_bot_heartbeat("position-monitor")
+
     ss = ScanSummary("position-monitor", log)
     now = datetime.datetime.now()
     log.info(f"\n{'='*60}")
@@ -705,11 +702,31 @@ def scan_positions():
     log.info(f"Loaded {len(entry_records)} entry records from {len(ALL_TRADE_LOGS)} trade logs")
     peaks = _load_peaks()
     # Grace period: skip trailing stop evaluation for first scan after restart
-    # to prevent stale peak data from triggering immediate exits
-    _first_scan = not hasattr(scan_positions, '_has_run')
-    scan_positions._has_run = True
-    if _first_scan:
-        log.info("  First scan after restart — trailing stop grace period active")
+    # to prevent stale peak data from triggering immediate exits.
+    # Persisted in trailing-state.json _metadata instead of function attribute.
+    _metadata = peaks.pop("_metadata", {})
+    _current_pid = str(os.getpid())
+    _stored_pid = _metadata.get("pid")
+    grace_expires = _metadata.get("grace_period_expires")
+    _first_scan = False
+    if _stored_pid != _current_pid:
+        # New process detected — set fresh grace period
+        _first_scan = True
+        _metadata["pid"] = _current_pid
+        _metadata["grace_period_expires"] = (datetime.datetime.now() + datetime.timedelta(minutes=5)).isoformat()
+        peaks["_metadata"] = _metadata
+        _save_peaks(peaks)
+        log.info("  New process (pid=%s) — trailing stop grace period active (5 min)", _current_pid)
+    elif grace_expires:
+        try:
+            expires_dt = datetime.datetime.fromisoformat(grace_expires)
+            if datetime.datetime.now() < expires_dt:
+                _first_scan = True
+                log.info("  Grace period still active (expires %s)", grace_expires)
+        except (ValueError, TypeError):
+            pass
+    # Restore _metadata into peaks for persistence
+    peaks["_metadata"] = _metadata
     open_tickers = set()
 
     for pos in positions:
@@ -816,8 +833,11 @@ def scan_positions():
             # No exit signal — position held
             ss.skip("no_exit_signal")
 
+    # Mid-scan heartbeat to prevent supervisor staleness detection on long scans
+    health.record_bot_heartbeat("position-monitor")
+
     # Clean up peaks for closed positions and save
-    stale_tickers = [t for t in peaks.keys() if t not in open_tickers]
+    stale_tickers = [t for t in peaks.keys() if t not in open_tickers and t != "_metadata"]
     for stale_ticker in stale_tickers:
         del peaks[stale_ticker]
     if stale_tickers:
@@ -904,8 +924,7 @@ def main():
                 log.warning("Health issues: %s", "; ".join(issues))
             scan_positions()
         except Exception as e:
-            log.error(f"Scan error: {e}")
-            traceback.print_exc()
+            log.error("Scan error: %s", e, exc_info=True)
 
         if is_shutdown_requested():
             log.info("Graceful shutdown requested, exiting.")

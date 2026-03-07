@@ -157,6 +157,47 @@ def _exit_config(take_profit_cents=80, stop_loss_cents=30, model_shift_pp=20,
 
 
 # ===================================================================
+# ALL_TRADE_LOGS canonical list tests
+# ===================================================================
+
+class TestAllTradeLogs:
+    """Verify ALL_TRADE_LOGS uses the canonical trade_files.py list."""
+
+    def test_all_trade_logs_matches_canonical(self):
+        """Position monitor should use the same trade log list as all other scripts."""
+        from trade_files import ALL_TRADE_PATHS
+        assert set(str(p) for p in _mod.ALL_TRADE_LOGS) == set(str(p) for p in ALL_TRADE_PATHS)
+
+    def test_includes_beatrelease_trades(self):
+        """Beatrelease trades must be visible to the exit system."""
+        filenames = [p.name for p in _mod.ALL_TRADE_LOGS]
+        assert "beatrelease-trades.json" in filenames
+
+    def test_includes_arb_trades(self):
+        """Cross-platform arb trades must be visible to the exit system."""
+        filenames = [p.name for p in _mod.ALL_TRADE_LOGS]
+        assert "kalshi-arb-trades.json" in filenames
+
+    def test_includes_position_monitor_trades(self):
+        """Position monitor's own trades must be in the list for entry lookup."""
+        filenames = [p.name for p in _mod.ALL_TRADE_LOGS]
+        assert "kalshi-position-trades.json" in filenames
+
+    def test_includes_market_maker_trades(self):
+        """Market maker trades must be visible to the exit system."""
+        filenames = [p.name for p in _mod.ALL_TRADE_LOGS]
+        assert "kalshi-mm-trades.json" in filenames
+
+    def test_all_trade_logs_is_list_of_paths(self):
+        """ALL_TRADE_LOGS should be a list of Path objects."""
+        assert isinstance(_mod.ALL_TRADE_LOGS, list)
+        assert len(_mod.ALL_TRADE_LOGS) >= 10  # canonical list has 10 files
+        from pathlib import Path
+        for p in _mod.ALL_TRADE_LOGS:
+            assert isinstance(p, Path), f"Expected Path, got {type(p)}: {p}"
+
+
+# ===================================================================
 # _get_exit_config tests
 # ===================================================================
 
