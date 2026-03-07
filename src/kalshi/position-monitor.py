@@ -34,6 +34,7 @@ setup_signal_handlers()
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
 WEATHER_CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-config.json"
 TRADES_PATH = PROJECT_DIR / "data" / "kalshi-position-trades.json"
+METRICS_PATH = PROJECT_DIR / "data" / "position-monitor-metrics.json"
 TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # Load config
@@ -74,6 +75,95 @@ def _get_exit_config(source_bot):
         "trailing_drop_cents": exit_cfg.get("trailingDropCents", pm_config.get("trailingDropCents", 10)),
         "trailing_min_profit_cents": exit_cfg.get("trailingMinProfitCents", pm_config.get("trailingMinProfitCents", 10)),
         "take_profit_fraction": exit_cfg.get("takeProfitFraction", 0.50),
+    }
+
+
+# Per-bot recommended stop-loss thresholds (cents) based on market volatility profiles.
+# Weather: slow-moving intraday, tight stop OK.
+# Crypto: high intraday vol, needs wider stop to avoid whipsaw.
+# Economics: illiquid, very wide stop or time-based exit preferred.
+# Strategy: longshot positions are cheap; use proportional stop (2x entry cost).
+# Entertainment/monitor: moderate default.
+STOP_LOSS_DEFAULTS = {
+    "weather": 20,
+    "source-monitor": 20,
+    "crypto": 35,
+    "economics": 40,
+    "strategy": None,       # Proportional: 2x entry cost (handled in evaluate_stop_loss)
+    "entertainment": 25,
+    "beatrelease": 25,
+    "monitor": 25,
+}
+
+STRATEGY_STOP_LOSS_MULTIPLIER = 2  # strategy stop-loss = entry_cost * this multiplier
+
+
+def get_effective_stop_loss(source_bot, config_stop_loss_cents, entry_price_cents=None):
+    """Compute effective stop-loss for a position.
+
+    For strategy (longshot) positions: uses proportional stop = entry_cost / MULTIPLIER
+    (i.e., if you bought at 5c, stop-loss at 5c / 2 = 2.5c, rounded to 2c).
+    For all other bots: uses configured or default threshold.
+
+    Returns stop_loss_cents (int).
+    """
+    if source_bot == "strategy" and entry_price_cents is not None and entry_price_cents > 0:
+        # For cheap longshot positions, proportional stop makes more sense:
+        # Stop-loss triggers when bid drops to entry_price / multiplier.
+        # E.g., bought at 5c → stop at 2c, bought at 10c → stop at 5c.
+        proportional = max(1, int(entry_price_cents / STRATEGY_STOP_LOSS_MULTIPLIER))
+        return proportional
+    return config_stop_loss_cents
+
+
+def backtest_stop_loss(trades, stop_loss_cents=25):
+    """Analyze stop-loss exits against settlement outcomes.
+
+    For each trade that was exited via stop-loss, checks whether the position
+    would have been profitable if held to settlement.
+
+    Args:
+        trades: List of trade records with settlement data.
+        stop_loss_cents: The stop-loss threshold being evaluated.
+
+    Returns:
+        dict with:
+          premature_exits: count of stop-loss exits that would have won at settlement
+          correct_exits: count of stop-loss exits that would have lost at settlement
+          unknown: count of stop-loss exits without settlement data
+          whipsaw_rate: fraction of premature exits out of total evaluated
+    """
+    premature_exits = 0
+    correct_exits = 0
+    unknown = 0
+
+    for trade in trades:
+        exit_type = trade.get("exit_type") or trade.get("exit_reason")
+        if exit_type != "stop_loss":
+            continue
+
+        settlement = trade.get("settlement_result")
+        if settlement is None:
+            unknown += 1
+            continue
+
+        # A premature exit is one where our side would have won at settlement.
+        # settlement_result: "win" means our side settled in the money.
+        if settlement == "win":
+            premature_exits += 1
+        else:
+            correct_exits += 1
+
+    total_evaluated = premature_exits + correct_exits
+    whipsaw_rate = premature_exits / total_evaluated if total_evaluated > 0 else 0.0
+
+    return {
+        "stop_loss_cents": stop_loss_cents,
+        "premature_exits": premature_exits,
+        "correct_exits": correct_exits,
+        "unknown": unknown,
+        "total_evaluated": total_evaluated,
+        "whipsaw_rate": whipsaw_rate,
     }
 
 
@@ -240,15 +330,17 @@ def evaluate_take_profit(position, market, exit_config):
     return None
 
 
-def evaluate_stop_loss(position, market, exit_config, entry_price_cents=None):
+def evaluate_stop_loss(position, market, exit_config, entry_price_cents=None, source_bot=""):
     """Check if position should be cut to limit losses.
 
-    Uses absolute threshold from exit_config. Sends market order (urgent exit).
-    Closes full position.
+    Uses effective stop-loss threshold (per-bot, proportional for strategy).
+    Sends market order (urgent exit). Closes full position.
     """
     yes_count = position.get("yes", 0)
     no_count = position.get("no", 0)
-    stop_loss_cents = exit_config["stop_loss_cents"]
+    stop_loss_cents = get_effective_stop_loss(
+        source_bot, exit_config["stop_loss_cents"], entry_price_cents
+    )
 
     yes_bid = market.get("yes_bid", 0)
     no_bid = market.get("no_bid", 0) if market.get("no_bid") else (100 - market.get("yes_ask", 100))
@@ -263,7 +355,7 @@ def evaluate_stop_loss(position, market, exit_config, entry_price_cents=None):
                 "price": yes_bid,
                 "order_type": "market",
                 "reasoning": (f"Stop loss: YES bid {yes_bid}c <= {stop_loss_cents}c threshold "
-                              f"(entry={entry_price_cents or '?'}c) — MARKET ORDER"),
+                              f"(entry={entry_price_cents or '?'}c, bot={source_bot or '?'}) — MARKET ORDER"),
             }
 
     # Check NO position stop-loss
@@ -276,7 +368,7 @@ def evaluate_stop_loss(position, market, exit_config, entry_price_cents=None):
                 "price": no_bid,
                 "order_type": "market",
                 "reasoning": (f"Stop loss: NO bid {no_bid}c <= {stop_loss_cents}c threshold "
-                              f"(entry={entry_price_cents or '?'}c) — MARKET ORDER"),
+                              f"(entry={entry_price_cents or '?'}c, bot={source_bot or '?'}) — MARKET ORDER"),
             }
 
     return None
@@ -562,9 +654,12 @@ def evaluate_model_shift(position, market, exit_config, entry_rec=None):
     if current_prob is None:
         return None  # Can't evaluate model-shift, skip
 
-    # Check if divergence exceeds threshold
-    divergence_pp = abs(current_prob * 100 - entry_prob * 100)
-    if divergence_pp >= model_shift_pp and current_prob < 0.50:
+    # Check if probability has dropped from entry by more than threshold.
+    # Directional: only exit when model now likes our position LESS (erosion).
+    # Old gate (current_prob < 0.50) missed cases like 70%->55% where edge eroded
+    # but position was still above coin-flip.
+    drop_pp = (entry_prob - current_prob) * 100  # positive = erosion
+    if drop_pp >= model_shift_pp:
         return {
             "action": "model_shift",
             "side": side,
@@ -573,10 +668,61 @@ def evaluate_model_shift(position, market, exit_config, entry_rec=None):
             "order_type": "limit",
             "reasoning": (f"Model shift: {reasoning}, current={current_prob*100:.0f}% "
                           f"vs entry={entry_prob*100:.0f}% "
-                          f"(divergence {divergence_pp:.0f}pp >= {model_shift_pp}pp) — limit at {bid}c"),
+                          f"(drop {drop_pp:.0f}pp >= {model_shift_pp}pp) — limit at {bid}c"),
         }
 
     return None
+
+
+def check_stale_positions(entry_records, positions, max_age_days=7):
+    """Identify losing positions that have been open longer than max_age_days.
+
+    Returns list of dicts with ticker, age_days, unrealized_pnl_cents for logging.
+    This is informational (logged as warnings) — does NOT auto-exit.
+    """
+    stale = []
+    now = datetime.datetime.now()
+    for pos in positions:
+        ticker = pos.get("ticker", "")
+        entry_rec = entry_records.get(ticker, {})
+        ts = entry_rec.get("timestamp")
+        if not ts:
+            continue
+        try:
+            entry_dt = datetime.datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            continue
+        age_days = (now - entry_dt).days
+        if age_days <= max_age_days:
+            continue
+
+        # Estimate unrealized P&L: (current_bid - entry_price) * count
+        entry_price = entry_rec.get("price_cents", 0)
+        yes_count = pos.get("yes", 0)
+        no_count = pos.get("no", 0)
+        if yes_count > 0:
+            current_bid = pos.get("market_yes_bid", 0)
+            unrealized = (current_bid - entry_price) * yes_count
+        elif no_count > 0:
+            current_bid = pos.get("market_no_bid", 0)
+            unrealized = (current_bid - entry_price) * no_count
+        else:
+            continue
+
+        if unrealized < 0:
+            stale.append({
+                "ticker": ticker,
+                "age_days": age_days,
+                "unrealized_pnl_cents": unrealized,
+                "entry_price": entry_price,
+                "current_bid": current_bid,
+            })
+            log.warning(
+                f"Stale losing position: {ticker} age={age_days}d "
+                f"entry={entry_price}c bid={current_bid}c "
+                f"P&L={unrealized}c"
+            )
+    return stale
 
 
 def cancel_stale_orders():
@@ -665,6 +811,82 @@ def _count_exits_today():
     return sum(1 for t in trades if t.get("action") == "sell" and t.get("timestamp", "").startswith(today))
 
 
+# === Scan Metrics ===
+
+class PositionScanMetrics:
+    """Collects per-scan metrics for observability and debugging.
+
+    Tracks: positions checked, exits by type (TP/SL/model-shift/trailing/stale),
+    total portfolio exposure, largest single position.
+    Saves rolling history to data/position-monitor-metrics.json.
+    """
+
+    MAX_HISTORY = 500  # keep last 500 scans
+
+    def __init__(self):
+        self.positions_checked = 0
+        self.exits_by_type = {
+            "take_profit": 0,
+            "stop_loss": 0,
+            "model_shift": 0,
+            "trailing_stop": 0,
+            "allocator_supersede": 0,
+        }
+        self.stale_positions = 0
+        self.total_exposure_cents = 0
+        self.largest_position_cents = 0
+        self.largest_position_ticker = ""
+
+    def record_position(self, ticker, count, entry_price_cents):
+        """Track a position's contribution to total exposure."""
+        self.positions_checked += 1
+        exposure = count * (entry_price_cents or 0)
+        self.total_exposure_cents += exposure
+        if exposure > self.largest_position_cents:
+            self.largest_position_cents = exposure
+            self.largest_position_ticker = ticker
+
+    def record_exit(self, exit_type):
+        """Record an exit by type."""
+        if exit_type in self.exits_by_type:
+            self.exits_by_type[exit_type] += 1
+
+    def record_stale(self, count):
+        """Record number of stale positions flagged."""
+        self.stale_positions = count
+
+    def to_dict(self):
+        """Serialize metrics for JSON storage."""
+        return {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "positions_checked": self.positions_checked,
+            "exits_by_type": dict(self.exits_by_type),
+            "total_exits": sum(self.exits_by_type.values()),
+            "stale_positions_flagged": self.stale_positions,
+            "total_exposure_cents": self.total_exposure_cents,
+            "largest_position_cents": self.largest_position_cents,
+            "largest_position_ticker": self.largest_position_ticker,
+        }
+
+    def save(self, path=None):
+        """Append this scan's metrics to rolling history file."""
+        metrics_path = path or METRICS_PATH
+        try:
+            history = []
+            if metrics_path.exists():
+                try:
+                    history = json.loads(metrics_path.read_text())
+                except (json.JSONDecodeError, ValueError):
+                    history = []
+            history.append(self.to_dict())
+            # Trim to max history
+            if len(history) > self.MAX_HISTORY:
+                history = history[-self.MAX_HISTORY:]
+            _atomic_write_json(metrics_path, history)
+        except Exception as e:
+            log.error(f"Failed to save scan metrics: {e}")
+
+
 # === Main Scan ===
 
 def scan_positions():
@@ -673,6 +895,7 @@ def scan_positions():
     health.record_bot_heartbeat("position-monitor")
 
     ss = ScanSummary("position-monitor", log)
+    metrics = PositionScanMetrics()
     now = datetime.datetime.now()
     log.info(f"\n{'='*60}")
     log.info(f"[{now.isoformat()}] Position scan starting...")
@@ -746,11 +969,18 @@ def scan_positions():
 
         log.info(f"  {ticker}: YES={yes_count} NO={no_count} | bid={market.get('yes_bid',0)}c ask={market.get('yes_ask',0)}c")
 
+        # Attach market bid info to position for stale check later
+        pos["market_yes_bid"] = market.get("yes_bid", 0)
+        pos["market_no_bid"] = market.get("no_bid", 0) or (100 - market.get("yes_ask", 100))
+
         # Look up entry record for this position
         entry_rec = entry_records.get(ticker, {})
         entry_price = entry_rec.get("price_cents")
         source_bot = entry_rec.get("source_bot", "")
         exit_config = _get_exit_config(source_bot)
+
+        # Track metrics
+        metrics.record_position(ticker, yes_count or no_count, entry_price)
 
         # Evaluate exit conditions in priority order
         exit_signal = None
@@ -760,7 +990,7 @@ def scan_positions():
 
         # 2. Stop loss (per-bot threshold, market order)
         if not exit_signal:
-            exit_signal = evaluate_stop_loss(pos, market, exit_config, entry_price_cents=entry_price)
+            exit_signal = evaluate_stop_loss(pos, market, exit_config, entry_price_cents=entry_price, source_bot=source_bot)
 
         # 3. Trailing stop (per-bot config, illiquidity protection, market orders)
         if not exit_signal:
@@ -809,6 +1039,7 @@ def scan_positions():
             if result:
                 exits_today += 1
                 ss.trades_placed += 1
+                metrics.record_exit(exit_signal["action"])
                 allocator.record_trade("position-monitor", ticker, risk=0, edge=0)
                 trade_manager.log_decision(ticker, exit_signal["side"], "placed", exit_signal["action"],
                                            price_cents=exit_signal["price"])
@@ -835,6 +1066,12 @@ def scan_positions():
 
     # Mid-scan heartbeat to prevent supervisor staleness detection on long scans
     health.record_bot_heartbeat("position-monitor")
+
+    # Check for stale losing positions (informational warning, no auto-exit)
+    stale_positions = check_stale_positions(entry_records, positions)
+    if stale_positions:
+        log.info(f"  {len(stale_positions)} stale losing positions flagged for review")
+    metrics.record_stale(len(stale_positions))
 
     # Clean up peaks for closed positions and save
     stale_tickers = [t for t in peaks.keys() if t not in open_tickers and t != "_metadata"]
@@ -883,7 +1120,12 @@ def scan_positions():
     ss.markets_fetched = len(positions)
     ss.markets_evaluated = len(open_tickers)
     ss.finalize()
-    log.info(f"Scan complete. {exits_today} exit orders placed.")
+
+    # Save scan metrics
+    metrics.save()
+    log.info(f"Scan complete. {exits_today} exit orders placed. "
+             f"Exposure: ${metrics.total_exposure_cents/100:.2f}, "
+             f"largest: {metrics.largest_position_ticker} ${metrics.largest_position_cents/100:.2f}")
 
 
 # === Entry Point ===
