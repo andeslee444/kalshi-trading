@@ -3,7 +3,7 @@
 Strategies: Longshot bias selling, maker-only limit orders, info arbitrage near settlement.
 """
 
-import json, time, datetime, os, sys, math, argparse
+import json, time, datetime, os, sys, math, argparse, statistics
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log, _atomic_write_json, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary
@@ -70,6 +70,7 @@ _buy_min_price = _bots_cfg.get("buyMinPrice", 70)
 SPORTS_PREFIXES = ["KXNBA", "KXNFL", "KXNHL", "KXMLB", "KXUFC", "KXNCAA", "KXSPORT", "KXSOCCER", "KXMARMAD"]
 
 TRADES_JSON_PATH = DATA_DIR / "kalshi-strategy-trades.json"
+METRICS_PATH = DATA_DIR / "strategy-metrics.json"
 trade_manager = TradeManager(client, TRADES_JSON_PATH, {
     "maxTradeAmount": MAX_BET / 100,
     "maxTradeAmountPct": _bots_cfg.get("maxTradeAmountPct"),
@@ -182,8 +183,8 @@ def find_longshot_sells(markets, bankroll):
             else:
                 kelly_mult = 1.0  # trust Becker prior at full quarter-Kelly
             n_same = category_counts.get(category, 0) + 1
-            # Only apply copula scaling when we have empirical correlation data
-            copula_scale = 1.0  # TODO: replace with empirical rho when data exists
+            rho = correlation_sizer.get_intra_category_rho(category)
+            copula_scale = correlation_sizer.kelly_scale(n_same, rho)
 
         # Check category cap before sizing
         if not correlation_sizer.check_category_cap(category, no_price * 1):
@@ -191,7 +192,57 @@ def find_longshot_sells(markets, bankroll):
                                        category=category)
             continue
 
-        # Request budget from portfolio allocator
+        # Track for copula
+        category_counts[category] = category_counts.get(category, 0) + 1
+
+        implied_prob = sell_price / 100.0
+        true_prob = implied_prob - est_edge
+
+        mu_edge = edge_est.mu_edge if edge_est else est_edge
+        sigma_edge = edge_est.sigma_edge if edge_est else 0.0
+        conf_ratio = edge_est.confidence_ratio if edge_est else 0.0
+
+        candidates.append({
+            "ticker": ticker,
+            "title": m.get("title", "")[:80],
+            "subtitle": m.get("subtitle", "")[:60],
+            "strategy": "longshot_sell",
+            "side": "no",  # selling YES = buying NO
+            "action": "buy",
+            "price": 100 - sell_price,  # NO price = 100 - YES price
+            "yes_price": sell_price,
+            "est_edge": est_edge,
+            "hours_to_close": hours,
+            "volume": volume,
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "close_time": m.get("close_time"),
+            "mu_edge": mu_edge,
+            "sigma_edge": sigma_edge,
+            "confidence_ratio": conf_ratio,
+            "kelly_multiplier": kelly_mult,
+            "copula_scale": copula_scale,
+            "fee_per_contract": fee_per_contract,
+            "category": category,
+            "reasoning": f"Longshot bias: YES@{sell_price}c implies {implied_prob*100:.1f}% prob, Becker model est true prob ~{true_prob*100:.2f}%. Sell YES (buy NO@{100-sell_price}c) for ~{est_edge*100:.2f}% edge. Bayesian CR={conf_ratio:.2f}, kelly_mult={kelly_mult:.2f}, copula={copula_scale:.2f}."
+        })
+
+    candidates.sort(key=lambda x: -x["est_edge"] * math.log1p(max(x.get("volume", 0), 1)))
+
+    # Defer allocator calls to top-N candidates only (avoids thousands of
+    # file-lock + JSON-parse cycles that cause 100% CPU spin).
+    TOP_N = 20
+    sized_candidates = []
+    n_allocator_calls = 0
+    for c in candidates[:TOP_N]:
+        ticker = c["ticker"]
+        est_edge = c["est_edge"]
+        sell_price = c["yes_price"]
+        kelly_mult = c["kelly_multiplier"]
+        copula_scale = c["copula_scale"]
+        fee_per_contract = c["fee_per_contract"]
+
+        n_allocator_calls += 1
         budget = allocator.request_budget("strategy", ticker, edge=est_edge)
         if not budget.approved:
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
@@ -217,45 +268,13 @@ def find_longshot_sells(markets, bankroll):
                                        edge=est_edge, price_cents=sell_price)
             continue
 
-        # Track for copula
-        category_counts[category] = category_counts.get(category, 0) + 1
+        c["contracts"] = contracts
+        c["risk_cents"] = risk
+        c["kelly_fraction"] = kelly_details.get("kelly_fraction")
+        c["bankroll_used"] = kelly_details.get("bankroll_used")
+        sized_candidates.append(c)
 
-        implied_prob = sell_price / 100.0
-        true_prob = implied_prob - est_edge
-
-        mu_edge = edge_est.mu_edge if edge_est else est_edge
-        sigma_edge = edge_est.sigma_edge if edge_est else 0.0
-        conf_ratio = edge_est.confidence_ratio if edge_est else 0.0
-
-        candidates.append({
-            "ticker": ticker,
-            "title": m.get("title", "")[:80],
-            "subtitle": m.get("subtitle", "")[:60],
-            "strategy": "longshot_sell",
-            "side": "no",  # selling YES = buying NO
-            "action": "buy",
-            "price": 100 - sell_price,  # NO price = 100 - YES price
-            "yes_price": sell_price,
-            "contracts": contracts,
-            "est_edge": est_edge,
-            "risk_cents": risk,
-            "hours_to_close": hours,
-            "volume": volume,
-            "yes_bid": yes_bid,
-            "yes_ask": yes_ask,
-            "close_time": m.get("close_time"),
-            "kelly_fraction": kelly_details.get("kelly_fraction"),
-            "bankroll_used": kelly_details.get("bankroll_used"),
-            "mu_edge": mu_edge,
-            "sigma_edge": sigma_edge,
-            "confidence_ratio": conf_ratio,
-            "kelly_multiplier": kelly_mult,
-            "copula_scale": copula_scale,
-            "reasoning": f"Longshot bias: YES@{sell_price}c implies {implied_prob*100:.1f}% prob, Becker model est true prob ~{true_prob*100:.2f}%. Sell YES (buy NO@{100-sell_price}c) for ~{est_edge*100:.2f}% edge. Bayesian CR={conf_ratio:.2f}, kelly_mult={kelly_mult:.2f}, copula={copula_scale:.2f}."
-        })
-
-    candidates.sort(key=lambda x: -x["est_edge"] * math.log1p(max(x.get("volume", 0), 1)))
-    return candidates
+    return sized_candidates, len(candidates), n_allocator_calls
 
 def find_longshot_buys(markets, bankroll):
     """Find YES 70-99c contracts to BUY (exploit NO-side longshot bias).
@@ -264,7 +283,7 @@ def find_longshot_buys(markets, bankroll):
     Buy YES to profit from NO-side longshot bias.
     """
     if not _buy_longshots_enabled:
-        return []
+        return [], 0, 0
 
     now = datetime.datetime.now(datetime.timezone.utc)
     candidates = []
@@ -331,33 +350,14 @@ def find_longshot_buys(markets, bankroll):
             else:
                 kelly_mult = 1.0  # trust Becker prior at full quarter-Kelly
             n_same = category_counts.get(category, 0) + 1
-            # Only apply copula scaling when we have empirical correlation data
-            copula_scale = 1.0  # TODO: replace with empirical rho when data exists
+            rho = correlation_sizer.get_intra_category_rho(category)
+            copula_scale = correlation_sizer.kelly_scale(n_same, rho)
 
         # Category cap check
         if not correlation_sizer.check_category_cap(category, buy_price):
             continue
 
-        # Budget from allocator
-        budget = allocator.request_budget("strategy", ticker, edge=est_edge)
-        if not budget.approved:
-            continue
-
         fee_per_contract = kalshi_fee_cents(buy_price)
-        contracts, risk, kelly_details = quarter_kelly(
-            est_edge, buy_price, budget.max_cost_cents,
-            bankroll_cents=budget.bankroll_cents, fee_cents=fee_per_contract,
-            return_details=True,
-        )
-
-        # Apply Bayesian + copula scaling
-        if contracts > 0 and _bayesian_edge_enabled:
-            adjusted = max(1, int(contracts * kelly_mult * copula_scale))
-            contracts = adjusted
-            risk = contracts * buy_price
-
-        if contracts <= 0:
-            continue
 
         category_counts[category] = category_counts.get(category, 0) + 1
 
@@ -374,23 +374,61 @@ def find_longshot_buys(markets, bankroll):
             "action": "buy",
             "price": buy_price,
             "yes_price": buy_price,
-            "contracts": contracts,
             "est_edge": est_edge,
-            "risk_cents": risk,
             "hours_to_close": hours,
             "volume": volume,
             "yes_bid": yes_bid,
             "yes_ask": yes_ask,
             "close_time": m.get("close_time"),
-            "kelly_fraction": kelly_details.get("kelly_fraction"),
-            "bankroll_used": kelly_details.get("bankroll_used"),
             "kelly_multiplier": kelly_mult,
             "copula_scale": copula_scale,
+            "fee_per_contract": fee_per_contract,
+            "category": category,
             "reasoning": f"Buy-side longshot: YES@{buy_price}c, NO equiv {no_equiv}c longshot. Becker model edge ~{est_edge*100:.2f}%. CR={conf_ratio:.2f}, kelly_mult={kelly_mult:.2f}."
         })
 
     candidates.sort(key=lambda x: -x["est_edge"] * math.log1p(max(x.get("volume", 0), 1)))
-    return candidates
+
+    # Defer allocator calls to top-N candidates only (avoids thousands of
+    # file-lock + JSON-parse cycles that cause 100% CPU spin).
+    TOP_N = 20
+    sized_candidates = []
+    n_allocator_calls = 0
+    for c in candidates[:TOP_N]:
+        ticker = c["ticker"]
+        est_edge = c["est_edge"]
+        buy_price = c["yes_price"]
+        kelly_mult = c["kelly_multiplier"]
+        copula_scale = c["copula_scale"]
+        fee_per_contract = c["fee_per_contract"]
+
+        n_allocator_calls += 1
+        budget = allocator.request_budget("strategy", ticker, edge=est_edge)
+        if not budget.approved:
+            continue
+
+        contracts, risk, kelly_details = quarter_kelly(
+            est_edge, buy_price, budget.max_cost_cents,
+            bankroll_cents=budget.bankroll_cents, fee_cents=fee_per_contract,
+            return_details=True,
+        )
+
+        # Apply Bayesian + copula scaling
+        if contracts > 0 and _bayesian_edge_enabled:
+            adjusted = max(1, int(contracts * kelly_mult * copula_scale))
+            contracts = adjusted
+            risk = contracts * buy_price
+
+        if contracts <= 0:
+            continue
+
+        c["contracts"] = contracts
+        c["risk_cents"] = risk
+        c["kelly_fraction"] = kelly_details.get("kelly_fraction")
+        c["bankroll_used"] = kelly_details.get("bankroll_used")
+        sized_candidates.append(c)
+
+    return sized_candidates, len(candidates), n_allocator_calls
 
 
 def check_settled_trades():
@@ -452,6 +490,9 @@ def check_settled_trades():
 
 def run_scan():
     """Run a single strategy scan cycle."""
+    scan_start = time.monotonic()
+    allocator_calls = 0  # tracks total allocator.request_budget calls this scan
+
     # Reset daily caps at start of scan (idempotent — safe to call every scan)
     correlation_sizer.reset_daily()
     if scheduler:
@@ -521,6 +562,7 @@ def run_scan():
 
             log.info(f"  INFO-ARB: {ticker} | Source: {info_edge.source} | Edge: {info_edge.edge*100:.0f}% | Confidence: {info_edge.confidence*100:.0f}%")
 
+            allocator_calls += 1
             budget = allocator.request_budget("strategy", ticker, edge=info_edge.edge)
             if not budget.approved:
                 log.info(f"    Allocator denied: {budget.reason}")
@@ -565,8 +607,9 @@ def run_scan():
     log.info("\n" + "=" * 70)
     log.info("STRATEGY 1: Longshot Bias Exploitation (Sell YES on low-prob events)")
     log.info("=" * 70)
-    longshots = find_longshot_sells(markets, avail)
-    log.info(f"  Found {len(longshots)} longshot sell candidates")
+    longshots, sell_candidates_total, sell_allocator_calls = find_longshot_sells(markets, avail)
+    allocator_calls += sell_allocator_calls
+    log.info(f"  Found {len(longshots)} longshot sell candidates (from {sell_candidates_total} pre-filter)")
     sports_candidates = [c for c in longshots if any(
         c["ticker"].upper().startswith(p) for p in SPORTS_PREFIXES
     )]
@@ -643,8 +686,9 @@ def run_scan():
     log.info("\n" + "=" * 70)
     log.info("STRATEGY 2: Buy-Side Longshot Exploitation (Buy YES on high-prob events)")
     log.info("=" * 70)
-    buy_longshots = find_longshot_buys(markets, avail)
-    log.info(f"  Found {len(buy_longshots)} buy-side longshot candidates")
+    buy_longshots, buy_candidates_total, buy_allocator_calls = find_longshot_buys(markets, avail)
+    allocator_calls += buy_allocator_calls
+    log.info(f"  Found {len(buy_longshots)} buy-side longshot candidates (from {buy_candidates_total} pre-filter)")
 
     for i, c in enumerate(buy_longshots[:5]):
         log.info(f"\n  {i+1}. {c['ticker']}")
@@ -725,7 +769,7 @@ def run_scan():
 
     new_section = f"\n\n## Trade Session: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
     new_section += f"**Balance**: ${balance/100:.2f} | **Available**: ${avail/100:.2f}\n\n"
-    new_section += f"**Markets Scanned**: {len(markets)} | **Sell Candidates**: {len(longshots)} | **Buy Candidates**: {len(buy_longshots)}\n\n"
+    new_section += f"**Markets Scanned**: {len(markets)} | **Sell Candidates**: {sell_candidates_total} (sized: {len(longshots)}) | **Buy Candidates**: {buy_candidates_total} (sized: {len(buy_longshots)})\n\n"
 
     if trades_executed:
         new_section += "### Trades Placed\n\n"
@@ -768,8 +812,36 @@ def run_scan():
     ss.trades_placed = len([t for t in trades_executed if t.get("status") not in ("BLOCKED/FAILED",)])
     ss.finalize()
 
+    # Write per-scan metrics
+    scan_duration = time.monotonic() - scan_start
+    all_edges = [c["est_edge"] for c in longshots] + [c["est_edge"] for c in buy_longshots]
+    edge_distribution = {}
+    if all_edges:
+        sorted_edges = sorted(all_edges)
+        edge_distribution = {
+            "min": round(sorted_edges[0], 4),
+            "median": round(statistics.median(sorted_edges), 4),
+            "max": round(sorted_edges[-1], 4),
+        }
+
+    metrics = {
+        "markets_scanned": len(markets),
+        "longshot_sell_candidates": sell_candidates_total,
+        "longshot_buy_candidates": buy_candidates_total,
+        "trades_placed": ss.trades_placed,
+        "edge_distribution": edge_distribution,
+        "scan_duration_seconds": round(scan_duration, 2),
+        "allocator_calls": allocator_calls,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    try:
+        _atomic_write_json(METRICS_PATH, metrics)
+    except Exception as e:
+        log.warning(f"Failed to write scan metrics: {e}")
+
     log.info(f"\n{'='*70}")
     log.info(f"STRATEGY TRADER COMPLETE -- {len(trades_executed)} trades placed")
+    log.info(f"  Scan: {scan_duration:.1f}s | Allocator calls: {allocator_calls}")
     log.info(f"{'='*70}")
 
     return len(trades_executed)
