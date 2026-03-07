@@ -56,6 +56,8 @@ class FREDClient:
         # FRED allows limited requests without a key, but key is recommended
         # For now, use the free tier (no key needed for basic series)
         self.api_key = api_key
+        self._scan_cache = {}      # Per-scan cache: cleared by clear_cache()
+        self._scan_cache_all = None  # Cached result of fetch_all()
 
     def _parse_observation(self, data: dict) -> Optional[float]:
         """Parse the latest observation value from a FRED API response."""
@@ -71,8 +73,13 @@ class FREDClient:
         except (ValueError, TypeError):
             return None
 
+    def clear_cache(self):
+        """Clear per-scan cache. Call at start of each scan cycle."""
+        self._scan_cache = {}
+        self._scan_cache_all = None
+
     def fetch_series(self, series_key: str) -> Optional[float]:
-        """Fetch the latest value for a FRED series.
+        """Fetch the latest value for a FRED series (cached per scan).
 
         Args:
             series_key: Key from SERIES dict (e.g. "tips_breakeven_10y").
@@ -80,6 +87,10 @@ class FREDClient:
         Returns:
             Latest value as float, or None on error.
         """
+        # Return cached value if available
+        if series_key in self._scan_cache:
+            return self._scan_cache[series_key]
+
         series_id = self.SERIES.get(series_key)
         if not series_id:
             _log.warning("Unknown FRED series key: %s", series_key)
@@ -100,18 +111,29 @@ class FREDClient:
             value = self._parse_observation(data)
             if value is not None:
                 _log.info("  FRED %s (%s): %.3f", series_key, series_id, value)
+            self._scan_cache[series_key] = value
             return value
         except Exception as e:
             _log.error("  FRED fetch failed for %s: %s", series_key, e)
+            self._scan_cache[series_key] = None
             return None
 
     def fetch_all(self) -> Dict[str, float]:
-        """Fetch all configured FRED series. Returns {key: value} dict."""
+        """Fetch all configured FRED series (cached per scan).
+
+        Returns {key: value} dict. Second call within same scan returns
+        cached result without making API calls.
+        """
+        if self._scan_cache_all is not None:
+            return self._scan_cache_all
+
         results = {}
         for key in self.SERIES:
             value = self.fetch_series(key)
             if value is not None:
                 results[key] = value
+
+        self._scan_cache_all = results
         return results
 
 

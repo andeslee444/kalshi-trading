@@ -792,6 +792,10 @@ def scan_and_trade():
         ss.finalize()
         return
 
+    # Clear FRED per-scan cache so fresh data is fetched this cycle
+    if macro is not None and hasattr(macro, '_fred'):
+        macro._fred.clear_cache()
+
     # Fetch nowcast data (health recording handled inside fetch_cleveland_fed_nowcast)
     log.info("\nFetching economic data sources...")
     nowcast = fetch_cleveland_fed_nowcast()
@@ -836,9 +840,11 @@ def scan_and_trade():
     if gas_price:
         ss.source_ok("aaa-gas")
 
-    # Fetch Bayesian filter data sources
+    # Fetch external data sources (FRED + Truflation) — ONE call per scan
+    # Previously fred.fetch_all() was called twice; now cached in fred_data.
     truflation_cpi = None
     tips_breakeven = None
+    fred_data = {}
     if macro is not None:
         try:
             truflation_cpi = macro._truflation.fetch() if hasattr(macro, '_truflation') else None
@@ -881,13 +887,12 @@ def scan_and_trade():
         log.info(f"  TIPS 10Y breakeven: {tips_breakeven:.2f}%")
         ss.source_ok("tips-breakeven")
 
-    # Fetch scenario weight data
+    # Build scenario weight inputs from FRED data (reuse cached fred_data, no second fetch)
     fred_scenario_data = {}
     polymarket_scenario_data = {}
-    if macro is not None:
+    if fred_data:
         try:
-            fred_all = macro._fred.fetch_all() if hasattr(macro, '_fred') else {}
-            crude_oil = fred_all.get("crude_oil")
+            crude_oil = fred_data.get("crude_oil")
 
             # Compute 90-day MA from FRED (fetch last 90 observations of daily WTI)
             crude_oil_90d_ma = None
@@ -912,8 +917,8 @@ def scan_and_trade():
                     log.warning(f"  Crude oil 90d MA calc failed (non-fatal): {e}")
 
             # TIPS 5Y-10Y spread for stagflation signal
-            tips_5y = fred_all.get("tips_breakeven_5y")
-            tips_10y = fred_all.get("tips_breakeven_10y")
+            tips_5y = fred_data.get("tips_breakeven_5y")
+            tips_10y = fred_data.get("tips_breakeven_10y")
             tips_5y_minus_10y = None
             if tips_5y is not None and tips_10y is not None:
                 tips_5y_minus_10y = tips_5y - tips_10y
@@ -921,12 +926,12 @@ def scan_and_trade():
             fred_scenario_data = {
                 "crude_oil": crude_oil,
                 "crude_oil_90d_ma": crude_oil_90d_ma,
-                "T10Y2Y": fred_all.get("yield_curve"),
-                "gdpnow": fred_all.get("gdpnow"),
+                "T10Y2Y": fred_data.get("yield_curve"),
+                "gdpnow": fred_data.get("gdpnow"),
                 "tips_5y_minus_10y": tips_5y_minus_10y,
             }
         except Exception as e:
-            log.warning(f"  FRED scenario data fetch failed (non-fatal): {e}")
+            log.warning(f"  FRED scenario data processing failed (non-fatal): {e}")
 
     # Compute scenario weights
     scenario_weights = compute_scenario_weights(polymarket_scenario_data, fred_scenario_data)
