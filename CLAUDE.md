@@ -27,7 +27,7 @@ npm run sync:down    # Pull trade logs + calibration from S3
 
 Requires AWS CLI configured with credentials. Set `S3_BUCKET` in `.env` (defaults to `kalshi-trading-logs`).
 
-**Synced:** `data/kalshi-*-trades.json`, `data/beatrelease-trades.json`, `data/beatrelease-state.json`, `data/backtest-results.json`, `config/calibration.json`.
+**Synced:** `data/kalshi-*-trades.json`, `data/beatrelease-trades.json`, `data/beatrelease-state.json`, `data/backtest-results.json`, `data/financial-snapshot.json`, `config/calibration.json`.
 **Excluded:** `data/logs/`, `data/pids/`, `data/HALT_TRADING`, market caches, demo trades, source snapshots.
 
 ## Running Bots
@@ -84,7 +84,7 @@ FastAPI web UI for real-time monitoring (default port 3456).
 npm run dashboard    # Start web server at http://localhost:3456
 ```
 
-Key API endpoints: `/api/bots` (status), `/api/account` (balance/P&L), `/api/trades` (recent fills), `/api/decisions` (bot decision logs), `/api/risk` (per-bot daily risk), `/api/settlements` (settled P&L, win rate), `/api/positions`, `/api/health`, `/api/logs`. Frontend served from `scripts/dashboard.html`.
+Key API endpoints: `/api/bots` (status), `/api/account` (balance/P&L), `/api/trades` (recent fills), `/api/decisions` (bot decision logs), `/api/risk` (per-bot daily risk), `/api/settlements` (settled P&L, win rate), `/api/positions`, `/api/health`, `/api/logs`, `/api/snapshot` (verified P&L snapshot). Frontend served from `scripts/dashboard.html`.
 
 ### Daily Automation
 
@@ -95,8 +95,10 @@ npm run backtest:daily      # Daily backtest with >10% drift detection alert
 npm run audit               # Comprehensive math & strategy audit
 npm run reconcile           # Annotate trade records with settlement outcomes
 npm run backfill            # Backfill settlement data from market endpoints
+npm run snapshot            # Verified P&L snapshot (Kalshi API + local logs)
 ```
 
+- **`pnl-snapshot.py`** — Dual-source verified P&L: fetches Kalshi API settlements/fills/positions, loads local trade logs, cross-references both, writes `data/financial-snapshot.json`. Flags: `--print` (stdout), `--pull-s3` (pull S3 data first). **This is the authoritative source for P&L data** — read `data/financial-snapshot.json` instead of computing P&L from raw trade logs.
 - **`audit.py`** — Programmatic audit covering P&L truth, data integrity, backtesting realism, execution slippage, sizing math, and per-bot edge validation. Uses severity levels (PASS/WARN/FAIL/INFO). Flags: `--json`, `--section N`, `--reconcile`.
 - **`reconcile-trades.py`** — Walks all trade log files, matches to API settlement/fill data, writes back `settlement_result`, `realized_edge`. Idempotent; `--dry-run` available.
 - **`backfill-settlements.py`** — Queries individual `/markets/{ticker}` endpoints for unsettled trades. Complements reconcile. Flags: `--dry-run`, `--report`.
@@ -111,6 +113,8 @@ npm run backfill            # Backfill settlement data from market endpoints
 | `allocator-state.json` | Capital allocator | Dashboard, bots | Circuit breaker status, allocation state |
 | `*-decisions.json` | Each bot | Dashboard | Every market evaluated with trade/skip reason |
 | `*-last-run.json` | One-shot bots | Supervisor | Completion markers (strategy, hdd, beatrelease) |
+| `financial-snapshot.json` | pnl-snapshot.py | Dashboard, Claude | Verified P&L with dual-source cross-check |
+| `deposits.json` | Manual | pnl-snapshot.py | Deposit/withdrawal ledger for ROI calculation |
 
 ## Testing
 
@@ -128,6 +132,26 @@ Tests cover pure functions — no API calls or credentials required.
 - Source files use hyphens (`strategy-trader.py`), so Python can't import them directly. Tests use `importlib.util.spec_from_file_location` to load bot modules.
 - Bots instantiate `KalshiClient` and read config at module-level import time, so tests must stub `kalshi_auth` in `sys.modules` before importing bot modules (see `test_kelly.py:_load_strategy_trader()` for the pattern).
 - Probability tests must call `_reset_calibration()` in setup/teardown to clear cached calibration state between tests.
+
+## P&L and Financial Data
+
+**To answer questions about P&L, deposits, balance, or trading performance, read `data/financial-snapshot.json`.** This is the single source of truth — it cross-references Kalshi API settlements against local trade logs and flags discrepancies. Do NOT compute P&L manually from trade log files (the `settlement_revenue_cents` field uses inconsistent semantics).
+
+Key fields in the snapshot:
+- `account.nav_cents` — Current net asset value (balance + open positions)
+- `realized_pnl.total_cents` — Authoritative realized P&L from API settlements (`revenue - yes_total_cost - no_total_cost`)
+- `realized_pnl.by_bot` — Per-bot P&L, wins, losses, fees, win rate
+- `realized_pnl.by_day` — Daily P&L breakdown
+- `unrealized_pnl` — Open position values vs cost basis
+- `verification.status` — "ok", "warnings", or "errors" (cross-check results)
+- `deposits` — ROI calculation if `data/deposits.json` exists
+
+**Kalshi API P&L gotcha:** The API's `revenue` field is **gross payout** (cost recovery + profit), NOT net profit. Always use `revenue - yes_total_cost - no_total_cost` for actual P&L. The `fee_cost` field is dollars as a string (e.g., `"0.04"`), not cents.
+
+To track deposits/withdrawals for ROI, maintain `data/deposits.json`:
+```json
+[{"date": "2026-02-15", "type": "deposit", "amount_cents": 50000, "note": "initial funding"}]
+```
 
 ## Performance Analysis
 
