@@ -149,6 +149,61 @@ for f in ['health-state.json', 'scan-summaries.json', 'financial-snapshot.json']
     fi
   done
 
+  # Generate sync manifest for audit trail
+  echo "Generating sync manifest..."
+  python3 -c "
+import json, sys, os
+from pathlib import Path
+from datetime import datetime, timezone
+
+proj = Path('$PROJECT_DIR')
+data = proj / 'data'
+sys.path.insert(0, str(proj / 'src' / 'kalshi'))
+from trade_files import TRADE_FILES
+
+manifest = {
+    'sync_time': datetime.now(timezone.utc).isoformat(),
+    'hostname': '$(hostname)',
+    'direction': 'upload',
+    'trade_logs': {},
+    'state_files': {},
+}
+
+for tf in TRADE_FILES:
+    p = data / tf['filename']
+    if p.exists():
+        try:
+            trades = json.loads(p.read_text())
+            manifest['trade_logs'][tf['filename']] = {
+                'size_bytes': p.stat().st_size,
+                'trade_count': len(trades),
+                'latest_timestamp': max((t.get('timestamp','') for t in trades), default=''),
+                'reconciled_count': sum(1 for t in trades if t.get('settlement_result')),
+            }
+        except json.JSONDecodeError:
+            manifest['trade_logs'][tf['filename']] = {'error': 'corrupt JSON'}
+
+for sf in ['health-state.json', 'financial-snapshot.json', 'allocator-state.json',
+           'scan-summaries.json', 'circuit-breaker-state.json']:
+    p = data / sf
+    if p.exists():
+        manifest['state_files'][sf] = {
+            'size_bytes': p.stat().st_size,
+            'modified': datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(),
+        }
+
+print(json.dumps(manifest, indent=2))
+" > "$PROJECT_DIR/data/.sync-manifest.json"
+
+  aws s3 cp "$PROJECT_DIR/data/.sync-manifest.json" "s3://${BUCKET}/data/.sync-manifest.json"
+
+  # Append to sync history (last 100 entries)
+  aws s3 cp "s3://${BUCKET}/data/.sync-history.jsonl" "$PROJECT_DIR/data/.sync-history.jsonl" 2>/dev/null || true
+  cat "$PROJECT_DIR/data/.sync-manifest.json" >> "$PROJECT_DIR/data/.sync-history.jsonl"
+  tail -100 "$PROJECT_DIR/data/.sync-history.jsonl" > "$PROJECT_DIR/data/.sync-history-trimmed.jsonl"
+  mv "$PROJECT_DIR/data/.sync-history-trimmed.jsonl" "$PROJECT_DIR/data/.sync-history.jsonl"
+  aws s3 cp "$PROJECT_DIR/data/.sync-history.jsonl" "s3://${BUCKET}/data/.sync-history.jsonl"
+
   echo "Upload complete."
 }
 
