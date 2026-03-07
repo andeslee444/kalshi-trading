@@ -11,7 +11,7 @@ from probability import weather_probability, weather_sigma, ensemble_weather_pro
 from ticker_utils import parse_weather_ticker as parse_ticker
 from capital_allocator import PortfolioAllocator
 from forecast_verifier import ForecastVerifier, DEFAULT_STATION_MAP
-from weather_data import EnsembleCollector, HRRRFetcher, OrderBookDepth, next_model_run, STATION_MAP
+from weather_data import EnsembleCollector, HRRRFetcher, OrderBookDepth, next_model_run, STATION_MAP, NWSForecastFetcher
 
 setup_unbuffered()
 log = setup_logging("weather")
@@ -35,8 +35,55 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxDailyTrades": config.get("maxDailyTrades", 10),
     "maxDailyLoss": config.get("maxDailyLoss", 10),
     "maxDailyLossPct": config.get("maxDailyLossPct"),
-}, logger=log, order_monitor=order_monitor, cooldown_hours=12, bot_name="weather")
+}, logger=log, order_monitor=order_monitor, cooldown_hours=0.5, bot_name="weather")
 trim_trade_log(TRADES_PATH)
+
+
+# === Days-out-aware dedup cooldown ===
+# Local dedup layer on top of TradeManager's RecentTradeTracker.
+# Day-0 markets should re-evaluate frequently (NWS updates every 1-2h),
+# while day-3+ markets don't need to be re-traded for 12 hours.
+
+_local_trade_times = {}  # ticker -> datetime of last trade
+
+
+def get_dedup_cooldown(days_out):
+    """Return dedup cooldown in seconds based on days until settlement.
+
+    Shorter cooldown for nearer-term markets where forecast accuracy
+    improves rapidly with new data (NWS, HRRR updates).
+    """
+    if days_out == 0:
+        return 1800    # 30 min -- NWS updates frequently
+    elif days_out == 1:
+        return 7200    # 2 hours
+    elif days_out == 2:
+        return 14400   # 4 hours
+    else:
+        return 43200   # 12 hours (original default)
+
+
+def is_locally_deduped(ticker, days_out):
+    """Check if this ticker was traded too recently given its days_out.
+
+    Returns True if the ticker should be skipped (still in cooldown).
+    """
+    last_trade = _local_trade_times.get(ticker)
+    if not last_trade:
+        return False
+    cooldown = get_dedup_cooldown(days_out)
+    elapsed = (datetime.datetime.now() - last_trade).total_seconds()
+    return elapsed < cooldown
+
+
+def record_local_trade(ticker):
+    """Record that we traded this ticker (for local dedup tracking)."""
+    _local_trade_times[ticker] = datetime.datetime.now()
+    # Prune old entries to prevent unbounded growth
+    if len(_local_trade_times) > 500:
+        cutoff = datetime.datetime.now() - datetime.timedelta(hours=24)
+        _local_trade_times.clear()
+        # In practice this rarely fires since weather markets settle daily
 
 # === Weather Forecast ===
 
@@ -84,42 +131,6 @@ def _rate_limited_request(url, timeout=15, max_retries=2):
     return retry_request("GET", url, timeout=timeout, max_retries=max_retries)
 
 
-# === Source-level circuit breaker ===
-
-class SourceCircuitBreaker:
-    """Per-source circuit breaker. Opens after N consecutive failures, resets after cooldown."""
-
-    def __init__(self, max_failures=5, cooldown_seconds=300):
-        self._max_failures = max_failures
-        self._cooldown = cooldown_seconds
-        self._failures = {}  # source -> consecutive failure count
-        self._opened_at = {}  # source -> timestamp when circuit opened
-
-    def is_open(self, source):
-        if source not in self._opened_at:
-            return False
-        elapsed = time.monotonic() - self._opened_at[source]
-        if elapsed > self._cooldown:
-            # Half-open: allow one attempt
-            del self._opened_at[source]
-            self._failures[source] = 0
-            return False
-        return True
-
-    def record_success(self, source):
-        self._failures[source] = 0
-        self._opened_at.pop(source, None)
-
-    def record_failure(self, source):
-        self._failures[source] = self._failures.get(source, 0) + 1
-        if self._failures[source] >= self._max_failures:
-            self._opened_at[source] = time.monotonic()
-            log.warning("Circuit breaker opened for %s after %d consecutive failures",
-                        source, self._failures[source])
-
-
-_source_breaker = SourceCircuitBreaker(max_failures=5, cooldown_seconds=600)
-
 
 # === Forecast Verification ===
 VERIFICATION_ENABLED = config.get("verification", {}).get("enabled", True)
@@ -133,6 +144,9 @@ ensemble_collector = EnsembleCollector(logger=log)
 
 # HRRR deterministic forecast fetcher (Phase 3)
 hrrr_fetcher = HRRRFetcher(logger=log)
+
+# NWS forecast fetcher (fallback when Open-Meteo fails)
+nws_fetcher = NWSForecastFetcher(logger=log)
 
 # Order book depth analyzer (Phase 3)
 orderbook = OrderBookDepth(logger=log)
@@ -201,7 +215,7 @@ def get_batch_ensemble_forecasts(cities_dict):
     # Fetch each model in a single batch request
     model_results = {}  # model_key -> {city_code: {date: temp}}
     for model_key, model_name in ENSEMBLE_MODELS.items():
-        if _source_breaker.is_open(f"open-meteo-{model_key}"):
+        if health.is_source_open(f"open-meteo-{model_key}"):
             log.warning(f"Circuit breaker open for {model_key}, skipping")
             continue
 
@@ -231,10 +245,10 @@ def get_batch_ensemble_forecasts(cities_dict):
                     city_forecasts[codes[0]] = dict(zip(d["time"], d["temperature_2m_max"]))
 
             model_results[model_key] = city_forecasts
-            _source_breaker.record_success(f"open-meteo-{model_key}")
+            health.record_source_success(f"open-meteo-{model_key}")
         except Exception as e:
             log.warning(f"Batch ensemble {model_key} failed: {e}")
-            _source_breaker.record_failure(f"open-meteo-{model_key}")
+            health.record_source_error(f"open-meteo-{model_key}", str(e))
 
     if not model_results:
         return {}
@@ -263,15 +277,22 @@ def get_batch_ensemble_forecasts(cities_dict):
 
 
 def get_ensemble_forecast(lat, lon):
-    """Fetch GFS, ECMWF, and ICON forecasts in parallel.
+    """Fetch GFS, ECMWF, and ICON forecasts with per-model error recovery.
 
     Returns dict: {date_str: {"gfs": temp, "ecmwf": temp, "icon": temp}}
-    Falls back to single-model GFS if any API fails.
+    Graceful degradation: if one or two models fail, returns the remainder.
+    Only falls back to single-model GFS if ALL models fail.
+    Per-model circuit breaker tracking so one model's failure doesn't block others.
     """
     from kalshi_auth import fetch_parallel
 
+    # Skip models whose circuit breaker is open
     urls = {}
+    skipped_models = []
     for model_key, model_name in ENSEMBLE_MODELS.items():
+        if health.is_source_open(f"open-meteo-{model_key}"):
+            skipped_models.append(model_key)
+            continue
         url = (
             f"https://api.open-meteo.com/v1/forecast?"
             f"latitude={lat}&longitude={lon}"
@@ -281,25 +302,50 @@ def get_ensemble_forecast(lat, lon):
         )
         urls[url] = model_key
 
+    if skipped_models:
+        log.info("Skipping models with open circuit breaker: %s", ", ".join(skipped_models))
+
+    if not urls:
+        log.warning("All ensemble model circuit breakers open, falling back to single GFS")
+        try:
+            single = get_forecast(lat, lon)
+            return {date: {"gfs": temp} for date, temp in single.items()}
+        except Exception:
+            return {}
+
     responses = fetch_parallel(list(urls.keys()), timeout=15)
 
-    # Parse each model's response
+    # Parse each model's response with per-model health tracking
     model_forecasts = {}  # model_key -> {date: temp}
+    failed_models = []
     for url, response in responses.items():
         model_key = urls[url]
         if response is None or response.status_code != 200:
-            log.warning(f"Ensemble model {model_key} failed, will use single-model fallback")
+            log.warning(f"Ensemble model {model_key} failed (status={getattr(response, 'status_code', 'None')})")
+            health.record_source_error(f"open-meteo-{model_key}",
+                                       f"status={getattr(response, 'status_code', 'None')}")
+            failed_models.append(model_key)
             continue
         try:
             d = response.json()["daily"]
             model_forecasts[model_key] = dict(zip(d["time"], d["temperature_2m_max"]))
+            health.record_source_success(f"open-meteo-{model_key}")
         except (KeyError, ValueError) as e:
             log.warning(f"Ensemble model {model_key} parse error: {e}")
+            health.record_source_error(f"open-meteo-{model_key}", str(e))
+            failed_models.append(model_key)
 
     if not model_forecasts:
         log.warning("All ensemble models failed, falling back to single GFS")
-        single = get_forecast(lat, lon)
-        return {date: {"gfs": temp} for date, temp in single.items()}
+        try:
+            single = get_forecast(lat, lon)
+            return {date: {"gfs": temp} for date, temp in single.items()}
+        except Exception:
+            return {}
+
+    if failed_models:
+        log.info("Ensemble degraded: %d/%d models available (%s failed)",
+                 len(model_forecasts), len(ENSEMBLE_MODELS), ", ".join(failed_models))
 
     # Combine into {date: {model: temp}} structure
     all_dates = set()
@@ -318,6 +364,52 @@ def get_ensemble_forecast(lat, lon):
     return combined
 
 # === Trading ===
+
+def choose_order_type(yes_bid, yes_ask, side, edge, our_prob, depth_data=None):
+    """Choose between limit and market order based on spread width and depth.
+
+    Returns:
+        Tuple of (order_type, price_cents) where order_type is "limit" or "market".
+
+    Logic:
+    - Wide spread (>5c) or thin depth (<100 contracts): use limit at model fair value
+    - Tight spread and good depth: use market (take the ask)
+    - Very high edge (>20%): always market (urgency, fill certainty matters)
+    """
+    spread = (yes_ask - yes_bid) if (yes_ask and yes_bid) else 0
+
+    # Very high edge -> market order for fill certainty
+    if edge > 0.20:
+        if side == "yes":
+            return "market", yes_ask
+        else:
+            return "market", 100 - yes_bid if yes_bid else yes_ask
+
+    # Check depth if available
+    thin_book = False
+    if depth_data:
+        side_depth = depth_data.get("total_ask_depth", 0) if side == "yes" else depth_data.get("total_bid_depth", 0)
+        if side_depth < 100:
+            thin_book = True
+
+    # Wide spread or thin book -> limit order at model fair value
+    if spread > 5 or thin_book:
+        model_price = int(our_prob * 100) if side == "yes" else int((1 - our_prob) * 100)
+        # Clamp to be competitive: between bid+1 and ask-1
+        if side == "yes":
+            limit_price = max(yes_bid + 1 if yes_bid else 1, min(model_price, yes_ask - 1 if yes_ask > 1 else yes_ask))
+        else:
+            no_bid = 100 - yes_ask if yes_ask else 0
+            no_ask = 100 - yes_bid if yes_bid else 100
+            limit_price = max(no_bid + 1 if no_bid else 1, min(model_price, no_ask - 1 if no_ask > 1 else no_ask))
+        return "limit", max(1, limit_price)
+
+    # Default: use compute_limit_price for edge-tiered placement
+    price = compute_limit_price(yes_bid, yes_ask, side, edge=edge)
+    if not price or price <= 0:
+        price = yes_ask if side == "yes" else (100 - yes_bid if yes_bid else 0)
+    return "market", price
+
 
 def compute_probability(forecast_temp, threshold, direction, days_out=0, city=None):
     """Estimate probability that YES resolves true.
@@ -407,9 +499,12 @@ def scan_and_trade():
         return
 
     # Get forecasts (batch API: 1-3 requests instead of 20-60+)
+    # Uses separate circuit breaker keys so batch failures don't block per-model fallback
     forecasts = {}
-    if _source_breaker.is_open("open-meteo"):
-        log.warning("Open-Meteo circuit breaker open, skipping forecast fetch")
+    batch_failed = False
+    if health.is_source_open("open-meteo-batch"):
+        log.info("Batch endpoint circuit breaker open, skipping batch fetch")
+        batch_failed = True
     else:
         try:
             if ENSEMBLE_ENABLED:
@@ -417,32 +512,104 @@ def scan_and_trade():
             else:
                 forecasts = get_batch_forecasts(CITIES)
             if forecasts:
-                health.record_source_success("open-meteo")
-                _source_breaker.record_success("open-meteo")
+                health.record_source_success("open-meteo-batch")
                 log.info(f"Batch forecasts received for {len(forecasts)} cities")
             else:
                 log.warning("Batch forecast returned empty, falling back to per-city")
-                _source_breaker.record_failure("open-meteo")
+                health.record_source_error("open-meteo-batch", "empty response")
+                batch_failed = True
         except Exception as e:
             log.error(f"Batch forecast error: {e}")
-            _source_breaker.record_failure("open-meteo")
-            health.record_source_error("open-meteo", str(e))
+            health.record_source_error("open-meteo-batch", str(e))
+            batch_failed = True
 
     # Fallback: per-city fetch for any missing cities
-    for code, info in CITIES.items():
-        if code in forecasts:
-            continue
-        if _source_breaker.is_open("open-meteo"):
-            break
+    # Uses per-model circuit breaker keys (open-meteo-gfs, etc.) so one model's
+    # failure doesn't block the others. Falls back gracefully: 3-model ensemble
+    # -> 2-model -> 1-model -> single GFS.
+    missing_cities = [code for code in CITIES if code not in forecasts]
+    if missing_cities and batch_failed:
+        log.info("Attempting per-city fallback for %d missing cities", len(missing_cities))
+    for code in missing_cities:
+        info = CITIES[code]
+        # Per-model fetches have their own circuit breaker keys (open-meteo-gfs, etc.)
+        # so we don't check a single "open-meteo" breaker here
         try:
             if ENSEMBLE_ENABLED:
                 forecasts[code] = get_ensemble_forecast(info["lat"], info["lon"])
             else:
                 forecasts[code] = get_forecast(info["lat"], info["lon"])
-            _source_breaker.record_success("open-meteo")
+            health.record_source_success("open-meteo-single")
         except Exception as e:
             log.error(f"Forecast error for {info['name']}: {e}")
-            _source_breaker.record_failure("open-meteo")
+            health.record_source_error("open-meteo-single", str(e))
+
+    # Log overall forecast recovery status
+    if forecasts:
+        models_available = set()
+        for city_data in forecasts.values():
+            if isinstance(city_data, dict):
+                # Check for date-keyed dicts containing model dicts
+                for v in city_data.values():
+                    if isinstance(v, dict):
+                        models_available.update(v.keys())
+                        break
+        if models_available:
+            log.info("Ensemble models available: %s (%d/%d cities)",
+                     ", ".join(sorted(models_available)), len(forecasts), len(CITIES))
+
+    # NWS fallback: fetch NWS forecasts for cities still missing after Open-Meteo attempts
+    # Also cross-validates when both sources are available (flags >3F disagreements)
+    nws_missing = [code for code in CITIES if code not in forecasts]
+    nws_forecasts = {}  # {city: {date: temp}} for cross-validation
+    if nws_missing:
+        log.info("NWS fallback: fetching for %d cities missing Open-Meteo data", len(nws_missing))
+    for code in nws_missing:
+        if health.is_source_open("nws-forecast"):
+            break
+        try:
+            nws_data = nws_fetcher.fetch_forecast(code)
+            if nws_data:
+                # Use NWS as single-model forecast (keyed as "nws" in ensemble dict)
+                if ENSEMBLE_ENABLED:
+                    forecasts[code] = {date: {"nws": temp} for date, temp in nws_data.items()}
+                else:
+                    forecasts[code] = nws_data
+                nws_forecasts[code] = nws_data
+                health.record_source_success("nws-forecast")
+                log.info("  NWS fallback for %s: %d days of forecast data", code, len(nws_data))
+        except Exception as e:
+            log.warning("NWS fallback failed for %s: %s", code, e)
+            health.record_source_error("nws-forecast", str(e))
+
+    # Cross-validate Open-Meteo vs NWS where both are available
+    if not nws_missing:  # Only cross-validate if we didn't need NWS as primary
+        for code in list(CITIES.keys())[:5]:  # Sample up to 5 cities to limit API calls
+            if code in forecasts and not health.is_source_open("nws-forecast"):
+                try:
+                    nws_data = nws_fetcher.fetch_forecast(code)
+                    if nws_data:
+                        nws_forecasts[code] = nws_data
+                        health.record_source_success("nws-forecast")
+                except Exception:
+                    pass  # Cross-validation is non-blocking
+
+    # Flag divergences between sources
+    for code, nws_data in nws_forecasts.items():
+        if code not in forecasts:
+            continue
+        city_forecast = forecasts[code]
+        for date_str, nws_temp in nws_data.items():
+            if date_str not in city_forecast:
+                continue
+            om_data = city_forecast[date_str]
+            if isinstance(om_data, dict):
+                om_temps = [t for t in om_data.values() if t is not None]
+                if om_temps:
+                    om_mean = sum(om_temps) / len(om_temps)
+                    nws_fetcher.cross_validate(code, om_mean, nws_temp)
+            elif om_data is not None:
+                nws_fetcher.cross_validate(code, om_data, nws_temp)
 
     # Forecast verification: verify past forecasts and record new ones
     if verifier:
@@ -477,19 +644,19 @@ def scan_and_trade():
 
     # Fetch raw ensemble member data for empirical CDF model
     ensemble_members = {}  # {city_code: {date_str: [member_temps]}}
-    if not _source_breaker.is_open("open-meteo-ensemble"):
+    if not health.is_source_open("open-meteo-ensemble"):
         for code, info in CITIES.items():
-            if _source_breaker.is_open("open-meteo-ensemble"):
+            if health.is_source_open("open-meteo-ensemble"):
                 break
             try:
                 _open_meteo_limiter.acquire()  # rate limit ensemble API too
                 members = ensemble_collector.fetch_ensemble(info["lat"], info["lon"])
                 if members:
                     ensemble_members[code] = members
-                    _source_breaker.record_success("open-meteo-ensemble")
+                    health.record_source_success("open-meteo-ensemble")
             except Exception as e:
                 log.warning("Ensemble member fetch failed for %s: %s", code, e)
-                _source_breaker.record_failure("open-meteo-ensemble")
+                health.record_source_error("open-meteo-ensemble", str(e))
     if ensemble_members:
         log.info("Ensemble member data available for %d cities", len(ensemble_members))
 
@@ -735,6 +902,17 @@ def scan_and_trade():
         yes_bid = opp["market"].get("yes_bid", 0)
         is_bracket = (direction == "B")
 
+        # Days-out-aware dedup: shorter cooldown for near-settlement markets
+        days_out_val = opp.get("days_out", 0)
+        if is_locally_deduped(ticker, days_out_val):
+            cooldown_secs = get_dedup_cooldown(days_out_val)
+            log.info(f"  Skipping {ticker}: local dedup cooldown ({cooldown_secs}s for day-{days_out_val})")
+            ss.skip("dedup_cooldown")
+            trade_manager.log_decision(ticker, "yes" if opp["our_prob"] > 0.5 else "no",
+                                       "skipped", f"dedup_cooldown ({cooldown_secs}s for day-{days_out_val})",
+                                       edge=edge, price_cents=yes_ask if opp["our_prob"] > 0.5 else no_ask)
+            continue
+
         # Rec 1: Brackets require 2x edge threshold (higher model uncertainty)
         if is_bracket and edge < config["edgeThreshold"] * 2:
             log.info(f"  Skipping bracket {ticker}: edge {edge*100:.1f}% < {config['edgeThreshold']*200:.0f}% (2x threshold)")
@@ -774,15 +952,15 @@ def scan_and_trade():
                 trade_manager.log_decision(ticker, "yes", "skipped", f"YES edge {edge*100:.1f}% < 15% minimum",
                                             edge=edge, price_cents=yes_ask)
                 continue
-            price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge)
+            order_type, price = choose_order_type(yes_bid, yes_ask, "yes", edge, opp["our_prob"], depth_data)
             if not price or price <= 0:
                 price = yes_ask
-            reasoning = f"{city_name} forecast: {forecast}F, {ticker} YES at {price}c -> our prob {opp['our_prob']*100:.0f}%, edge +{edge*100:.1f}%, buying YES"
+            reasoning = f"{city_name} forecast: {forecast}F, {ticker} YES at {price}c ({order_type}) -> our prob {opp['our_prob']*100:.0f}%, edge +{edge*100:.1f}%, buying YES"
         elif side == "no" and no_ask and no_ask < 99:
-            price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge)
+            order_type, price = choose_order_type(yes_bid, yes_ask, "no", edge, opp["our_prob"], depth_data)
             if not price or price <= 0:
                 price = no_ask
-            reasoning = f"{city_name} forecast: {forecast}F, {ticker} NO at {price}c -> our prob {(1-opp['our_prob'])*100:.0f}%, edge +{edge*100:.1f}%, buying NO"
+            reasoning = f"{city_name} forecast: {forecast}F, {ticker} NO at {price}c ({order_type}) -> our prob {(1-opp['our_prob'])*100:.0f}%, edge +{edge*100:.1f}%, buying NO"
         else:
             continue
 
@@ -889,6 +1067,7 @@ def scan_and_trade():
         if result:
             ss.trades_placed += 1
             allocator.record_trade("weather", ticker, risk, edge=edge)
+            record_local_trade(ticker)
 
     # Save verification state
     if verifier:

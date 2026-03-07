@@ -2,6 +2,8 @@
 
 Provides:
 - STATION_MAP: Kalshi city code -> IEM ASOS station ID mapping
+- NWS_GRID_MAP: Kalshi city code -> NWS API grid point mapping
+- NWSForecastFetcher: Fetches NWS 7-day forecast as fallback data source
 - EnsembleCollector: Fetches raw ensemble member temperatures from Open-Meteo
 - HRRRFetcher: Fetches HRRR deterministic forecast data from Open-Meteo
 - IEMFetcher: Fetches actual daily high temperatures from Iowa Environmental Mesonet
@@ -48,6 +50,140 @@ STATION_MAP = {
     "OKC": "KOKC",
     "SATX": "KSAT",
 }
+
+
+# NWS API grid point mapping for 7-day forecast fallback.
+# Grid points determined by NWS /points/{lat},{lon} endpoint.
+# office/gridX/gridY identify the NWS forecast grid cell for each station.
+NWS_GRID_MAP = {
+    "MIA": {"office": "MFL", "gridX": 76, "gridY": 50},
+    "LAX": {"office": "LOX", "gridX": 152, "gridY": 44},
+    "PHIL": {"office": "PHI", "gridX": 57, "gridY": 97},
+    "NY": {"office": "OKX", "gridX": 33, "gridY": 37},
+    "CHI": {"office": "LOT", "gridX": 65, "gridY": 76},
+    "AUS": {"office": "EWX", "gridX": 156, "gridY": 93},
+    "DEN": {"office": "BOU", "gridX": 62, "gridY": 60},
+    "HOU": {"office": "HGX", "gridX": 65, "gridY": 97},
+    "ATL": {"office": "FFC", "gridX": 52, "gridY": 88},
+    "BOS": {"office": "BOX", "gridX": 71, "gridY": 90},
+    "SFO": {"office": "MTR", "gridX": 85, "gridY": 105},
+    "SEA": {"office": "SEW", "gridX": 124, "gridY": 67},
+    "LV": {"office": "VEF", "gridX": 126, "gridY": 97},
+    "DAL": {"office": "FWD", "gridX": 80, "gridY": 108},
+    "MIN": {"office": "MPX", "gridX": 107, "gridY": 71},
+    "PHX": {"office": "PSR", "gridX": 159, "gridY": 57},
+    "DC": {"office": "LWX", "gridX": 97, "gridY": 71},
+    "NOLA": {"office": "LIX", "gridX": 76, "gridY": 72},
+    "OKC": {"office": "OUN", "gridX": 39, "gridY": 44},
+    "SATX": {"office": "EWX", "gridX": 131, "gridY": 68},
+}
+
+
+class NWSForecastFetcher:
+    """Fetches NWS 7-day forecast as fallback when Open-Meteo is unavailable.
+
+    Uses the NWS API (api.weather.gov) gridpoint forecast endpoint.
+    Returns daily high temperature forecasts in Fahrenheit.
+    """
+
+    NWS_CROSS_VALIDATE_THRESHOLD_F = 3.0  # Flag if sources disagree by >3F
+
+    def __init__(self, logger=None):
+        self.log = logger or _log
+
+    def fetch_forecast(self, city_code):
+        """Fetch NWS 7-day forecast for a city.
+
+        Args:
+            city_code: Kalshi city code (e.g. "MIA", "NY")
+
+        Returns:
+            dict of {date_str: temp_f} with daily high temps,
+            or None on failure.
+        """
+        if _retry_request is None:
+            self.log.warning("retry_request not available")
+            return None
+
+        grid = NWS_GRID_MAP.get(city_code)
+        if not grid:
+            self.log.debug("No NWS grid mapping for city %s", city_code)
+            return None
+
+        url = (
+            f"https://api.weather.gov/gridpoints/"
+            f"{grid['office']}/{grid['gridX']},{grid['gridY']}/forecast"
+        )
+
+        try:
+            resp = _retry_request("GET", url, timeout=10, max_retries=2)
+            if resp is None or resp.status_code != 200:
+                self.log.warning(
+                    "NWS API returned status %s for %s",
+                    getattr(resp, "status_code", "None"),
+                    city_code,
+                )
+                return None
+
+            data = resp.json()
+            periods = data.get("properties", {}).get("periods", [])
+            if not periods:
+                self.log.warning("NWS API returned no forecast periods for %s", city_code)
+                return None
+
+            return self._parse_periods(periods)
+        except Exception as e:
+            self.log.warning("NWS API error for %s: %s", city_code, e)
+            return None
+
+    def _parse_periods(self, periods):
+        """Parse NWS forecast periods into {date_str: high_temp_f}.
+
+        NWS returns periods alternating between daytime and nighttime.
+        We extract only daytime periods (isDaytime=True) with temperature.
+        """
+        result = {}
+        for period in periods:
+            if not period.get("isDaytime", False):
+                continue
+            temp = period.get("temperature")
+            temp_unit = period.get("temperatureUnit", "F")
+            start_time = period.get("startTime", "")
+
+            if temp is None or not start_time:
+                continue
+
+            # Convert to Fahrenheit if needed
+            if temp_unit == "C":
+                temp = temp * 9.0 / 5.0 + 32.0
+
+            # Extract date from ISO format "2026-03-07T06:00:00-05:00"
+            date_str = start_time[:10]
+            result[date_str] = float(temp)
+
+        return result if result else None
+
+    def cross_validate(self, city_code, open_meteo_temp, nws_temp):
+        """Check if Open-Meteo and NWS forecasts agree within threshold.
+
+        Args:
+            city_code: city code for logging
+            open_meteo_temp: temperature from Open-Meteo (F)
+            nws_temp: temperature from NWS (F)
+
+        Returns:
+            True if sources agree (difference <= threshold), False if they diverge.
+        """
+        diff = abs(open_meteo_temp - nws_temp)
+        if diff > self.NWS_CROSS_VALIDATE_THRESHOLD_F:
+            self.log.warning(
+                "%s: Open-Meteo (%.1fF) and NWS (%.1fF) disagree by %.1fF (>%.1fF threshold) "
+                "-- one source may be stale",
+                city_code, open_meteo_temp, nws_temp, diff,
+                self.NWS_CROSS_VALIDATE_THRESHOLD_F,
+            )
+            return False
+        return True
 
 
 class EnsembleCollector:

@@ -7,7 +7,7 @@ from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, "src/kalshi")
 
-from weather_data import STATION_MAP, EnsembleCollector, IEMFetcher, TrainingStore
+from weather_data import STATION_MAP, EnsembleCollector, IEMFetcher, TrainingStore, NWSForecastFetcher, NWS_GRID_MAP
 
 
 # ===================================================================
@@ -547,3 +547,122 @@ class TestModelRunSchedule:
         now = datetime.datetime(2026, 3, 5, 10, 50, 0)
         model, minutes = next_model_run(now)
         assert minutes == 55
+
+
+# ===================================================================
+# NWS_GRID_MAP and NWSForecastFetcher tests
+# ===================================================================
+
+class TestNWSGridMap:
+
+    def test_has_20_cities(self):
+        assert len(NWS_GRID_MAP) == 20
+
+    def test_all_cities_have_required_keys(self):
+        for city, grid in NWS_GRID_MAP.items():
+            assert "office" in grid, f"{city} missing 'office'"
+            assert "gridX" in grid, f"{city} missing 'gridX'"
+            assert "gridY" in grid, f"{city} missing 'gridY'"
+            assert isinstance(grid["office"], str)
+            assert isinstance(grid["gridX"], int)
+            assert isinstance(grid["gridY"], int)
+
+    def test_station_map_cities_match(self):
+        """NWS_GRID_MAP should cover the same cities as STATION_MAP."""
+        assert set(NWS_GRID_MAP.keys()) == set(STATION_MAP.keys())
+
+
+class TestNWSForecastFetcher:
+
+    def _make_mock_response(self, json_data, status_code=200):
+        mock_resp = MagicMock()
+        mock_resp.status_code = status_code
+        mock_resp.json.return_value = json_data
+        return mock_resp
+
+    @patch("weather_data._retry_request")
+    def test_fetch_forecast_parses_periods(self, mock_retry):
+        """NWS forecast should parse daytime periods into daily highs."""
+        json_data = {
+            "properties": {
+                "periods": [
+                    {"isDaytime": True, "temperature": 82, "temperatureUnit": "F",
+                     "startTime": "2026-03-07T06:00:00-05:00"},
+                    {"isDaytime": False, "temperature": 65, "temperatureUnit": "F",
+                     "startTime": "2026-03-07T18:00:00-05:00"},
+                    {"isDaytime": True, "temperature": 85, "temperatureUnit": "F",
+                     "startTime": "2026-03-08T06:00:00-05:00"},
+                ]
+            }
+        }
+        mock_retry.return_value = self._make_mock_response(json_data)
+
+        fetcher = NWSForecastFetcher()
+        result = fetcher.fetch_forecast("MIA")
+
+        assert result is not None
+        assert result["2026-03-07"] == 82.0
+        assert result["2026-03-08"] == 85.0
+        # Nighttime period should be excluded
+        assert len(result) == 2
+
+    @patch("weather_data._retry_request")
+    def test_fetch_forecast_handles_celsius(self, mock_retry):
+        """NWS sometimes returns Celsius; should convert to Fahrenheit."""
+        json_data = {
+            "properties": {
+                "periods": [
+                    {"isDaytime": True, "temperature": 30, "temperatureUnit": "C",
+                     "startTime": "2026-03-07T06:00:00-05:00"},
+                ]
+            }
+        }
+        mock_retry.return_value = self._make_mock_response(json_data)
+
+        fetcher = NWSForecastFetcher()
+        result = fetcher.fetch_forecast("MIA")
+
+        assert result is not None
+        # 30C = 86F
+        assert result["2026-03-07"] == pytest.approx(86.0, abs=0.01)
+
+    @patch("weather_data._retry_request")
+    def test_fetch_forecast_returns_none_on_failure(self, mock_retry):
+        mock_retry.return_value = None
+        fetcher = NWSForecastFetcher()
+        result = fetcher.fetch_forecast("MIA")
+        assert result is None
+
+    @patch("weather_data._retry_request")
+    def test_fetch_forecast_returns_none_on_bad_status(self, mock_retry):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_retry.return_value = mock_resp
+        fetcher = NWSForecastFetcher()
+        result = fetcher.fetch_forecast("MIA")
+        assert result is None
+
+    def test_fetch_forecast_unknown_city(self):
+        fetcher = NWSForecastFetcher()
+        result = fetcher.fetch_forecast("UNKNOWN")
+        assert result is None
+
+    @patch("weather_data._retry_request")
+    def test_fetch_forecast_empty_periods(self, mock_retry):
+        json_data = {"properties": {"periods": []}}
+        mock_retry.return_value = self._make_mock_response(json_data)
+        fetcher = NWSForecastFetcher()
+        result = fetcher.fetch_forecast("MIA")
+        assert result is None
+
+    def test_cross_validate_sources_agree(self):
+        """Sources within 3F should return True."""
+        fetcher = NWSForecastFetcher()
+        assert fetcher.cross_validate("MIA", 85.0, 84.0) is True
+        assert fetcher.cross_validate("MIA", 85.0, 82.0) is True  # exactly 3F
+
+    def test_cross_validate_sources_disagree(self):
+        """Sources diverging >3F should return False."""
+        fetcher = NWSForecastFetcher()
+        assert fetcher.cross_validate("MIA", 85.0, 81.0) is False  # 4F diff
+        assert fetcher.cross_validate("MIA", 85.0, 90.0) is False  # 5F diff
