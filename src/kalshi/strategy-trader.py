@@ -176,7 +176,8 @@ def find_longshot_sells(markets, bankroll):
         no_price = 100 - sell_price
         if no_price > 96:
             trade_manager.log_decision(ticker, "no", "skipped", "profit_risk_ratio",
-                                       no_price=no_price, sell_price=sell_price)
+                                       no_price=no_price, sell_price=sell_price,
+                                       edge=round(est_edge, 4))
             continue
 
         # Bayesian edge estimate for confidence-scaled sizing

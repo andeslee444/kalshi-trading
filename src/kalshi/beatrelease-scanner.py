@@ -9,7 +9,7 @@ Usage:
     python3 beatrelease-scanner.py --once   # Single scan, no loop
 """
 
-import json, time, datetime, os, sys, re, signal, atexit, hashlib
+import json, time, datetime, os, sys, re, signal, hashlib
 import requests
 from pathlib import Path
 from bs4 import BeautifulSoup
@@ -25,9 +25,6 @@ log = setup_logging("beatrelease")
 DEEPSEEK_KEY_PATH = PROJECT_DIR / "config" / "keys" / "deepseek.txt"
 STATE_PATH = PROJECT_DIR / "data" / "beatrelease-state.json"
 TRADES_PATH = PROJECT_DIR / "data" / "beatrelease-trades.json"
-PID_FILE = PROJECT_DIR / "data" / "pids" / "beatrelease-scanner.pid"
-PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 LLM_LOG_PATH = PROJECT_DIR / "data" / "beatrelease-llm-log.json"
 
@@ -51,27 +48,6 @@ trade_manager = TradeManager(client, TRADES_PATH, {
 allocator = PortfolioAllocator(client, logger=log)
 health = HealthCheckMonitor(logger=log)
 trim_trade_log(TRADES_PATH)
-
-
-# === PID Management ===
-def write_pid():
-    PID_FILE.write_text(str(os.getpid()))
-
-def remove_pid():
-    try:
-        PID_FILE.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-def check_existing():
-    if PID_FILE.exists():
-        try:
-            pid = int(PID_FILE.read_text().strip())
-            os.kill(pid, 0)  # Check if running
-            log.info(f"Another instance running (PID {pid}). Exiting.")
-            sys.exit(1)
-        except (ProcessLookupError, ValueError):
-            pass  # Stale PID file
 
 
 # === State ===
@@ -769,9 +745,6 @@ def scan_cycle():
 
 # === Daemon ===
 def run_daemon():
-    check_existing()
-    write_pid()
-    atexit.register(remove_pid)
     setup_signal_handlers()
 
     log.info(f"BeatRelease scanner daemon started (PID {os.getpid()})")

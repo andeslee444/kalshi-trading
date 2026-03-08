@@ -1245,7 +1245,7 @@ def scan_and_trade():
             continue
 
         # Concentration check
-        existing_trades = trade_manager.load_trades()
+        existing_trades = load_trades(TRADES_PATH)
         allowed, conc_reason = _check_concentration(ticker, budget.bankroll_cents, existing_trades)
         if not allowed:
             log.info(f"  Concentration limit hit for {ticker}: {conc_reason}")

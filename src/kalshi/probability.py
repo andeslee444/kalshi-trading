@@ -1490,7 +1490,7 @@ def half_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None, fee_cents
     original_prob = our_prob
     our_prob = max(0.001, min(0.999, our_prob))
     if original_prob <= 0.001 or original_prob >= 0.999:
-        _log.warning("Probability clamped: %.6f → [0.001, 0.999]", original_prob)
+        _log.debug("Probability clamped: %.6f → [0.001, 0.999]", original_prob)
 
     # Kelly fraction: f = (b*p - q) / b
     # where b = win/loss ratio, p = win prob, q = 1 - p
@@ -1554,7 +1554,7 @@ def half_kelly_sell(edge, sell_price_cents, max_cost_cents, bankroll_cents=None,
     raw_p_true = implied_prob - edge
     p_true = max(0.001, min(0.999, raw_p_true))
     if raw_p_true <= 0.001 or raw_p_true >= 0.999:
-        _log.warning("Probability clamped (sell): %.6f → [0.001, 0.999]", raw_p_true)
+        _log.debug("Probability clamped (sell): %.6f → [0.001, 0.999]", raw_p_true)
 
     # Selling YES: win (sell_price - fee) cents with prob (1-p_true),
     #              lose (100-sell_price) cents with prob p_true

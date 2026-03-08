@@ -1043,7 +1043,7 @@ def scan_positions():
                 exits_today += 1
                 ss.trades_placed += 1
                 metrics.record_exit(exit_signal["action"])
-                allocator.record_trade("position-monitor", ticker, risk=0, edge=0)
+                allocator.record_trade("position-monitor", ticker, risk_cents=0, edge=0)
                 trade_manager.log_decision(ticker, exit_signal["side"], "placed", exit_signal["action"],
                                            price_cents=exit_signal["price"])
 
@@ -1107,7 +1107,7 @@ def scan_positions():
                             )
                             if result:
                                 exits_today += 1
-                                allocator.record_trade("position-monitor", pending_ticker, risk=0, edge=0)
+                                allocator.record_trade("position-monitor", pending_ticker, risk_cents=0, edge=0)
                     elif no_count > 0:
                         no_bid = market.get("no_bid", 0) or (100 - market.get("yes_ask", 100))
                         if no_bid > 0:
@@ -1118,7 +1118,7 @@ def scan_positions():
                             )
                             if result:
                                 exits_today += 1
-                                allocator.record_trade("position-monitor", pending_ticker, risk=0, edge=0)
+                                allocator.record_trade("position-monitor", pending_ticker, risk_cents=0, edge=0)
 
     ss.markets_fetched = len(positions)
     ss.markets_evaluated = len(open_tickers)

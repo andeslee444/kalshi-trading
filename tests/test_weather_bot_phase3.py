@@ -324,7 +324,7 @@ class TestConfigPhase3:
         assert self.config["maxTradeAmount"] == 30
         assert self.config["edgeThreshold"] == 0.06
         assert len(self.config["cities"]) == 20
-        assert self.config["ensemble"]["enabled"] is True
+        assert self.config["ensemble"]["enabled"] is False  # disabled on free Open-Meteo tier
         assert self.config["verification"]["enabled"] is True
 
 
