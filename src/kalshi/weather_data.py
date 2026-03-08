@@ -422,8 +422,9 @@ class HRRRFetcher:
     day-0 and day-1 temperature forecasts.
     """
 
-    def __init__(self, logger=None):
+    def __init__(self, logger=None, rate_limiter=None):
         self.log = logger or _log
+        self._rate_limiter = rate_limiter
 
     def fetch_hrrr(self, lat, lon):
         """Fetch HRRR hourly temps and compute daily max temperatures.
@@ -455,6 +456,8 @@ class HRRRFetcher:
         url = f"{base}?{params}" + (f"&apikey={api_key}" if api_key else "")
 
         try:
+            if self._rate_limiter is not None:
+                self._rate_limiter()
             resp = _retry_request("GET", url, timeout=15, max_retries=2)
             if resp is None or resp.status_code != 200:
                 self.log.warning(

@@ -152,6 +152,30 @@ def _rate_limited_request(url, timeout=15, max_retries=2):
     return retry_request("GET", url, timeout=timeout, max_retries=max_retries)
 
 
+# Forecast response cache — reduces redundant Open-Meteo calls within scan cycles
+_forecast_cache = {}  # key -> (timestamp, response_data)
+_FORECAST_CACHE_TTL = 300  # 5 minutes — covers a full scan cycle
+
+
+def _cached_request(url, timeout=15, max_retries=2):
+    """Rate-limited Open-Meteo request with TTL caching."""
+    now = time.monotonic()
+    # Evict stale entries periodically
+    if len(_forecast_cache) > 100:
+        stale = [k for k, (ts, _) in _forecast_cache.items() if now - ts > _FORECAST_CACHE_TTL]
+        for k in stale:
+            del _forecast_cache[k]
+
+    if url in _forecast_cache:
+        ts, data = _forecast_cache[url]
+        if now - ts < _FORECAST_CACHE_TTL:
+            return data
+
+    resp = _rate_limited_request(url, timeout=timeout, max_retries=max_retries)
+    if resp is not None and resp.status_code == 200:
+        _forecast_cache[url] = (now, resp)
+    return resp
+
 
 # === Forecast Verification ===
 VERIFICATION_ENABLED = config.get("verification", {}).get("enabled", True)
@@ -164,7 +188,7 @@ if verifier:
 ensemble_collector = EnsembleCollector(logger=log)
 
 # HRRR deterministic forecast fetcher (Phase 3)
-hrrr_fetcher = HRRRFetcher(logger=log)
+hrrr_fetcher = HRRRFetcher(logger=log, rate_limiter=_open_meteo_limiter.acquire)
 
 # NWS forecast fetcher (fallback when Open-Meteo fails)
 nws_fetcher = NWSForecastFetcher(logger=log)
@@ -176,7 +200,7 @@ orderbook = OrderBookDepth(logger=log)
 def get_forecast(lat, lon):
     """Single-model GFS forecast (fallback)."""
     url = _open_meteo_url(f"latitude={lat}&longitude={lon}&daily=temperature_2m_max&temperature_unit=fahrenheit&timezone=America%2FNew_York&forecast_days=14")
-    r = _rate_limited_request(url, timeout=10)
+    r = _cached_request(url, timeout=10)
     d = r.json()["daily"]
     return dict(zip(d["time"], d["temperature_2m_max"]))
 
@@ -198,7 +222,7 @@ def get_batch_forecasts(cities_dict):
     )
 
     try:
-        r = _rate_limited_request(url, timeout=30)
+        r = _cached_request(url, timeout=30)
         data = r.json()
 
         # Multi-location returns a list of results
@@ -247,7 +271,7 @@ def get_batch_ensemble_forecasts(cities_dict):
         )
 
         try:
-            r = _rate_limited_request(url, timeout=30)
+            r = _cached_request(url, timeout=30)
             data = r.json()
 
             city_forecasts = {}

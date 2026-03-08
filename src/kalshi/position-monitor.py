@@ -681,7 +681,7 @@ def check_stale_positions(entry_records, positions, max_age_days=7):
     This is informational (logged as warnings) — does NOT auto-exit.
     """
     stale = []
-    now = datetime.datetime.now()
+    now = datetime.datetime.now(datetime.timezone.utc)
     for pos in positions:
         ticker = pos.get("ticker", "")
         entry_rec = entry_records.get(ticker, {})
@@ -692,6 +692,9 @@ def check_stale_positions(entry_records, positions, max_age_days=7):
             entry_dt = datetime.datetime.fromisoformat(ts)
         except (ValueError, TypeError):
             continue
+        # If entry_dt is naive (older records without timezone), assume UTC
+        if entry_dt.tzinfo is None:
+            entry_dt = entry_dt.replace(tzinfo=datetime.timezone.utc)
         age_days = (now - entry_dt).days
         if age_days <= max_age_days:
             continue

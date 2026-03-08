@@ -137,12 +137,12 @@ _PRICE_HISTORY_PATH = PROJECT_DIR / "data" / "crypto-price-history.json"
 
 
 def _load_price_history():
-    """Load price history from disk, keeping only last 24h."""
+    """Load price history from disk, keeping only last 7 days."""
     global _price_history
     try:
         if _PRICE_HISTORY_PATH.exists():
             data = json.loads(_PRICE_HISTORY_PATH.read_text())
-            cutoff = time.time() - 86400
+            cutoff = time.time() - 604800
             for asset, entries in data.items():
                 _price_history[asset] = [(t, p) for t, p in entries if t > cutoff]
     except (json.JSONDecodeError, OSError, KeyError):
@@ -476,9 +476,9 @@ def compute_realized_vol(asset, current_price=None, lookback_seconds=86400):
         if asset not in _price_history:
             _price_history[asset] = []
         _price_history[asset].append((now, current_price))
-        # Prune to 24h regardless of lookback (keep full history for flexibility)
-        cutoff_24h = now - 86400
-        _price_history[asset] = [(t, p) for t, p in _price_history[asset] if t > cutoff_24h]
+        # Prune to 7 days regardless of lookback (keep full history for flexibility)
+        cutoff_7d = now - 604800
+        _price_history[asset] = [(t, p) for t, p in _price_history[asset] if t > cutoff_7d]
         _save_price_history()
 
     # Compute vol with requested lookback
@@ -999,7 +999,8 @@ def scan_and_trade():
             if vov is not None:
                 heston_params["xi"] = max(0.1, min(2.0, vov))
 
-        ou_tgt = compute_ou_target(asset) if USE_OU else None
+        ou_tgt = compute_ou_target(asset)
+        ou_shadow_prob = None  # shadow OU probability for dual logging
 
         if direction == "T":
             prob = ensemble_model.estimate_prob(
@@ -1010,6 +1011,17 @@ def scan_and_trade():
                 use_ou=USE_OU, ou_half_life_minutes=OU_HALF_LIFE,
                 ou_target=ou_tgt,
             )
+            # Shadow OU computation: when OU is disabled, also compute OU prob for comparison
+            if not USE_OU and ou_tgt is not None:
+                ou_shadow_prob = ensemble_model.estimate_prob(
+                    current_price=current_price, threshold=threshold,
+                    direction="above", time_horizon_minutes=minutes_to_settle,
+                    vol=vol_to_use, regime=current_regime,
+                    drift_pct=drift, heston_params=heston_params,
+                    use_ou=True, ou_half_life_minutes=OU_HALF_LIFE,
+                    ou_target=ou_tgt,
+                )
+                log.debug(f"  OU shadow: {ticker} GBM={prob:.3f} OU={ou_shadow_prob:.3f} delta={ou_shadow_prob-prob:+.3f}")
         else:
             # Bracket
             range_size = _parse_bracket_range(ticker, asset, all_markets)
@@ -1060,6 +1072,7 @@ def scan_and_trade():
                     "vol_used": vol_to_use,
                     "is_bracket": direction == "B",
                     "raw_prob": raw_prob, "filtered_est": filtered_est,
+                    "ou_shadow_prob": ou_shadow_prob,
                 })
             else:
                 reason = "net edge below threshold" if net_edge <= eff_threshold else "edge below threshold"
@@ -1067,6 +1080,7 @@ def scan_and_trade():
                     ticker, "yes", "skipped", reason,
                     edge=edge, net_edge=round(net_edge, 4), fee_pp=round(fee_pp, 4),
                     price_cents=market_price, asset=asset, vol_used=round(vol_to_use, 4),
+                    ou_shadow_prob=round(ou_shadow_prob, 4) if ou_shadow_prob is not None else None,
                 )
         elif prob <= 0.5:
             no_prob = 1.0 - prob
@@ -1085,6 +1099,7 @@ def scan_and_trade():
                     "vol_used": vol_to_use,
                     "is_bracket": direction == "B",
                     "raw_prob": raw_prob, "filtered_est": filtered_est,
+                    "ou_shadow_prob": ou_shadow_prob,
                 })
             else:
                 reason = "net edge below threshold" if net_edge <= eff_threshold else "edge below threshold"
@@ -1092,6 +1107,7 @@ def scan_and_trade():
                     ticker, "no", "skipped", reason,
                     edge=edge, net_edge=round(net_edge, 4), fee_pp=round(fee_pp, 4),
                     price_cents=no_ask, asset=asset, vol_used=round(vol_to_use, 4),
+                    ou_shadow_prob=round(ou_shadow_prob, 4) if ou_shadow_prob is not None else None,
                 )
 
     # Sort by edge
@@ -1117,9 +1133,11 @@ def scan_and_trade():
         if not budget.approved:
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             ss.skip("allocator_denied")
+            _ou_sp = opp.get("ou_shadow_prob")
             trade_manager.log_decision(ticker, side, "skipped", f"allocator denied: {budget.reason}",
                                        edge=edge, price_cents=yes_ask if side == "yes" else no_ask,
-                                       asset=opp["asset"], vol_used=round(opp["vol_used"], 4))
+                                       asset=opp["asset"], vol_used=round(opp["vol_used"], 4),
+                                       ou_shadow_prob=round(_ou_sp, 4) if _ou_sp is not None else None)
             continue
 
         if opp.get("is_bracket"):
@@ -1170,9 +1188,11 @@ def scan_and_trade():
 
         if count <= 0:
             ss.skip("kelly_zero")
+            _ou_sp = opp.get("ou_shadow_prob")
             trade_manager.log_decision(ticker, side, "skipped", "kelly_zero: edge too small for price",
                                        edge=edge, price_cents=price,
-                                       asset=opp["asset"], vol_used=round(opp["vol_used"], 4))
+                                       asset=opp["asset"], vol_used=round(opp["vol_used"], 4),
+                                       ou_shadow_prob=round(_ou_sp, 4) if _ou_sp is not None else None)
             continue
 
         # Determine vol_source for trade record
@@ -1217,7 +1237,8 @@ def scan_and_trade():
                                             pf_updates=filtered_est.n_updates,
                                             pf_kelly_mult=round(kelly_mult, 4),
                                             regime_mult=round(regime_mult, 4),
-                                            regime=regime_detector.current_regime())
+                                            regime=regime_detector.current_regime(),
+                                            ou_shadow_prob=round(opp["ou_shadow_prob"], 4) if opp.get("ou_shadow_prob") is not None else None)
         if result:
             ss.trades_placed += 1
             allocator.record_trade("crypto", ticker, risk, edge=edge)
