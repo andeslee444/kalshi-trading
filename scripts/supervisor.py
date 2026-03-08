@@ -318,6 +318,11 @@ class BotProcess:
     def check_and_restart(self, health_data=None):
         """Check if daemon crashed or hung and auto-restart with rate limiting.
 
+        Detection strategy:
+        - First 60s after start: aggressively verify PID is alive (catches import
+          errors, missing config, etc. without waiting for heartbeat grace period)
+        - After grace period: also check heartbeat staleness for hung processes
+
         Args:
             health_data: Optional health-state.json dict for heartbeat checks.
 
@@ -338,6 +343,15 @@ class BotProcess:
                 needs_restart = False
             else:
                 needs_restart = True
+        elif self.started_at and (time.time() - self.started_at) < 60:
+            # Early life check: verify the process is still alive via waitpid
+            # (catches bots that crash right after start, before heartbeat grace)
+            if self.process is not None:
+                ret = self.process.poll()
+                if ret is not None:
+                    log.warning(f"  {self.name} exited early (code {ret}) — check data/logs/{self.name}.log")
+                    self._remove_pid()
+                    needs_restart = True
         elif health_data is not None:
             is_stale, age_min = self.is_heartbeat_stale(health_data)
             if is_stale:
@@ -439,23 +453,61 @@ class Supervisor:
             log.warning(f"Failed to save supervisor state: {e}")
 
     def _acquire_lock(self):
-        """Acquire singleton lock. Exit if another supervisor is running."""
+        """Acquire singleton lock. Exit if another supervisor is running.
+
+        If the lock is held but the owning process is dead (stale lock from
+        a crashed supervisor), we steal the lock instead of refusing to start.
+        """
         lock_path = PID_DIR / "supervisor.lock"
-        self._lock_file = open(lock_path, "w")
+        self._lock_file = open(lock_path, "w+")
         try:
             fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             self._lock_file.write(str(os.getpid()))
             self._lock_file.flush()
         except (IOError, OSError):
-            log.error("Another supervisor is already running. Exiting.")
-            self._lock_file.close()
-            self._lock_file = None
-            sys.exit(1)
+            # Lock is held — check if the holder is still alive
+            stale = False
+            old_pid = None
+            try:
+                self._lock_file.seek(0)
+                content = self._lock_file.read().strip()
+                if content:
+                    old_pid = int(content)
+                    os.kill(old_pid, 0)  # raises if process is dead
+                else:
+                    stale = True  # empty lock file = stale
+            except (ValueError, ProcessLookupError):
+                stale = True
+            except PermissionError:
+                pass  # process alive but owned by another user — not stale
+
+            if stale:
+                log.warning(f"Stale supervisor lock (PID {old_pid or '?'} is dead). Stealing lock.")
+                # Close and reopen to get a fresh file descriptor
+                self._lock_file.close()
+                self._lock_file = open(lock_path, "w")
+                try:
+                    fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self._lock_file.write(str(os.getpid()))
+                    self._lock_file.flush()
+                except (IOError, OSError):
+                    # Lock is actually held (edge case: empty PID file but live holder)
+                    log.error("Could not steal lock — another supervisor is still running. Exiting.")
+                    self._lock_file.close()
+                    self._lock_file = None
+                    sys.exit(1)
+            else:
+                log.error("Another supervisor is already running. Exiting.")
+                self._lock_file.close()
+                self._lock_file = None
+                sys.exit(1)
 
     def _release_lock(self):
-        """Release singleton lock."""
+        """Release singleton lock and remove lock file."""
         if self._lock_file:
             try:
+                lock_path = PID_DIR / "supervisor.lock"
+                lock_path.unlink(missing_ok=True)
                 fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
                 self._lock_file.close()
             except Exception:
@@ -503,13 +555,26 @@ class Supervisor:
         return [n for n in self.bots if n not in DISABLED_BY_DEFAULT]
 
     def start_bots(self, names=None):
-        """Start specified bots (or all enabled)."""
+        """Start specified bots (or all enabled), with post-start verification."""
         targets = self._resolve_names(names)
         if not targets:
             return
         log.info(f"Starting {len(targets)} bot(s)...")
         for name in targets:
             self.bots[name].start()
+
+        # Post-start verification: wait briefly, then check each bot is still alive.
+        # Catches immediate crashes (import errors, config issues, missing deps).
+        time.sleep(3)
+        failed = []
+        for name in targets:
+            bot = self.bots[name]
+            if not bot.is_running():
+                failed.append(name)
+                log.error(f"  {name} died immediately after start — check data/logs/{name}.log")
+        if failed:
+            notify_webhook(f"Bots died on startup: {', '.join(failed)}", level="critical")
+
         self._save_state()
 
     def stop_bots(self, names=None):
