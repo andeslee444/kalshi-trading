@@ -95,6 +95,15 @@ ENSEMBLE_MODELS = {
 }
 ENSEMBLE_ENABLED = config.get("ensemble", {}).get("enabled", False)
 
+# === Open-Meteo API Configuration ===
+# Premium API: set OPEN_METEO_API_KEY in .env for higher rate limits and priority
+_OPEN_METEO_API_KEY = os.environ.get("OPEN_METEO_API_KEY", "")
+if _OPEN_METEO_API_KEY:
+    OPEN_METEO_BASE = "https://customer-api.open-meteo.com/v1/forecast"
+    log.info("Using Open-Meteo PREMIUM API (customer endpoint)")
+else:
+    OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
+
 
 # === Rate Limiter ===
 
@@ -122,7 +131,19 @@ class RateLimiter:
             time.sleep(self._interval)
 
 
-_open_meteo_limiter = RateLimiter(max_per_second=4, burst=4)
+# Premium API allows higher rate limits
+_open_meteo_limiter = RateLimiter(
+    max_per_second=10 if _OPEN_METEO_API_KEY else 4,
+    burst=10 if _OPEN_METEO_API_KEY else 4,
+)
+
+
+def _open_meteo_url(params):
+    """Build Open-Meteo URL with API key if configured."""
+    url = f"{OPEN_METEO_BASE}?{params}"
+    if _OPEN_METEO_API_KEY:
+        url += f"&apikey={_OPEN_METEO_API_KEY}"
+    return url
 
 
 def _rate_limited_request(url, timeout=15, max_retries=2):
@@ -154,7 +175,7 @@ orderbook = OrderBookDepth(logger=log)
 
 def get_forecast(lat, lon):
     """Single-model GFS forecast (fallback)."""
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max&temperature_unit=fahrenheit&timezone=America%2FNew_York&forecast_days=14"
+    url = _open_meteo_url(f"latitude={lat}&longitude={lon}&daily=temperature_2m_max&temperature_unit=fahrenheit&timezone=America%2FNew_York&forecast_days=14")
     r = _rate_limited_request(url, timeout=10)
     d = r.json()["daily"]
     return dict(zip(d["time"], d["temperature_2m_max"]))
@@ -170,8 +191,7 @@ def get_batch_forecasts(cities_dict):
     lats = ",".join(str(cities_dict[c]["lat"]) for c in codes)
     lons = ",".join(str(cities_dict[c]["lon"]) for c in codes)
 
-    url = (
-        f"https://api.open-meteo.com/v1/forecast?"
+    url = _open_meteo_url(
         f"latitude={lats}&longitude={lons}"
         f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
         f"&timezone=America%2FNew_York&forecast_days=14"
@@ -219,8 +239,7 @@ def get_batch_ensemble_forecasts(cities_dict):
             log.warning(f"Circuit breaker open for {model_key}, skipping")
             continue
 
-        url = (
-            f"https://api.open-meteo.com/v1/forecast?"
+        url = _open_meteo_url(
             f"latitude={lats}&longitude={lons}"
             f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
             f"&timezone=America%2FNew_York&forecast_days=14"
@@ -293,8 +312,7 @@ def get_ensemble_forecast(lat, lon):
         if health.is_source_open(f"open-meteo-{model_key}"):
             skipped_models.append(model_key)
             continue
-        url = (
-            f"https://api.open-meteo.com/v1/forecast?"
+        url = _open_meteo_url(
             f"latitude={lat}&longitude={lon}"
             f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
             f"&timezone=America%2FNew_York&forecast_days=14"

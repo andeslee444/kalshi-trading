@@ -19,7 +19,7 @@ from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot,
     HealthCheckMonitor, OrderMonitor, ScanSummary,
-    is_shutdown_requested,
+    is_shutdown_requested, load_trades,
 )
 from probability import (
     econ_nowcast_probability, cpi_nowcast_sigma, gdp_nowcast_sigma, quarter_kelly,
@@ -1221,7 +1221,7 @@ def scan_and_trade():
 
     # Edge scaler: limit total exposure based on settlement track record
     edge_scaler = EdgeScaler()
-    settled = [t for t in trade_manager.load_trades() if t.get("settlement_result") is not None]
+    settled = [t for t in load_trades(TRADES_PATH) if t.get("settlement_result") is not None]
     max_exposure_pct = edge_scaler.current_limit(settled)
     max_econ_exposure = int(balance * max_exposure_pct)
     log.info(f"  Edge scaler: {len([s for s in settled if s.get('profitable')])} wins -> "

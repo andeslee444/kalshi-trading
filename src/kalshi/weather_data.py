@@ -14,6 +14,7 @@ Provides:
 
 import datetime
 import logging
+import os
 import sqlite3
 from collections import defaultdict
 
@@ -442,13 +443,16 @@ class HRRRFetcher:
             self.log.warning("retry_request not available")
             return None
 
-        url = (
-            f"https://api.open-meteo.com/v1/forecast?"
+        # Use premium endpoint if API key is configured
+        api_key = os.environ.get("OPEN_METEO_API_KEY", "")
+        base = "https://customer-api.open-meteo.com/v1/forecast" if api_key else "https://api.open-meteo.com/v1/forecast"
+        params = (
             f"latitude={lat}&longitude={lon}"
             f"&hourly=temperature_2m&temperature_unit=fahrenheit"
             f"&timezone=auto&forecast_days=2"
             f"&models=hrrr_conus"
         )
+        url = f"{base}?{params}" + (f"&apikey={api_key}" if api_key else "")
 
         try:
             resp = _retry_request("GET", url, timeout=15, max_retries=2)
