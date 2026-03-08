@@ -161,6 +161,7 @@
     "maxConcurrentPositions": 30,
     "absoluteDailyLossCap": 750,
     "absoluteDailyLossCapPct": 0.15,
+    "drawdownHaltThreshold": 0.80,
     "perBotDailyLimit": {
       "weather": 200,
       "economics": 300,

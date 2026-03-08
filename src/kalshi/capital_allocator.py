@@ -128,7 +128,19 @@ ABSOLUTE_DAILY_LOSS_CAP_CENTS = _load_absolute_cap()
 ABSOLUTE_DAILY_LOSS_CAP_PCT = _load_absolute_cap_pct()
 
 # Portfolio drawdown halt: if NAV drops below (1 - threshold) * deposits, create HALT_TRADING
-DRAWDOWN_HALT_THRESHOLD = 0.10  # 10% drawdown triggers halt
+# Set via allocator.drawdownHaltThreshold in bots-config.json (default 0.50 = 50%)
+def _load_drawdown_threshold():
+    try:
+        config_path = Path(__file__).resolve().parent.parent.parent / "config" / "bots-config.json"
+        if config_path.exists():
+            cfg = json.loads(config_path.read_text())
+            val = cfg.get("allocator", {}).get("drawdownHaltThreshold", 0.50)
+            return max(0.05, min(0.95, float(val)))
+    except Exception:
+        pass
+    return 0.50
+
+DRAWDOWN_HALT_THRESHOLD = _load_drawdown_threshold()
 DRAWDOWN_CHECK_INTERVAL = 60  # check at most once per 60 seconds
 _HALT_TRADING_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "HALT_TRADING"
 _DEPOSITS_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "deposits.json"
