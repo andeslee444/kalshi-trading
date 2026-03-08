@@ -193,6 +193,14 @@ class BotProcess:
             else:
                 now_dt = datetime.now()
             age_min = (now_dt - hb_dt).total_seconds() / 60
+
+            # If heartbeat is old but bot was recently (re)started, it hasn't
+            # had a chance to complete a scan yet — don't kill it prematurely
+            if self.started_at is not None:
+                running_min = (time.time() - self.started_at) / 60
+                if running_min < stale_threshold_min:
+                    return False, None
+
             if age_min > stale_threshold_min:
                 return True, age_min
         except (ValueError, TypeError):
