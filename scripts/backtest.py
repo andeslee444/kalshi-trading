@@ -30,6 +30,7 @@ from probability import (
     half_kelly,
     half_kelly_sell,
     quarter_kelly,
+    longshot_edge,
 )
 from kalshi_auth import _atomic_write_json
 from trade_files import TRADE_FILES as _CANONICAL_TRADE_FILES
@@ -228,11 +229,8 @@ def reeval_weather_trade(trade, settlement_revenue):
 
     # Determine actual outcome
     side = trade.get("side", "").lower()
-    if side == "yes":
-        actual = 1 if settlement_revenue > 0 else 0
-    elif side == "no":
-        actual = 0 if settlement_revenue > 0 else 1
-    else:
+    actual = _determine_outcome(trade, settlement_revenue, side)
+    if actual is None:
         return None
 
     # Compute days_out
@@ -285,35 +283,79 @@ def reeval_weather_trade(trade, settlement_revenue):
     }
 
 
+def _determine_outcome(trade, settlement_revenue, side):
+    """Determine trade outcome, preferring local settlement_result over API revenue.
+
+    API revenue is 0 for positions exited before settlement (by position-monitor),
+    which the old logic incorrectly treated as losses. The local settlement_result
+    field (set by reconcile-trades.py) is authoritative.
+    """
+    local_result = trade.get("settlement_result")
+    if local_result == "won":
+        return 1
+    if local_result == "lost":
+        return 0
+    # Fallback: API revenue (unreliable for pre-exit trades)
+    if side == "yes":
+        return 1 if settlement_revenue > 0 else 0
+    elif side == "no":
+        return 0 if settlement_revenue > 0 else 1
+    return None
+
+
 def reeval_strategy_trade(trade, settlement_revenue):
     """Re-evaluate a strategy/longshot trade. Returns dict or None."""
     ticker = trade.get("ticker", "")
+    strategy = trade.get("strategy", "longshot_sell")
     yes_price = trade.get("yes_price_at_entry") or trade.get("yes_price", 0)
-    if not yes_price or yes_price <= 0 or yes_price > 15:
+
+    if strategy == "longshot_buy":
+        # Buy-side: YES price is 70-99c, use NO-equivalent for edge
+        if not yes_price or yes_price < 70 or yes_price > 99:
+            return None
+        no_price = 100 - yes_price
+        edge_price = no_price  # edge is computed on the longshot (NO) side
+    else:
+        # Sell-side: YES price is 1-30c
+        if not yes_price or yes_price <= 0 or yes_price > 30:
+            return None
+        edge_price = yes_price
+
+    # Edge: prefer stored edge (captures Bayesian adjustments at trade time),
+    # fall back to longshot_edge() from probability.py
+    stored_edge = trade.get("edge")
+    if stored_edge and stored_edge > 0:
+        est_edge = stored_edge
+    else:
+        est_edge = longshot_edge(edge_price, ticker=ticker)
+
+    # Outcome: prefer local settlement_result over API revenue
+    side = "yes" if strategy == "longshot_buy" else "no"
+    actual_win = _determine_outcome(trade, settlement_revenue, side)
+    if actual_win is None:
         return None
 
-    # Becker model: edge = 0.57 * exp(-0.15 * price)
-    est_edge = 0.57 * math.exp(-0.15 * yes_price)
-
-    # Determine outcome: selling YES, so we win if event doesn't occur
-    # Revenue > 0 means we won
-    actual_win = 1 if settlement_revenue > 0 else 0
-    # For calibration: predicted probability that our SELL wins = 1 - true_prob
-    implied = yes_price / 100.0
-    p_true = max(0.001, implied - est_edge)
-    predicted_win = 1 - p_true
+    # Predicted win probability
+    implied = edge_price / 100.0
+    p_true = max(0.001, min(0.999, implied - est_edge))
+    if strategy == "longshot_sell":
+        predicted_win = 1 - p_true  # seller wins when event doesn't happen
+    else:
+        predicted_win = 1 - p_true  # buyer wins when longshot (NO) doesn't happen
 
     # Re-compute Kelly sizing
-    sell_price = yes_price
-    contracts, risk = half_kelly_sell(est_edge, sell_price, 500)
+    if strategy == "longshot_buy":
+        contracts, risk = half_kelly(est_edge, yes_price, 500)
+    else:
+        contracts, risk = half_kelly_sell(est_edge, edge_price, 500)
 
     return {
         "ticker": ticker,
         "predicted": predicted_win,
         "actual": actual_win,
-        "side": "no",
+        "side": side,
         "revenue": settlement_revenue,
-        "price": 100 - yes_price,
+        "price": yes_price if strategy == "longshot_buy" else 100 - yes_price,
         "kelly_contracts": contracts,
     }
 
@@ -331,14 +373,13 @@ def reeval_entertainment_trade(trade, settlement_revenue):
         return None
 
     side = trade.get("side", "").lower()
-    if side == "yes":
-        actual = 1 if settlement_revenue > 0 else 0
-        predicted = conf_val
-    elif side == "no":
-        actual = 0 if settlement_revenue > 0 else 1
-        predicted = 1 - conf_val
-    else:
+    actual = _determine_outcome(trade, settlement_revenue, side)
+    if actual is None:
         return None
+    if side == "yes":
+        predicted = conf_val
+    else:
+        predicted = 1 - conf_val
 
     return {
         "ticker": ticker,
@@ -359,14 +400,13 @@ def reeval_crypto_trade(trade, settlement_revenue):
         return None
 
     side = trade.get("side", "").lower()
-    if side == "yes":
-        actual = 1 if settlement_revenue > 0 else 0
-        predicted = model_prob
-    elif side == "no":
-        actual = 0 if settlement_revenue > 0 else 1
-        predicted = 1 - model_prob
-    else:
+    actual = _determine_outcome(trade, settlement_revenue, side)
+    if actual is None:
         return None
+    if side == "yes":
+        predicted = model_prob
+    else:
+        predicted = 1 - model_prob
 
     price = trade.get("price_cents") or trade.get("price", 0)
     if price and price > 0 and price < 100:

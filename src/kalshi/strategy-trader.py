@@ -80,6 +80,9 @@ trade_manager = TradeManager(client, TRADES_JSON_PATH, {
 }, logger=log, order_monitor=order_monitor, bot_name="strategy")
 trim_trade_log(TRADES_JSON_PATH)
 
+# Multi-outcome futures where longshot bias model doesn't apply
+TOURNAMENT_PREFIXES = ("KXMARMAD-",)
+
 def find_longshot_sells(markets, bankroll):
     """Find contracts priced <=30c YES to SELL (exploit longshot bias).
 
@@ -100,6 +103,12 @@ def find_longshot_sells(markets, bankroll):
 
         if yes_ask <= 0 or yes_ask > _sell_max_price:
             trade_manager.log_decision(ticker, "no", "skipped", "price_out_of_range",
+                                       yes_ask=yes_ask)
+            continue
+
+        # Skip tournament/championship futures (multi-outcome, violates longshot bias premise)
+        if any(ticker.startswith(p) for p in TOURNAMENT_PREFIXES):
+            trade_manager.log_decision(ticker, "no", "skipped", "tournament_market",
                                        yes_ask=yes_ask)
             continue
 
@@ -458,13 +467,23 @@ def check_settled_trades():
                     ticker = s.get("ticker", "")
                     if not ticker:
                         continue
+                    # Only process settlements for OUR strategy trades
+                    trade_rec = our_trades.get(ticker)
+                    if not trade_rec:
+                        continue
+
                     category = classify_ticker_category(ticker)
-                    # Determine if seller won (YES expired worthless)
-                    won = s.get("settlement_result") == "won" or s.get("revenue", 0) > 0
-                    # Look up original trade to determine side
-                    trade_rec = our_trades.get(ticker, {})
                     strategy = trade_rec.get("strategy", "")
-                    price_cents = s.get("yes_price_at_entry") or trade_rec.get("yes_price_at_entry", 5)
+                    price_cents = trade_rec.get("yes_price_at_entry", 5)
+
+                    # Determine outcome: prefer local settlement_result
+                    local_result = trade_rec.get("settlement_result")
+                    if local_result == "won":
+                        won = True
+                    elif local_result == "lost":
+                        won = False
+                    else:
+                        won = s.get("revenue", 0) > 0
 
                     # Fix side conflation: for buy-side trades (YES 70-99c),
                     # convert to NO-equivalent price (1-30c) before bucketing
