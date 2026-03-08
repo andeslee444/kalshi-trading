@@ -686,7 +686,7 @@ def scan_and_trade():
 
     # Fetch raw ensemble member data for empirical CDF model
     ensemble_members = {}  # {city_code: {date_str: [member_temps]}}
-    if not health.is_source_open("open-meteo-ensemble"):
+    if ENSEMBLE_ENABLED and not health.is_source_open("open-meteo-ensemble"):
         for code, info in CITIES.items():
             if health.is_source_open("open-meteo-ensemble"):
                 break
