@@ -301,7 +301,7 @@ class TestConfigPhase3:
 
     def test_hrrr_config_present(self):
         assert "hrrr" in self.config
-        assert self.config["hrrr"]["enabled"] is True
+        assert self.config["hrrr"]["enabled"] is False  # disabled on free Open-Meteo tier
         assert self.config["hrrr"]["weight_day0"] == 0.60
         assert self.config["hrrr"]["weight_day1"] == 0.30
 

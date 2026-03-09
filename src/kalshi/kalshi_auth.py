@@ -1656,6 +1656,8 @@ class HealthCheckMonitor:
             "sources": {},      # source -> {"last_success": ts, "last_error": ts, "error_count": int}
             "bots": {},         # bot -> {"last_heartbeat": ts}
         }
+        self._dirty_bots = set()      # bot names modified by this process
+        self._dirty_sources = set()   # source names modified by this process
         self._load()
 
     def _load(self):
@@ -1683,8 +1685,16 @@ class HealthCheckMonitor:
                             on_disk = json.loads(self.state_path.read_text())
                         except (json.JSONDecodeError, OSError):
                             pass
-                    on_disk.setdefault("bots", {}).update(self._state.get("bots", {}))
-                    on_disk.setdefault("sources", {}).update(self._state.get("sources", {}))
+                    # Only write back entries this process has modified, to avoid
+                    # overwriting other bots' fresh heartbeats with stale startup copies
+                    on_disk_bots = on_disk.setdefault("bots", {})
+                    for bot in self._dirty_bots:
+                        if bot in self._state.get("bots", {}):
+                            on_disk_bots[bot] = self._state["bots"][bot]
+                    on_disk_sources = on_disk.setdefault("sources", {})
+                    for source in self._dirty_sources:
+                        if source in self._state.get("sources", {}):
+                            on_disk_sources[source] = self._state["sources"][source]
                     _atomic_write_json(self.state_path, on_disk)
                 finally:
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -1698,6 +1708,7 @@ class HealthCheckMonitor:
         self._state["sources"][source]["last_success"] = _utc_now_iso()
         self._state["sources"][source]["error_count"] = 0
         self._state["sources"][source]["opened_at"] = None
+        self._dirty_sources.add(source)
         self._save()
 
     def record_source_error(self, source, msg=""):
@@ -1713,6 +1724,7 @@ class HealthCheckMonitor:
             alert_msg = f"Source circuit breaker opened: {source} ({data['error_count']} consecutive errors)"
             notify_webhook(alert_msg, level="warning", logger=self.log)
             notify_imessage(alert_msg, logger=self.log)
+        self._dirty_sources.add(source)
         self._save()
 
     def is_source_open(self, source):
@@ -1739,6 +1751,7 @@ class HealthCheckMonitor:
     def record_bot_heartbeat(self, bot):
         """Record a bot heartbeat (proves the bot loop is running)."""
         self._state["bots"][bot] = {"last_heartbeat": _utc_now_iso()}
+        self._dirty_bots.add(bot)
         self._save()
 
     def should_send_alert(self, alert_key):
