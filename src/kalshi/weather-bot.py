@@ -525,11 +525,13 @@ def scan_and_trade():
         ss.finalize()
         return
 
-    # Get weather markets (5-min cache — markets don't change that fast)
+    # Get weather markets (10-min cache — market structure doesn't change fast,
+    # and full pagination through 20K+ Kalshi markets takes 30-60s on demo API)
     try:
-        markets = client.get_all_markets(prefix="KXHIGH", cache_ttl=300)
+        t0 = time.time()
+        markets = client.get_all_markets(prefix="KXHIGH", cache_ttl=600)
         ss.markets_fetched = len(markets)
-        log.info(f"Found {len(markets)} KXHIGH markets")
+        log.info(f"Found {len(markets)} KXHIGH markets ({time.time()-t0:.1f}s)")
     except Exception as e:
         log.error(f"Market fetch error: {e}")
         ss.finalize()
@@ -542,6 +544,7 @@ def scan_and_trade():
 
     # Get forecasts (batch API: 1-3 requests instead of 20-60+)
     # Uses separate circuit breaker keys so batch failures don't block per-model fallback
+    t_forecast = time.time()
     forecasts = {}
     batch_failed = False
     if health.is_source_open("open-meteo-batch"):
@@ -718,8 +721,10 @@ def scan_and_trade():
 
     # Current hour for intra-day sigma (day-0 markets only)
     current_hour = now.hour
+    log.info(f"Forecast data collected ({time.time()-t_forecast:.1f}s)")
 
     # Analyze markets
+    t_analysis = time.time()
     opportunities = []
     for m in markets:
         ticker = m.get("ticker", "")
@@ -1110,6 +1115,8 @@ def scan_and_trade():
             ss.trades_placed += 1
             allocator.record_trade("weather", ticker, risk, edge=edge)
             record_local_trade(ticker)
+
+    log.info(f"Market analysis + trading ({time.time()-t_analysis:.1f}s)")
 
     # Save verification state
     if verifier:
