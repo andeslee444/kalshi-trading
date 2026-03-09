@@ -1509,12 +1509,12 @@ class TradeManager:
             "type": order_type,
             "count": count,
         }
-        # Only include price for limit orders; market orders execute at best available
-        if order_type == "limit":
-            if side == "yes":
-                order_body["yes_price"] = price_cents
-            else:
-                order_body["no_price"] = price_cents
+        # Kalshi API always requires a price field (no true market orders).
+        # For "market" type exits, we pass the current bid as the price.
+        if side == "yes":
+            order_body["yes_price"] = price_cents
+        else:
+            order_body["no_price"] = price_cents
 
         try:
             result = self.client.post("/portfolio/orders", body=order_body)
