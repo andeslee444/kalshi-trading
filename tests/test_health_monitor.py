@@ -136,11 +136,12 @@ class TestAutoHalt:
 
         hm = self._make_monitor(tmp_path, auto_halt=True, staleness_minutes=10)
 
-        # Create critical source failures for weather (open-meteo)
+        # Create critical source failures for all weather sources
         old_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=30)).isoformat()
         hm._state["bots"]["weather"] = {"last_heartbeat": old_time}
-        for i in range(5):
-            hm.record_source_error("open-meteo", f"err{i}")
+        for src in ["open-meteo-batch", "open-meteo-single", "open-meteo-ensemble", "nws-forecast"]:
+            for i in range(5):
+                hm.record_source_error(src, f"err{i}")
 
         # Redirect per-bot halt paths to tmp_path
         monkeypatch.setattr(kalshi_auth, "per_bot_halt_path",

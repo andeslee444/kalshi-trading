@@ -25,6 +25,7 @@ from kalshi_auth import (
 from probability import (
     half_kelly, compute_limit_price,
     kalshi_fee_cents, is_market_liquid,
+    apply_kelly_multipliers as _shared_apply_kelly_multipliers,
 )
 from ticker_utils import parse_crypto_ticker
 from capital_allocator import PortfolioAllocator
@@ -755,27 +756,8 @@ def select_order_price(side, yes_bid, yes_ask, no_ask, edge, model_fair_value_ce
 
 
 def apply_kelly_multipliers(base_count, multipliers, floor_pct=0.25):
-    """Apply multiple Kelly fraction multipliers with a floor to prevent stack crushing.
-
-    The crypto bot applies several multiplicative reductions to base Kelly:
-    CI multiplier, regime multiplier, correlation multiplier. Without a floor,
-    the product can crush positions to <1/64th of optimal.
-
-    Args:
-        base_count: Base contract count from Kelly sizing.
-        multipliers: List of multiplier floats (each in [0, 1+]).
-        floor_pct: Minimum combined multiplier as fraction of base (default 25%).
-
-    Returns:
-        int: Adjusted contract count, at least floor_pct * base_count (if base > 0).
-    """
-    combined = 1.0
-    for m in multipliers:
-        combined *= m
-    # Floor: never crush below floor_pct of the base
-    combined = max(floor_pct, combined)
-    result = int(base_count * combined)
-    return max(0, result)
+    """Apply Kelly multipliers — delegates to shared probability.py implementation."""
+    return int(_shared_apply_kelly_multipliers(base_count, multipliers, floor_pct))
 
 
 def compute_correlation_multiplier(max_positive_corr):

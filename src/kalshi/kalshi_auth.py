@@ -37,11 +37,11 @@ RETRY_BACKOFF_BASE = 1.0  # seconds
 KILL_SWITCH_PATH = PROJECT_DIR / "data" / "HALT_TRADING"
 PER_BOT_HALT_PREFIX = "HALT_bot_"
 BOT_SOURCE_MAP = {
-    "weather": ["open-meteo"],
-    "crypto": ["coinbase"],
+    "weather": ["open-meteo-batch", "open-meteo-single", "open-meteo-ensemble", "nws-forecast"],
+    "crypto": ["coinbase", "deribit"],
     "economics": ["cleveland-fed", "gdpnow", "cme-fedwatch"],
     "entertainment": ["hdd", "boxoffice"],
-    "source-monitor": ["hdd", "boxoffice"],
+    "source-monitor": ["hdd", "boxoffice", "nws"],
     "beatrelease": ["beatrelease"],
 }
 SCAN_SUMMARIES_PATH = PROJECT_DIR / "data" / "scan-summaries.json"
@@ -389,8 +389,13 @@ class KalshiClient:
         return all_markets
 
     def get_balance(self):
-        """Get portfolio balance. Returns (balance_cents, available_cents)."""
+        """Get portfolio balance. Returns (balance_cents, available_cents).
+
+        Also stores market_exposure (cost basis of open positions) on the client
+        for NAV approximation: NAV ~ balance + market_exposure.
+        """
         data = self.get("/portfolio/balance")
+        self._market_exposure = data.get("market_exposure", 0)
         return data.get("balance", 0), data.get("available_balance", data.get("balance", 0))
 
 
@@ -1149,6 +1154,7 @@ class TradeManager:
         if not entries:
             return
         self.log.warning("WAL recovery: found %d pending entries", len(entries))
+        failed_entries = []
         for entry in entries:
             ticker = entry.get("ticker", "?")
             order_id = entry.get("order_id")
@@ -1171,8 +1177,13 @@ class TradeManager:
                                      order_id, ticker, status)
             except Exception as e:
                 self.log.warning("WAL recovery: failed to check order %s: %s", order_id, e)
-        # Clear all WAL entries after recovery attempt
-        if self._wal_path.exists():
+                failed_entries.append(entry)
+        # Only retain entries that failed to verify (transient API errors)
+        if failed_entries:
+            self.log.warning("WAL recovery: %d entries unverified, retaining for next startup",
+                             len(failed_entries))
+            _atomic_write_json(self._wal_path, failed_entries)
+        elif self._wal_path.exists():
             self._wal_path.unlink()
 
     @staticmethod
@@ -1472,8 +1483,9 @@ class TradeManager:
             price_cents: Limit price in cents (1-99).
             count: Number of contracts to sell.
             reasoning: Human-readable exit rationale.
-            order_type: "limit" (default) or "market". Market orders omit
-                price from the API body for immediate execution.
+            order_type: "limit" (default) or "market". Kalshi API always
+                requires a price field; for "market" exits we pass the
+                current bid/ask as the price.
             **extra_fields: Additional fields for the trade record.
 
         Returns:
@@ -1744,6 +1756,7 @@ class HealthCheckMonitor:
             # Half-open: reset error_count so one retry is allowed
             data["error_count"] = 0
             data["opened_at"] = None
+            self._dirty_sources.add(source)
             self._save()
             return False
         return True

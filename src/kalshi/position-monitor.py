@@ -596,7 +596,11 @@ def _compute_current_probability(ticker, source_bot, entry_side):
                     if ts:
                         try:
                             d_dt = datetime.datetime.fromisoformat(ts)
-                            age_min = (datetime.datetime.now() - d_dt).total_seconds() / 60
+                            now = datetime.datetime.now(datetime.timezone.utc)
+                            # Handle naive timestamps from older decision logs
+                            if d_dt.tzinfo is None:
+                                d_dt = d_dt.replace(tzinfo=datetime.timezone.utc)
+                            age_min = (now - d_dt).total_seconds() / 60
                         except (ValueError, TypeError):
                             pass
                     # Only use if decision is less than 12 hours old

@@ -82,8 +82,9 @@ def record_local_trade(ticker):
     # Prune old entries to prevent unbounded growth
     if len(_local_trade_times) > 500:
         cutoff = datetime.datetime.now() - datetime.timedelta(hours=24)
-        _local_trade_times.clear()
-        # In practice this rarely fires since weather markets settle daily
+        expired = [k for k, v in _local_trade_times.items() if v < cutoff]
+        for k in expired:
+            del _local_trade_times[k]
 
 # === Weather Forecast ===
 

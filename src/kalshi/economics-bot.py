@@ -986,8 +986,10 @@ def scan_and_trade():
         # Determine which nowcast value to use
         nowcast_value = None
         if market_type == "CORE_CPI":
-            # Core CPI markets should use core_cpi_yoy (not headline)
-            nowcast_value = nowcast.get("core_cpi_yoy") or nowcast.get("cpi_yoy")
+            # Core CPI markets must use core_cpi_yoy — never fall back to headline
+            nowcast_value = nowcast.get("core_cpi_yoy")
+            if nowcast_value is None:
+                log.warning("  Skipping %s: core_cpi_yoy not available (refusing headline fallback)", ticker)
         elif "CPI" in ticker.upper() or "INFLATION" in ticker.upper():
             nowcast_value = nowcast.get("cpi_yoy") or nowcast.get("core_cpi_yoy")
         elif "GDP" in ticker.upper():

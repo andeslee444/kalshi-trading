@@ -327,9 +327,11 @@ class PortfolioAllocator:
         self._last_drawdown_check = now
 
         try:
-            # Get current NAV
+            # Get current NAV (cash + cost basis of open positions)
             total_balance, _ = self._get_balance()
-            if total_balance <= 0:
+            exposure = getattr(self.client, '_market_exposure', 0) if self.client else 0
+            nav = total_balance + exposure
+            if nav <= 0:
                 return False
 
             # Get total deposits (use data dir relative to state_path, not hardcoded)
@@ -349,18 +351,19 @@ class PortfolioAllocator:
             if net_funded <= 0:
                 return False
 
-            # Check drawdown
-            drawdown_pct = (net_funded - total_balance) / net_funded
+            # Check drawdown using NAV (cash + position cost basis)
+            drawdown_pct = (net_funded - nav) / net_funded
             if drawdown_pct >= DRAWDOWN_HALT_THRESHOLD:
                 if not self._drawdown_halted:
-                    msg = (f"DRAWDOWN HALT: NAV ${total_balance/100:.2f} is "
+                    msg = (f"DRAWDOWN HALT: NAV ${nav/100:.2f} "
+                           f"(cash=${total_balance/100:.2f} + positions=${exposure/100:.2f}) is "
                            f"{drawdown_pct*100:.1f}% below deposits ${net_funded/100:.2f} "
                            f"(threshold: {DRAWDOWN_HALT_THRESHOLD*100:.0f}%)")
                     self.log.critical(msg)
                     _HALT_TRADING_PATH.write_text(
-                        f"Automated drawdown halt at {datetime.datetime.now().isoformat()}\n"
-                        f"NAV: ${total_balance/100:.2f} | Deposits: ${net_funded/100:.2f} | "
-                        f"Drawdown: {drawdown_pct*100:.1f}%\n"
+                        f"Automated drawdown halt at {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n"
+                        f"NAV: ${nav/100:.2f} (cash=${total_balance/100:.2f} + positions=${exposure/100:.2f}) | "
+                        f"Deposits: ${net_funded/100:.2f} | Drawdown: {drawdown_pct*100:.1f}%\n"
                     )
                     try:
                         from kalshi_auth import notify_whatsapp
@@ -522,6 +525,26 @@ class PortfolioAllocator:
             self._pending_exits = []
             self._correlation_engine.reset_daily()
             self._save_state()
+
+    def _prefetch_api_data(self):
+        """Pre-fetch balance and positions before acquiring the lock.
+
+        Populates cached values so _request_budget_inner won't need API calls
+        while holding LOCK_EX. Failures are tolerated — cached values or
+        defaults will be used inside the lock.
+        """
+        try:
+            self._get_balance()
+        except Exception:
+            pass
+        try:
+            self._get_position_count()
+        except Exception:
+            pass
+        try:
+            self._reconcile_settled_positions()
+        except Exception:
+            pass
 
     def _get_balance(self):
         """Get total and available balance, cached for 5 seconds.
@@ -737,6 +760,10 @@ class PortfolioAllocator:
         Returns:
             BudgetResponse with approved flag, allocated max_cost, and bankroll.
         """
+        # Pre-fetch API data BEFORE acquiring the lock to avoid blocking
+        # other bots during slow network calls.
+        self._prefetch_api_data()
+
         def _do_request():
             self._load_state()
             self._reset_daily_if_needed_inner()

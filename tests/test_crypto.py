@@ -28,6 +28,17 @@ for fn in ["half_kelly", "compute_limit_price", "kalshi_fee_cents",
            "_load_calibration", "_reset_calibration"]:
     setattr(_fake_prob, fn, MagicMock())
 
+# Use real apply_kelly_multipliers so crypto-bot delegation works correctly
+def _real_apply_kelly_multipliers(base, multipliers, floor_pct=0.25):
+    if base <= 0:
+        return 0
+    adjusted = base
+    for m in multipliers:
+        adjusted *= m
+    floor = base * floor_pct
+    return max(adjusted, floor)
+_fake_prob.apply_kelly_multipliers = _real_apply_kelly_multipliers
+
 _fake_ticker = types.ModuleType("ticker_utils")
 _fake_ticker.parse_crypto_ticker = MagicMock(return_value=None)
 

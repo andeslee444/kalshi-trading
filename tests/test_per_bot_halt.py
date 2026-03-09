@@ -145,7 +145,8 @@ class TestCheckPerBotHalts:
 
     def test_creates_halt_when_all_sources_failing(self, tmp_path):
         monitor = self._make_monitor(tmp_path)
-        self._set_source_errors(monitor, "open-meteo", 5)
+        for src in ["open-meteo-batch", "open-meteo-single", "open-meteo-ensemble", "nws-forecast"]:
+            self._set_source_errors(monitor, src, 5)
 
         with patch("kalshi_auth.per_bot_halt_path", side_effect=lambda name: tmp_path / f"HALT_bot_{name}"):
             status = monitor.check_per_bot_halts()
@@ -170,7 +171,8 @@ class TestCheckPerBotHalts:
         halt_file = tmp_path / "HALT_bot_weather"
         halt_file.write_text("previously halted")
 
-        self._set_source_errors(monitor, "open-meteo", 0)
+        for src in ["open-meteo-batch", "open-meteo-single", "open-meteo-ensemble", "nws-forecast"]:
+            self._set_source_errors(monitor, src, 0)
 
         with patch("kalshi_auth.per_bot_halt_path", side_effect=lambda name: tmp_path / f"HALT_bot_{name}"):
             status = monitor.check_per_bot_halts()
@@ -181,7 +183,8 @@ class TestCheckPerBotHalts:
         monitor = self._make_monitor(tmp_path, cooldown=600)
         monitor._halt_transitions["weather"] = time.time()
 
-        self._set_source_errors(monitor, "open-meteo", 5)
+        for src in ["open-meteo-batch", "open-meteo-single", "open-meteo-ensemble", "nws-forecast"]:
+            self._set_source_errors(monitor, src, 5)
 
         with patch("kalshi_auth.per_bot_halt_path", side_effect=lambda name: tmp_path / f"HALT_bot_{name}"):
             status = monitor.check_per_bot_halts()
@@ -194,7 +197,8 @@ class TestCheckPerBotHalts:
         halt_file.write_text("halted")
         monitor._halt_transitions["weather"] = time.time()
 
-        self._set_source_errors(monitor, "open-meteo", 0)
+        for src in ["open-meteo-batch", "open-meteo-single", "open-meteo-ensemble", "nws-forecast"]:
+            self._set_source_errors(monitor, src, 0)
 
         with patch("kalshi_auth.per_bot_halt_path", side_effect=lambda name: tmp_path / f"HALT_bot_{name}"):
             status = monitor.check_per_bot_halts()
@@ -204,7 +208,8 @@ class TestCheckPerBotHalts:
     def test_check_health_no_global_halt(self, tmp_path):
         """check_health() with auto_halt=True should NOT create global HALT_TRADING."""
         monitor = self._make_monitor(tmp_path)
-        self._set_source_errors(monitor, "open-meteo", 10)
+        for src in ["open-meteo-batch", "open-meteo-single", "open-meteo-ensemble", "nws-forecast"]:
+            self._set_source_errors(monitor, src, 10)
         self._set_source_errors(monitor, "cleveland-fed", 10)
 
         with patch("kalshi_auth.per_bot_halt_path", side_effect=lambda name: tmp_path / f"HALT_bot_{name}"):
@@ -214,8 +219,9 @@ class TestCheckPerBotHalts:
 
     def test_only_bots_with_all_failing_sources_halted(self, tmp_path):
         monitor = self._make_monitor(tmp_path)
-        # Weather: all failing (single source)
-        self._set_source_errors(monitor, "open-meteo", 5)
+        # Weather: all sources failing
+        for src in ["open-meteo-batch", "open-meteo-single", "open-meteo-ensemble", "nws-forecast"]:
+            self._set_source_errors(monitor, src, 5)
         # Economics: only one of three failing
         self._set_source_errors(monitor, "cleveland-fed", 5)
         self._set_source_errors(monitor, "gdpnow", 0)
