@@ -8,3 +8,5 @@ data/
 config/keys/
 kalshi-source-snapshots/
 .worktrees/
+.playwright-mcp/
+*.png

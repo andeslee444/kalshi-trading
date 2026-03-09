@@ -19,7 +19,7 @@ Kalshi KXALBUMSALES markets settle directly on the HDD Hits Top 50
 "Albums" column. When this chart publishes, the settlement value is known.
 """
 
-import json, time, datetime, os, sys, re, traceback
+import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR
@@ -241,8 +241,7 @@ def scan_charts():
                 log.info(f"  Raw (first 300): {raw[:300]}")
 
         except Exception as e:
-            log.error(f"  Chart {chart_slug} failed: {e}")
-            traceback.print_exc()
+            log.error("  Chart %s failed: %s", chart_slug, e, exc_info=True)
 
 
 def scan_articles():
@@ -289,8 +288,7 @@ def scan_articles():
             log.info("  No articles with sales data found in recent batch")
 
     except Exception as e:
-        log.error(f"  Article scan failed: {e}")
-        traceback.print_exc()
+        log.error("  Article scan failed: %s", e, exc_info=True)
 
     # Also try keyword search
     try:
@@ -328,8 +326,7 @@ def scan_kalshi_markets():
 
         return markets
     except Exception as e:
-        log.error(f"  Kalshi search failed: {e}")
-        traceback.print_exc()
+        log.error("  Kalshi search failed: %s", e, exc_info=True)
         return []
 
 
@@ -382,8 +379,7 @@ def monitor_loop(interval_minutes: int = 15):
         try:
             run_full_scan()
         except Exception as e:
-            log.error(f"Scan error: {e}")
-            traceback.print_exc()
+            log.error("Scan error: %s", e, exc_info=True)
 
         log.info(f"\nNext scan in {interval_minutes} minutes...")
         time.sleep(interval_minutes * 60)

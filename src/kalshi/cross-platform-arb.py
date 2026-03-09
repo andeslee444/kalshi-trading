@@ -14,7 +14,7 @@ Usage:
     python3 src/kalshi/cross-platform-arb.py --once    # single scan
 """
 
-import json, time, datetime, os, sys, re, argparse, traceback
+import json, time, datetime, os, sys, re, argparse
 from pathlib import Path
 from difflib import SequenceMatcher
 from kalshi_auth import (
@@ -430,8 +430,7 @@ def main():
                 log.warning("Health issues: %s", "; ".join(issues))
             scan_spreads()
         except Exception as e:
-            log.error(f"Scan error: {e}")
-            traceback.print_exc()
+            log.error("Scan error: %s", e, exc_info=True)
 
         if is_shutdown_requested():
             log.info("Graceful shutdown requested, exiting.")

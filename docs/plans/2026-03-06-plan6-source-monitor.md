@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3, NWS API, web scraping
 
-**NOTE:** Deep code review confirmed NWS timezone handling is CORRECT — already uses per-city `ZoneInfo` timezones via `_local_today()`. Pre-dawn gate at 8 AM and observation staleness gate (2h) are also already implemented.
+**NOTE:** Pre-plan code review confirmed `_local_today()` date boundaries were correct (per-city `ZoneInfo`). However, during execution the developer found a separate bug: the **hour-of-day** used for the sigma model / pre-dawn gate was using server time, not per-city local time. This meant LAX at 6am PT was being evaluated as 9am ET. Both issues are now fixed and regression-tested.
 
 ---
 

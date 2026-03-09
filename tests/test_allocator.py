@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 from capital_allocator import (
     PortfolioAllocator, compute_signal_quality, MODEL_QUALITY_FACTOR, BudgetResponse,
     CITY_REGIONS, _CITY_TO_REGION, MAX_REGION_FRACTION, _load_absolute_cap,
-    _load_absolute_cap_pct, ABSOLUTE_DAILY_LOSS_CAP_PCT,
+    _load_absolute_cap_pct, ABSOLUTE_DAILY_LOSS_CAP_PCT, _load_per_bot_daily_limits,
 )
 
 
@@ -708,3 +708,52 @@ class TestMinimumPositionFloor:
         assert result.approved
         # Bankroll should be the full available balance (no regime/tail reductions)
         assert result.bankroll_cents == 500000
+
+
+# ===================================================================
+# Config Loader Error Handling tests (Plan 1 Task 1)
+# ===================================================================
+
+class TestConfigLoaderErrorHandling:
+    """Config loaders must log warnings on corrupt config, not silently use defaults."""
+
+    def test_load_absolute_cap_logs_on_corrupt_json(self, caplog):
+        """Corrupt config should produce a warning log, not silence."""
+        import logging
+        with patch("capital_allocator.Path.exists", return_value=True):
+            with patch("capital_allocator.Path.read_text", return_value="not json"):
+                with caplog.at_level(logging.WARNING):
+                    cap = _load_absolute_cap()
+        assert cap == 10000  # $100 default
+        assert any("absoluteDailyLossCap" in r.message or "Failed to load" in r.message
+                    for r in caplog.records if r.levelno >= logging.WARNING)
+
+    def test_load_absolute_cap_pct_logs_on_corrupt_json(self, caplog):
+        """Corrupt config should produce a warning log for pct loader."""
+        import logging
+        with patch("capital_allocator.Path.exists", return_value=True):
+            with patch("capital_allocator.Path.read_text", return_value="not json"):
+                with caplog.at_level(logging.WARNING):
+                    pct = _load_absolute_cap_pct()
+        assert pct == 0.0
+        assert any("Failed to load" in r.message
+                    for r in caplog.records if r.levelno >= logging.WARNING)
+
+    def test_per_bot_limits_corrupt_structure_returns_empty_with_warning(self, caplog):
+        """Per-bot limits with non-dict structure should log warning and return empty dict.
+
+        When perBotDailyLimit is not a dict (e.g., an integer), calling
+        .items() raises AttributeError. The exception handler should catch
+        it, log a warning, and return {}.
+        """
+        import logging
+        corrupt_config = json.dumps({
+            "allocator": {"perBotDailyLimit": 42}
+        })
+        with patch("capital_allocator.Path.exists", return_value=True):
+            with patch("capital_allocator.Path.read_text", return_value=corrupt_config):
+                with caplog.at_level(logging.WARNING):
+                    result = _load_per_bot_daily_limits()
+        assert result == {}
+        assert any("Failed to load" in r.message or "perBotDailyLimit" in r.message
+                    for r in caplog.records if r.levelno >= logging.WARNING)

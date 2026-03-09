@@ -1205,13 +1205,15 @@ class TestCryptoPriceProbability:
 
     def test_ou_differs_from_gbm_short_horizon(self):
         """OU adjusts both vol and drift, producing different prob than GBM."""
+        # ou_target is required to activate OU mean-reversion (see probability.py line 1152)
         gbm = crypto_price_probability(70000, 69000, "above",
                                         time_horizon_minutes=60,
                                         realized_vol_pct=0.60)
         ou = crypto_price_probability(70000, 69000, "above",
                                        time_horizon_minutes=60,
                                        realized_vol_pct=0.60,
-                                       use_ou=True, ou_half_life_minutes=120)
+                                       use_ou=True, ou_half_life_minutes=120,
+                                       ou_target=68000)
         # OU reduces vol but also adds mean-reversion drift correction
         # Net effect depends on parameters — just verify they differ
         assert abs(ou - gbm) > 0.001, "OU should produce different prob than GBM"

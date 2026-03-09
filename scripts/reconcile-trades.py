@@ -106,19 +106,24 @@ def _annotate_trade(trade, settlements, fills):
     """Annotate a single trade record with settlement/fill data.
 
     Returns True if the record was modified.
+    Skips sell (exit) records — settlement belongs to the original buy.
     """
+    # Skip sell (exit) records — legacy records without action are assumed buys
+    if trade.get("action", "buy") != "buy":
+        return False
+
     # Skip already-annotated records
     if trade.get("settlement_result") is not None:
         return False
 
     ticker = trade.get("ticker", "")
     order_id = trade.get("order_id", "")
+    side = trade.get("side", "yes")
     modified = False
 
     # Match settlement
     if ticker in settlements:
         s = settlements[ticker]
-        side = trade.get("side", "yes")
         yes_won = s["yes_won"]
 
         if side == "yes":
@@ -135,11 +140,19 @@ def _annotate_trade(trade, settlements, fills):
         trade["fill_price_cents"] = f["fill_price_cents"]
         modified = True
 
-    # Compute realized edge if we have enough data
+    # Compute realized edge (in P(YES) frame to match model_prob convention)
     if trade.get("settlement_result") and trade.get("model_prob") is not None:
-        actual = 1.0 if trade["settlement_result"] == "won" else 0.0
-        fill_price = trade.get("fill_price_cents") or trade.get("price_cents", 50) or 50
-        implied = fill_price / 100.0
+        fill_price = trade.get("fill_price_cents")
+        if fill_price is None:
+            fill_price = trade.get("price_cents")
+        if fill_price is None:
+            fill_price = 50
+        if side == "yes":
+            actual = 1.0 if trade["settlement_result"] == "won" else 0.0
+            implied = fill_price / 100.0
+        else:
+            actual = 0.0 if trade["settlement_result"] == "won" else 1.0
+            implied = 1.0 - fill_price / 100.0
         trade["realized_edge"] = round(actual - implied, 4)
         modified = True
 

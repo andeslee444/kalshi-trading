@@ -1,9 +1,12 @@
 {
-  "generated_at": "2026-02-20T21:53:29",
-  "n_settlements": 44,
-  "n_trades": 14,
+  "generated_at": "2026-02-26T08:33:04",
+  "n_settlements": 116,
+  "n_trades": 188,
   "weather": {
-    "n": 0
+    "global_brier": 0.309726,
+    "global_log_loss": 0.937282,
+    "global_pnl_cents": 36643,
+    "n": 69
   },
   "nws": {
     "n": 0
@@ -12,6 +15,9 @@
     "n": 0
   },
   "box_office": {
+    "n": 0
+  },
+  "ensemble": {
     "n": 0
   }
 }

@@ -107,6 +107,9 @@ def backfill(dry_run=False):
     for trade_file, trades in all_file_trades:
         file_modified = 0
         for trade in trades:
+            # Skip sell (exit) records — legacy records without action are assumed buys
+            if trade.get("action", "buy") != "buy":
+                continue
             if trade.get("settlement_result") is not None:
                 continue
 
@@ -124,17 +127,24 @@ def backfill(dry_run=False):
                 trade["settlement_result"] = "won" if not yes_won else "lost"
 
             # Compute revenue: won = 100 - price, lost = -price
-            price = trade.get("price_cents") or trade.get("cost_cents") or 50
+            # price_cents is per-contract; cost_cents is total (price * count), don't use it
+            price = trade.get("price_cents")
+            if price is None:
+                price = 50
             count = trade.get("count", 1)
             if trade["settlement_result"] == "won":
                 trade["settlement_revenue_cents"] = (100 - price) * count
             else:
                 trade["settlement_revenue_cents"] = -price * count
 
-            # Compute realized edge
+            # Compute realized edge (in P(YES) frame to match model_prob convention)
             if trade.get("model_prob") is not None:
-                actual = 1.0 if trade["settlement_result"] == "won" else 0.0
-                implied = price / 100.0
+                if side == "yes":
+                    actual = 1.0 if trade["settlement_result"] == "won" else 0.0
+                    implied = price / 100.0
+                else:
+                    actual = 0.0 if trade["settlement_result"] == "won" else 1.0
+                    implied = 1.0 - price / 100.0
                 trade["realized_edge"] = round(actual - implied, 4)
 
             file_modified += 1
@@ -219,7 +229,7 @@ def summary_report():
     # Per-bot breakdown
     by_bot = defaultdict(lambda: {"wins": 0, "losses": 0, "pnl": 0})
     for t in settled:
-        bot = t.get("bot", t.get("source", "unknown"))
+        bot = t.get("source_bot", t.get("bot", t.get("source", "unknown")))
         if t["settlement_result"] == "won":
             by_bot[bot]["wins"] += 1
         else:

@@ -145,8 +145,7 @@ class TestCheckPerBotHalts:
 
     def test_creates_halt_when_all_sources_failing(self, tmp_path):
         monitor = self._make_monitor(tmp_path)
-        self._set_source_errors(monitor, "NWS", 5)
-        self._set_source_errors(monitor, "OpenMeteo", 5)
+        self._set_source_errors(monitor, "open-meteo", 5)
 
         with patch("kalshi_auth.per_bot_halt_path", side_effect=lambda name: tmp_path / f"HALT_bot_{name}"):
             status = monitor.check_per_bot_halts()
@@ -154,14 +153,16 @@ class TestCheckPerBotHalts:
         assert (tmp_path / "HALT_bot_weather").exists()
 
     def test_no_halt_on_partial_failure(self, tmp_path):
+        """Economics has 3 sources — one failing shouldn't trigger halt."""
         monitor = self._make_monitor(tmp_path)
-        self._set_source_errors(monitor, "NWS", 5)
-        self._set_source_errors(monitor, "OpenMeteo", 0)
+        self._set_source_errors(monitor, "cleveland-fed", 5)
+        self._set_source_errors(monitor, "gdpnow", 0)
+        self._set_source_errors(monitor, "cme-fedwatch", 0)
 
         with patch("kalshi_auth.per_bot_halt_path", side_effect=lambda name: tmp_path / f"HALT_bot_{name}"):
             status = monitor.check_per_bot_halts()
-        assert status["weather"] == "unchanged"
-        assert not (tmp_path / "HALT_bot_weather").exists()
+        assert status["economics"] == "unchanged"
+        assert not (tmp_path / "HALT_bot_economics").exists()
 
     def test_removes_halt_when_sources_recover(self, tmp_path):
         monitor = self._make_monitor(tmp_path)
@@ -169,8 +170,7 @@ class TestCheckPerBotHalts:
         halt_file = tmp_path / "HALT_bot_weather"
         halt_file.write_text("previously halted")
 
-        self._set_source_errors(monitor, "NWS", 0)
-        self._set_source_errors(monitor, "OpenMeteo", 0)
+        self._set_source_errors(monitor, "open-meteo", 0)
 
         with patch("kalshi_auth.per_bot_halt_path", side_effect=lambda name: tmp_path / f"HALT_bot_{name}"):
             status = monitor.check_per_bot_halts()
@@ -181,8 +181,7 @@ class TestCheckPerBotHalts:
         monitor = self._make_monitor(tmp_path, cooldown=600)
         monitor._halt_transitions["weather"] = time.time()
 
-        self._set_source_errors(monitor, "NWS", 5)
-        self._set_source_errors(monitor, "OpenMeteo", 5)
+        self._set_source_errors(monitor, "open-meteo", 5)
 
         with patch("kalshi_auth.per_bot_halt_path", side_effect=lambda name: tmp_path / f"HALT_bot_{name}"):
             status = monitor.check_per_bot_halts()
@@ -195,8 +194,7 @@ class TestCheckPerBotHalts:
         halt_file.write_text("halted")
         monitor._halt_transitions["weather"] = time.time()
 
-        self._set_source_errors(monitor, "NWS", 0)
-        self._set_source_errors(monitor, "OpenMeteo", 0)
+        self._set_source_errors(monitor, "open-meteo", 0)
 
         with patch("kalshi_auth.per_bot_halt_path", side_effect=lambda name: tmp_path / f"HALT_bot_{name}"):
             status = monitor.check_per_bot_halts()
@@ -206,9 +204,8 @@ class TestCheckPerBotHalts:
     def test_check_health_no_global_halt(self, tmp_path):
         """check_health() with auto_halt=True should NOT create global HALT_TRADING."""
         monitor = self._make_monitor(tmp_path)
-        self._set_source_errors(monitor, "NWS", 10)
-        self._set_source_errors(monitor, "OpenMeteo", 10)
-        self._set_source_errors(monitor, "ClevelandFed", 10)
+        self._set_source_errors(monitor, "open-meteo", 10)
+        self._set_source_errors(monitor, "cleveland-fed", 10)
 
         with patch("kalshi_auth.per_bot_halt_path", side_effect=lambda name: tmp_path / f"HALT_bot_{name}"):
             issues = monitor.check_health()
@@ -217,17 +214,17 @@ class TestCheckPerBotHalts:
 
     def test_only_bots_with_all_failing_sources_halted(self, tmp_path):
         monitor = self._make_monitor(tmp_path)
-        # Weather: all failing
-        self._set_source_errors(monitor, "NWS", 5)
-        self._set_source_errors(monitor, "OpenMeteo", 5)
-        # Crypto: only one failing
-        self._set_source_errors(monitor, "Coinbase", 5)
-        self._set_source_errors(monitor, "Deribit", 0)
+        # Weather: all failing (single source)
+        self._set_source_errors(monitor, "open-meteo", 5)
+        # Economics: only one of three failing
+        self._set_source_errors(monitor, "cleveland-fed", 5)
+        self._set_source_errors(monitor, "gdpnow", 0)
+        self._set_source_errors(monitor, "cme-fedwatch", 0)
 
         with patch("kalshi_auth.per_bot_halt_path", side_effect=lambda name: tmp_path / f"HALT_bot_{name}"):
             status = monitor.check_per_bot_halts()
         assert status["weather"] == "halted"
-        assert status["crypto"] == "unchanged"
+        assert status["economics"] == "unchanged"
 
     def test_unknown_sources_treated_as_ok(self, tmp_path):
         """Sources not in health state default to error_count=0 (not failing)."""

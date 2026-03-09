@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""GitHub webhook listener — triggers auto-pull on push events.
+"""GitHub webhook listener — fast inline deploy on push events.
 
 Runs on port 3458, exposed via Cloudflare tunnel at deploy.andeslee.com.
-GitHub sends POST /webhook on every push, this script runs the auto-pull script.
+On push to main: git pull, send iMessage via BlueBubbles, then reload bots in background.
 
 Usage:
     python3 scripts/github-webhook.py                  # default (warn if no secret)
@@ -10,25 +10,31 @@ Usage:
 """
 
 import argparse
+import datetime
 import hashlib
 import hmac
 import json
 import os
 import subprocess
 import sys
+import threading
+import urllib.request
+import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 PORT = 3458
-AUTO_PULL_SCRIPT = "/Users/andeslee/.openclaw/workspace/scripts/github-auto-pull.sh"
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RELOAD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reload-bots.sh")
 LOG = "/tmp/github-webhook.log"
 
-# Module-level — set by main() after arg parsing
+# Module-level — set by main() after arg parsing / env loading
 WEBHOOK_SECRET = ""
+BLUEBUBBLES_URL = ""
+BLUEBUBBLES_PASSWORD = ""
+BLUEBUBBLES_CHAT_GUID = ""
 
 
 def log(msg):
-    import datetime
     line = f"[{datetime.datetime.now().isoformat()}] {msg}"
     with open(LOG, "a") as f:
         f.write(line + "\n")
@@ -44,6 +50,77 @@ def verify_signature(payload, signature):
         WEBHOOK_SECRET.encode(), payload, hashlib.sha256
     ).hexdigest()
     return hmac.compare_digest(f"sha256={expected}", signature)
+
+
+def send_imessage(text):
+    """Send iMessage via BlueBubbles API. Logs and returns on failure."""
+    if not BLUEBUBBLES_PASSWORD or not BLUEBUBBLES_CHAT_GUID:
+        log("Skipping iMessage: BLUEBUBBLES_PASSWORD or BLUEBUBBLES_CHAT_GUID not set")
+        return
+    url = f"{BLUEBUBBLES_URL}/api/v1/message/text?password={BLUEBUBBLES_PASSWORD}"
+    body = json.dumps({
+        "chatGuid": BLUEBUBBLES_CHAT_GUID,
+        "message": text,
+    }).encode()
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            log(f"iMessage sent (HTTP {resp.status})")
+    except Exception as e:
+        log(f"iMessage failed: {e}")
+
+
+def run_command(cmd, cwd=None, timeout=60):
+    """Run a shell command, return (success, stdout+stderr)."""
+    try:
+        result = subprocess.run(
+            cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+        )
+        output = (result.stdout + result.stderr).strip()
+        return result.returncode == 0, output
+    except subprocess.TimeoutExpired:
+        return False, f"Command timed out after {timeout}s"
+    except Exception as e:
+        return False, str(e)
+
+
+def deploy(repo_name, commits, changed_files):
+    """Pull, notify, then do slow work (pip, sync, reload) in sequence."""
+    try:
+        # 1. git pull
+        ok, output = run_command("git pull --ff-only", cwd=PROJECT_DIR, timeout=30)
+        log(f"git pull: {'OK' if ok else 'FAILED'} — {output}")
+        if not ok:
+            send_imessage(f"⚠️ {repo_name} deploy FAILED: git pull\n{output[:200]}")
+            return
+
+        # 2. Send iMessage immediately
+        commit_summary = "\n".join(f"• {c}" for c in commits[:5])
+        if len(commits) > 5:
+            commit_summary += f"\n  ...and {len(commits) - 5} more"
+        send_imessage(f"🚀 {repo_name} deployed\n{commit_summary}")
+
+        # 3. pip install (only if requirements.txt changed)
+        if "requirements.txt" in changed_files:
+            log("requirements.txt changed — running pip install")
+            ok, output = run_command(
+                f"pip install -r {PROJECT_DIR}/requirements.txt", cwd=PROJECT_DIR, timeout=120,
+            )
+            log(f"pip install: {'OK' if ok else 'FAILED'} — {output[:300]}")
+
+        # 4. S3 sync
+        ok, output = run_command("npm run sync:down", cwd=PROJECT_DIR, timeout=60)
+        log(f"sync:down: {'OK' if ok else 'FAILED'} — {output[:200]}")
+        ok, output = run_command("npm run sync:up", cwd=PROJECT_DIR, timeout=60)
+        log(f"sync:up: {'OK' if ok else 'FAILED'} — {output[:200]}")
+
+        # 5. Reload bots
+        ok, output = run_command(f'bash "{RELOAD_SCRIPT}"', cwd=PROJECT_DIR, timeout=10)
+        log(f"reload-bots: {'OK' if ok else 'FAILED'} — {output}")
+
+        log("Deploy complete")
+    except Exception as e:
+        log(f"Deploy error: {e}")
 
 
 class WebhookHandler(BaseHTTPRequestHandler):
@@ -76,17 +153,23 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 commits = [c.get("message", "").split("\n")[0] for c in data.get("commits", [])]
                 log(f"Push to {repo} ({ref}) by {pusher}: {commits}")
 
-                # Only trigger on main branch
+                # Collect changed files from all commits
+                changed_files = set()
+                for c in data.get("commits", []):
+                    changed_files.update(c.get("added", []))
+                    changed_files.update(c.get("modified", []))
+                    changed_files.update(c.get("removed", []))
+
                 if ref in ("refs/heads/main", "refs/heads/master"):
-                    log(f"Triggering auto-pull + bot reload...")
-                    subprocess.Popen(
-                        ["/bin/bash", "-c", f'"{AUTO_PULL_SCRIPT}" && /bin/bash "{RELOAD_SCRIPT}"'],
-                        stdout=open("/tmp/github-auto-pull.log", "a"),
-                        stderr=subprocess.STDOUT,
-                    )
+                    log("Triggering inline deploy...")
+                    threading.Thread(
+                        target=deploy,
+                        args=(repo, commits, changed_files),
+                        daemon=True,
+                    ).start()
                     self.send_response(200)
                     self.end_headers()
-                    self.wfile.write(b"OK: pull triggered")
+                    self.wfile.write(b"OK: deploy triggered")
                 else:
                     log(f"Ignoring push to {ref} (not main)")
                     self.send_response(200)
@@ -113,19 +196,39 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"GitHub webhook listener running")
 
     def log_message(self, format, *args):
-        pass  # Suppress default HTTP logging
+        pass
+
+
+def load_env():
+    """Load .env file if present (simple key=value parsing)."""
+    env_path = os.path.join(PROJECT_DIR, ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if key and key not in os.environ:
+                os.environ[key] = value
 
 
 def main(args=None):
-    """Entry point. Parses args and starts the webhook server."""
-    global WEBHOOK_SECRET
+    global WEBHOOK_SECRET, BLUEBUBBLES_URL, BLUEBUBBLES_PASSWORD, BLUEBUBBLES_CHAT_GUID
 
     parser = argparse.ArgumentParser(description="GitHub webhook listener")
     parser.add_argument("--require-secret", action="store_true",
                         help="Exit with error if GITHUB_WEBHOOK_SECRET is not set")
     parsed = parser.parse_args(args)
 
+    load_env()
+
     WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+    BLUEBUBBLES_URL = os.environ.get("BLUEBUBBLES_URL", "http://localhost:1234")
+    BLUEBUBBLES_PASSWORD = os.environ.get("BLUEBUBBLES_PASSWORD", "")
+    BLUEBUBBLES_CHAT_GUID = os.environ.get("BLUEBUBBLES_CHAT_GUID", "")
 
     if parsed.require_secret and not WEBHOOK_SECRET:
         print("ERROR: --require-secret set but GITHUB_WEBHOOK_SECRET env var is empty.",
@@ -135,7 +238,9 @@ def main(args=None):
 
     if not WEBHOOK_SECRET:
         print("WARNING: GITHUB_WEBHOOK_SECRET not set — webhook signature verification disabled")
-        print("Set GITHUB_WEBHOOK_SECRET env var for production security")
+
+    if not BLUEBUBBLES_PASSWORD or not BLUEBUBBLES_CHAT_GUID:
+        print("WARNING: BLUEBUBBLES_PASSWORD or BLUEBUBBLES_CHAT_GUID not set — iMessage notifications disabled")
 
     log(f"Starting webhook listener on port {PORT}")
     server = HTTPServer(("127.0.0.1", PORT), WebhookHandler)

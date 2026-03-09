@@ -13,6 +13,8 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+httpx = pytest.importorskip("httpx", reason="Dashboard tests require httpx: pip install httpx")
+
 
 # ---------------------------------------------------------------------------
 # Module loading helper
