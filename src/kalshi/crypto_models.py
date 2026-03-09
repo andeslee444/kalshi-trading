@@ -29,6 +29,12 @@ REGIME_BMA_WEIGHTS = {
 # Default Heston parameters (calibrated by calibrate-crypto.py)
 DEFAULT_HESTON = {"v0": 0.25, "kappa": 2.0, "theta": 0.25, "xi": 0.3, "rho": -0.7}
 
+# Probability floor/ceiling for "no opinion" detection
+# When all sub-models return values within this threshold of the floor/ceiling,
+# the ensemble model lacks information and should signal "no opinion" rather
+# than trading on a phantom edge from the probability clamp.
+NO_OPINION_THRESHOLD = 0.005  # Within 0.5% of 0 or 1
+
 # Default JD parameters
 DEFAULT_JD = {"jump_mean": -0.05, "jump_std": 0.10, "max_jumps": 10}
 
@@ -205,13 +211,13 @@ class EnsembleModel:
 
         return cls(jd_params=jd_params, heston_params=heston_params, bma_weights=bma_weights)
 
-    def estimate_prob(self, current_price, threshold, direction="above",
-                      time_horizon_minutes=1440, vol=0.50, regime="normal",
-                      drift_pct=0.0, heston_params=None, use_ou=False,
-                      ou_half_life_minutes=120):
-        """Compute ensemble probability via BMA.
+    def _compute_sub_model_probs(self, current_price, threshold, direction="above",
+                                  time_horizon_minutes=1440, vol=0.50, regime="normal",
+                                  drift_pct=0.0, heston_params=None, use_ou=False,
+                                  ou_half_life_minutes=120, ou_target=None):
+        """Compute individual sub-model probabilities.
 
-        Returns float in [0.001, 0.999].
+        Returns tuple: (p_gbm, p_jd, p_heston, weights)
         """
         weights = self._bma_weights.get(regime, self._bma_weights["normal"])
 
@@ -221,6 +227,7 @@ class EnsembleModel:
             direction=direction, time_horizon_minutes=time_horizon_minutes,
             realized_vol_pct=vol, drift_pct=drift_pct,
             use_ou=use_ou, ou_half_life_minutes=ou_half_life_minutes,
+            ou_target=ou_target,
         )
 
         # JD with regime-dependent lambda
@@ -242,6 +249,43 @@ class EnsembleModel:
             current_price=current_price, threshold=threshold,
             direction=direction, time_horizon_minutes=time_horizon_minutes,
             drift_pct=drift_pct, **hp_with_v0,
+        )
+
+        return p_gbm, p_jd, p_heston, weights
+
+    def is_no_opinion(self, current_price, threshold, direction="above",
+                      time_horizon_minutes=1440, vol=0.50, regime="normal",
+                      drift_pct=0.0, heston_params=None):
+        """Check if all sub-models hit the probability floor/ceiling.
+
+        When all models return values within NO_OPINION_THRESHOLD of 0 or 1,
+        the ensemble has no information — the probability is just the clamp
+        value, not a real estimate. Trading on this creates phantom edges.
+
+        Returns True if the model has "no opinion" on this market.
+        """
+        p_gbm, p_jd, p_heston, _ = self._compute_sub_model_probs(
+            current_price, threshold, direction, time_horizon_minutes,
+            vol, regime, drift_pct, heston_params,
+        )
+        probs = [p_gbm, p_jd, p_heston]
+        # All models at floor (near 0) or all at ceiling (near 1)
+        all_at_floor = all(p <= 0.001 + NO_OPINION_THRESHOLD for p in probs)
+        all_at_ceiling = all(p >= 0.999 - NO_OPINION_THRESHOLD for p in probs)
+        return all_at_floor or all_at_ceiling
+
+    def estimate_prob(self, current_price, threshold, direction="above",
+                      time_horizon_minutes=1440, vol=0.50, regime="normal",
+                      drift_pct=0.0, heston_params=None, use_ou=False,
+                      ou_half_life_minutes=120, ou_target=None):
+        """Compute ensemble probability via BMA.
+
+        Returns float in [0.001, 0.999].
+        """
+        p_gbm, p_jd, p_heston, weights = self._compute_sub_model_probs(
+            current_price, threshold, direction, time_horizon_minutes,
+            vol, regime, drift_pct, heston_params, use_ou, ou_half_life_minutes,
+            ou_target=ou_target,
         )
 
         # BMA blend

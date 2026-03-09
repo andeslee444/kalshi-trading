@@ -11,7 +11,7 @@ Usage:
     python3 src/kalshi/economics-bot.py --once    # single scan
 """
 
-import json, time, datetime, os, sys, re, argparse, traceback, math
+import json, time, datetime, os, sys, re, argparse, math
 import requests
 from bs4 import BeautifulSoup
 from pathlib import Path
@@ -19,7 +19,7 @@ from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot,
     HealthCheckMonitor, OrderMonitor, ScanSummary,
-    is_shutdown_requested,
+    is_shutdown_requested, load_trades,
 )
 from probability import (
     econ_nowcast_probability, cpi_nowcast_sigma, gdp_nowcast_sigma, quarter_kelly,
@@ -105,7 +105,10 @@ trim_trade_log(TRADES_PATH)
 def _classify_econ_market(ticker):
     """Classify economics market type from ticker."""
     t = ticker.upper()
-    if "CPI" in t or "INFLATION" in t:
+    # Check Core CPI before CPI (more specific match first)
+    if "CORECPI" in t or ("CORE" in t and "CPI" in t):
+        return "CORE_CPI"
+    elif "CPI" in t or "INFLATION" in t:
         return "CPI"
     elif "GDP" in t:
         return "GDP"
@@ -120,6 +123,7 @@ def _classify_econ_market(ticker):
 # === Concentration Limits ===
 FAMILY_EXPOSURE_PCT = 0.15   # 15% of bankroll per ticker family
 TOTAL_ECON_PCT = 0.40        # 40% total economics exposure
+MAX_CONTRACTS_PER_ORDER = 200  # Hard cap: prevent enormous penny-contract positions
 
 def _ticker_family(ticker):
     """Extract ticker family (everything before -T/-B threshold suffix)."""
@@ -205,7 +209,7 @@ class EdgeScaler:
 # Note: KXFED removed — CME FedWatch is a JavaScript SPA, HTML scraper returns garbage.
 # Re-enable when a proper FedWatch data source (JSON API or FRED SOFR futures) is wired up.
 # KXJOBS kept — will skip gracefully when no nowcast source is connected.
-ECON_PREFIXES = ["KXCPI", "KXGDP", "KXJOBS", "KXINFLATION", "KXECON", "KXGAS"]
+ECON_PREFIXES = ["KXCPI", "KXCORECPI", "KXGDP", "KXJOBS", "KXINFLATION", "KXECON", "KXGAS"]
 
 # === Nowcast cache ===
 NOWCAST_CACHE_PATH = PROJECT_DIR / "data" / "econ-nowcast-cache.json"
@@ -788,6 +792,10 @@ def scan_and_trade():
         ss.finalize()
         return
 
+    # Clear FRED per-scan cache so fresh data is fetched this cycle
+    if macro is not None and hasattr(macro, '_fred'):
+        macro._fred.clear_cache()
+
     # Fetch nowcast data (health recording handled inside fetch_cleveland_fed_nowcast)
     log.info("\nFetching economic data sources...")
     nowcast = fetch_cleveland_fed_nowcast()
@@ -832,9 +840,11 @@ def scan_and_trade():
     if gas_price:
         ss.source_ok("aaa-gas")
 
-    # Fetch Bayesian filter data sources
+    # Fetch external data sources (FRED + Truflation) — ONE call per scan
+    # Previously fred.fetch_all() was called twice; now cached in fred_data.
     truflation_cpi = None
     tips_breakeven = None
+    fred_data = {}
     if macro is not None:
         try:
             truflation_cpi = macro._truflation.fetch() if hasattr(macro, '_truflation') else None
@@ -861,14 +871,14 @@ def scan_and_trade():
             except Exception:
                 pass
 
-    if macro_signal and macro_signal.confidence > 0.2 and nowcast:
-        if "cpi_yoy" in nowcast:
-            adjusted_cpi = nowcast["cpi_yoy"] + macro_signal.cpi_bias
-            nowcast["cpi_yoy"] = adjusted_cpi
-            log.info(f"  Macro-adjusted CPI nowcast: {adjusted_cpi:.3f}% "
-                     f"(bias={macro_signal.cpi_bias:+.3f}%, conf={macro_signal.confidence:.2f})")
+    # NOTE: Heuristic cpi_bias adjustment removed to prevent double-counting.
+    # Truflation/TIPS data already enters via CPIBeliefFilter Bayesian fusion below.
+    # The macro_signal is still computed for sigma_multiplier and scenario weights.
+    if macro_signal and macro_signal.confidence > 0.2:
+        log.info(f"  Macro signal: bias={macro_signal.cpi_bias:+.3f}%, conf={macro_signal.confidence:.2f} "
+                 f"(not applied — handled by Bayesian fusion)")
 
-    # Bayesian belief filter (replaces heuristic macro bias)
+    # Bayesian belief filter (sole path for Truflation/TIPS adjustments)
     # Sources: Cleveland Fed (prior) + Truflation + TIPS breakeven
     if truflation_cpi is not None:
         log.info(f"  Truflation CPI: {truflation_cpi:.2f}%")
@@ -877,13 +887,12 @@ def scan_and_trade():
         log.info(f"  TIPS 10Y breakeven: {tips_breakeven:.2f}%")
         ss.source_ok("tips-breakeven")
 
-    # Fetch scenario weight data
+    # Build scenario weight inputs from FRED data (reuse cached fred_data, no second fetch)
     fred_scenario_data = {}
     polymarket_scenario_data = {}
-    if macro is not None:
+    if fred_data:
         try:
-            fred_all = macro._fred.fetch_all() if hasattr(macro, '_fred') else {}
-            crude_oil = fred_all.get("crude_oil")
+            crude_oil = fred_data.get("crude_oil")
 
             # Compute 90-day MA from FRED (fetch last 90 observations of daily WTI)
             crude_oil_90d_ma = None
@@ -908,8 +917,8 @@ def scan_and_trade():
                     log.warning(f"  Crude oil 90d MA calc failed (non-fatal): {e}")
 
             # TIPS 5Y-10Y spread for stagflation signal
-            tips_5y = fred_all.get("tips_breakeven_5y")
-            tips_10y = fred_all.get("tips_breakeven_10y")
+            tips_5y = fred_data.get("tips_breakeven_5y")
+            tips_10y = fred_data.get("tips_breakeven_10y")
             tips_5y_minus_10y = None
             if tips_5y is not None and tips_10y is not None:
                 tips_5y_minus_10y = tips_5y - tips_10y
@@ -917,12 +926,12 @@ def scan_and_trade():
             fred_scenario_data = {
                 "crude_oil": crude_oil,
                 "crude_oil_90d_ma": crude_oil_90d_ma,
-                "T10Y2Y": fred_all.get("yield_curve"),
-                "gdpnow": fred_all.get("gdpnow"),
+                "T10Y2Y": fred_data.get("yield_curve"),
+                "gdpnow": fred_data.get("gdpnow"),
                 "tips_5y_minus_10y": tips_5y_minus_10y,
             }
         except Exception as e:
-            log.warning(f"  FRED scenario data fetch failed (non-fatal): {e}")
+            log.warning(f"  FRED scenario data processing failed (non-fatal): {e}")
 
     # Compute scenario weights
     scenario_weights = compute_scenario_weights(polymarket_scenario_data, fred_scenario_data)
@@ -976,7 +985,12 @@ def scan_and_trade():
 
         # Determine which nowcast value to use
         nowcast_value = None
-        if "CPI" in ticker.upper() or "INFLATION" in ticker.upper():
+        if market_type == "CORE_CPI":
+            # Core CPI markets must use core_cpi_yoy — never fall back to headline
+            nowcast_value = nowcast.get("core_cpi_yoy")
+            if nowcast_value is None:
+                log.warning("  Skipping %s: core_cpi_yoy not available (refusing headline fallback)", ticker)
+        elif "CPI" in ticker.upper() or "INFLATION" in ticker.upper():
             nowcast_value = nowcast.get("cpi_yoy") or nowcast.get("core_cpi_yoy")
         elif "GDP" in ticker.upper():
             # Primary: direct GDPNow fetch. Fallback: Cleveland Fed, then macro engine
@@ -1015,7 +1029,7 @@ def scan_and_trade():
         # Estimate uncertainty — use market-type-specific sigma
         days_to_release = estimate_days_to_release(m)
         ticker_upper = ticker.upper()
-        if "CPI" in ticker_upper:
+        if market_type in ("CPI", "CORE_CPI"):
             sigma = cpi_nowcast_sigma(days_to_release, fed_ci_width=dispersion_ci)
         elif "GAS" in ticker_upper:
             # Gas handled separately via gas_price_probability path
@@ -1037,10 +1051,12 @@ def scan_and_trade():
         belief = CPIBeliefFilter(nowcast_value, sigma)
         if truflation_cpi is not None:
             # Truflation tracks different basket than BLS CPI. Historical RMSE ~0.30pp.
-            belief.update(truflation_cpi, obs_sigma=0.30)
+            # source= enables correlation discount (corr=0.70 with Cleveland Fed).
+            belief.update(truflation_cpi, obs_sigma=0.30, source="truflation")
         if tips_breakeven is not None:
             # TIPS 10Y breakeven is a long-term measure. Mapping to 1-month CPI has ~0.60pp noise.
-            belief.update(tips_breakeven, obs_sigma=0.60)
+            # source= enables correlation discount (corr=0.30 with Cleveland Fed).
+            belief.update(tips_breakeven, obs_sigma=0.60, source="tips_breakeven")
         fused_nowcast, posterior_sigma = belief.posterior
 
         # Compute probability using scenario-weighted mixture
@@ -1207,7 +1223,7 @@ def scan_and_trade():
 
     # Edge scaler: limit total exposure based on settlement track record
     edge_scaler = EdgeScaler()
-    settled = [t for t in trade_manager.load_trades() if t.get("settlement_result") is not None]
+    settled = [t for t in load_trades(TRADES_PATH) if t.get("settlement_result") is not None]
     max_exposure_pct = edge_scaler.current_limit(settled)
     max_econ_exposure = int(balance * max_exposure_pct)
     log.info(f"  Edge scaler: {len([s for s in settled if s.get('profitable')])} wins -> "
@@ -1231,7 +1247,7 @@ def scan_and_trade():
             continue
 
         # Concentration check
-        existing_trades = trade_manager.load_trades()
+        existing_trades = load_trades(TRADES_PATH)
         allowed, conc_reason = _check_concentration(ticker, budget.bankroll_cents, existing_trades)
         if not allowed:
             log.info(f"  Concentration limit hit for {ticker}: {conc_reason}")
@@ -1267,6 +1283,12 @@ def scan_and_trade():
             trade_manager.log_decision(ticker, side, "skipped", "kelly_zero: edge too small for price",
                                        edge=edge, price_cents=price)
             continue
+
+        # Hard cap on contract count (penny contracts can produce absurd Kelly sizes)
+        if count > MAX_CONTRACTS_PER_ORDER:
+            log.info(f"  Capping {ticker} from {count} to {MAX_CONTRACTS_PER_ORDER} contracts")
+            count = MAX_CONTRACTS_PER_ORDER
+            risk = count * price
 
         # Format gas price markets differently (dollars, not percentages)
         is_gas = ticker.startswith("KXGAS")
@@ -1376,8 +1398,7 @@ def main():
             order_monitor.check_orders()
             scan_and_trade()
         except Exception as e:
-            log.error(f"Scan error: {e}")
-            traceback.print_exc()
+            log.error("Scan error: %s", e, exc_info=True)
 
         if is_shutdown_requested():
             log.info("Graceful shutdown requested, exiting.")

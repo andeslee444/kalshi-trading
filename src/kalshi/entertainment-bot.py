@@ -4,16 +4,15 @@ Monitors HITS Daily Double and Box Office Mojo for settlement data before market
 DEMO API ONLY — $5 max per trade.
 """
 
-import json, time, datetime, os, sys, re, traceback
+import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, load_trades, save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
-from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, quarter_kelly, compute_limit_price, kalshi_fee_cents
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
+from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, half_kelly, quarter_kelly, compute_limit_price, kalshi_fee_cents
 from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_threshold, configure_sanity
 from capital_allocator import PortfolioAllocator
 
 setup_unbuffered()
-setup_signal_handlers()
 
 TRADES_PATH = PROJECT_DIR / "data" / "kalshi-entertainment-trades.json"
 PID_PATH = PROJECT_DIR / "data" / "pids" / "kalshi-entertainment.pid"
@@ -28,6 +27,7 @@ Path(PID_PATH).write_text(str(os.getpid()))
 
 # Logging — auto file logging via setup_logging (writes to data/logs/entertainment.log)
 log = setup_logging("entertainment")
+setup_signal_handlers()
 
 # === Config from file ===
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
@@ -49,6 +49,40 @@ MIN_EDGE_UNCERTAIN = 0.10  # 10% when sigma > 5% (projections/articles)
 MAX_DATA_AGE_HOURS = 168  # HDD charts publish weekly; keep data fresh for 7 days
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+
+# === Tiered Kelly sizing ===
+def _eighth_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None,
+                  fee_cents=0, return_details=False):
+    """Eighth-Kelly for low-confidence entertainment trades.
+
+    Uses half_kelly internally, then divides by 4 (= 1/8 Kelly).
+    """
+    result = half_kelly(edge, price_cents, max_cost_cents, bankroll_cents,
+                        fee_cents=fee_cents, return_details=True)
+    contracts, _risk, details = result
+    contracts = max(1, round(contracts / 4)) if contracts >= 1 else 0
+    details["kelly_fraction"] = details["kelly_fraction"] / 4
+    risk = contracts * price_cents
+    if return_details:
+        return (contracts, risk, details)
+    return (contracts, risk)
+
+
+def _select_kelly_sizer(sigma):
+    """Select Kelly sizing function based on data confidence (sigma).
+
+    Returns (sizing_fn, sizing_method_name).
+      - sigma <= 0.05: confirmed data (HDD final chart) -> half_kelly
+      - sigma <= 0.10: high confidence (mid-week updates) -> quarter_kelly
+      - sigma > 0.10: low confidence (early projections/articles) -> eighth_kelly
+    """
+    if sigma <= 0.05:
+        return half_kelly, "half_kelly"
+    elif sigma <= 0.10:
+        return quarter_kelly, "quarter_kelly"
+    else:
+        return _eighth_kelly, "eighth_kelly"
 
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
@@ -384,7 +418,8 @@ def evaluate_album_opportunity(market, album, market_price, ss=None):
             return
         price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
         fee = kalshi_fee_cents(price)
-        count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+        kelly_fn, sizing_method = _select_kelly_sizer(sigma)
+        count, risk, kelly_details = kelly_fn(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
             if ss:
                 ss.skip("kelly_zero")
@@ -396,11 +431,11 @@ def evaluate_album_opportunity(market, album, market_price, ss=None):
             return
         reasoning = f"HDD: {artist} at {units/1000:.0f}K vs {threshold/1000:.0f}K threshold. YES@{price}c, conf={confidence*100:.0f}%"
         log.info(f"\nALBUM ARBITRAGE: {artist} {units/1000:.0f}K units > {threshold/1000:.0f}K")
-        log.info(f"    {ticker} YES@{price}c | edge={edge*100:.1f}% | conf={confidence*100:.0f}%")
+        log.info(f"    {ticker} YES@{price}c | edge={edge*100:.1f}% | conf={confidence*100:.0f}% | sizing={sizing_method}")
         result = trade_manager.place_order(ticker, "yes", price, count, reasoning, confidence=confidence,
                                             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                             model_prob=round(confidence, 4), raw_edge=round(edge, 4),
-                                            fee_cents=round(fee, 2), sizing_method="quarter_kelly",
+                                            fee_cents=round(fee, 2), sizing_method=sizing_method,
                                             market_close_time=market.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
@@ -414,6 +449,7 @@ def evaluate_album_opportunity(market, album, market_price, ss=None):
                 edge=round(edge, 4), price_cents=price, count=count,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
                 units=units, threshold=threshold, source=album.get("source", ""),
+                sizing_method=sizing_method,
             )
             allocator.record_trade("entertainment", ticker, risk, edge=edge)
 
@@ -443,7 +479,8 @@ def evaluate_album_opportunity(market, album, market_price, ss=None):
             return
         price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
         fee = kalshi_fee_cents(price)
-        count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+        kelly_fn, sizing_method = _select_kelly_sizer(sigma)
+        count, risk, kelly_details = kelly_fn(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
             if ss:
                 ss.skip("kelly_zero")
@@ -455,11 +492,11 @@ def evaluate_album_opportunity(market, album, market_price, ss=None):
             return
         reasoning = f"HDD: {artist} at {units/1000:.0f}K vs {threshold/1000:.0f}K threshold. NO@{price}c, conf={confidence*100:.0f}%"
         log.info(f"\nALBUM ARBITRAGE: {artist} {units/1000:.0f}K units < {threshold/1000:.0f}K")
-        log.info(f"    {ticker} NO@{price}c | edge={edge*100:.1f}% | conf={confidence*100:.0f}%")
+        log.info(f"    {ticker} NO@{price}c | edge={edge*100:.1f}% | conf={confidence*100:.0f}% | sizing={sizing_method}")
         result = trade_manager.place_order(ticker, "no", price, count, reasoning, confidence=confidence,
                                             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                             model_prob=round(1.0 - confidence, 4), raw_edge=round(edge, 4),
-                                            fee_cents=round(fee, 2), sizing_method="quarter_kelly",
+                                            fee_cents=round(fee, 2), sizing_method=sizing_method,
                                             market_close_time=market.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
@@ -473,6 +510,7 @@ def evaluate_album_opportunity(market, album, market_price, ss=None):
                 edge=round(edge, 4), price_cents=price, count=count,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
                 units=units, threshold=threshold, source=album.get("source", ""),
+                sizing_method=sizing_method,
             )
             allocator.record_trade("entertainment", ticker, risk, edge=edge)
 
@@ -551,7 +589,8 @@ def evaluate_boxoffice_opportunity(market, movie, market_price, ss=None):
             return
         price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
         fee = kalshi_fee_cents(price)
-        count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+        kelly_fn, sizing_method = _select_kelly_sizer(sigma)
+        count, risk, kelly_details = kelly_fn(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
             if ss:
                 ss.skip("kelly_zero")
@@ -566,7 +605,7 @@ def evaluate_boxoffice_opportunity(market, movie, market_price, ss=None):
         result = trade_manager.place_order(ticker, "yes", price, count, reasoning, confidence=confidence,
                                             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                             model_prob=round(confidence, 4), raw_edge=round(edge, 4),
-                                            fee_cents=round(fee, 2), sizing_method="quarter_kelly",
+                                            fee_cents=round(fee, 2), sizing_method=sizing_method,
                                             market_close_time=market.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
@@ -580,6 +619,7 @@ def evaluate_boxoffice_opportunity(market, movie, market_price, ss=None):
                 edge=round(edge, 4), price_cents=price, count=count,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
                 gross=gross, threshold=threshold, source=movie.get("source", ""),
+                sizing_method=sizing_method,
             )
             allocator.record_trade("entertainment", ticker, risk, edge=edge)
 
@@ -609,7 +649,8 @@ def evaluate_boxoffice_opportunity(market, movie, market_price, ss=None):
             return
         price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
         fee = kalshi_fee_cents(price)
-        count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+        kelly_fn, sizing_method = _select_kelly_sizer(sigma)
+        count, risk, kelly_details = kelly_fn(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
         if count <= 0:
             if ss:
                 ss.skip("kelly_zero")
@@ -624,7 +665,7 @@ def evaluate_boxoffice_opportunity(market, movie, market_price, ss=None):
         result = trade_manager.place_order(ticker, "no", price, count, reasoning, confidence=confidence,
                                             market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                             model_prob=round(1.0 - confidence, 4), raw_edge=round(edge, 4),
-                                            fee_cents=round(fee, 2), sizing_method="quarter_kelly",
+                                            fee_cents=round(fee, 2), sizing_method=sizing_method,
                                             market_close_time=market.get("close_time"),
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
@@ -638,6 +679,7 @@ def evaluate_boxoffice_opportunity(market, movie, market_price, ss=None):
                 edge=round(edge, 4), price_cents=price, count=count,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
                 gross=gross, threshold=threshold, source=movie.get("source", ""),
+                sizing_method=sizing_method,
             )
             allocator.record_trade("entertainment", ticker, risk, edge=edge)
 
@@ -674,20 +716,18 @@ def scan():
         health.record_source_success("hdd")
         ss.source_ok("hdd")
     except Exception as e:
-        log.error(f"HDD scrape error: {e}")
+        log.error("HDD scrape error: %s", e, exc_info=True)
         health.record_source_error("hdd", str(e))
         ss.source_fail("hdd", str(e))
-        traceback.print_exc()
 
     try:
         box_data = scrape_box_office()
         health.record_source_success("boxoffice")
         ss.source_ok("boxoffice")
     except Exception as e:
-        log.error(f"Box office scrape error: {e}")
+        log.error("Box office scrape error: %s", e, exc_info=True)
         health.record_source_error("boxoffice", str(e))
         ss.source_fail("boxoffice", str(e))
-        traceback.print_exc()
 
     log.info(f"Source data: {len(album_data)} album entries, {len(box_data)} box office entries")
 
@@ -696,10 +736,17 @@ def scan():
     elif markets:
         log.info("Markets found but no source data to compare -- will retry next cycle")
 
-    log.info(f"Scan complete.")
+    # Per-scan metrics for observability
+    log.info(f"SCAN METRICS: albums={len(album_data)} boxoffice={len(box_data)} "
+             f"markets={len(markets)}")
     ss.finalize()
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Entertainment markets trading bot")
+    parser.add_argument("--once", action="store_true", help="Run single scan then exit")
+    args = parser.parse_args()
+
     log.info("=" * 60)
     log.info("Kalshi Entertainment Markets Bot (DEMO)")
     log.info(f"   Max trade: ${MAX_TRADE_AMOUNT} | Confidence threshold: {CONFIDENCE_THRESHOLD*100:.0f}%")
@@ -716,6 +763,10 @@ def main():
         log.error(f"Auth failed: {e}")
         sys.exit(1)
 
+    if args.once:
+        scan()
+        return
+
     while True:
         try:
             health.record_bot_heartbeat("entertainment")
@@ -725,8 +776,7 @@ def main():
             order_monitor.check_orders()
             scan()
         except Exception as e:
-            log.error(f"Scan error: {e}")
-            traceback.print_exc()
+            log.error("Scan error: %s", e, exc_info=True)
 
         if is_shutdown_requested():
             log.info("Graceful shutdown requested, exiting.")

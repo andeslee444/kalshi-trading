@@ -1,0 +1,187 @@
+{
+  "kappa": 30,
+  "categories": {
+    "sports": {
+      "buckets": {
+        "1-5": {
+          "wins": 0,
+          "losses": 0
+        },
+        "6-10": {
+          "wins": 205,
+          "losses": 41
+        },
+        "11-15": {
+          "wins": 246,
+          "losses": 82
+        },
+        "16-20": {
+          "wins": 0,
+          "losses": 0
+        },
+        "21-30": {
+          "wins": 0,
+          "losses": 0
+        }
+      },
+      "empirical_alpha": 0.1,
+      "empirical_delta": 0.3
+    },
+    "default": {
+      "buckets": {
+        "1-5": {
+          "wins": 0,
+          "losses": 38
+        },
+        "6-10": {
+          "wins": 0,
+          "losses": 185
+        },
+        "11-15": {
+          "wins": 0,
+          "losses": 0
+        },
+        "16-20": {
+          "wins": 0,
+          "losses": 0
+        },
+        "21-30": {
+          "wins": 0,
+          "losses": 0
+        }
+      },
+      "empirical_alpha": 0.1,
+      "empirical_delta": 0.3
+    },
+    "crypto": {
+      "buckets": {
+        "1-5": {
+          "wins": 0,
+          "losses": 0
+        },
+        "6-10": {
+          "wins": 0,
+          "losses": 0
+        },
+        "11-15": {
+          "wins": 0,
+          "losses": 0
+        },
+        "16-20": {
+          "wins": 0,
+          "losses": 0
+        },
+        "21-30": {
+          "wins": 0,
+          "losses": 0
+        }
+      },
+      "empirical_alpha": null,
+      "empirical_delta": null
+    },
+    "weather": {
+      "buckets": {
+        "1-5": {
+          "wins": 0,
+          "losses": 0
+        },
+        "6-10": {
+          "wins": 0,
+          "losses": 0
+        },
+        "11-15": {
+          "wins": 0,
+          "losses": 0
+        },
+        "16-20": {
+          "wins": 0,
+          "losses": 0
+        },
+        "21-30": {
+          "wins": 0,
+          "losses": 0
+        }
+      },
+      "empirical_alpha": null,
+      "empirical_delta": null
+    },
+    "economics": {
+      "buckets": {
+        "1-5": {
+          "wins": 0,
+          "losses": 0
+        },
+        "6-10": {
+          "wins": 0,
+          "losses": 0
+        },
+        "11-15": {
+          "wins": 0,
+          "losses": 0
+        },
+        "16-20": {
+          "wins": 0,
+          "losses": 0
+        },
+        "21-30": {
+          "wins": 0,
+          "losses": 0
+        }
+      },
+      "empirical_alpha": null,
+      "empirical_delta": null
+    },
+    "politics": {
+      "buckets": {
+        "1-5": {
+          "wins": 0,
+          "losses": 0
+        },
+        "6-10": {
+          "wins": 0,
+          "losses": 0
+        },
+        "11-15": {
+          "wins": 0,
+          "losses": 0
+        },
+        "16-20": {
+          "wins": 0,
+          "losses": 0
+        },
+        "21-30": {
+          "wins": 0,
+          "losses": 0
+        }
+      },
+      "empirical_alpha": null,
+      "empirical_delta": null
+    },
+    "entertainment": {
+      "buckets": {
+        "1-5": {
+          "wins": 0,
+          "losses": 0
+        },
+        "6-10": {
+          "wins": 0,
+          "losses": 0
+        },
+        "11-15": {
+          "wins": 0,
+          "losses": 0
+        },
+        "16-20": {
+          "wins": 0,
+          "losses": 0
+        },
+        "21-30": {
+          "wins": 0,
+          "losses": 0
+        }
+      },
+      "empirical_alpha": null,
+      "empirical_delta": null
+    }
+  }
+}

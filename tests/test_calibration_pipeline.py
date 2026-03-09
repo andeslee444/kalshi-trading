@@ -1,11 +1,13 @@
 """Tests for the calibration pipeline core logic.
 
 Tests pure functions from calibration-pipeline.py: drift detection,
-baseline management, suggestion evaluation, and WhatsApp formatting.
+baseline management, suggestion evaluation, WhatsApp formatting,
+regression gate, calibration history, and auto-apply decision.
 Uses importlib to load the hyphenated script file.
 """
 
 import importlib.util
+import json
 import logging
 import sys
 import types
@@ -325,3 +327,263 @@ class TestFormatWhatsappSummary:
         assert "FAILED" in msg
         assert "backfill" in msg
         assert len(msg) < 500
+
+
+# ---------------------------------------------------------------------------
+# Regression Gate Tests
+# ---------------------------------------------------------------------------
+
+class TestRegressionGate:
+    """Tests for check_regression_gate() -- per-bot regression safety."""
+
+    def test_all_bots_improved_passes(self, pipeline):
+        before = {
+            "brier_score": 0.30,
+            "per_bot": {
+                "weather": {"brier_score": 0.28, "n_evaluated": 50},
+                "crypto": {"brier_score": 0.35, "n_evaluated": 30},
+            },
+        }
+        after = {
+            "brier_score": 0.27,
+            "per_bot": {
+                "weather": {"brier_score": 0.25, "n_evaluated": 50},
+                "crypto": {"brier_score": 0.33, "n_evaluated": 30},
+            },
+        }
+        safe, reason = pipeline.check_regression_gate(before, after)
+        assert safe, f"Should pass when all improve: {reason}"
+
+    def test_one_bot_regressed_fails(self, pipeline):
+        before = {
+            "brier_score": 0.30,
+            "per_bot": {
+                "weather": {"brier_score": 0.28, "n_evaluated": 50},
+                "crypto": {"brier_score": 0.35, "n_evaluated": 30},
+            },
+        }
+        after = {
+            "brier_score": 0.27,
+            "per_bot": {
+                "weather": {"brier_score": 0.25, "n_evaluated": 50},
+                "crypto": {"brier_score": 0.40, "n_evaluated": 30},  # 14% worse
+            },
+        }
+        safe, reason = pipeline.check_regression_gate(before, after)
+        assert not safe, "Should fail when a bot regresses >5%"
+        assert "crypto" in reason
+
+    def test_small_regression_within_tolerance(self, pipeline):
+        before = {
+            "brier_score": 0.30,
+            "per_bot": {
+                "weather": {"brier_score": 0.28, "n_evaluated": 50},
+            },
+        }
+        after = {
+            "brier_score": 0.29,
+            "per_bot": {
+                "weather": {"brier_score": 0.29, "n_evaluated": 50},  # 3.6% worse -- within 5%
+            },
+        }
+        safe, reason = pipeline.check_regression_gate(before, after)
+        assert safe, f"Small regression within 5% should pass: {reason}"
+
+    def test_insufficient_samples_skips_bot(self, pipeline):
+        before = {
+            "brier_score": 0.30,
+            "per_bot": {
+                "weather": {"brier_score": 0.28, "n_evaluated": 50},
+                "strategy": {"brier_score": 0.80, "n_evaluated": 3},  # too few
+            },
+        }
+        after = {
+            "brier_score": 0.28,
+            "per_bot": {
+                "weather": {"brier_score": 0.26, "n_evaluated": 50},
+                "strategy": {"brier_score": 0.90, "n_evaluated": 3},  # worse but <10 samples
+            },
+        }
+        safe, reason = pipeline.check_regression_gate(before, after)
+        assert safe, f"Bots with <10 samples should be skipped: {reason}"
+
+    def test_no_aggregate_improvement_fails(self, pipeline):
+        before = {"brier_score": 0.30, "per_bot": {}}
+        after = {"brier_score": 0.31, "per_bot": {}}
+        safe, reason = pipeline.check_regression_gate(before, after)
+        assert not safe, "Should fail when aggregate Brier gets worse"
+
+
+# ---------------------------------------------------------------------------
+# Calibration History Tests
+# ---------------------------------------------------------------------------
+
+def _real_atomic_write(path, data):
+    """Actual file writer for tests (replaces mocked _atomic_write_json)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2))
+
+
+class TestCalibrationHistory:
+    """Tests for archive_calibration() -- versioned calibration storage."""
+
+    def test_archive_creates_versioned_file(self, pipeline, tmp_path):
+        # Patch _atomic_write_json to actually write files in tests
+        orig = pipeline._atomic_write_json
+        pipeline._atomic_write_json = _real_atomic_write
+        try:
+            history_dir = tmp_path / "calibration-history"
+            cal = {"weather": {"global_brier": 0.30}, "generated_at": "2026-03-07T06:00:00"}
+            path = pipeline.archive_calibration(cal, history_dir=history_dir)
+            assert path.exists()
+            assert "calibration-" in path.name
+            # Verify content
+            saved = json.loads(path.read_text())
+            assert saved["calibration"]["weather"]["global_brier"] == 0.30
+            assert "archived_at" in saved
+        finally:
+            pipeline._atomic_write_json = orig
+
+    def test_archive_deduplicates_same_day(self, pipeline, tmp_path):
+        orig = pipeline._atomic_write_json
+        pipeline._atomic_write_json = _real_atomic_write
+        try:
+            history_dir = tmp_path / "calibration-history"
+            cal = {"weather": {"global_brier": 0.30}}
+            path1 = pipeline.archive_calibration(cal, history_dir=history_dir)
+            path2 = pipeline.archive_calibration(cal, history_dir=history_dir)
+            assert path1 != path2  # Different filenames (appends -2, -3, etc.)
+            assert len(list(history_dir.iterdir())) == 2
+        finally:
+            pipeline._atomic_write_json = orig
+
+
+# ---------------------------------------------------------------------------
+# Auto-Apply Decision Tests
+# ---------------------------------------------------------------------------
+
+class TestAutoApplyDecision:
+    """Tests for should_auto_apply() -- combined gate logic."""
+
+    def test_auto_apply_passes_all_gates(self, pipeline):
+        before = {"brier_score": 0.30, "per_bot": {"weather": {"brier_score": 0.28, "n_evaluated": 50}}}
+        after = {"brier_score": 0.27, "per_bot": {"weather": {"brier_score": 0.25, "n_evaluated": 50}}}
+        suggestion_eval = {"should_suggest": True, "aggregate_improvement_pct": 0.10}
+        should, reason = pipeline.should_auto_apply(before, after, suggestion_eval)
+        assert should, f"Should auto-apply when all gates pass: {reason}"
+
+    def test_auto_apply_blocked_by_regression(self, pipeline):
+        before = {"brier_score": 0.30, "per_bot": {"crypto": {"brier_score": 0.35, "n_evaluated": 30}}}
+        after = {"brier_score": 0.28, "per_bot": {"crypto": {"brier_score": 0.45, "n_evaluated": 30}}}
+        suggestion_eval = {"should_suggest": True, "aggregate_improvement_pct": 0.10}
+        should, reason = pipeline.should_auto_apply(before, after, suggestion_eval)
+        assert not should, "Should block when a bot regresses"
+
+    def test_auto_apply_blocked_by_no_suggestion(self, pipeline):
+        before = {"brier_score": 0.30, "per_bot": {}}
+        after = {"brier_score": 0.29, "per_bot": {}}
+        suggestion_eval = {"should_suggest": False, "aggregate_improvement_pct": 0.02}
+        should, reason = pipeline.should_auto_apply(before, after, suggestion_eval)
+        assert not should, "Should block when suggestion eval says no"
+
+
+# ---------------------------------------------------------------------------
+# Weekly Summary Tests
+# ---------------------------------------------------------------------------
+
+class TestFormatWeeklySummary:
+    """Tests for format_weekly_summary() -- weekly WhatsApp message format."""
+
+    def _make_stage_results(self):
+        return {
+            "reconcile": {"success": True, "duration_s": 1.0},
+            "backfill": {"success": True, "duration_s": 1.5},
+            "backtest": {"success": True, "duration_s": 0.5},
+            "calibrate_weather": {"success": True, "duration_s": 18.0},
+            "calibrate_crypto": {"success": False, "duration_s": 5.0},
+            "calibrate_cpi": {"success": True, "duration_s": 3.0},
+        }
+
+    def test_weekly_summary_auto_applied(self, pipeline):
+        stages = self._make_stage_results()
+        drift_findings = []
+        msg = pipeline.format_weekly_summary(stages, drift_findings, {}, True, "applied")
+        assert "Weekly Calibration" in msg
+        assert "AUTO-APPLIED" in msg
+        assert "weather: OK" in msg
+        assert "crypto: FAIL" in msg
+
+    def test_weekly_summary_skipped(self, pipeline):
+        stages = self._make_stage_results()
+        drift_findings = []
+        msg = pipeline.format_weekly_summary(stages, drift_findings, {}, False, "regression gate failed")
+        assert "skipped" in msg
+        assert "regression gate failed" in msg
+
+    def test_weekly_summary_with_drift(self, pipeline):
+        stages = self._make_stage_results()
+        drift_findings = [
+            {"entity": "MIA", "drifted": True, "baseline_brier": 0.25, "current_brier": 0.40},
+        ]
+        msg = pipeline.format_weekly_summary(stages, drift_findings, {}, False, "no suggestion")
+        assert "DRIFT" in msg
+        assert "MIA" in msg
+
+
+# ---------------------------------------------------------------------------
+# Strategy Calibrator Guard Tests
+# ---------------------------------------------------------------------------
+
+class TestStrategyCalibrationGuard:
+    """Tests for should_run_strategy_calibrator() -- PM guard for broken models."""
+
+    def test_good_model_runs(self, pipeline):
+        results = {
+            "per_bot": {
+                "strategy": {"brier_score": 0.35, "n_evaluated": 50},
+            },
+        }
+        assert pipeline.should_run_strategy_calibrator(results) is True
+
+    def test_broken_model_skipped(self, pipeline):
+        """Strategy Brier > 0.50 means model is broken -- do not calibrate."""
+        results = {
+            "per_bot": {
+                "strategy": {"brier_score": 0.83, "n_evaluated": 50},
+            },
+        }
+        assert pipeline.should_run_strategy_calibrator(results) is False
+
+    def test_brier_exactly_at_threshold_skipped(self, pipeline):
+        """Brier == 0.50 is at the boundary -- should be skipped (> check)."""
+        results = {
+            "per_bot": {
+                "strategy": {"brier_score": 0.50, "n_evaluated": 50},
+            },
+        }
+        # 0.50 is not > 0.50, so it should run
+        assert pipeline.should_run_strategy_calibrator(results) is True
+
+    def test_brier_just_above_threshold(self, pipeline):
+        results = {
+            "per_bot": {
+                "strategy": {"brier_score": 0.51, "n_evaluated": 50},
+            },
+        }
+        assert pipeline.should_run_strategy_calibrator(results) is False
+
+    def test_insufficient_trades_skipped(self, pipeline):
+        results = {
+            "per_bot": {
+                "strategy": {"brier_score": 0.30, "n_evaluated": 5},
+            },
+        }
+        assert pipeline.should_run_strategy_calibrator(results) is False
+
+    def test_no_strategy_data_skipped(self, pipeline):
+        """No strategy bot in results means no data -- skip."""
+        results = {"per_bot": {"weather": {"brier_score": 0.30, "n_evaluated": 50}}}
+        assert pipeline.should_run_strategy_calibrator(results) is False
+
+    def test_empty_results_skipped(self, pipeline):
+        assert pipeline.should_run_strategy_calibrator({}) is False

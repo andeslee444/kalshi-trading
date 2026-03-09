@@ -14,7 +14,7 @@ Usage:
 
 from pathlib import Path
 
-from kalshi_auth import PROJECT_DIR
+PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 
 DATA_DIR = PROJECT_DIR / "data"
 

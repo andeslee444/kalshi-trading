@@ -47,6 +47,6 @@ class TestWeatherCityConfig:
     def test_config_has_ensemble_settings(self):
         """Ensemble configuration must be present."""
         assert "ensemble" in self.config
-        assert self.config["ensemble"].get("enabled") is True
+        assert self.config["ensemble"].get("enabled") is False  # disabled on free Open-Meteo tier
         assert "models" in self.config["ensemble"]
         assert "weights" in self.config["ensemble"]

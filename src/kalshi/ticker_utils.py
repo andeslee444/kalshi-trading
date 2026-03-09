@@ -123,8 +123,21 @@ def parse_crypto_ticker(ticker):
         if m2:
             return {
                 "asset": m2.group(1),
+                "date": None,
                 "direction": m2.group(2),
                 "threshold": float(m2.group(3)),
+                "market_type": None,
+            }
+        # Try bare threshold format (no T/B prefix): KXBTCMAXMON-BTC-26MAR31-8750000
+        # This is already handled above, but catch any remaining unmatched crypto tickers
+        m3 = re.match(r"KX(BTC|ETH|SOL|DOGE|XRP)\w*-.*?-(\d+\.?\d*)$", ticker)
+        if m3:
+            return {
+                "asset": m3.group(1),
+                "date": None,
+                "direction": "T",
+                "threshold": float(m3.group(2)),
+                "market_type": None,
             }
         return None
 
@@ -156,9 +169,9 @@ def parse_crypto_ticker(ticker):
         "date": f"{2000+yr}-{month:02d}-{day:02d}",
         "direction": direction,
         "threshold": threshold,
+        "market_type": "hourly" if settlement_hour is not None else "standard",
+        "settlement_hour": settlement_hour,
     }
-    if settlement_hour is not None:
-        result["settlement_hour"] = settlement_hour
     return result
 
 

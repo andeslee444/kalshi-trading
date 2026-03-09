@@ -6,11 +6,15 @@ Fix 5C: Validates the health monitoring infrastructure.
 import datetime
 import json
 import tempfile
+import time
 import pytest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from kalshi_auth import HealthCheckMonitor, KILL_SWITCH_PATH
+from kalshi_auth import (
+    HealthCheckMonitor, KILL_SWITCH_PATH,
+    notify_imessage, _reset_imessage_rate_limiter,
+)
 
 
 class TestBotHeartbeat:
@@ -45,7 +49,7 @@ class TestBotHeartbeat:
     def test_old_heartbeat_is_stale(self, tmp_path):
         hm = self._make_monitor(tmp_path, staleness_minutes=30)
         # Manually set an old heartbeat
-        old_time = (datetime.datetime.now() - datetime.timedelta(minutes=60)).isoformat()
+        old_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=60)).isoformat()
         hm._state["bots"]["weather"] = {"last_heartbeat": old_time}
         hm._save()
 
@@ -132,12 +136,12 @@ class TestAutoHalt:
 
         hm = self._make_monitor(tmp_path, auto_halt=True, staleness_minutes=10)
 
-        # Create critical source failures for weather (NWS + OpenMeteo)
-        old_time = (datetime.datetime.now() - datetime.timedelta(minutes=30)).isoformat()
+        # Create critical source failures for all weather sources
+        old_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=30)).isoformat()
         hm._state["bots"]["weather"] = {"last_heartbeat": old_time}
-        for i in range(5):
-            hm.record_source_error("NWS", f"err{i}")
-            hm.record_source_error("OpenMeteo", f"err{i}")
+        for src in ["open-meteo-batch", "open-meteo-single", "open-meteo-ensemble", "nws-forecast"]:
+            for i in range(5):
+                hm.record_source_error(src, f"err{i}")
 
         # Redirect per-bot halt paths to tmp_path
         monkeypatch.setattr(kalshi_auth, "per_bot_halt_path",
@@ -160,7 +164,7 @@ class TestAutoHalt:
         hm = self._make_monitor(tmp_path, auto_halt=True, staleness_minutes=10)
 
         # Only one issue: stale bot
-        old_time = (datetime.datetime.now() - datetime.timedelta(minutes=30)).isoformat()
+        old_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=30)).isoformat()
         hm._state["bots"]["weather"] = {"last_heartbeat": old_time}
 
         issues = hm.check_health()
@@ -175,7 +179,7 @@ class TestAutoHalt:
         monkeypatch.setattr(kalshi_auth, "KILL_SWITCH_PATH", halt_path)
 
         hm = self._make_monitor(tmp_path, auto_halt=True, staleness_minutes=10)
-        old_time = (datetime.datetime.now() - datetime.timedelta(minutes=30)).isoformat()
+        old_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=30)).isoformat()
         hm._state["bots"]["weather"] = {"last_heartbeat": old_time}
         for i in range(5):
             hm.record_source_error("nws", f"err{i}")
@@ -271,3 +275,129 @@ class TestHealthSummary:
             mon.record_source_error("hdd", "timeout")
         summary = mon.get_summary()
         assert summary["overall"] in ("degraded", "critical")
+
+
+class TestIsSourceOpen:
+    """Test source circuit breaker via is_source_open."""
+
+    def _make_monitor(self, tmp_path, **kwargs):
+        state_path = tmp_path / "health-state.json"
+        return HealthCheckMonitor(state_path=str(state_path), **kwargs)
+
+    def test_below_threshold_returns_false(self, tmp_path):
+        mon = self._make_monitor(tmp_path, source_breaker_threshold=5)
+        for _ in range(4):
+            mon.record_source_error("open-meteo", "err")
+        assert mon.is_source_open("open-meteo") is False
+
+    def test_at_threshold_returns_true(self, tmp_path):
+        mon = self._make_monitor(tmp_path, source_breaker_threshold=5)
+        for _ in range(5):
+            mon.record_source_error("open-meteo", "err")
+        assert mon.is_source_open("open-meteo") is True
+
+    def test_resets_after_cooldown(self, tmp_path):
+        mon = self._make_monitor(tmp_path, source_breaker_threshold=3, source_breaker_cooldown_seconds=1)
+        for _ in range(3):
+            mon.record_source_error("coinbase", "err")
+        assert mon.is_source_open("coinbase") is True
+        # Simulate cooldown elapsed by backdating opened_at
+        mon._state["sources"]["coinbase"]["opened_at"] = time.time() - 2
+        assert mon.is_source_open("coinbase") is False
+        # After reset, error_count should be 0 (half-open)
+        assert mon._state["sources"]["coinbase"]["error_count"] == 0
+
+    def test_record_source_success_clears_breaker(self, tmp_path):
+        mon = self._make_monitor(tmp_path, source_breaker_threshold=3)
+        for _ in range(3):
+            mon.record_source_error("deribit", "err")
+        assert mon.is_source_open("deribit") is True
+        mon.record_source_success("deribit")
+        assert mon.is_source_open("deribit") is False
+        assert mon._state["sources"]["deribit"]["error_count"] == 0
+        assert mon._state["sources"]["deribit"]["opened_at"] is None
+
+    def test_opened_at_persists_in_state(self, tmp_path):
+        state_path = tmp_path / "health-state.json"
+        mon = HealthCheckMonitor(state_path=str(state_path), source_breaker_threshold=3)
+        for _ in range(3):
+            mon.record_source_error("hdd", "err")
+        assert mon._state["sources"]["hdd"].get("opened_at") is not None
+
+        # Reload from disk
+        mon2 = HealthCheckMonitor(state_path=str(state_path), source_breaker_threshold=3)
+        assert mon2._state["sources"]["hdd"].get("opened_at") is not None
+        assert mon2.is_source_open("hdd") is True
+
+    def test_unknown_source_returns_false(self, tmp_path):
+        mon = self._make_monitor(tmp_path)
+        assert mon.is_source_open("nonexistent") is False
+
+
+class TestNotifyImessage:
+    """Test iMessage notification via BlueBubbles API."""
+
+    def setup_method(self):
+        _reset_imessage_rate_limiter()
+
+    def test_returns_false_when_env_vars_missing(self):
+        with patch.dict("os.environ", {}, clear=True):
+            assert notify_imessage("test message") is False
+
+    def _dispatch_and_join(self, message):
+        """Call notify_imessage and join the background thread so assertions are safe."""
+        import threading
+        before = set(threading.enumerate())
+        result = notify_imessage(message)
+        after = set(threading.enumerate())
+        for t in after - before:
+            t.join(timeout=5)
+        return result
+
+    def test_sends_post_to_correct_url(self):
+        env = {
+            "BLUEBUBBLES_URL": "http://localhost:1234",
+            "BLUEBUBBLES_PASSWORD": "secret",
+            "BLUEBUBBLES_CHAT_GUID": "iMessage;+;chat123",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            with patch("kalshi_auth.requests.post") as mock_post:
+                mock_post.return_value = MagicMock(status_code=200)
+                mock_post.return_value.raise_for_status = MagicMock()
+                result = self._dispatch_and_join("hello world")
+                assert result is True
+                mock_post.assert_called_once()
+                args, kwargs = mock_post.call_args
+                assert args[0] == "http://localhost:1234/api/v1/message/text"
+                assert kwargs["params"] == {"password": "secret"}
+                assert kwargs["json"]["chatGuid"] == "iMessage;+;chat123"
+                assert kwargs["json"]["message"] == "hello world"
+
+    def test_rate_limits_duplicate_messages(self):
+        env = {
+            "BLUEBUBBLES_URL": "http://localhost:1234",
+            "BLUEBUBBLES_PASSWORD": "secret",
+            "BLUEBUBBLES_CHAT_GUID": "iMessage;+;chat123",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            with patch("kalshi_auth.requests.post") as mock_post:
+                mock_post.return_value = MagicMock(status_code=200)
+                mock_post.return_value.raise_for_status = MagicMock()
+                assert self._dispatch_and_join("duplicate msg") is True
+                assert notify_imessage("duplicate msg") is False
+                assert mock_post.call_count == 1
+
+    def test_http_error_does_not_crash(self):
+        """HTTP errors are swallowed in the background thread (fire-and-forget)."""
+        env = {
+            "BLUEBUBBLES_URL": "http://localhost:1234",
+            "BLUEBUBBLES_PASSWORD": "secret",
+            "BLUEBUBBLES_CHAT_GUID": "iMessage;+;chat123",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            with patch("kalshi_auth.requests.post") as mock_post:
+                mock_post.return_value = MagicMock()
+                mock_post.return_value.raise_for_status.side_effect = Exception("500 error")
+                # Dispatches True (fire-and-forget), error handled in thread
+                assert self._dispatch_and_join("fail msg") is True
+                mock_post.assert_called_once()

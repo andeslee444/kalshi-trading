@@ -36,6 +36,7 @@ RESULTS_PATH = DATA_DIR / "backtest-results.json"
 SUGGESTION_DIR = DATA_DIR / "calibration-suggestions"
 CALIBRATION_PATH = PROJECT_DIR / "config" / "calibration.json"
 CALIBRATION_BACKUP_PATH = PROJECT_DIR / "config" / "calibration-backup.json"
+HISTORY_DIR = DATA_DIR / "calibration-history"
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DRIFT_THRESHOLD = 0.10   # 10% degradation triggers drift alert
@@ -43,15 +44,29 @@ MIN_SAMPLES = 10         # minimum trades before drift detection activates
 SUGGESTION_IMPROVEMENT_THRESHOLD = 0.05  # 5% Brier improvement required to generate suggestion
 
 # Calibration sections that may contain Brier scores
-CALIBRATION_SECTIONS = ["weather", "nws", "album_sales", "box_office", "ensemble"]
+CALIBRATION_SECTIONS = ["weather", "nws", "album_sales", "box_office", "ensemble", "cpi"]
 
 # (name, script_path, args, timeout_seconds)
-STAGES = [
+# Core stages run first and are required for the pipeline to proceed.
+STAGES_CORE = [
     ("reconcile", SCRIPTS_DIR / "reconcile-trades.py", [], 120),
     ("backfill",  SCRIPTS_DIR / "backfill-settlements.py", [], 180),
     ("backtest",  SCRIPTS_DIR / "backtest.py", ["--save"], 120),
-    ("calibrate", SCRIPTS_DIR / "calibrate-sigma.py", ["--json"], 300),
 ]
+
+# Calibration stages run independently -- if one fails, others still proceed.
+STAGES_CALIBRATE = [
+    ("calibrate_weather",  SCRIPTS_DIR / "calibrate-sigma.py", ["--json"], 300),
+    ("calibrate_crypto",   SCRIPTS_DIR / "calibrate-crypto.py", ["--dry-run"], 300),
+    ("calibrate_cpi",      SCRIPTS_DIR / "calibrate-cpi-sigma.py", ["--json"], 120),
+    ("calibrate_strategy", SCRIPTS_DIR / "calibrate-strategy.py", ["--json"], 120),
+]
+
+STAGES = STAGES_CORE + STAGES_CALIBRATE
+
+# Minimum requirements before strategy calibration runs
+STRATEGY_MIN_TRADES = 20
+STRATEGY_MAX_BRIER = 0.50  # PM guard: do NOT calibrate if model is broken
 
 
 # ── Stage Runner ─────────────────────────────────────────────────────────────
@@ -92,15 +107,47 @@ def run_stage(name, script, args, timeout):
         }
 
 
-def run_pipeline():
+def should_run_strategy_calibrator(backtest_results):
+    """Guard: skip strategy calibration if model is broken or has insufficient data.
+
+    Returns True if strategy calibrator should run.
+    PM rule: do NOT calibrate if strategy Brier > 0.50.
+    """
+    strategy_stats = backtest_results.get("per_bot", {}).get("strategy", {})
+    n = strategy_stats.get("n_evaluated", 0)
+    brier = strategy_stats.get("brier_score", 1.0)
+    if n < STRATEGY_MIN_TRADES:
+        log.info(f"Skipping strategy calibration: only {n} settled trades (need {STRATEGY_MIN_TRADES}+)")
+        return False
+    if brier > STRATEGY_MAX_BRIER:
+        log.warning(f"Skipping strategy calibration: Brier {brier:.3f} > {STRATEGY_MAX_BRIER} (model broken)")
+        return False
+    return True
+
+
+def run_pipeline(skip_stages=None):
     """Run all pipeline stages sequentially.
 
-    Returns dict with stages results and proposed_calibration (if available).
+    Returns dict with stages results, proposed_calibration (weather, backward compat),
+    and all_calibrations (all calibrate_* stage outputs).
+
+    skip_stages: optional set of stage names to skip (e.g., {"calibrate_strategy"}).
     """
     stages = {}
-    proposed_calibration = None
+    proposed_calibrations = {}
+    skip_stages = skip_stages or set()
 
     for name, script, args, timeout in STAGES:
+        if name in skip_stages:
+            log.info(f"Skipping stage: {name}")
+            stages[name] = {
+                "success": True,
+                "stdout": "",
+                "stderr": "skipped",
+                "duration_s": 0.0,
+            }
+            continue
+
         log.info(f"Running stage: {name}")
         result = run_stage(name, script, args, timeout)
         stages[name] = result
@@ -110,14 +157,21 @@ def run_pipeline():
         if not result["success"]:
             log.warning(f"  {name} stderr: {result['stderr'][:300]}")
 
-        # Parse calibrate stage JSON output
-        if name == "calibrate" and result["success"] and result["stdout"].strip():
+        # Parse JSON output from calibration stages
+        if name.startswith("calibrate_") and result["success"] and result["stdout"].strip():
             try:
-                proposed_calibration = json.loads(result["stdout"])
+                proposed_calibrations[name] = json.loads(result["stdout"])
             except (json.JSONDecodeError, ValueError):
-                log.warning("Could not parse calibrate JSON output")
+                log.warning(f"Could not parse {name} JSON output")
 
-    return {"stages": stages, "proposed_calibration": proposed_calibration}
+    # Merge weather calibration as the primary proposed_calibration (backward compat)
+    proposed_calibration = proposed_calibrations.get("calibrate_weather")
+
+    return {
+        "stages": stages,
+        "proposed_calibration": proposed_calibration,
+        "all_calibrations": proposed_calibrations,
+    }
 
 
 # ── Baseline Management ─────────────────────────────────────────────────────
@@ -256,6 +310,79 @@ def _compare_entity(entity, entity_type, baseline_brier, baseline_n, current_bri
     return finding
 
 
+# ── Per-Bot Regression Gate ──────────────────────────────────────────────────
+
+BOT_REGRESSION_THRESHOLD = 0.05   # 5% -- no bot can get this much worse
+AGGREGATE_IMPROVEMENT_THRESHOLD = 0.0  # aggregate must not get worse
+
+
+def check_regression_gate(before_results, after_results, min_samples=10):
+    """Per-bot regression gate for auto-apply safety.
+
+    Returns (safe: bool, reason: str).
+    Safe = True means auto-apply is OK.
+
+    Rules:
+    1. Aggregate Brier must not increase (after <= before)
+    2. No individual bot's Brier can increase by > BOT_REGRESSION_THRESHOLD (5%)
+    3. Bots with < min_samples are skipped (insufficient data to judge)
+    """
+    before_brier = before_results.get("brier_score")
+    after_brier = after_results.get("brier_score")
+
+    if before_brier is None or after_brier is None:
+        return False, "Missing aggregate Brier score"
+
+    # Rule 1: aggregate must not get worse
+    if after_brier > before_brier:
+        change = (after_brier - before_brier) / before_brier if before_brier > 0 else 0
+        return False, f"Aggregate Brier regressed: {before_brier:.4f} -> {after_brier:.4f} (+{change:.1%})"
+
+    # Rule 2: per-bot regression check
+    before_bots = before_results.get("per_bot", {})
+    after_bots = after_results.get("per_bot", {})
+
+    for bot_name, before_bot in before_bots.items():
+        b_brier = before_bot.get("brier_score")
+        b_n = before_bot.get("n_evaluated", 0)
+
+        if b_brier is None or b_n < min_samples:
+            continue  # skip bots with insufficient data
+
+        after_bot = after_bots.get(bot_name, {})
+        a_brier = after_bot.get("brier_score")
+
+        if a_brier is None:
+            continue
+
+        if b_brier > 0 and (a_brier - b_brier) / b_brier > BOT_REGRESSION_THRESHOLD:
+            change = (a_brier - b_brier) / b_brier
+            return False, (
+                f"{bot_name} regressed: {b_brier:.4f} -> {a_brier:.4f} "
+                f"(+{change:.1%}, threshold {BOT_REGRESSION_THRESHOLD:.0%})"
+            )
+
+    return True, "All checks passed"
+
+
+def should_auto_apply(before_results, after_results, suggestion_eval):
+    """Determine if calibration should be auto-applied.
+
+    Returns (should_apply: bool, reason: str).
+    Requires BOTH suggestion evaluation AND regression gate to pass.
+    """
+    # Gate 1: suggestion must be worthwhile
+    if not suggestion_eval.get("should_suggest", False):
+        return False, "Suggestion evaluation says not worth applying"
+
+    # Gate 2: regression gate must pass
+    safe, gate_reason = check_regression_gate(before_results, after_results)
+    if not safe:
+        return False, f"Regression gate failed: {gate_reason}"
+
+    return True, "All gates passed"
+
+
 # ── WhatsApp Summary ─────────────────────────────────────────────────────────
 
 def format_whatsapp_summary(stage_results, drift_findings, any_stage_failed, suggestion_path=None):
@@ -295,6 +422,47 @@ def format_whatsapp_summary(stage_results, drift_findings, any_stage_failed, sug
     if suggestion_path:
         lines.append("")
         lines.append(f"Calibration suggestion generated -- review {suggestion_path}")
+
+    return "\n".join(lines)
+
+
+def format_weekly_summary(stage_results, drift_findings, all_calibrations,
+                          auto_applied, apply_reason, suggestion_path=None):
+    """Format weekly calibration summary for WhatsApp."""
+    total = len(stage_results)
+    passed = sum(1 for s in stage_results.values() if s["success"])
+    failed_names = [n for n, s in stage_results.items() if not s["success"]]
+
+    lines = ["Kalshi Weekly Calibration", ""]
+
+    if failed_names:
+        lines.append(f"Stages: {passed}/{total} OK, FAILED: {', '.join(failed_names)}")
+    else:
+        lines.append(f"Stages: {passed}/{total} OK")
+
+    # Calibrator results
+    cal_stages = {k: v for k, v in stage_results.items() if k.startswith("calibrate_")}
+    if cal_stages:
+        lines.append("")
+        for name, result in cal_stages.items():
+            short_name = name.replace("calibrate_", "")
+            status = "OK" if result["success"] else "FAIL"
+            lines.append(f"  {short_name}: {status} ({result['duration_s']}s)")
+
+    # Auto-apply result
+    lines.append("")
+    if auto_applied:
+        lines.append("AUTO-APPLIED: New calibration is live")
+    else:
+        lines.append(f"Auto-apply: skipped ({apply_reason})")
+
+    # Drift summary
+    drifted = [f for f in drift_findings if f["drifted"]]
+    if drifted:
+        lines.append("")
+        lines.append("DRIFT:")
+        for f in drifted:
+            lines.append(f"  {f['entity']}: {f['baseline_brier']:.3f}->{f['current_brier']:.3f}")
 
     return "\n".join(lines)
 
@@ -407,11 +575,38 @@ def generate_suggestion(proposed_calibration, current_calibration, improvements)
     return suggestion_path
 
 
+def archive_calibration(calibration_data, history_dir=None):
+    """Save a versioned copy of calibration to the history directory.
+
+    Filenames: calibration-YYYY-MM-DD.json (appends -N if same-day exists).
+    Returns the path of the saved file.
+    """
+    hdir = history_dir or HISTORY_DIR
+    hdir.mkdir(parents=True, exist_ok=True)
+
+    now = datetime.now(timezone.utc)
+    date_str = now.strftime("%Y-%m-%d")
+    base_name = f"calibration-{date_str}"
+    path = hdir / f"{base_name}.json"
+    counter = 2
+    while path.exists():
+        path = hdir / f"{base_name}-{counter}.json"
+        counter += 1
+
+    archive_entry = {
+        "archived_at": now.isoformat(),
+        "calibration": calibration_data,
+    }
+    _atomic_write_json(path, archive_entry)
+    log.info(f"Calibration archived: {path}")
+    return path
+
+
 def apply_suggestion(suggestion_path):
     """Apply a calibration suggestion file.
 
-    Backs up current config/calibration.json, writes proposed calibration,
-    then re-snapshots baselines from current backtest results.
+    Archives current calibration to history, backs up to calibration-backup.json,
+    writes proposed calibration, then re-snapshots baselines.
     Returns True on success.
     """
     suggestion_path = Path(suggestion_path)
@@ -430,8 +625,13 @@ def apply_suggestion(suggestion_path):
         log.error("Suggestion file missing proposed_calibration")
         return False
 
-    # Backup current calibration
+    # Archive current calibration before overwriting
     if CALIBRATION_PATH.exists():
+        try:
+            current_cal = json.loads(CALIBRATION_PATH.read_text())
+            archive_calibration(current_cal)
+        except Exception as e:
+            log.warning(f"Could not archive current calibration: {e}")
         shutil.copy2(str(CALIBRATION_PATH), str(CALIBRATION_BACKUP_PATH))
         log.info(f"Backed up current calibration to {CALIBRATION_BACKUP_PATH}")
 
@@ -503,6 +703,8 @@ def main():
                         help="Re-snapshot baselines from current results")
     parser.add_argument("--apply-suggestion", type=str, metavar="PATH",
                         help="Apply a calibration suggestion file")
+    parser.add_argument("--auto-apply", action="store_true",
+                        help="Auto-apply calibration if regression gate passes (for weekly cron)")
     args = parser.parse_args()
 
     setup_unbuffered()
@@ -527,8 +729,20 @@ def main():
     log.info("Calibration pipeline starting")
     log.info("=" * 60)
 
+    # 0. Check strategy calibrator guard (uses previous backtest results)
+    skip_stages = set()
+    if RESULTS_PATH.exists():
+        try:
+            prev_results = json.loads(RESULTS_PATH.read_text())
+            if not should_run_strategy_calibrator(prev_results):
+                skip_stages.add("calibrate_strategy")
+        except Exception:
+            skip_stages.add("calibrate_strategy")  # skip if can't read results
+    else:
+        skip_stages.add("calibrate_strategy")  # skip if no previous results
+
     # 1. Run all stages
-    pipeline_result = run_pipeline()
+    pipeline_result = run_pipeline(skip_stages=skip_stages)
     stage_results = pipeline_result["stages"]
     proposed_calibration = pipeline_result["proposed_calibration"]
     any_stage_failed = any(not s["success"] for s in stage_results.values())
@@ -594,12 +808,43 @@ def main():
             suggestion_generated = True
     else:
         log.info("No proposed calibration available -- suggestion evaluation skipped")
+        eval_result = {}
+
+    # 6b. Auto-apply (weekly mode)
+    auto_applied = False
+    apply_reason = ""
+    if args.auto_apply and suggestion_generated and proposed_calibration:
+        apply_decision, apply_reason = should_auto_apply(
+            backtest_results, backtest_results, eval_result
+        )
+        if apply_decision:
+            log.info(f"Auto-apply: {apply_reason}")
+            success = apply_suggestion(str(suggestion_path))
+            if success:
+                auto_applied = True
+                log.info("Auto-applied calibration suggestion")
+            else:
+                apply_reason = "apply_suggestion() failed"
+                log.error("Auto-apply failed during apply_suggestion()")
+        else:
+            log.info(f"Auto-apply skipped: {apply_reason}")
+    elif args.auto_apply:
+        apply_reason = "no suggestion generated"
+        log.info("Auto-apply skipped: no suggestion generated")
 
     # 7. WhatsApp summary
-    summary = format_whatsapp_summary(
-        stage_results, drift_findings, any_stage_failed,
-        suggestion_path=suggestion_path,
-    )
+    if args.auto_apply:
+        summary = format_weekly_summary(
+            stage_results, drift_findings,
+            pipeline_result.get("all_calibrations", {}),
+            auto_applied, apply_reason if not auto_applied else "applied",
+            suggestion_path=suggestion_path,
+        )
+    else:
+        summary = format_whatsapp_summary(
+            stage_results, drift_findings, any_stage_failed,
+            suggestion_path=suggestion_path,
+        )
     whatsapp_sent = False
 
     if args.dry_run:

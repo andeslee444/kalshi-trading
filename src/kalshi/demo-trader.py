@@ -172,8 +172,7 @@ def main():
         markets = get_all_markets(limit=2000)
         log.info("Found %d open markets total", len(markets))
     except Exception as e:
-        log.error("Market fetch failed: %s", e)
-        import traceback; traceback.print_exc()
+        log.error("Market fetch failed: %s", e, exc_info=True)
         sys.exit(1)
 
     # Step 3: Categorize

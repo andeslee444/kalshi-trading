@@ -9,7 +9,7 @@ Usage:
     python3 beatrelease-scanner.py --once   # Single scan, no loop
 """
 
-import json, time, datetime, os, sys, re, signal, atexit, hashlib
+import json, time, datetime, os, sys, re, signal, hashlib
 import requests
 from pathlib import Path
 from bs4 import BeautifulSoup
@@ -25,16 +25,13 @@ log = setup_logging("beatrelease")
 DEEPSEEK_KEY_PATH = PROJECT_DIR / "config" / "keys" / "deepseek.txt"
 STATE_PATH = PROJECT_DIR / "data" / "beatrelease-state.json"
 TRADES_PATH = PROJECT_DIR / "data" / "beatrelease-trades.json"
-PID_FILE = PROJECT_DIR / "data" / "pids" / "beatrelease-scanner.pid"
-PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 LLM_LOG_PATH = PROJECT_DIR / "data" / "beatrelease-llm-log.json"
 
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
 _bots_cfg = json.loads(BOTS_CONFIG_PATH.read_text())["beatrelease"]
 CHECK_INTERVAL_HOURS = _bots_cfg["checkIntervalHours"]
-MAX_TRADE_CENTS = _bots_cfg["maxTradeCents"]
+MAX_TRADE_CENTS = _bots_cfg.get("maxTradeAmount", 15) * 100  # dollars → cents
 BLOG_URLS = _bots_cfg["blogUrls"]
 
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -51,27 +48,6 @@ trade_manager = TradeManager(client, TRADES_PATH, {
 allocator = PortfolioAllocator(client, logger=log)
 health = HealthCheckMonitor(logger=log)
 trim_trade_log(TRADES_PATH)
-
-
-# === PID Management ===
-def write_pid():
-    PID_FILE.write_text(str(os.getpid()))
-
-def remove_pid():
-    try:
-        PID_FILE.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-def check_existing():
-    if PID_FILE.exists():
-        try:
-            pid = int(PID_FILE.read_text().strip())
-            os.kill(pid, 0)  # Check if running
-            log.info(f"Another instance running (PID {pid}). Exiting.")
-            sys.exit(1)
-        except (ProcessLookupError, ValueError):
-            pass  # Stale PID file
 
 
 # === State ===
@@ -711,7 +687,14 @@ def scan_cycle():
                 bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True,
             )
             # Use the lesser of LLM-recommended and Kelly-bounded quantity
-            bounded_qty = min(t["quantity"], kelly_count) if kelly_count > 0 else t["quantity"]
+            if kelly_count <= 0:
+                log.info(f"  Skipping {ticker}: Kelly sizing returned 0 (edge {edge*100:.1f}% insufficient at {limit_price}c)")
+                ss.skip("kelly_zero")
+                trade_manager.log_decision(ticker, side, "skipped", "kelly_zero",
+                                           edge=round(edge, 4), price_cents=limit_price,
+                                           kelly_count=kelly_count)
+                continue
+            bounded_qty = min(t["quantity"], kelly_count)
 
             result = trade_manager.place_order(
                 ticker, side, limit_price, bounded_qty,
@@ -762,9 +745,6 @@ def scan_cycle():
 
 # === Daemon ===
 def run_daemon():
-    check_existing()
-    write_pid()
-    atexit.register(remove_pid)
     setup_signal_handlers()
 
     log.info(f"BeatRelease scanner daemon started (PID {os.getpid()})")
@@ -777,9 +757,7 @@ def run_daemon():
             health.record_bot_heartbeat("beatrelease")
             scan_cycle()
         except Exception as e:
-            log.error(f"Scan cycle error: {e}")
-            import traceback
-            traceback.print_exc()
+            log.error("Scan cycle error: %s", e, exc_info=True)
 
         if is_shutdown_requested():
             log.info("Graceful shutdown requested, exiting.")
@@ -794,9 +772,7 @@ if __name__ == "__main__":
         try:
             scan_cycle()
         except Exception as e:
-            log.error(f"Error: {e}")
-            import traceback
-            traceback.print_exc()
+            log.error("Error: %s", e, exc_info=True)
             sys.exit(1)
     else:
         run_daemon()

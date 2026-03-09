@@ -8,71 +8,26 @@ import json
 import re
 import pytest
 from unittest.mock import MagicMock, patch
-import importlib
-import importlib.util
 import sys
 from pathlib import Path
+
+from conftest import make_fake_auth, load_bot_module
 
 
 # --- Module loading (same pattern as test_source_monitor.py) ---
 
 def _load_source_monitor():
     """Load source-monitor.py with stubbed dependencies."""
-    stub_names = ["kalshi_auth", "probability", "capital_allocator",
-                  "hdd_parser", "macro_engine", "correlation_engine", "ticker_utils"]
+    fake_auth = make_fake_auth(round_half_up=round)
 
-    # Save originals
-    originals = {name: sys.modules.get(name) for name in stub_names}
-
-    # Stub kalshi_auth before import
-    mock_auth = MagicMock()
-    mock_client = MagicMock()
-    mock_auth.KalshiClient.return_value = mock_client
-    mock_auth.setup_logging.return_value = MagicMock()
-    mock_auth.setup_unbuffered = MagicMock()
-    mock_auth.setup_signal_handlers = MagicMock()
-    mock_auth.PROJECT_DIR = Path(__file__).resolve().parent.parent
-    mock_auth.TradeManager = MagicMock()
-    mock_auth.HealthCheckMonitor = MagicMock()
-    mock_auth.OrderMonitor = MagicMock()
-    mock_auth.ScanSummary = MagicMock()
-    mock_auth.build_market_snapshot = MagicMock(return_value={})
-    mock_auth.CITY_TIMEZONES = {}
-    mock_auth._local_today = MagicMock()
-    mock_auth.round_half_up = round
-    mock_auth.trim_trade_log = MagicMock()
-    mock_auth.check_kill_switch = MagicMock()
-    mock_auth.retry_request = MagicMock()
-    mock_auth.load_trades.return_value = []
-    mock_auth.fetch_parallel = MagicMock(return_value={})
-    mock_auth.is_market_liquid = MagicMock(return_value=True)
-    mock_auth.compute_limit_price = MagicMock(return_value=50)
-    mock_auth.kalshi_fee_cents = MagicMock(return_value=1)
-
-    # Stub other imports
-    sys.modules["kalshi_auth"] = mock_auth
-    sys.modules["probability"] = MagicMock()
-    sys.modules["capital_allocator"] = MagicMock()
-    sys.modules["hdd_parser"] = MagicMock()
-    sys.modules["macro_engine"] = MagicMock()
-    sys.modules["correlation_engine"] = MagicMock()
-    sys.modules["ticker_utils"] = MagicMock()
-
-    spec = importlib.util.spec_from_file_location(
-        "source_monitor",
-        str(Path(__file__).resolve().parent.parent / "src" / "kalshi" / "source-monitor.py"),
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    # Restore originals
-    for name in stub_names:
-        if originals[name] is None:
-            sys.modules.pop(name, None)
-        else:
-            sys.modules[name] = originals[name]
-
-    return mod
+    return load_bot_module("source-monitor.py", fake_auth, extra_stubs={
+        "probability": MagicMock(),
+        "capital_allocator": MagicMock(),
+        "hdd_parser": MagicMock(),
+        "macro_engine": MagicMock(),
+        "correlation_engine": MagicMock(),
+        "ticker_utils": MagicMock(),
+    })
 
 
 # --- Fixtures: realistic HTML snippets ---

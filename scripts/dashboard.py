@@ -10,6 +10,7 @@ Visit http://localhost:3456 in a browser.
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
@@ -25,6 +26,9 @@ from pnl_attribution import PnLAttributor, _classify_market_type
 from edge_monitor import EdgeMonitor
 from execution_quality import ExecutionAnalyzer
 from ticker_utils import format_ticker_human
+from trade_files import TRADE_FILES as _CANONICAL_FILES
+
+logger = logging.getLogger("dashboard")
 
 DASHBOARD_HTML = Path(__file__).resolve().parent / "dashboard.html"
 DATA_DIR = PROJECT_DIR / "data"
@@ -81,18 +85,10 @@ BOT_CONFIG_KEY = {
     "arb": "cross_platform_arb",
 }
 
-# ─── Trade file definitions (from analyze-performance.py) ───
+# ─── Trade file definitions (derived from canonical trade_files.py) ───
 TRADE_FILES = [
-    {"label": "Weather Bot",        "bot": "weather",       "path": DATA_DIR / "kalshi-trades.json"},
-    {"label": "Strategy Trader",    "bot": "strategy",      "path": DATA_DIR / "kalshi-strategy-trades.json"},
-    {"label": "Entertainment Bot",  "bot": "entertainment", "path": DATA_DIR / "kalshi-entertainment-trades.json"},
-    {"label": "BeatRelease Scanner","bot": "beatrelease",   "path": DATA_DIR / "beatrelease-trades.json"},
-    {"label": "Source Monitor",     "bot": "monitor",       "path": DATA_DIR / "kalshi-monitor-trades.json"},
-    {"label": "Position Monitor",   "bot": "positions",     "path": DATA_DIR / "kalshi-position-trades.json"},
-    {"label": "Economics Bot",      "bot": "economics",     "path": DATA_DIR / "kalshi-economics-trades.json"},
-    {"label": "Crypto Bot",         "bot": "crypto",        "path": DATA_DIR / "kalshi-crypto-trades.json"},
-    {"label": "Cross-Platform Arb", "bot": "arb",           "path": DATA_DIR / "kalshi-arb-trades.json"},
-    {"label": "Market Maker",       "bot": "mm",            "path": DATA_DIR / "kalshi-mm-trades.json"},
+    {"label": f["label"], "bot": f["bot"], "path": DATA_DIR / f["filename"]}
+    for f in _CANONICAL_FILES
 ]
 
 # ─── Bot definitions (from supervisor.py) ───
@@ -242,11 +238,12 @@ _market_pool = ThreadPoolExecutor(max_workers=5)
 
 _kalshi_client = None
 _kalshi_available = None
+_kalshi_checked_at = 0
 
 
 def get_kalshi_client():
-    global _kalshi_client, _kalshi_available
-    if _kalshi_available is False:
+    global _kalshi_client, _kalshi_available, _kalshi_checked_at
+    if _kalshi_available is False and time.time() - _kalshi_checked_at < 60:
         return None
     if _kalshi_client is not None:
         return _kalshi_client
@@ -255,8 +252,10 @@ def get_kalshi_client():
         _kalshi_client = KalshiClient()
         _kalshi_available = True
         return _kalshi_client
-    except Exception:
+    except Exception as e:
+        logger.warning("Kalshi API unavailable: %s", e)
         _kalshi_available = False
+        _kalshi_checked_at = time.time()
         return None
 
 
@@ -310,8 +309,8 @@ async def api_bots():
                     interval_min = bot_cfg.get("scanIntervalMinutes", 30)
                     if age_s > interval_min * 60 * 2.5:
                         status = "stale"
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("Failed to parse heartbeat for %s: %s", name, e)
 
         result.append({
             "name": name,
@@ -368,8 +367,8 @@ async def api_account():
                     "losses": s["losses"],
                     "win_rate": s["win_rate"],
                 }
-        except Exception:
-            pass  # Account still returns balance data if P&L fails
+        except Exception as e:
+            logger.warning("Failed to fetch P&L summary: %s", e)
 
         cache.set("account", result)
         return result
@@ -472,7 +471,8 @@ async def api_trades(
                 result.sort(key=lambda x: x["timestamp"] or "", reverse=True)
                 cache.set("fills", result)
                 return result[:limit]
-            except Exception:
+            except Exception as e:
+                logger.warning("Failed to fetch fills from API: %s", e)
                 if source == "api":
                     return {"error": "API unavailable"}
 
@@ -510,9 +510,9 @@ def _infer_bot_from_ticker(ticker: str) -> str:
     t = ticker.upper()
     if t.startswith("KXHIGH"):
         return "weather"
-    if t.startswith(("KXBTC", "KXETH")):
+    if t.startswith(("KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXXRP", "KXCRYPTO")):
         return "crypto"
-    if t.startswith(("KXCPI", "KXGDP", "KXJOBS")):
+    if t.startswith(("KXCPI", "KXGDP", "KXJOBS", "KXFED", "KXGAS", "KXINFL")):
         return "economics"
     if t.startswith(("KXALBUM", "KX1ALBUM")):
         return "entertainment"
@@ -611,8 +611,8 @@ async def api_risk():
                     api_counts[bot] = {"trades": 0, "risk": 0}
                 api_counts[bot]["trades"] += 1
                 api_counts[bot]["risk"] += risk
-        except Exception:
-            pass  # Fall through to local logs
+        except Exception as e:
+            logger.warning("Failed to fetch risk data from API: %s", e)
 
     # Build per-bot risk: merge API data with config limits
     per_bot_risk = []
@@ -846,6 +846,15 @@ async def api_performance():
     return data
 
 
+@app.get("/api/snapshot")
+async def api_snapshot():
+    """Return verified financial snapshot (generated by pnl-snapshot.py)."""
+    data = load_json_safe(DATA_DIR / "financial-snapshot.json")
+    if data is None:
+        return {"error": "No snapshot found. Run: npm run snapshot"}
+    return data
+
+
 @app.get("/api/logs")
 async def api_logs(
     bot: str = Query("weather"),
@@ -874,7 +883,8 @@ def _fetch_market(client, ticker: str) -> dict | None:
         market = data.get("market", data)
         cache.set(cache_key, market, ttl=60)
         return market
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to fetch market %s: %s", ticker, e)
         return None
 
 
@@ -904,7 +914,8 @@ async def api_positions():
             for ticker, fut in futures.items():
                 try:
                     market_map[ticker] = fut.result(timeout=10)
-                except Exception:
+                except Exception as e:
+                    logger.warning("Failed to fetch market %s: %s", ticker, e)
                     market_map[ticker] = None
 
         result = []

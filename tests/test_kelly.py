@@ -7,7 +7,7 @@ conftest.py adds src/kalshi/ to sys.path so direct import works.
 import math
 import pytest
 
-from probability import half_kelly, half_kelly_sell, quarter_kelly, quarter_kelly_sell
+from probability import half_kelly, half_kelly_sell, quarter_kelly, quarter_kelly_sell, apply_kelly_multipliers, uncertainty_kelly
 
 
 # ---------------------------------------------------------------------------
@@ -318,30 +318,139 @@ class TestQuarterKellyPreservesSingleContract:
 
     def test_quarter_kelly_preserves_single_contract(self):
         """quarter_kelly should return 1 contract when half_kelly returns 1, not zero."""
-        # Use params where half_kelly returns exactly 1 contract:
-        # tiny edge + small bankroll + high price = 1 contract from half_kelly
-        hk_contracts, _, _ = half_kelly(0.08, 90, 500, bankroll_cents=2000, return_details=True)
-        if hk_contracts >= 1 and hk_contracts <= 2:
-            qk_contracts, _, _ = quarter_kelly(0.08, 90, 500, bankroll_cents=2000, return_details=True)
-            assert qk_contracts >= 1, (
-                f"quarter_kelly zeroed out: half_kelly={hk_contracts}, quarter_kelly={qk_contracts}"
-            )
+        # Params calibrated to produce hk=1: edge=0.08, price=80, bankroll=500
+        hk_contracts, _, _ = half_kelly(0.08, 80, 500, bankroll_cents=500, return_details=True)
+        assert hk_contracts >= 1, f"half_kelly should return >= 1 contract, got {hk_contracts}"
+        assert hk_contracts <= 2, f"half_kelly should return <= 2 contracts, got {hk_contracts}"
+        qk_contracts, _, _ = quarter_kelly(0.08, 80, 500, bankroll_cents=500, return_details=True)
+        assert qk_contracts >= 1, (
+            f"quarter_kelly zeroed out: half_kelly={hk_contracts}, quarter_kelly={qk_contracts}"
+        )
 
     def test_quarter_kelly_sell_preserves_single_contract(self):
         """quarter_kelly_sell should return 1 contract when half_kelly_sell returns 1, not zero."""
-        hk_contracts, _, _ = half_kelly_sell(0.08, 10, 500, bankroll_cents=2000, return_details=True)
-        if hk_contracts >= 1 and hk_contracts <= 2:
-            qk_contracts, _, _ = quarter_kelly_sell(0.08, 10, 500, bankroll_cents=2000, return_details=True)
-            assert qk_contracts >= 1, (
-                f"quarter_kelly_sell zeroed out: half_kelly_sell={hk_contracts}, quarter_kelly_sell={qk_contracts}"
-            )
+        # Params calibrated to produce hk=1: edge=0.05, price=10, bankroll=500
+        hk_contracts, _, _ = half_kelly_sell(0.05, 10, 500, bankroll_cents=500, return_details=True)
+        assert hk_contracts >= 1, f"half_kelly_sell should return >= 1 contract, got {hk_contracts}"
+        assert hk_contracts <= 2, f"half_kelly_sell should return <= 2 contracts, got {hk_contracts}"
+        qk_contracts, _, _ = quarter_kelly_sell(0.05, 10, 500, bankroll_cents=500, return_details=True)
+        assert qk_contracts >= 1, (
+            f"quarter_kelly_sell zeroed out: half_kelly_sell={hk_contracts}, quarter_kelly_sell={qk_contracts}"
+        )
 
     def test_quarter_kelly_one_becomes_one_not_zero(self):
         """Directly verify: if half_kelly gives 1, round(1/2)=0 but max(1,...) saves it."""
-        # Construct scenario: half_kelly returns 1 contract
-        # edge=0.05, price=80, max_cost=500, bankroll=2000
-        # half_f ≈ small, int(half_f * 2000 / 80) should be ~1
-        hk, _, details = half_kelly(0.05, 80, 500, bankroll_cents=2000, return_details=True)
-        if hk == 1:
-            qk, _, _ = quarter_kelly(0.05, 80, 500, bankroll_cents=2000, return_details=True)
-            assert qk == 1, f"Expected 1 contract, got {qk}"
+        # Params calibrated to produce hk=1: edge=0.05, price=80, bankroll=800
+        hk, _, details = half_kelly(0.05, 80, 500, bankroll_cents=800, return_details=True)
+        assert hk == 1, f"Expected half_kelly to return 1 contract, got {hk}"
+        qk, _, _ = quarter_kelly(0.05, 80, 500, bankroll_cents=800, return_details=True)
+        assert qk == 1, f"Expected 1 contract, got {qk}"
+
+
+# ---------------------------------------------------------------------------
+# apply_kelly_multipliers tests
+# ---------------------------------------------------------------------------
+
+class TestApplyKellyMultipliers:
+    """Tests for apply_kelly_multipliers with floor protection."""
+
+    def test_single_multiplier(self):
+        result = apply_kelly_multipliers(100, [0.5])
+        assert result == 50
+
+    def test_multiple_multipliers(self):
+        result = apply_kelly_multipliers(100, [0.5, 0.5])
+        assert result == 25
+
+    def test_floor_prevents_crushing(self):
+        """4 multipliers that would crush to ~43% should be respected (above 25% floor)."""
+        result = apply_kelly_multipliers(100, [0.7, 0.8, 0.9, 0.85])
+        expected_product = 100 * 0.7 * 0.8 * 0.9 * 0.85  # ~42.84
+        assert result == pytest.approx(expected_product, abs=0.01)
+
+    def test_floor_kicks_in_when_crushed_below(self):
+        """Extreme multipliers that would crush below floor should be clamped."""
+        result = apply_kelly_multipliers(100, [0.1, 0.1, 0.1])
+        # 100 * 0.001 = 0.1, but floor = 25
+        assert result == 25.0
+
+    def test_custom_floor(self):
+        result = apply_kelly_multipliers(100, [0.1, 0.1], floor_pct=0.50)
+        # 100 * 0.01 = 1, but floor = 50
+        assert result == 50.0
+
+    def test_zero_base_returns_zero(self):
+        result = apply_kelly_multipliers(0, [0.5, 0.5])
+        assert result == 0
+
+    def test_empty_multipliers(self):
+        result = apply_kelly_multipliers(100, [])
+        assert result == 100
+
+    def test_all_ones_no_change(self):
+        result = apply_kelly_multipliers(100, [1.0, 1.0, 1.0])
+        assert result == 100
+
+    def test_with_real_kelly_output(self):
+        """Integration: apply multipliers to actual half_kelly output."""
+        contracts, _ = half_kelly(0.20, 30, 500, 50000)
+        assert contracts > 0
+        reduced = apply_kelly_multipliers(contracts, [0.7, 0.8, 0.9, 0.85])
+        assert reduced >= contracts * 0.25  # floor
+        assert reduced <= contracts  # can't increase
+
+
+# ---------------------------------------------------------------------------
+# uncertainty_kelly tests
+# ---------------------------------------------------------------------------
+
+class TestUncertaintyKelly:
+    """Tests for uncertainty_kelly confidence scaling."""
+
+    def test_high_confidence_preserves_kelly(self):
+        """High agreement + tight sigma -> near full quarter_kelly."""
+        count, risk, details = uncertainty_kelly(
+            edge=0.15, price_cents=40, max_cost_cents=500, bankroll_cents=50000,
+            scenario_agreement=1.0, posterior_sigma=0.05,
+        )
+        base, _, _ = quarter_kelly(0.15, 40, 500, 50000, return_details=True)
+        assert base > 0
+        ratio = count / base
+        assert ratio >= 0.8, f"High confidence should keep >=80% of Kelly, got {ratio:.2f}"
+
+    def test_moderate_uncertainty_not_crushed(self):
+        """Moderate model uncertainty should reduce Kelly by ~20-40%, not 60-70%."""
+        count, risk, details = uncertainty_kelly(
+            edge=0.15, price_cents=40, max_cost_cents=500, bankroll_cents=50000,
+            scenario_agreement=0.8, posterior_sigma=0.20,
+        )
+        base, _, _ = quarter_kelly(0.15, 40, 500, 50000, return_details=True)
+        assert base > 0
+        ratio = count / base
+        assert ratio >= 0.30, f"Moderate uncertainty should keep >=30% of Kelly, got {ratio:.2f}"
+
+    def test_low_confidence_still_trades(self):
+        """Even low confidence should produce at least 1 contract."""
+        count, risk, details = uncertainty_kelly(
+            edge=0.15, price_cents=40, max_cost_cents=500, bankroll_cents=50000,
+            scenario_agreement=0.3, posterior_sigma=0.40,
+        )
+        assert count >= 1, "Low confidence should still produce at least 1 contract"
+
+    def test_zero_edge_returns_zero(self):
+        count, risk, details = uncertainty_kelly(
+            edge=0, price_cents=40, max_cost_cents=500, bankroll_cents=50000,
+            scenario_agreement=0.8, posterior_sigma=0.10,
+        )
+        assert count == 0
+
+    def test_confidence_decomposition(self):
+        """Details should expose agreement_mult, sigma_mult, and confidence."""
+        _, _, details = uncertainty_kelly(
+            edge=0.15, price_cents=40, max_cost_cents=500, bankroll_cents=50000,
+            scenario_agreement=0.8, posterior_sigma=0.10,
+        )
+        assert "confidence" in details
+        assert "agreement_mult" in details
+        assert "sigma_mult" in details
+        assert details["sigma_mult"] == 1.0  # 0.10/0.10 = 1.0

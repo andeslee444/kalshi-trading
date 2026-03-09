@@ -157,11 +157,28 @@ class BayesianEdgeEstimator:
             post_alpha = prior_alpha
             post_delta = prior_delta
 
-        # Time decay: same formula as longshot_edge()
-        time_factor = min(1.0, 0.5 + 0.5 * min(hours_to_close, 24) / 24)
+        # Time decay: aggressive sqrt curve, floor at 20%
+        # At 24h: 1.0, at 6h: 0.50, at 2h: 0.29, at 0.5h: 0.14 -> clamped to 0.20
+        time_factor = min(1.0, max(0.20, (min(hours_to_close, 24) / 24) ** 0.5))
+
+        # Category penalty: if category has poor calibration (>50% loss rate with
+        # enough data), apply 50% penalty to edge estimate
+        category_penalty = 1.0
+        if n_obs >= 10:
+            total_wins = sum(
+                b["wins"] for b in state["buckets"].values()
+            )
+            total_losses = sum(
+                b["losses"] for b in state["buckets"].values()
+            )
+            total = total_wins + total_losses
+            if total >= 10:
+                loss_rate = total_losses / total
+                if loss_rate > 0.50:
+                    category_penalty = 0.50
 
         # Overpricing and edge
-        overpricing_ratio = post_alpha * math.exp(-post_delta * price_cents) * time_factor
+        overpricing_ratio = post_alpha * math.exp(-post_delta * price_cents) * time_factor * category_penalty
         implied_prob = price_cents / 100.0
         mu_edge = max(0.0, implied_prob * overpricing_ratio)
 
@@ -368,6 +385,7 @@ class CorrelationAwareSizer:
         self._category_cap_pct = category_cap_pct
         self._single_trade_cap_pct = single_trade_cap_pct
         self._risk_by_category = {}  # category -> total risk cents today
+        self._last_reset_date = None
 
     def get_intra_category_rho(self, category):
         """Return default intra-category pairwise correlation."""
@@ -409,8 +427,12 @@ class CorrelationAwareSizer:
         self._risk_by_category[category] = self._risk_by_category.get(category, 0) + risk_cents
 
     def reset_daily(self):
-        """Clear daily tracking at start of new day."""
+        """Clear daily tracking at start of new day. Idempotent — skips if already reset today."""
+        today = datetime.date.today()
+        if self._last_reset_date == today:
+            return
         self._risk_by_category.clear()
+        self._last_reset_date = today
 
     def size_trade(self, edge_estimate, n_concurrent_same_category, bankroll_cents,
                    max_cost_cents, side="sell"):
@@ -537,11 +559,14 @@ class ScheduledScanner:
             self._wave_budgets[wave] = max(0, self._wave_budgets[wave] - cents)
 
     def reset_daily(self):
-        """Reset all wave budgets to their initial allocation."""
+        """Reset all wave budgets to their initial allocation. Idempotent — skips if already reset today."""
+        today = datetime.date.today()
+        if self._last_reset_date == today:
+            return
         self._wave_budgets = {}
         for w in self.WAVES:
             self._wave_budgets[w["id"]] = int(self._daily_budget * w["budget_pct"])
-        self._last_reset_date = datetime.date.today()
+        self._last_reset_date = today
 
     def next_scan_time(self):
         """Return datetime of next wave start, or None if no more waves today."""

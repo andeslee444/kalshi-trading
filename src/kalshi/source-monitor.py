@@ -9,10 +9,10 @@ Sources:
   3. NWS actual temperatures — every 10 min
 """
 
-import json, time, datetime, os, sys, re, hashlib, traceback
+import json, time, datetime, os, sys, re, hashlib
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from kalshi_auth import KalshiClient, load_trades, save_trade as _save_trade, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, quarter_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, nws_sigma_for_hour
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
 from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_threshold, check_sanity_health
@@ -26,6 +26,7 @@ setup_signal_handlers()
 CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-monitor-config.json"
 TRADES_PATH = PROJECT_DIR / "data" / "kalshi-monitor-trades.json"
 SNAPSHOTS_DIR = PROJECT_DIR / "data" / "kalshi-source-snapshots"
+METRICS_PATH = PROJECT_DIR / "data" / "source-monitor-metrics.json"
 
 # Ensure dirs
 TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -62,8 +63,75 @@ def save_snapshot(source_name, content, ext="html"):
     return fname
 
 MAX_DATA_AGE_HOURS = 168  # 7 days — same as entertainment-bot
+NWS_MAX_OBS_AGE_MINUTES = 90  # Skip NWS trades if observation is older than this
 
 _compute_data_age_hours = compute_data_age_hours  # backward compat alias
+
+
+def _compute_nws_obs_age_minutes(obs_ts):
+    """Compute age in minutes of an NWS observation timestamp.
+
+    Returns age in minutes, or None if timestamp is missing/unparseable.
+    """
+    if not obs_ts:
+        return None
+    try:
+        obs_dt = datetime.datetime.fromisoformat(obs_ts.replace("Z", "+00:00"))
+        age_seconds = (datetime.datetime.now(datetime.timezone.utc) - obs_dt).total_seconds()
+        return age_seconds / 60
+    except (ValueError, TypeError):
+        return None
+
+MAX_METRICS_ENTRIES = 1000  # Keep last 1000 scan metrics (rolling)
+
+
+def _build_scan_metrics(ss, sources_checked=None, nws_freshness=None):
+    """Build a metrics dict from a completed scan cycle.
+
+    Args:
+        ss: ScanSummary instance (after finalize)
+        sources_checked: list of source names checked this cycle
+        nws_freshness: dict of city -> obs_age_minutes (from check_nws)
+    """
+    metrics = {
+        "sources_checked": sources_checked or [],
+        "markets_fetched": ss.markets_fetched if ss else 0,
+        "markets_evaluated": ss.markets_evaluated if ss else 0,
+        "trades_placed": ss.trades_placed if ss else 0,
+        "skips": dict(ss.skips) if ss else {},
+        "data_sources": dict(ss.data_sources) if ss else {},
+    }
+    if nws_freshness:
+        metrics["nws_freshness"] = nws_freshness
+    return metrics
+
+
+def _log_scan_metrics(scan_data):
+    """Append per-scan metrics to the rolling metrics log.
+
+    Each entry captures: timestamp, NWS data freshness per city,
+    HDD data availability, trades placed, sigma values, and source status.
+    Keeps at most MAX_METRICS_ENTRIES entries (FIFO).
+    """
+    try:
+        existing = []
+        if METRICS_PATH.exists():
+            try:
+                existing = json.loads(METRICS_PATH.read_text())
+            except (json.JSONDecodeError, ValueError):
+                existing = []
+
+        scan_data["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        existing.append(scan_data)
+
+        # Trim to max entries
+        if len(existing) > MAX_METRICS_ENTRIES:
+            existing = existing[-MAX_METRICS_ENTRIES:]
+
+        METRICS_PATH.write_text(json.dumps(existing, indent=2, default=str))
+    except Exception as e:
+        log.warning(f"Failed to write scan metrics: {e}")
+
 
 def _check_with_retry(check_fn, source_name, prefetched, ss, max_retries=2):
     """Retry a source check with exponential backoff on transient failures."""
@@ -80,11 +148,10 @@ def _check_with_retry(check_fn, source_name, prefetched, ss, max_retries=2):
                 log.warning(f"{source_name} attempt {attempt+1} failed: {e}, retrying in {delay}s")
                 time.sleep(delay)
             else:
-                log.error(f"{source_name} failed after {max_retries+1} attempts: {e}")
+                log.error("%s failed after %d attempts: %s", source_name, max_retries+1, e, exc_info=True)
                 health.record_source_error(source_name, str(e))
                 if ss:
                     ss.source_fail(source_name, str(e))
-                traceback.print_exc()
 
 def _validate_market_cluster(entity_key, market_signals):
     """Check that markets for the same entity have monotonically decreasing
@@ -813,17 +880,17 @@ def check_nws(prefetched_markets=None, ss=None):
                     "timestamp": obs_ts,
                 }
                 log.info(f"  {city_code} ({station_id}): {temp_f:.1f}F ({temp_c:.1f}C) @ {obs_ts or '?'}")
-                # Check observation staleness
-                if obs_ts:
-                    try:
-                        obs_dt = datetime.datetime.fromisoformat(obs_ts.replace("Z", "+00:00"))
-                        obs_age_hours = (datetime.datetime.now(datetime.timezone.utc) - obs_dt).total_seconds() / 3600
-                        if obs_age_hours > 2:
-                            log.warning(f"  {city_code}: NWS observation is {obs_age_hours:.1f}h stale — skipping trades")
-                            del actual_temps[city_code]
-                            continue
-                    except (ValueError, TypeError):
-                        pass
+                # Check observation staleness — reject data older than NWS_MAX_OBS_AGE_MINUTES
+                obs_age_minutes = _compute_nws_obs_age_minutes(obs_ts)
+                if obs_age_minutes is not None:
+                    actual_temps[city_code]["obs_age_minutes"] = round(obs_age_minutes, 1)
+                    if obs_age_minutes > NWS_MAX_OBS_AGE_MINUTES:
+                        log.warning(f"  {city_code}: NWS observation is {obs_age_minutes:.0f}min stale (>{NWS_MAX_OBS_AGE_MINUTES}min) — skipping trades")
+                        del actual_temps[city_code]
+                        continue
+                elif not obs_ts:
+                    # No timestamp at all — warn but allow (fail-open for robustness)
+                    log.warning(f"  {city_code}: NWS observation has no timestamp — proceeding with caution")
             else:
                 log.info(f"  {city_code} ({station_id}): No temperature data available")
         except Exception as e:
@@ -912,16 +979,6 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
 
         log.info(f"  Found {len(today_markets)} temperature markets settling today")
 
-        now = datetime.datetime.now()
-
-        # Pre-dawn gate: running_high is meaningless before 8 AM
-        # The daily high hasn't started building yet
-        if now.hour < 8:
-            log.info(f"  NWS: skipping all cities — pre-dawn ({now.hour}:00), running_high unreliable")
-            if ss:
-                ss.skip("pre_dawn")
-            return
-
         # Group by city for consistency validation
         by_city = {}
         for m, parsed in today_markets:
@@ -934,6 +991,19 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
             if city not in temp_data or "running_high_f" not in temp_data[city]:
                 continue
 
+            # Use city-local hour for pre-dawn gate, sigma model, and edge thresholds
+            city_tz = ZoneInfo(CITY_TIMEZONES.get(city, "America/New_York"))
+            city_now = datetime.datetime.now(city_tz)
+            city_hour = city_now.hour
+
+            # Pre-dawn gate: running_high is meaningless before 8 AM local time
+            # The daily high hasn't started building yet
+            if city_hour < 8:
+                log.info(f"  NWS: skipping {city} — pre-dawn ({city_hour}:00 local), running_high unreliable")
+                if ss:
+                    ss.skip("pre_dawn")
+                continue
+
             running_high = temp_data[city]["running_high_f"]
 
             # Validate threshold market consistency for this city
@@ -941,7 +1011,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
             for m, parsed in city_markets:
                 if parsed["direction"] == "T":
                     threshold = parsed["threshold"]
-                    prob = nws_probability(running_high, threshold, "T", now.hour)
+                    prob = nws_probability(running_high, threshold, "T", city_hour)
                     threshold_signals.append((m, threshold, prob))
 
             consistent_tickers = set()
@@ -963,7 +1033,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                 max_cost = config["maxTradeAmount"] * 100
                 is_bracket = (direction == "B")
 
-                prob = nws_probability(running_high, threshold, direction, now.hour)
+                prob = nws_probability(running_high, threshold, direction, city_hour)
 
                 yes_ask = m.get("yes_ask", 0)
                 no_ask = m.get("no_ask", 0)
@@ -985,7 +1055,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                 if prob > 0.5 and yes_ask and yes_ask < 99:
                     # Buy YES (raw edge, fees handled in Kelly)
                     edge = prob - yes_ask / 100
-                    min_edge = _nws_min_edge(running_high, threshold, now.hour, is_bracket)
+                    min_edge = _nws_min_edge(running_high, threshold, city_hour, is_bracket)
                     if edge <= min_edge:
                         if ss:
                             ss.skip("low_edge")
@@ -993,7 +1063,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             ticker, "yes", "skipped", "edge_below_min",
                             edge=round(edge, 4), price_cents=yes_ask, min_edge=min_edge,
                             confidence=round(prob, 4), running_high=round(running_high, 1),
-                            city=city, threshold=threshold, hour=now.hour,
+                            city=city, threshold=threshold, hour=city_hour,
                         )
                         continue
                     budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=prob, source_type="nws")
@@ -1017,7 +1087,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                         )
                         continue
                     if direction == "T":
-                        reasoning = f"NWS {city} running high {running_high:.1f}F > {threshold}F by {margin:.1f}F, prob {prob*100:.0f}% (hour {now.hour})"
+                        reasoning = f"NWS {city} running high {running_high:.1f}F > {threshold}F by {margin:.1f}F, prob {prob*100:.0f}% (hour {city_hour})"
                     else:
                         reasoning = f"NWS {city} running high {running_high:.1f}F in bracket [{threshold}, {threshold+1})F, prob {prob*100:.0f}%"
                     log.info(f"\nARBITRAGE FOUND: NWS {city} high {running_high:.1f}F -> YES on {ticker}")
@@ -1030,7 +1100,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                                                         kelly_fraction=kelly_details.get("kelly_fraction"),
                                                         bankroll_used=kelly_details.get("bankroll_used"),
                                                         running_high=round(running_high, 1),
-                                                        hour_of_day=now.hour,
+                                                        hour_of_day=city_hour,
                                                         city=city, direction=direction, threshold=threshold,
                                                         source_type="nws")
                     if result:
@@ -1040,7 +1110,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             ticker, "yes", "placed", "nws_arb",
                             edge=round(edge, 4), price_cents=price, count=count,
                             confidence=round(prob, 4), running_high=round(running_high, 1),
-                            city=city, threshold=threshold, hour=now.hour,
+                            city=city, threshold=threshold, hour=city_hour,
                         )
                         allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
@@ -1048,7 +1118,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     # Buy NO (raw edge, fees handled in Kelly)
                     no_prob = 1.0 - prob
                     edge = no_prob - no_ask / 100
-                    min_edge = _nws_min_edge(running_high, threshold, now.hour, is_bracket)
+                    min_edge = _nws_min_edge(running_high, threshold, city_hour, is_bracket)
                     if edge <= min_edge:
                         if ss:
                             ss.skip("low_edge")
@@ -1056,7 +1126,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             ticker, "no", "skipped", "edge_below_min",
                             edge=round(edge, 4), price_cents=no_ask, min_edge=min_edge,
                             confidence=round(no_prob, 4), running_high=round(running_high, 1),
-                            city=city, threshold=threshold, hour=now.hour,
+                            city=city, threshold=threshold, hour=city_hour,
                         )
                         continue
                     budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=no_prob, source_type="nws")
@@ -1080,7 +1150,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                         )
                         continue
                     if direction == "T":
-                        reasoning = f"NWS {city} running high {running_high:.1f}F < {threshold}F by {abs(margin):.1f}F, prob NO {no_prob*100:.0f}% (hour {now.hour})"
+                        reasoning = f"NWS {city} running high {running_high:.1f}F < {threshold}F by {abs(margin):.1f}F, prob NO {no_prob*100:.0f}% (hour {city_hour})"
                     else:
                         reasoning = f"NWS {city} running high {running_high:.1f}F outside bracket [{threshold}, {threshold+1})F, prob NO {no_prob*100:.0f}%"
                     log.info(f"\nARBITRAGE FOUND: NWS {city} high {running_high:.1f}F -> NO on {ticker}")
@@ -1093,7 +1163,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                                                         kelly_fraction=kelly_details.get("kelly_fraction"),
                                                         bankroll_used=kelly_details.get("bankroll_used"),
                                                         running_high=round(running_high, 1),
-                                                        hour_of_day=now.hour,
+                                                        hour_of_day=city_hour,
                                                         city=city, direction=direction, threshold=threshold,
                                                         source_type="nws")
                     if result:
@@ -1103,13 +1173,12 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             ticker, "no", "placed", "nws_arb",
                             edge=round(edge, 4), price_cents=price, count=count,
                             confidence=round(no_prob, 4), running_high=round(running_high, 1),
-                            city=city, threshold=threshold, hour=now.hour,
+                            city=city, threshold=threshold, hour=city_hour,
                         )
                         allocator.record_trade("source-monitor", ticker, risk, edge=edge)
 
     except Exception as e:
-        log.error(f"  NWS market matching failed: {e}")
-        traceback.print_exc()
+        log.error("  NWS market matching failed: %s", e, exc_info=True)
 
 
 # ============================================================
@@ -1133,9 +1202,14 @@ def _nws_interval_seconds(config):
 # ============================================================
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Settlement source monitor (info arbitrage)")
+    parser.add_argument("--once", action="store_true", help="Run single scan of all sources then exit")
+    args = parser.parse_args()
+
     log.info("=" * 70)
     log.info("Kalshi Settlement Source Monitor -- Information Arbitrage Bot")
-    log.info(f"   Mode: {config['mode']} | Max: ${config['maxTradeAmount']}/trade | Daily limit: {config['maxDailyTrades']} trades")
+    log.info(f"   Mode: {os.environ.get('KALSHI_MODE', 'demo')} | Max: ${config['maxTradeAmount']}/trade | Daily limit: {config['maxDailyTrades']} trades")
     log.info(f"   Sources: HDD={config['sources']['hdd']['enabled']} | BoxOffice={config['sources']['boxoffice']['enabled']} | NWS={config['sources']['nws']['enabled']}")
     log.info("=" * 70)
 
@@ -1150,6 +1224,33 @@ def main():
     last_hdd = 0
     last_boxoffice = 0
     last_nws = 0
+
+    if args.once:
+        # Run one full cycle of all enabled sources
+        ss = ScanSummary("source-monitor", log)
+        prefetched = {}
+        sources_checked = []
+        if config["sources"]["hdd"]["enabled"]:
+            album_markets = get_markets_by_prefix("KXALBUMSALES")
+            if not album_markets:
+                album_markets = get_markets_by_prefix("KXALBUM")
+            prefetched["album"] = album_markets
+            _check_with_retry(check_hdd, "hdd", prefetched, ss)
+            sources_checked.append("hdd")
+        if config["sources"]["boxoffice"]["enabled"]:
+            box_markets = []
+            for prefix in ["KXBOXOFFICE", "KXBOX", "KXMOVIE", "KXFILM"]:
+                box_markets.extend(get_markets_by_prefix(prefix))
+            prefetched["boxoffice"] = box_markets
+            _check_with_retry(scan_boxoffice, "boxoffice", prefetched, ss)
+            sources_checked.append("boxoffice")
+        if config["sources"]["nws"]["enabled"]:
+            prefetched["weather"] = get_markets_by_prefix("KXHIGH")
+            _check_with_retry(check_nws, "nws", prefetched, ss)
+            sources_checked.append("nws")
+        ss.finalize()
+        _log_scan_metrics(_build_scan_metrics(ss, sources_checked=sources_checked))
+        return
 
     hdd_interval = config["sources"]["hdd"]["intervalMinutes"] * 60
     box_interval = config["sources"]["boxoffice"]["intervalMinutes"] * 60
@@ -1193,8 +1294,11 @@ def main():
                 if need_nws:
                     prefetched["weather"] = get_markets_by_prefix("KXHIGH")
 
+            sources_this_cycle = []
+
             if need_hdd:
                 _check_with_retry(check_hdd, "hdd", prefetched, ss)
+                sources_this_cycle.append("hdd")
                 last_hdd = now
 
             if need_box:
@@ -1205,23 +1309,25 @@ def main():
                 day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
                 if day_names[dow] in active_days:
                     _check_with_retry(scan_boxoffice, "boxoffice", prefetched, ss)
+                    sources_this_cycle.append("boxoffice")
                 else:
                     log.info(f"  Box office: skipping (not an active day)")
                 last_boxoffice = now
 
             if need_nws:
                 _check_with_retry(check_nws, "nws", prefetched, ss)
+                sources_this_cycle.append("nws")
                 last_nws = now
 
             if ss:
                 ss.finalize()
+                _log_scan_metrics(_build_scan_metrics(ss, sources_checked=sources_this_cycle))
 
             # Record heartbeat AFTER successful cycle (not before)
             health.record_bot_heartbeat("source-monitor")
 
         except Exception as e:
-            log.error(f"Main loop error: {e}")
-            traceback.print_exc()
+            log.error("Main loop error: %s", e, exc_info=True)
 
         if is_shutdown_requested():
             log.info("Graceful shutdown requested, exiting.")

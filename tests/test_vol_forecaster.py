@@ -215,3 +215,50 @@ class TestDCCWarmup:
         corr = dcc.correlation_matrix()
         assert corr is not None
         assert corr[0, 1] > 0.2  # should detect positive correlation
+
+
+class TestGARCHVolCeiling:
+    """GARCH vol should be bounded after extreme events (flash crashes)."""
+
+    def test_garch_bounded_after_extreme_return(self):
+        """GARCH vol should be bounded even after a 10% flash crash."""
+        from vol_forecaster import GARCHForecaster
+        garch = GARCHForecaster()
+        # Feed 100 calm returns then a 10% crash
+        for _ in range(100):
+            garch.update(0.001, interval_seconds=300)
+        garch.update(-0.10, interval_seconds=300)  # 10% crash
+        vol = garch.forecast_vol(use_actual_interval=True)
+        assert vol is not None
+        assert vol <= 2.0, f"GARCH vol after crash should be bounded at 200%, got {vol*100:.0f}%"
+        assert vol > 0.10, f"GARCH vol after crash should still reflect elevated risk, got {vol*100:.0f}%"
+
+    def test_garch_bounded_after_multiple_shocks(self):
+        """Multiple consecutive shocks should not cause vol explosion."""
+        from vol_forecaster import GARCHForecaster
+        garch = GARCHForecaster()
+        for _ in range(15):
+            garch.update(0.001, interval_seconds=300)
+        # Multiple large shocks
+        for _ in range(5):
+            garch.update(-0.08, interval_seconds=300)
+        vol = garch.forecast_vol(use_actual_interval=True)
+        assert vol is not None
+        assert vol <= 2.0, f"GARCH vol should be capped at 200%, got {vol*100:.0f}%"
+
+    def test_garch_ceiling_allows_elevated_vol(self):
+        """Vol should be elevated after a shock, just not exploded."""
+        from vol_forecaster import GARCHForecaster
+        garch = GARCHForecaster()
+        for _ in range(20):
+            garch.update(0.001, interval_seconds=300)
+        calm_vol = garch.forecast_vol(use_actual_interval=True)
+        garch.update(-0.05, interval_seconds=300)
+        shock_vol = garch.forecast_vol(use_actual_interval=True)
+        assert shock_vol > calm_vol, "Shock should increase vol"
+        assert shock_vol <= 2.0, f"But bounded at 200%, got {shock_vol*100:.0f}%"
+
+    def test_garch_max_annualized_vol_constant(self):
+        """MAX_ANNUALIZED_VOL should be 2.0 (200%)."""
+        from vol_forecaster import GARCHForecaster
+        assert GARCHForecaster.MAX_ANNUALIZED_VOL == 2.0

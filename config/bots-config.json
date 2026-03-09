@@ -1,4 +1,5 @@
 {
+  "_naming_convention": "Single-word sections: flat (crypto, weather, economics). Multi-word: snake_case (position_monitor, market_maker, cross_platform_arb). Values in dollars unless key ends with Cents. Times in minutes unless key ends with Hours or Seconds.",
   "weather": {
     "exit": {
       "takeProfitCents": 80,
@@ -10,14 +11,14 @@
     }
   },
   "entertainment": {
-    "enabled": false,
+    "enabled": true,
     "sanityProject": "8aky18h3",
     "sanityApiVersion": "2021-10-21",
-    "maxTradeAmount": 15,
-    "maxTradeAmountPct": 0.03,
-    "maxDailyTrades": 10,
-    "maxDailyLoss": 50,
-    "maxDailyLossPct": 0.05,
+    "maxTradeAmount": 5,
+    "maxTradeAmountPct": 0.02,
+    "maxDailyTrades": 5,
+    "maxDailyLoss": 10,
+    "maxDailyLossPct": 0.03,
     "confidenceThreshold": 0.70,
     "scanIntervalMinutes": 15,
     "tickers": ["ALBUM", "BOX", "MOVIE", "STREAM", "MUSIC", "BILLBOARD", "OSCAR", "GRAMMY", "SPOTIFY", "FILM", "ENTERTAIN"],
@@ -31,9 +32,9 @@
     }
   },
   "beatrelease": {
-    "enabled": false,
+    "enabled": true,
     "checkIntervalHours": 1,
-    "maxTradeCents": 1500,
+    "maxTradeAmount": 15,
     "maxTradeAmountPct": 0.03,
     "maxDailyTrades": 10,
     "maxDailyLoss": 50,
@@ -53,8 +54,9 @@
     }
   },
   "strategy": {
-    "maxBetCents": 1000,
-    "maxBetPct": 0.02,
+    "enabled": true,
+    "maxTradeAmount": 10,
+    "maxTradeAmountPct": 0.02,
     "maxDailyTrades": 20,
     "maxDailyLoss": 100,
     "maxDailyLossPct": 0.10,
@@ -88,21 +90,11 @@
     "maxDailyLossPct": 0.10,
     "scanIntervalMinutes": 5,
     "edgeThreshold": 0.08,
-    "midRangeEdgeThreshold": 0.15,
-    "midRangeLow": 0.25,
-    "midRangeHigh": 0.75,
     "driftPct": 0.0,
     "settlementBufferMinutes": 1,
-    "useOrnsteinUhlenbeck": true,
+    "useOrnsteinUhlenbeck": false,
     "ouHalfLifeMinutes": 120,
     "enableBrackets": true,
-    "useJumpDiffusion": true,
-    "jumpDiffusion": {
-      "jumpIntensity": 1.0,
-      "jumpMean": -0.05,
-      "jumpStd": 0.10,
-      "maxJumps": 10
-    },
     "pfProcessNoise": 0.005,
     "pfObservationNoise": 0.05,
     "pfParticles": 200,
@@ -169,14 +161,15 @@
     "maxConcurrentPositions": 30,
     "absoluteDailyLossCap": 750,
     "absoluteDailyLossCapPct": 0.15,
+    "drawdownHaltThreshold": 0.80,
     "perBotDailyLimit": {
       "weather": 200,
       "economics": 300,
       "crypto": 150,
       "strategy": 150,
       "monitor": 100,
-      "entertainment": 0,
-      "beatrelease": 0,
+      "entertainment": 50,
+      "beatrelease": 200,
       "arb": 0
     }
   },
@@ -199,12 +192,6 @@
     "tailDepKellyThreshold": 0.15,
     "tailDepKellyCut": 0.25,
     "varConfidence": 0.99,
-    "copulaDf": 5,
-    "minTradesForEmpirical": 10,
-    "empiricalWeightCap": 0.50
-  },
-  "regime": {
-    "enabled": true,
-    "maxAgeHours": 24
+    "copulaDf": 5
   }
 }

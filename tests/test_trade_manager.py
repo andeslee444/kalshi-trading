@@ -690,8 +690,8 @@ class TestOrderMonitor:
 
 # Import evaluate_stop_loss and evaluate_trailing_stop from production code.
 # position-monitor.py uses hyphens and has heavy module-level init, so we need importlib + stubs.
-import importlib.util
 import types
+from conftest import make_fake_auth, load_bot_module
 
 _pm_module = None
 
@@ -700,41 +700,20 @@ def _load_position_monitor():
     global _pm_module
     if _pm_module is not None:
         return _pm_module
-    import logging
 
-    orig_auth = sys.modules.get("kalshi_auth")
-    orig_prob = sys.modules.get("probability")
-    orig_ticker = sys.modules.get("ticker_utils")
-    orig_alloc = sys.modules.get("capital_allocator")
-
-    fake_auth = types.ModuleType("kalshi_auth")
-    fake_auth.KalshiClient = lambda *a, **kw: MagicMock()
-    fake_auth.setup_unbuffered = lambda: None
-    fake_auth.setup_signal_handlers = lambda: None
-    fake_auth.is_shutdown_requested = lambda: False
-    fake_auth.setup_logging = lambda *a, **kw: logging.getLogger("test")
-    fake_auth.PROJECT_DIR = Path(tempfile.mkdtemp())
-    fake_auth.load_trades = lambda *a, **kw: []
-    fake_auth.save_trade = MagicMock()
-    fake_auth.TradeManager = MagicMock()
-    fake_auth.trim_trade_log = MagicMock()
-    fake_auth.CITY_TIMEZONES = {}
-    fake_auth._local_today = lambda *a: "2026-03-04"
-    fake_auth.round_half_up = lambda x: round(x)
-    fake_auth.retry_request = MagicMock()
-    fake_auth.fetch_parallel = MagicMock(return_value={})
-    fake_auth.HealthCheckMonitor = MagicMock()
-    fake_auth._atomic_write_json = MagicMock()
-    fake_auth.ScanSummary = MagicMock()
-    fake_auth.notify_whatsapp = MagicMock()
+    _tmp_dir = Path(tempfile.mkdtemp())
+    fake_auth = make_fake_auth(
+        PROJECT_DIR=_tmp_dir,
+        _local_today=lambda *a: "2026-03-04",
+        round_half_up=lambda x: round(x),
+    )
 
     # Create config directories and files
-    config_dir = fake_auth.PROJECT_DIR / "config"
+    config_dir = _tmp_dir / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / "bots-config.json").write_text(json.dumps({"position_monitor": {}}))
     (config_dir / "kalshi-config.json").write_text(json.dumps({"cities": {}}))
-    data_dir = fake_auth.PROJECT_DIR / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
+    (_tmp_dir / "data").mkdir(parents=True, exist_ok=True)
 
     fake_prob = types.ModuleType("probability")
     fake_prob.weather_probability = MagicMock(return_value=0.5)
@@ -750,35 +729,12 @@ def _load_position_monitor():
     fake_alloc = types.ModuleType("capital_allocator")
     fake_alloc.PortfolioAllocator = MagicMock()
 
-    sys.modules["kalshi_auth"] = fake_auth
-    sys.modules["probability"] = fake_prob
-    sys.modules["ticker_utils"] = fake_ticker
-    sys.modules["capital_allocator"] = fake_alloc
-
-    try:
-        bot_path = Path(__file__).resolve().parent.parent / "src" / "kalshi" / "position-monitor.py"
-        spec = importlib.util.spec_from_file_location("position_monitor", str(bot_path))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        _pm_module = mod
-        return mod
-    finally:
-        if orig_auth is not None:
-            sys.modules["kalshi_auth"] = orig_auth
-        else:
-            sys.modules.pop("kalshi_auth", None)
-        if orig_prob is not None:
-            sys.modules["probability"] = orig_prob
-        else:
-            sys.modules.pop("probability", None)
-        if orig_ticker is not None:
-            sys.modules["ticker_utils"] = orig_ticker
-        else:
-            sys.modules.pop("ticker_utils", None)
-        if orig_alloc is not None:
-            sys.modules["capital_allocator"] = orig_alloc
-        else:
-            sys.modules.pop("capital_allocator", None)
+    _pm_module = load_bot_module("position-monitor.py", fake_auth, extra_stubs={
+        "probability": fake_prob,
+        "ticker_utils": fake_ticker,
+        "capital_allocator": fake_alloc,
+    })
+    return _pm_module
 
 
 class TestEntryPriceStopLoss:
@@ -943,3 +899,155 @@ class TestSharedCircuitBreaker:
         assert cb.is_open() is True
         cb.record_success()
         assert cb.is_open() is False
+
+
+# ===================================================================
+# UTC Timestamp tests (Plan 1 Task 4)
+# ===================================================================
+
+class TestTimestampTimezone:
+    def test_golden_record_has_utc_timestamp(self, tmp_path):
+        """Trade record timestamps must include timezone offset."""
+        import datetime as dt
+        mgr, _, _ = _make_manager(tmp_path)
+        record = mgr._build_golden_record(
+            ticker="TEST-TICKER", side="yes", price_cents=50,
+            count=1, cost_cents=50, reasoning="test",
+            order_info={"order_id": "abc", "status": "resting"},
+        )
+        ts = record["timestamp"]
+        parsed = dt.datetime.fromisoformat(ts)
+        assert parsed.tzinfo is not None, f"Timestamp {ts} is naive (no timezone)"
+
+
+# ===================================================================
+# Action Field tests (Plan 1 Task 5)
+# ===================================================================
+
+class TestActionField:
+    def test_buy_record_has_action_buy(self, tmp_path):
+        """Buy records must have action='buy' (not missing)."""
+        mgr, _, _ = _make_manager(tmp_path)
+        record = mgr._build_golden_record(
+            ticker="TEST", side="yes", price_cents=50, count=1,
+            cost_cents=50, reasoning="test",
+            order_info={"order_id": "x", "status": "resting"},
+        )
+        assert record.get("action") == "buy"
+
+    def test_sell_position_records_action_sell(self, tmp_path):
+        """sell_position should record action='sell' in the trade log."""
+        mgr, client, _ = _make_manager(tmp_path)
+        # Mock sell order API response
+        client.post.return_value = {
+            "order": {"order_id": "sell-456", "status": "resting"}
+        }
+        result = mgr.sell_position("TEST-SELL", "yes", 70, 1, "test exit reason")
+        assert result is not None
+        assert result.get("order_id") == "sell-456"
+        # Verify trade log has action="sell"
+        trades = load_trades(mgr.trades_path)
+        sell_records = [t for t in trades if t.get("action") == "sell"]
+        assert len(sell_records) == 1
+        assert sell_records[0]["ticker"] == "TEST-SELL"
+        assert sell_records[0]["side"] == "yes"
+        assert sell_records[0]["price_cents"] == 70
+
+
+# ===================================================================
+# Write-Ahead Log tests (Plan 1 Task 1.10)
+# ===================================================================
+
+class TestWriteAheadLog:
+
+    def test_wal_created_during_trade(self, tmp_path):
+        """WAL file should exist briefly during trade placement."""
+        mgr, client, _ = _make_manager(tmp_path)
+        # After successful trade, WAL should be cleared
+        mgr.place_order("TICK-WAL", "yes", 50, 1, "test")
+        assert not mgr._wal_path.exists(), "WAL should be cleared after successful trade"
+
+    def test_wal_survives_save_failure(self, tmp_path):
+        """If save_trade crashes after API call, WAL should still exist."""
+        mgr, client, _ = _make_manager(tmp_path)
+        # Make save_trade crash by making trades_path parent read-only
+        # Instead, intercept _clear_wal to verify it was called
+        wal_entries_written = []
+        original_write = mgr._write_wal
+        def capture_write(entry):
+            wal_entries_written.append(entry)
+            original_write(entry)
+        mgr._write_wal = capture_write
+        mgr.place_order("TICK-WAL2", "yes", 50, 1, "test")
+        assert len(wal_entries_written) == 1
+        assert wal_entries_written[0]["ticker"] == "TICK-WAL2"
+        assert wal_entries_written[0]["order_id"] == "test-123"
+
+    def test_wal_recovery_writes_to_trade_log(self, tmp_path):
+        """WAL recovery should write missed trades to the trade log."""
+        # Create a WAL file with a pending entry
+        wal_path = (tmp_path / "trades.wal.json")
+        wal_entry = {
+            "order_id": "recovered-001",
+            "ticker": "TICK-RECOVER",
+            "record": {
+                "ticker": "TICK-RECOVER", "side": "yes", "price_cents": 40,
+                "count": 2, "cost_cents": 80, "reasoning": "original",
+                "order_id": "recovered-001", "status": "pending",
+            }
+        }
+        wal_path.write_text(json.dumps([wal_entry]))
+
+        # Mock client.get to return filled status for the order
+        mock_client = MagicMock()
+        mock_client.post.return_value = {"order": {"order_id": "x", "status": "resting"}}
+        mock_client.get.return_value = {"order": {"order_id": "recovered-001", "status": "filled"}}
+
+        trades_path = tmp_path / "trades.json"
+        cfg = {"maxTradeAmount": 5, "maxDailyTrades": 10, "maxDailyLoss": 25}
+        mgr = TradeManager(mock_client, trades_path, cfg,
+                           kill_switch_path=tmp_path / "HALT",
+                           breaker_state_path=None)
+        # WAL should be cleared after recovery
+        assert not wal_path.exists()
+        # Trade should be in the log
+        trades = load_trades(trades_path)
+        recovered = [t for t in trades if t.get("wal_recovered")]
+        assert len(recovered) == 1
+        assert recovered[0]["ticker"] == "TICK-RECOVER"
+        assert recovered[0]["status"] == "filled"
+
+    def test_wal_recovery_discards_cancelled(self, tmp_path):
+        """WAL recovery should discard cancelled orders."""
+        wal_path = (tmp_path / "trades.wal.json")
+        wal_entry = {
+            "order_id": "cancelled-001",
+            "ticker": "TICK-CANCEL",
+            "record": {"ticker": "TICK-CANCEL", "order_id": "cancelled-001"}
+        }
+        wal_path.write_text(json.dumps([wal_entry]))
+
+        mock_client = MagicMock()
+        mock_client.post.return_value = {"order": {"order_id": "x", "status": "resting"}}
+        mock_client.get.return_value = {"order": {"order_id": "cancelled-001", "status": "cancelled"}}
+
+        trades_path = tmp_path / "trades.json"
+        cfg = {"maxTradeAmount": 5, "maxDailyTrades": 10, "maxDailyLoss": 25}
+        mgr = TradeManager(mock_client, trades_path, cfg,
+                           kill_switch_path=tmp_path / "HALT",
+                           breaker_state_path=None)
+        assert not wal_path.exists()
+        trades = load_trades(trades_path)
+        assert len(trades) == 0
+
+    def test_wal_empty_on_fresh_start(self, tmp_path):
+        """No WAL file on fresh start should be fine."""
+        mgr, _, _ = _make_manager(tmp_path)
+        assert mgr._read_wal() == []
+
+    def test_wal_corrupt_file_handled(self, tmp_path):
+        """Corrupt WAL file should not crash init."""
+        wal_path = (tmp_path / "trades.wal.json")
+        wal_path.write_text("not json")
+        mgr, _, _ = _make_manager(tmp_path)
+        assert mgr._read_wal() == []

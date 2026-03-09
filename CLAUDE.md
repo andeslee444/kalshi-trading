@@ -17,18 +17,29 @@ RSA private keys go in `config/keys/` (gitignored): `kalshi-demo.pem`, `kalshi-l
 
 ## Data Sync
 
-Trade logs in `data/` are gitignored but essential for backtesting and auditing. S3 syncs them between machines (Mac Mini production ↔ MacBook development).
+Trade logs in `data/` are gitignored but essential for backtesting and auditing. S3 syncs them between machines (Mac Mini production → MacBook development).
 
 ```bash
 npm run sync:setup   # Create S3 bucket (one-time)
-npm run sync:up      # Push trade logs + calibration to S3
-npm run sync:down    # Pull trade logs + calibration from S3
+npm run sync:full    # RECOMMENDED: snapshot → reconcile → validate → upload
+npm run sync:up      # Upload only (with pre-upload validation)
+npm run sync:down    # Pull from S3 (with post-download integrity report)
+npm run sync:check   # Data integrity report without syncing
 ```
 
 Requires AWS CLI configured with credentials. Set `S3_BUCKET` in `.env` (defaults to `kalshi-trading-logs`).
 
-**Synced:** `data/kalshi-*-trades.json`, `data/beatrelease-trades.json`, `data/beatrelease-state.json`, `data/backtest-results.json`, `config/calibration.json`.
-**Excluded:** `data/logs/`, `data/pids/`, `data/HALT_TRADING`, market caches, demo trades, source snapshots.
+**Synced (trade logs):** All files in `trade_files.py` — `kalshi-*-trades.json`, `beatrelease-trades.json`.
+**Synced (analytics):** `financial-snapshot.json`, `backtest-results.json`, `performance-metrics.json`, `deposits.json`.
+**Synced (observability):** `health-state.json`, `allocator-state.json`, `scan-summaries.json`, `circuit-breaker-state.json`, `*-decisions.json`, `*-metrics.json`.
+**Synced (model state):** `correlation-state.json`, `regime-state.json`, `pf-state-crypto.json`, `weather-verification.json`, `nowcast-history.json`, `crypto-price-history.json`.
+**Synced (config):** `config/calibration.json`, `config/bayes-params.json`.
+**Synced (logs):** `data/logs/*.log`.
+**Excluded:** `data/pids/`, `data/HALT_TRADING`, market caches, demo trades, source snapshots, temp files.
+
+**Pre-upload validation** blocks sync if trade logs are corrupt, truncated, or missing `source_bot`. **Post-download report** shows trade counts, reconciliation status, snapshot freshness, and bot heartbeats. **Sync manifest** logs every upload with file sizes, trade counts, and timestamps for audit trail.
+
+**Cron:** `scripts/sync-up-cron.sh` runs the full workflow (snapshot → reconcile → upload) on schedule.
 
 ## Running Bots
 
@@ -84,7 +95,7 @@ FastAPI web UI for real-time monitoring (default port 3456).
 npm run dashboard    # Start web server at http://localhost:3456
 ```
 
-Key API endpoints: `/api/bots` (status), `/api/account` (balance/P&L), `/api/trades` (recent fills), `/api/decisions` (bot decision logs), `/api/risk` (per-bot daily risk), `/api/settlements` (settled P&L, win rate), `/api/positions`, `/api/health`, `/api/logs`. Frontend served from `scripts/dashboard.html`.
+Key API endpoints: `/api/bots` (status), `/api/account` (balance/P&L), `/api/trades` (recent fills), `/api/decisions` (bot decision logs), `/api/risk` (per-bot daily risk), `/api/settlements` (settled P&L, win rate), `/api/positions`, `/api/health`, `/api/logs`, `/api/snapshot` (verified P&L snapshot). Frontend served from `scripts/dashboard.html`.
 
 ### Daily Automation
 
@@ -95,8 +106,10 @@ npm run backtest:daily      # Daily backtest with >10% drift detection alert
 npm run audit               # Comprehensive math & strategy audit
 npm run reconcile           # Annotate trade records with settlement outcomes
 npm run backfill            # Backfill settlement data from market endpoints
+npm run snapshot            # Verified P&L snapshot (Kalshi API + local logs)
 ```
 
+- **`pnl-snapshot.py`** — Dual-source verified P&L: fetches Kalshi API settlements/fills/positions, loads local trade logs, cross-references both, writes `data/financial-snapshot.json`. Flags: `--print` (stdout), `--pull-s3` (pull S3 data first). **This is the authoritative source for P&L data** — read `data/financial-snapshot.json` instead of computing P&L from raw trade logs.
 - **`audit.py`** — Programmatic audit covering P&L truth, data integrity, backtesting realism, execution slippage, sizing math, and per-bot edge validation. Uses severity levels (PASS/WARN/FAIL/INFO). Flags: `--json`, `--section N`, `--reconcile`.
 - **`reconcile-trades.py`** — Walks all trade log files, matches to API settlement/fill data, writes back `settlement_result`, `realized_edge`. Idempotent; `--dry-run` available.
 - **`backfill-settlements.py`** — Queries individual `/markets/{ticker}` endpoints for unsettled trades. Complements reconcile. Flags: `--dry-run`, `--report`.
@@ -111,11 +124,13 @@ npm run backfill            # Backfill settlement data from market endpoints
 | `allocator-state.json` | Capital allocator | Dashboard, bots | Circuit breaker status, allocation state |
 | `*-decisions.json` | Each bot | Dashboard | Every market evaluated with trade/skip reason |
 | `*-last-run.json` | One-shot bots | Supervisor | Completion markers (strategy, hdd, beatrelease) |
+| `financial-snapshot.json` | pnl-snapshot.py | Dashboard, Claude | Verified P&L with dual-source cross-check |
+| `deposits.json` | Manual | pnl-snapshot.py | Deposit/withdrawal ledger for ROI calculation |
 
 ## Testing
 
 ```bash
-pytest tests/                      # Run all tests (41 test files, ~1259 tests)
+pytest tests/                      # Run all tests (67 test files, ~20K lines)
 pytest tests/ -v                   # Verbose output
 pytest tests/test_kelly.py         # Run specific test file
 pytest tests/test_kelly.py -k "test_returns_zero"  # Run matching tests
@@ -129,6 +144,28 @@ Tests cover pure functions — no API calls or credentials required.
 - Bots instantiate `KalshiClient` and read config at module-level import time, so tests must stub `kalshi_auth` in `sys.modules` before importing bot modules (see `test_kelly.py:_load_strategy_trader()` for the pattern).
 - Probability tests must call `_reset_calibration()` in setup/teardown to clear cached calibration state between tests.
 
+## P&L and Financial Data
+
+**To answer questions about P&L, deposits, balance, or trading performance, read `data/financial-snapshot.json`.** This is the single source of truth — it cross-references Kalshi API settlements against local trade logs and flags discrepancies. Do NOT compute P&L manually from trade log files (the `settlement_revenue_cents` field uses inconsistent semantics).
+
+Key fields in the snapshot:
+- `account.nav_cents` — Current net asset value (balance + open positions)
+- `realized_pnl.total_cents` — Authoritative realized P&L from API settlements (`revenue - yes_total_cost - no_total_cost`)
+- `realized_pnl.by_bot` — Per-bot P&L, wins, losses, fees, win rate
+- `realized_pnl.by_day` — Daily P&L breakdown
+- `balance_check` — **Ground truth P&L** derived from `NAV - deposits`. Use this for true total P&L and true unrealized P&L (the `unrealized_pnl` section is unreliable because Kalshi's `market_exposure` returns cost basis, not current market value)
+- `balance_check.true_total_pnl_cents` — Authoritative total P&L (NAV minus deposits)
+- `balance_check.implied_unrealized_cents` — True unrealized = total P&L minus realized net
+- `verification.status` — "ok", "warnings", or "errors" (cross-check results)
+- `deposits.roi_pct` — ROI based on true total P&L (NAV - deposits) / deposits
+
+**Kalshi API P&L gotcha:** The API's `revenue` field is **gross payout** (cost recovery + profit), NOT net profit. Always use `revenue - yes_total_cost - no_total_cost` for actual P&L. The `fee_cost` field is dollars as a string (e.g., `"0.04"`), not cents.
+
+To track deposits/withdrawals for ROI, maintain `data/deposits.json`:
+```json
+[{"date": "2026-02-15", "type": "deposit", "amount_cents": 50000, "note": "initial funding"}]
+```
+
 ## Performance Analysis
 
 ```bash
@@ -141,7 +178,7 @@ python3 scripts/analyze-performance.py --reconcile   # With API reconciliation (
 
 ### Shared Modules
 
-**`src/kalshi/kalshi_auth.py`** — Authentication, safety infrastructure, and trade management (~680 lines). All bots import from here:
+**`src/kalshi/kalshi_auth.py`** — Authentication, safety infrastructure, and trade management (~1,980 lines). All bots import from here:
 
 ```python
 from kalshi_auth import KalshiClient, setup_logging, setup_unbuffered, setup_signal_handlers, PROJECT_DIR
@@ -162,7 +199,7 @@ Key components:
 - `check_kill_switch()` — Graceful halt via `data/HALT_TRADING` file
 - Helper functions: `load_trades()`, `save_trade()`, `_atomic_write_json()`, `retry_request()`, `fetch_parallel()`, `validate_trade_config()`
 
-**`src/kalshi/probability.py`** — Centralized probability models and position sizing (~450 lines). Uses `math.erf` for normal CDF (no scipy dependency):
+**`src/kalshi/probability.py`** — Centralized probability models and position sizing (~1,820 lines). Uses `math.erf` for normal CDF (no scipy dependency):
 
 ```python
 from probability import weather_probability, ensemble_weather_probability, nws_probability, info_arb_probability
@@ -192,9 +229,17 @@ Key functions:
 
 **`src/kalshi/polymarket_client.py`** — Polymarket CLOB API client for cross-platform arbitrage.
 
+**`src/kalshi/trade_files.py`** — Canonical trade log file list. All scripts that read trade logs should import `TRADE_FILES` or `ALL_TRADE_PATHS` from here (not hardcode their own list). Used by pnl-snapshot, dashboard, reconcile, backfill, calibrate, backtest, analyze-performance. **Note:** `position-monitor.py` still uses a hardcoded `ALL_TRADE_LOGS` list instead of importing from here — this is a known bug (see Plan 8).
+
 **`src/kalshi/macro_engine.py`** — Macro/geopolitics sentiment engine (~300 lines). Fetches from FRED API (TIPS breakevens, UMich expectations, GDPNow), Truflation real-time CPI, and curated blog/RSS feeds. DeepSeek LLM extracts sentiment. Produces `MacroSignal` with CPI bias and confidence for economics bot nowcast adjustment.
 
 **`src/kalshi/particle_filter.py`** — Sequential Monte Carlo (particle filter) for Bayesian belief tracking (~400 lines). Maintains weighted particle distributions per market, carries memory across scans. `FilterManager` manages per-ticker filters with JSON state persistence. `ci_kelly_multiplier()` reduces Kelly fraction when filter CI is wide. Integrates with crypto-bot (5-min scans), extensible to weather/economics.
+
+**`src/kalshi/correlation_engine.py`** — Cross-bot correlation tracking with cluster and marginal VaR limits. Integrated with capital allocator.
+
+**`src/kalshi/execution_quality.py`** — Execution quality tracking (slippage, fill rates).
+
+**`src/kalshi/pnl_attribution.py`** — P&L attribution by source/model/signal.
 
 ### Bot Structure
 
@@ -244,11 +289,28 @@ Controlled by `KALSHI_MODE` env var:
 
 ## Data Storage
 
-Trade logs, state files, PID files, bot logs, and source snapshots are saved under `data/` (gitignored, `.gitkeep` preserves directory). Each bot writes to its own trade log file (e.g., `data/kalshi-trades.json`, `data/kalshi-strategy-trades.json`, `data/kalshi-entertainment-trades.json`, `data/beatrelease-trades.json`). Trading can be halted by creating `data/HALT_TRADING` (checked by `TradeManager`).
+Trade logs, state files, PID files, bot logs, and source snapshots are saved under `data/` (gitignored, `.gitkeep` preserves directory). Trading can be halted by creating `data/HALT_TRADING` (checked by `TradeManager`).
+
+### Trade Log Paths (canonical list in `trade_files.py`)
+
+| Bot | Trade Log File | Bot Key |
+|-----|---------------|---------|
+| Weather Bot | `kalshi-trades.json` | `weather` |
+| Strategy Trader | `kalshi-strategy-trades.json` | `strategy` |
+| Entertainment Bot | `kalshi-entertainment-trades.json` | `entertainment` |
+| BeatRelease Scanner | `beatrelease-trades.json` | `beatrelease` |
+| Source Monitor | `kalshi-monitor-trades.json` | `monitor` |
+| Position Monitor | `kalshi-position-trades.json` | `positions` |
+| Economics Bot | `kalshi-economics-trades.json` | `economics` |
+| Crypto Bot | `kalshi-crypto-trades.json` | `crypto` |
+| Cross-Platform Arb | `kalshi-arb-trades.json` | `arb` |
+| Market Maker | `kalshi-mm-trades.json` | `mm` |
+
+Every trade record should include a `source_bot` field matching the "Bot Key" above. This enables accurate per-bot P&L attribution in `pnl-snapshot.py`. If `source_bot` is missing, the snapshot falls back to ticker-prefix inference (fragile).
 
 ## Risk Controls
 
-Bots enforce: max trade amount ($5-10), max daily trades (10-20), max daily loss ($10-50), edge threshold (8%+), and half-Kelly position sizing. These are configured in the JSON config files. `TradeManager` enforces all limits plus circuit breaker, deduplication, and stale data rejection.
+Bots enforce: max trade amount ($10-50 depending on bot), max daily trades (5-30), max daily loss ($25-75), edge threshold (4-8% depending on bot and market type), and Kelly position sizing (half-Kelly for weather/crypto, quarter-Kelly for brackets/strategy). These are configured in the JSON config files. `TradeManager` enforces all limits plus circuit breaker, deduplication, and stale data rejection.
 
 ## Strategy Notes
 
@@ -256,7 +318,7 @@ Bots enforce: max trade amount ($5-10), max daily trades (10-20), max daily loss
 - **Weather probability** (weather-bot): CDF-based model using NWS forecast error distribution with per-city sigma calibration. Optional ensemble (GFS+ECMWF+ICON) via Bayesian Model Averaging.
 - **Info arbitrage** (source-monitor, entertainment-bot): Trade when external data (HDD charts, NWS actuals, box office) confirms outcome before Kalshi settles. NWS trades fire at all hours (sigma model handles morning uncertainty).
 - **Economics nowcast** (economics-bot): Cleveland Fed CPI nowcast + CDF model. Sigma steps down as release date approaches.
-- **Crypto GBM** (crypto-bot): Log-normal model using spot price, IV/realized vol, and time to settlement. Quarter-Kelly sizing.
+- **Crypto GBM** (crypto-bot): Log-normal model using spot price, IV/realized vol, and time to settlement. Half-Kelly with horizon scaling, plus CI/regime/correlation multipliers.
 - **Cross-platform arb** (cross-platform-arb): Monitors Kalshi vs Polymarket price discrepancies. Phase 1 = monitoring only.
 - **Market making** (market-maker): Avellaneda-Stoikov reservation price with gamma increasing near settlement. Disabled by default.
 
@@ -274,6 +336,7 @@ When working on a specific bot, ONLY modify files owned by that bot. Do NOT touc
 | strategy-trader | `strategy-trader.py`, `strategy_engine.py`, `test_strategy*.py` | probability.py, kalshi_auth.py, other bots |
 | entertainment-bot | `entertainment-bot.py`, `test_entertainment*.py` | probability.py, kalshi_auth.py, other bots |
 | source-monitor | `source-monitor.py`, `hdd_parser.py`, `test_source*.py` | probability.py, kalshi_auth.py, other bots |
+| position-monitor | `position-monitor.py`, `test_position*.py` | probability.py, kalshi_auth.py, other bots |
 
 ### Shared Modules (require dedicated session)
 
@@ -283,6 +346,11 @@ These files are shared across bots. Changes require a dedicated "shared infrastr
 - `kalshi_auth.py` — Auth, TradeManager, safety infrastructure
 - `capital_allocator.py` — Cross-bot capital allocation
 - `ticker_utils.py` — Ticker parsing (used by multiple bots + dashboard)
+- `trade_files.py` — Canonical trade log file list (used by pnl-snapshot, dashboard, reconcile, backtest, calibrate)
+- `correlation_engine.py` — Cross-bot correlation tracking
+- `execution_quality.py` — Slippage and fill rate tracking
+- `pnl_attribution.py` — P&L attribution by source
+- `scripts/pnl-snapshot.py` — Verified P&L snapshot tool
 - `config/bots-config.json` — Only modify YOUR bot's section
 
 ### If you need a shared module change
@@ -303,3 +371,7 @@ These files are shared across bots. Changes require a dedicated "shared infrastr
 `research/` contains strategy documentation: `kalshi-deep-dive.md`, `kalshi-info-arbitrage.md`, `kalshi-markets-research.md`. Reference these for Kalshi API details, market structure, and strategy rationale.
 
 `prompts/full-codebase-review.md` contains a comprehensive audit prompt for systematic code review of edge models, sizing, risk controls, and operational reliability.
+
+## Implementation Plans
+
+`docs/plans/2026-03-06-master-plan.md` is the consolidated optimization plan with 9 sub-plans (Plan 0-8). Each sub-plan has its own file. Old plans are archived in `docs/plans/archive/`. Plans respect the File Ownership rules above — each bot plan only modifies that bot's files.

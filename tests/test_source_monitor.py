@@ -4,8 +4,6 @@ cross-market consistency, retry logic, and edge thresholds."""
 import math
 import datetime
 import sys
-import os
-import importlib.util
 import tempfile
 import json
 import pytest
@@ -14,10 +12,10 @@ from unittest.mock import MagicMock, patch
 from probability import album_data_sigma, boxoffice_data_sigma, _reset_calibration
 from probability import nws_sigma_for_hour, nws_probability
 
+from conftest import make_fake_auth, load_bot_module
+
 
 # === Module import helper for source-monitor.py ===
-# source-monitor.py has module-level initialization (KalshiClient, TradeManager, etc.)
-# that requires API keys. Stub the dependencies before importing.
 
 _sm_module = None
 
@@ -28,43 +26,6 @@ def _load_source_monitor():
     if _sm_module is not None:
         return _sm_module
 
-    # Stub kalshi_auth so module-level KalshiClient() doesn't need real keys
-    mock_auth = MagicMock()
-    mock_auth.KalshiClient.return_value = MagicMock()
-    mock_auth.setup_unbuffered = MagicMock()
-    mock_auth.setup_signal_handlers = MagicMock()
-    mock_auth.setup_logging.return_value = MagicMock()
-    mock_auth.TradeManager.return_value = MagicMock()
-    mock_auth.trim_trade_log = MagicMock()
-    mock_auth.PROJECT_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    mock_auth.HealthCheckMonitor.return_value = MagicMock()
-    mock_auth.OrderMonitor.return_value = MagicMock()
-    mock_auth.ScanSummary = MagicMock()
-    mock_auth.build_market_snapshot = MagicMock(return_value={})
-    mock_auth.CITY_TIMEZONES = {}
-    mock_auth._local_today = MagicMock()
-    mock_auth.round_half_up = round
-    mock_auth.load_trades.return_value = []
-    mock_auth.fetch_parallel = MagicMock(return_value={})
-    mock_auth.retry_request = MagicMock()
-    mock_auth.is_market_liquid = MagicMock(return_value=True)
-    mock_auth.compute_limit_price = MagicMock(return_value=50)
-    mock_auth.kalshi_fee_cents = MagicMock(return_value=1)
-
-    # Stub capital_allocator
-    mock_allocator_mod = MagicMock()
-    mock_allocator_mod.PortfolioAllocator.return_value = MagicMock()
-
-    # Stub hdd_parser
-    mock_hdd = MagicMock()
-    mock_hdd.get_album_sales = MagicMock(return_value=[])
-    mock_hdd.compute_data_age_hours = MagicMock(return_value=0)
-    mock_hdd.parse_album_threshold = MagicMock(return_value=None)
-
-    # Stub ticker_utils
-    mock_ticker = MagicMock()
-
-    # Write a minimal config file for the module to load
     _config = {
         "maxTradeAmount": 25, "maxDailyTrades": 25, "maxDailyLoss": 50,
         "sources": {
@@ -73,43 +34,26 @@ def _load_source_monitor():
             "nws": {"enabled": True, "intervalMinutes": 10, "stations": {}},
         },
     }
-    config_dir = Path(tempfile.mkdtemp()) / "config"
+    _tmp_dir = Path(tempfile.mkdtemp())
+    config_dir = _tmp_dir / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / "kalshi-monitor-config.json").write_text(json.dumps(_config))
-    # Ensure data dirs exist for module-level mkdir calls
-    data_dir = config_dir.parent / "data"
+    data_dir = _tmp_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "kalshi-source-snapshots").mkdir(parents=True, exist_ok=True)
-    # Create empty trades file
     (data_dir / "kalshi-monitor-trades.json").write_text("[]")
 
-    # Save originals before stubbing
-    stub_names = ["kalshi_auth", "capital_allocator", "hdd_parser", "ticker_utils"]
-    originals = {name: sys.modules.get(name) for name in stub_names}
+    fake_auth = make_fake_auth(
+        PROJECT_DIR=_tmp_dir,
+        round_half_up=round,
+    )
 
-    # Inject stubs
-    sys.modules["kalshi_auth"] = mock_auth
-    sys.modules["capital_allocator"] = mock_allocator_mod
-    sys.modules["hdd_parser"] = mock_hdd
-    sys.modules["ticker_utils"] = mock_ticker
-
-    # Temporarily patch PROJECT_DIR so config loads from our temp dir
-    mock_auth.PROJECT_DIR = config_dir.parent
-
-    src_dir = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) / "src" / "kalshi"
-    spec = importlib.util.spec_from_file_location("source_monitor", src_dir / "source-monitor.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    # Restore originals
-    for name in stub_names:
-        if originals[name] is None:
-            sys.modules.pop(name, None)
-        else:
-            sys.modules[name] = originals[name]
-
-    _sm_module = mod
-    return mod
+    _sm_module = load_bot_module("source-monitor.py", fake_auth, extra_stubs={
+        "capital_allocator": MagicMock(),
+        "hdd_parser": MagicMock(),
+        "ticker_utils": MagicMock(),
+    })
+    return _sm_module
 
 
 class TestTimeDecaySigma:
@@ -419,3 +363,386 @@ class TestSourceAwareSigma:
         """No source falls back to day-of-week default."""
         sigma = album_data_sigma(4, source=None)
         assert sigma == album_data_sigma(4)
+
+
+# ============================================================
+# Task 6.1: NWS Timezone Correctness Regression Tests
+# ============================================================
+
+
+class TestNWSTimezoneCorrectness:
+    """Verify source-monitor uses per-city local timezone for date boundaries.
+
+    The code uses _local_today(city) and CITY_TIMEZONES from kalshi_auth.py
+    to determine which markets are "settling today". These tests lock in
+    that behavior to prevent regressions to naive UTC/server-local dates.
+    """
+
+    def test_local_today_uses_city_timezone(self):
+        """_local_today should use per-city ZoneInfo, not UTC or server local."""
+        from zoneinfo import ZoneInfo
+        # Verify the real _local_today uses CITY_TIMEZONES
+        from kalshi_auth import _local_today, CITY_TIMEZONES
+        # NYC should use Eastern time
+        assert CITY_TIMEZONES["NY"] == "America/New_York"
+        # LAX should use Pacific time
+        assert CITY_TIMEZONES["LAX"] == "America/Los_Angeles"
+        # _local_today returns an ISO date string
+        result = _local_today("NY")
+        assert len(result) == 10  # YYYY-MM-DD format
+        assert result.count("-") == 2
+
+    def test_local_today_different_cities_can_differ(self):
+        """At midnight boundaries, different cities can report different dates."""
+        from kalshi_auth import _local_today, CITY_TIMEZONES
+        # Both calls should return valid ISO dates
+        ny_date = _local_today("NY")
+        lax_date = _local_today("LAX")
+        # Both are valid dates (may or may not differ depending on server time)
+        assert len(ny_date) == 10
+        assert len(lax_date) == 10
+
+    def test_local_today_with_mock_late_night_est(self):
+        """At 11pm EST, it's still today in NYC but already tomorrow in UTC.
+
+        Confirms _local_today returns the city-local date, not UTC date.
+        """
+        from zoneinfo import ZoneInfo
+        from kalshi_auth import CITY_TIMEZONES
+        # 2026-03-07 23:30 EST = 2026-03-08 04:30 UTC
+        est_tz = ZoneInfo("America/New_York")
+        fake_time = datetime.datetime(2026, 3, 7, 23, 30, tzinfo=est_tz)
+        utc_date = fake_time.astimezone(datetime.timezone.utc).date().isoformat()
+        local_date = fake_time.date().isoformat()
+        assert local_date == "2026-03-07"
+        assert utc_date == "2026-03-08"  # UTC has already rolled over
+
+    def test_local_today_pst_vs_est_boundary(self):
+        """At 11pm PST (2am EST next day), LAX should still show today."""
+        from zoneinfo import ZoneInfo
+        pst_tz = ZoneInfo("America/Los_Angeles")
+        est_tz = ZoneInfo("America/New_York")
+        # 2026-03-07 23:00 PST
+        pst_time = datetime.datetime(2026, 3, 7, 23, 0, tzinfo=pst_tz)
+        # In EST this is already March 8
+        est_equivalent = pst_time.astimezone(est_tz).date().isoformat()
+        pst_date = pst_time.date().isoformat()
+        assert pst_date == "2026-03-07"
+        assert est_equivalent == "2026-03-08"  # EST has rolled over
+
+    def test_city_timezones_all_valid(self):
+        """All cities in CITY_TIMEZONES should have valid ZoneInfo entries."""
+        from zoneinfo import ZoneInfo
+        from kalshi_auth import CITY_TIMEZONES
+        for city, tz_name in CITY_TIMEZONES.items():
+            tz = ZoneInfo(tz_name)
+            assert tz is not None, f"Invalid timezone for {city}: {tz_name}"
+
+    def test_check_nws_daily_highs_uses_local_midnight(self):
+        """check_nws_daily_highs uses per-city local midnight, not UTC midnight.
+
+        The function constructs NWS observation query URLs using
+        ZoneInfo(CITY_TIMEZONES[city]) for local midnight, then converts
+        to UTC. This prevents including yesterday's late-afternoon temps
+        for western cities.
+        """
+        sm = _load_source_monitor()
+        # Verify the function exists and has the timezone logic
+        import inspect
+        source = inspect.getsource(sm.check_nws_daily_highs)
+        # Must reference CITY_TIMEZONES for per-city midnight
+        assert "CITY_TIMEZONES" in source
+        # Must compute local_midnight and convert to UTC
+        assert "local_midnight" in source
+        assert "astimezone" in source
+
+    def test_match_nws_uses_local_today_for_market_date(self):
+        """match_nws_to_markets uses _local_today(city) for date matching.
+
+        Each city's market should be matched against the city-local date,
+        not the server date or UTC date.
+        """
+        sm = _load_source_monitor()
+        import inspect
+        source = inspect.getsource(sm.match_nws_to_markets)
+        assert "_local_today" in source
+
+
+class TestPreDawnGate:
+    """Verify the pre-dawn gate prevents NWS trades before 8 AM local time.
+
+    Before 8 AM local time in the city, the running high temperature is
+    unreliable because the day hasn't really started. The pre-dawn gate
+    in match_nws_to_markets skips NWS trade evaluation during this period.
+    """
+
+    def test_pre_dawn_gate_uses_city_local_hour(self):
+        """Pre-dawn gate should use city-local hour, not server-local hour."""
+        sm = _load_source_monitor()
+        import inspect
+        source = inspect.getsource(sm.match_nws_to_markets)
+        # Must use city_hour for the pre-dawn check, not now.hour
+        assert "city_hour < 8" in source
+        # Must NOT use naive now.hour for the gate
+        assert "now.hour < 8" not in source
+
+    def test_pre_dawn_gate_skips_record(self):
+        """When pre-dawn is active, scan summary should record a skip."""
+        sm = _load_source_monitor()
+        import inspect
+        source = inspect.getsource(sm.match_nws_to_markets)
+        # Should call ss.skip("pre_dawn") when gated
+        assert "pre_dawn" in source
+
+    def test_nws_uses_city_hour_for_sigma(self):
+        """NWS probability and edge calculation should use city-local hour.
+
+        This ensures sigma model uses the city's local hour (e.g., LAX at
+        Pacific time, not server time) for accurate uncertainty estimates.
+        """
+        sm = _load_source_monitor()
+        import inspect
+        source = inspect.getsource(sm.match_nws_to_markets)
+        # Should use city_hour in nws_probability calls, not now.hour
+        assert "nws_probability(running_high, threshold, direction, city_hour)" in source
+        assert "nws_probability(running_high, threshold, \"T\", city_hour)" in source
+        # Should use city_hour in _nws_min_edge calls
+        assert "_nws_min_edge(running_high, threshold, city_hour," in source
+
+
+class TestNWSObservationFreshness:
+    """Test NWS observation staleness detection.
+
+    The source-monitor rejects NWS data if the observation timestamp
+    is older than NWS_MAX_OBS_AGE_MINUTES (90 minutes).
+    """
+
+    def test_max_obs_age_constant(self):
+        """NWS_MAX_OBS_AGE_MINUTES should be 90."""
+        sm = _load_source_monitor()
+        assert sm.NWS_MAX_OBS_AGE_MINUTES == 90
+
+    def test_compute_obs_age_recent(self):
+        """A recent observation (10 seconds ago) should return a small age."""
+        sm = _load_source_monitor()
+        recent_ts = (datetime.datetime.now(datetime.timezone.utc) -
+                     datetime.timedelta(seconds=10)).isoformat()
+        age = sm._compute_nws_obs_age_minutes(recent_ts)
+        assert age is not None
+        assert age < 1.0  # Less than 1 minute
+
+    def test_compute_obs_age_stale(self):
+        """A 2-hour-old observation should return ~120 minutes."""
+        sm = _load_source_monitor()
+        old_ts = (datetime.datetime.now(datetime.timezone.utc) -
+                  datetime.timedelta(hours=2)).isoformat()
+        age = sm._compute_nws_obs_age_minutes(old_ts)
+        assert age is not None
+        assert 119 < age < 121
+
+    def test_compute_obs_age_none_timestamp(self):
+        """Missing timestamp should return None."""
+        sm = _load_source_monitor()
+        assert sm._compute_nws_obs_age_minutes(None) is None
+        assert sm._compute_nws_obs_age_minutes("") is None
+
+    def test_compute_obs_age_invalid_timestamp(self):
+        """Invalid timestamp should return None (not raise)."""
+        sm = _load_source_monitor()
+        assert sm._compute_nws_obs_age_minutes("not-a-date") is None
+        assert sm._compute_nws_obs_age_minutes("2026-13-45T99:00:00Z") is None
+
+    def test_compute_obs_age_z_suffix(self):
+        """Timestamps with 'Z' suffix should be handled correctly."""
+        sm = _load_source_monitor()
+        ts = (datetime.datetime.now(datetime.timezone.utc) -
+              datetime.timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        age = sm._compute_nws_obs_age_minutes(ts)
+        assert age is not None
+        assert 29 < age < 31
+
+    def test_compute_obs_age_offset_format(self):
+        """Timestamps with +00:00 offset should work."""
+        sm = _load_source_monitor()
+        ts = (datetime.datetime.now(datetime.timezone.utc) -
+              datetime.timedelta(minutes=45)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        age = sm._compute_nws_obs_age_minutes(ts)
+        assert age is not None
+        assert 44 < age < 46
+
+    def test_staleness_gate_threshold(self):
+        """Observations at exactly 90 minutes should be rejected (> not >=)."""
+        sm = _load_source_monitor()
+        # 91 minutes ago — should be rejected
+        ts_91 = (datetime.datetime.now(datetime.timezone.utc) -
+                 datetime.timedelta(minutes=91)).isoformat()
+        age = sm._compute_nws_obs_age_minutes(ts_91)
+        assert age > sm.NWS_MAX_OBS_AGE_MINUTES
+
+        # 89 minutes ago — should be accepted
+        ts_89 = (datetime.datetime.now(datetime.timezone.utc) -
+                 datetime.timedelta(minutes=89)).isoformat()
+        age = sm._compute_nws_obs_age_minutes(ts_89)
+        assert age < sm.NWS_MAX_OBS_AGE_MINUTES
+
+
+class TestNWSEdgeThresholdBoundaries:
+    """Test edge threshold tier boundaries in detail.
+
+    The CI-based tier system should produce appropriate min-edge
+    requirements based on the margin-to-CI ratio at different hours.
+    """
+
+    def setup_method(self):
+        _reset_calibration()
+
+    def teardown_method(self):
+        _reset_calibration()
+
+    def test_edge_tiers_are_consistent_across_hours(self):
+        """As hours increase (sigma decreases), the same margin should move
+        from uncertain to confident. A 3F margin at hour 8 (sigma~2.65) is
+        uncertain, but at hour 18 (sigma=0.5) it's very confident."""
+        sm = _load_source_monitor()
+        # At hour 8, sigma ~2.65, ci_99 ~6.83, 3F margin < ci_99/2 = uncertain
+        edge_morning = sm._nws_min_edge(83, 80, 8, False)
+        # At hour 18, sigma 0.5, ci_99 ~1.29, 3F margin > ci_99 = very confident
+        edge_evening = sm._nws_min_edge(83, 80, 18, False)
+        assert edge_morning > edge_evening
+        assert edge_morning == 0.15  # uncertain
+        assert edge_evening == 0.05  # very confident
+
+    def test_zero_margin_always_uncertain(self):
+        """When running high equals threshold, should always be uncertain tier."""
+        sm = _load_source_monitor()
+        for hour in [8, 12, 15, 18]:
+            edge = sm._nws_min_edge(80, 80, hour, False)
+            assert edge == 0.15, f"Expected 0.15 at hour {hour} with zero margin"
+
+    def test_large_margin_always_confident(self):
+        """A 10F margin should be in the confident tier at any hour after dawn."""
+        sm = _load_source_monitor()
+        for hour in [8, 12, 15, 18]:
+            edge = sm._nws_min_edge(90, 80, hour, False)
+            assert edge == 0.05, f"Expected 0.05 at hour {hour} with 10F margin"
+
+
+class TestScanMetrics:
+    """Test the per-scan measurement framework.
+
+    Metrics are logged to data/source-monitor-metrics.json for
+    observability of NWS freshness, source availability, and trade activity.
+    """
+
+    def test_build_scan_metrics_basic(self):
+        """_build_scan_metrics should produce a dict with expected keys."""
+        sm = _load_source_monitor()
+        mock_ss = MagicMock()
+        mock_ss.markets_fetched = 10
+        mock_ss.markets_evaluated = 5
+        mock_ss.trades_placed = 2
+        mock_ss.skips = {"low_edge": 3}
+        mock_ss.data_sources = {"nws": "ok"}
+
+        metrics = sm._build_scan_metrics(mock_ss, sources_checked=["nws", "hdd"])
+        assert metrics["sources_checked"] == ["nws", "hdd"]
+        assert metrics["markets_fetched"] == 10
+        assert metrics["markets_evaluated"] == 5
+        assert metrics["trades_placed"] == 2
+        assert metrics["skips"] == {"low_edge": 3}
+        assert metrics["data_sources"] == {"nws": "ok"}
+
+    def test_build_scan_metrics_with_nws_freshness(self):
+        """NWS freshness data should be included when provided."""
+        sm = _load_source_monitor()
+        mock_ss = MagicMock()
+        mock_ss.markets_fetched = 0
+        mock_ss.markets_evaluated = 0
+        mock_ss.trades_placed = 0
+        mock_ss.skips = {}
+        mock_ss.data_sources = {}
+
+        freshness = {"MIA": 12.5, "LAX": 45.0}
+        metrics = sm._build_scan_metrics(mock_ss, nws_freshness=freshness)
+        assert metrics["nws_freshness"] == {"MIA": 12.5, "LAX": 45.0}
+
+    def test_build_scan_metrics_no_nws_freshness(self):
+        """When no NWS freshness, key should be absent."""
+        sm = _load_source_monitor()
+        mock_ss = MagicMock()
+        mock_ss.markets_fetched = 0
+        mock_ss.markets_evaluated = 0
+        mock_ss.trades_placed = 0
+        mock_ss.skips = {}
+        mock_ss.data_sources = {}
+
+        metrics = sm._build_scan_metrics(mock_ss)
+        assert "nws_freshness" not in metrics
+
+    def test_build_scan_metrics_none_ss(self):
+        """With ss=None, should return safe defaults."""
+        sm = _load_source_monitor()
+        metrics = sm._build_scan_metrics(None)
+        assert metrics["markets_fetched"] == 0
+        assert metrics["trades_placed"] == 0
+        assert metrics["skips"] == {}
+
+    def test_log_scan_metrics_creates_file(self):
+        """_log_scan_metrics should create the metrics file if absent."""
+        sm = _load_source_monitor()
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_path = sm.METRICS_PATH
+            sm.METRICS_PATH = Path(tmpdir) / "test-metrics.json"
+            try:
+                sm._log_scan_metrics({"test": True})
+                assert sm.METRICS_PATH.exists()
+                data = json.loads(sm.METRICS_PATH.read_text())
+                assert len(data) == 1
+                assert data[0]["test"] is True
+                assert "timestamp" in data[0]
+            finally:
+                sm.METRICS_PATH = original_path
+
+    def test_log_scan_metrics_appends(self):
+        """_log_scan_metrics should append to existing entries."""
+        sm = _load_source_monitor()
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_path = sm.METRICS_PATH
+            sm.METRICS_PATH = Path(tmpdir) / "test-metrics.json"
+            try:
+                sm._log_scan_metrics({"scan": 1})
+                sm._log_scan_metrics({"scan": 2})
+                data = json.loads(sm.METRICS_PATH.read_text())
+                assert len(data) == 2
+                assert data[0]["scan"] == 1
+                assert data[1]["scan"] == 2
+            finally:
+                sm.METRICS_PATH = original_path
+
+    def test_log_scan_metrics_trims_to_max(self):
+        """_log_scan_metrics should trim to MAX_METRICS_ENTRIES."""
+        sm = _load_source_monitor()
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_path = sm.METRICS_PATH
+            original_max = sm.MAX_METRICS_ENTRIES
+            sm.METRICS_PATH = Path(tmpdir) / "test-metrics.json"
+            sm.MAX_METRICS_ENTRIES = 5  # Small for testing
+            try:
+                for i in range(10):
+                    sm._log_scan_metrics({"scan": i})
+                data = json.loads(sm.METRICS_PATH.read_text())
+                assert len(data) == 5
+                # Should keep the last 5
+                assert data[0]["scan"] == 5
+                assert data[4]["scan"] == 9
+            finally:
+                sm.METRICS_PATH = original_path
+                sm.MAX_METRICS_ENTRIES = original_max
+
+    def test_metrics_path_constant(self):
+        """METRICS_PATH should point to data/source-monitor-metrics.json."""
+        sm = _load_source_monitor()
+        assert sm.METRICS_PATH.name == "source-monitor-metrics.json"

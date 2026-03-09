@@ -280,3 +280,28 @@ class TestGetLatestCryptoVol:
         self._decisions_path().write_text(json.dumps(decisions))
         result = self.mod._get_latest_crypto_vol("BTC")
         assert result == 0.50
+
+
+# ===================================================================
+# API Response Validation tests (Plan 1 Task 8)
+# ===================================================================
+
+class TestApiResponseValidation:
+    def test_non_json_response_raises_clear_error(self):
+        """HTML error page on 200 should raise ValueError, not raw JSONDecodeError."""
+        from kalshi_auth import KalshiClient
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.side_effect = json.JSONDecodeError("msg", "doc", 0)
+        mock_response.text = "<html>503 Service Unavailable</html>"
+        mock_response.raise_for_status.return_value = None
+
+        client = KalshiClient.__new__(KalshiClient)
+        client.base_url = "https://api.kalshi.com/trade-api/v2"
+        client.session = MagicMock()
+        client.session.request.return_value = mock_response
+        client.log = logging.getLogger("test")
+        client._sign = MagicMock(return_value={})
+
+        with pytest.raises(ValueError, match="Non-JSON response"):
+            client._request("GET", "/portfolio/balance")

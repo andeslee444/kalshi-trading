@@ -4,14 +4,15 @@ Tests cover per-bot exit config routing, partial exits, market vs limit
 order types, and multi-model probability routing for model-shift.
 """
 
+import decimal
 import json
 import sys
 import types
-import importlib.util
-import logging
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+from conftest import make_fake_auth, load_bot_module
 
 
 # ---------------------------------------------------------------------------
@@ -92,110 +93,50 @@ _BOT_CONFIG = {
     },
 }
 
+_fake_project = Path("/tmp/fake_posmon_exits")
+(_fake_project / "data").mkdir(parents=True, exist_ok=True)
+(_fake_project / "config").mkdir(parents=True, exist_ok=True)
+(_fake_project / "config" / "bots-config.json").write_text(json.dumps(_BOT_CONFIG))
 
-def _load_position_monitor():
-    """Load position-monitor.py module with mock dependencies."""
-    orig_modules = {}
-    for mod_name in ("kalshi_auth", "probability", "capital_allocator", "ticker_utils"):
-        if mod_name in sys.modules:
-            orig_modules[mod_name] = sys.modules[mod_name]
+KALSHI_FEE_RATE = 0.07
 
-    fake_client = MagicMock()
-
-    fake_auth = types.ModuleType("kalshi_auth")
-    fake_auth.KalshiClient = lambda *a, **kw: fake_client
-    fake_auth.setup_unbuffered = lambda: None
-    fake_auth.setup_signal_handlers = lambda: None
-    fake_auth.is_shutdown_requested = lambda: False
-    fake_auth.setup_logging = lambda *a, **kw: logging.getLogger("test")
-    fake_auth.PROJECT_DIR = Path("/tmp/fake_posmon_exits")
-    fake_auth.TradeManager = type("TradeManager", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "sell_position": lambda self, *a, **kw: None,
-        "log_decision": lambda self, *a, **kw: None,
-    })
-    fake_auth.trim_trade_log = lambda *a, **kw: None
-    fake_auth.load_trades = lambda *a, **kw: []
-    fake_auth._atomic_write_json = lambda *a, **kw: None
-    fake_auth.CITY_TIMEZONES = {
+_fake_auth = make_fake_auth(
+    PROJECT_DIR=_fake_project,
+    CITY_TIMEZONES={
         "MIA": "America/New_York", "LAX": "America/Los_Angeles",
         "PHIL": "America/New_York", "NY": "America/New_York",
         "CHI": "America/Chicago", "AUS": "America/Chicago",
         "DEN": "America/Denver", "HOU": "America/Chicago",
-    }
-    fake_auth._local_today = lambda city_code="NY": "2026-02-20"
-    fake_auth.round_half_up = lambda v: int(
-        __import__("decimal").Decimal(str(v)).quantize(
-            __import__("decimal").Decimal("1"),
-            rounding=__import__("decimal").ROUND_HALF_UP,
+    },
+    _local_today=lambda city_code="NY": "2026-02-20",
+    round_half_up=lambda v: int(
+        decimal.Decimal(str(v)).quantize(
+            decimal.Decimal("1"), rounding=decimal.ROUND_HALF_UP,
         )
-    )
-    fake_auth.retry_request = lambda *a, **kw: MagicMock()
-    fake_auth.fetch_parallel = lambda *a, **kw: []
-    fake_auth.HealthCheckMonitor = type("HealthCheckMonitor", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "record_bot_heartbeat": lambda self, *a, **kw: None,
-        "check_health": lambda self, *a, **kw: [],
-    })
-    fake_auth.ScanSummary = type("ScanSummary", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "markets_fetched": 0,
-        "markets_evaluated": 0,
-        "trades_placed": 0,
-        "skip": lambda self, *a, **kw: None,
-        "finalize": lambda self: None,
-    })
-    fake_auth.notify_whatsapp = lambda *a, **kw: None
-    sys.modules["kalshi_auth"] = fake_auth
+    ),
+    retry_request=lambda *a, **kw: MagicMock(),
+)
 
-    # Real kalshi_fee_cents formula for accurate testing
-    KALSHI_FEE_RATE = 0.07
-    fake_prob = types.ModuleType("probability")
-    fake_prob.half_kelly = lambda *a, **kw: (0, 0)
-    fake_prob.weather_probability = lambda *a, **kw: 0.5
-    fake_prob.nws_probability = lambda *a, **kw: 0.5
-    fake_prob.crypto_price_probability = lambda *a, **kw: 0.5
-    fake_prob.kalshi_fee_cents = lambda p: KALSHI_FEE_RATE * (p / 100) * (1 - p / 100) * 100
-    sys.modules["probability"] = fake_prob
+_fake_prob = types.ModuleType("probability")
+_fake_prob.half_kelly = lambda *a, **kw: (0, 0)
+_fake_prob.weather_probability = lambda *a, **kw: 0.5
+_fake_prob.nws_probability = lambda *a, **kw: 0.5
+_fake_prob.crypto_price_probability = lambda *a, **kw: 0.5
+_fake_prob.kalshi_fee_cents = lambda p: KALSHI_FEE_RATE * (p / 100) * (1 - p / 100) * 100
 
-    fake_ticker = types.ModuleType("ticker_utils")
-    fake_ticker.parse_weather_ticker = lambda ticker: None
-    fake_ticker.parse_crypto_ticker = lambda ticker: None
-    sys.modules["ticker_utils"] = fake_ticker
+_fake_ticker = types.ModuleType("ticker_utils")
+_fake_ticker.parse_weather_ticker = lambda ticker: None
+_fake_ticker.parse_crypto_ticker = lambda ticker: None
 
-    fake_alloc = types.ModuleType("capital_allocator")
-    fake_alloc.PortfolioAllocator = type("PortfolioAllocator", (), {
-        "__init__": lambda self, *a, **kw: None,
-    })
-    sys.modules["capital_allocator"] = fake_alloc
-
-    # Create dirs and config
-    data_dir = Path("/tmp/fake_posmon_exits/data")
-    data_dir.mkdir(parents=True, exist_ok=True)
-    config_dir = Path("/tmp/fake_posmon_exits/config")
-    config_dir.mkdir(parents=True, exist_ok=True)
-    (config_dir / "bots-config.json").write_text(json.dumps(_BOT_CONFIG))
-
-    # Load the module
-    spec = importlib.util.spec_from_file_location(
-        "position_monitor",
-        str(Path(__file__).resolve().parent.parent / "src" / "kalshi" / "position-monitor.py"),
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    # Restore original modules
-    for mod_name in ("kalshi_auth", "probability", "capital_allocator", "ticker_utils"):
-        if mod_name in orig_modules:
-            sys.modules[mod_name] = orig_modules[mod_name]
-        elif mod_name in sys.modules:
-            del sys.modules[mod_name]
-
-    return mod
-
+_fake_alloc = types.ModuleType("capital_allocator")
+_fake_alloc.PortfolioAllocator = lambda *a, **kw: None
 
 # Load module once at import time (fast: all dependencies are mocked)
-_mod = _load_position_monitor()
+_mod = load_bot_module("position-monitor.py", _fake_auth, extra_stubs={
+    "probability": _fake_prob,
+    "ticker_utils": _fake_ticker,
+    "capital_allocator": _fake_alloc,
+})
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +154,47 @@ def _exit_config(take_profit_cents=80, stop_loss_cents=30, model_shift_pp=20,
         "trailing_min_profit_cents": trailing_min_profit_cents,
         "take_profit_fraction": take_profit_fraction,
     }
+
+
+# ===================================================================
+# ALL_TRADE_LOGS canonical list tests
+# ===================================================================
+
+class TestAllTradeLogs:
+    """Verify ALL_TRADE_LOGS uses the canonical trade_files.py list."""
+
+    def test_all_trade_logs_matches_canonical(self):
+        """Position monitor should use the same trade log list as all other scripts."""
+        from trade_files import ALL_TRADE_PATHS
+        assert set(str(p) for p in _mod.ALL_TRADE_LOGS) == set(str(p) for p in ALL_TRADE_PATHS)
+
+    def test_includes_beatrelease_trades(self):
+        """Beatrelease trades must be visible to the exit system."""
+        filenames = [p.name for p in _mod.ALL_TRADE_LOGS]
+        assert "beatrelease-trades.json" in filenames
+
+    def test_includes_arb_trades(self):
+        """Cross-platform arb trades must be visible to the exit system."""
+        filenames = [p.name for p in _mod.ALL_TRADE_LOGS]
+        assert "kalshi-arb-trades.json" in filenames
+
+    def test_includes_position_monitor_trades(self):
+        """Position monitor's own trades must be in the list for entry lookup."""
+        filenames = [p.name for p in _mod.ALL_TRADE_LOGS]
+        assert "kalshi-position-trades.json" in filenames
+
+    def test_includes_market_maker_trades(self):
+        """Market maker trades must be visible to the exit system."""
+        filenames = [p.name for p in _mod.ALL_TRADE_LOGS]
+        assert "kalshi-mm-trades.json" in filenames
+
+    def test_all_trade_logs_is_list_of_paths(self):
+        """ALL_TRADE_LOGS should be a list of Path objects."""
+        assert isinstance(_mod.ALL_TRADE_LOGS, list)
+        assert len(_mod.ALL_TRADE_LOGS) >= 10  # canonical list has 10 files
+        from pathlib import Path
+        for p in _mod.ALL_TRADE_LOGS:
+            assert isinstance(p, Path), f"Expected Path, got {type(p)}: {p}"
 
 
 # ===================================================================
@@ -379,30 +361,30 @@ class TestEvaluateStopLoss:
 class TestEvaluateModelShift:
     """Test model-shift with multi-model routing."""
 
-    def test_triggers_on_divergence(self):
-        """Should trigger when current prob diverges from entry by >= model_shift_pp."""
+    def test_triggers_on_drop(self):
+        """Should trigger when current prob drops from entry by >= model_shift_pp."""
         pos = {"ticker": "KXHIGHMIA-26FEB20-T86", "yes": 3, "no": 0}
         market = {"yes_bid": 40, "yes_ask": 45}
         entry_rec = {"source_bot": "weather", "model_prob": 0.75}
         ec = _exit_config(model_shift_pp=20)
 
-        # Mock _compute_current_probability to return low prob (divergence)
+        # Mock _compute_current_probability to return low prob (drop from 75% to 30%)
         with patch.object(_mod, "_compute_current_probability",
                           return_value=(0.30, "NWS MIA high 78F, model prob=30%")):
             result = _mod.evaluate_model_shift(pos, market, ec, entry_rec=entry_rec)
         assert result is not None
         assert result["action"] == "model_shift"
         assert result["order_type"] == "limit"
-        assert "divergence" in result["reasoning"]
+        assert "drop" in result["reasoning"]
 
-    def test_no_trigger_small_divergence(self):
-        """Should return None when divergence < model_shift_pp."""
+    def test_no_trigger_small_drop(self):
+        """Should return None when drop < model_shift_pp."""
         pos = {"ticker": "KXHIGHMIA-26FEB20-T86", "yes": 3, "no": 0}
         market = {"yes_bid": 70, "yes_ask": 72}
         entry_rec = {"source_bot": "weather", "model_prob": 0.75}
         ec = _exit_config(model_shift_pp=20)
 
-        # Current prob close to entry (divergence only 5pp, below 20pp threshold)
+        # Current prob close to entry (drop only 5pp, below 20pp threshold)
         with patch.object(_mod, "_compute_current_probability",
                           return_value=(0.70, "NWS MIA high 85F, model prob=70%")):
             result = _mod.evaluate_model_shift(pos, market, ec, entry_rec=entry_rec)
@@ -472,16 +454,48 @@ class TestEvaluateModelShift:
         result = _mod.evaluate_model_shift(pos, market, ec, entry_rec=entry_rec)
         assert result is None
 
-    def test_no_trigger_when_prob_above_50(self):
-        """Even with large divergence, should not trigger if current prob >= 0.50."""
+    def test_triggers_when_prob_dropped_above_50(self):
+        """Should trigger when prob dropped from entry by >= threshold, even if > 0.50.
+
+        A position entered at 90% that's now at 55% has lost 35pp of edge.
+        The old code (current_prob < 0.50 gate) would miss this.
+        """
         pos = {"ticker": "KXHIGHMIA-26FEB20-T86", "yes": 3, "no": 0}
         market = {"yes_bid": 60, "yes_ask": 65}
         entry_rec = {"source_bot": "weather", "model_prob": 0.90}
         ec = _exit_config(model_shift_pp=20)
 
-        # current prob 0.55 -- divergence is 35pp (>20pp) but prob > 0.50
+        # current prob 0.55 -- drop is 35pp (>20pp), should trigger now
         with patch.object(_mod, "_compute_current_probability",
                           return_value=(0.55, "NWS MIA high 84F, model prob=55%")):
+            result = _mod.evaluate_model_shift(pos, market, ec, entry_rec=entry_rec)
+        assert result is not None
+        assert result["action"] == "model_shift"
+        assert "drop 35pp" in result["reasoning"]
+
+    def test_no_trigger_when_prob_increased(self):
+        """Should NOT trigger when current prob is HIGHER than entry (model improved)."""
+        pos = {"ticker": "KXHIGHMIA-26FEB20-T86", "yes": 3, "no": 0}
+        market = {"yes_bid": 80, "yes_ask": 82}
+        entry_rec = {"source_bot": "weather", "model_prob": 0.60}
+        ec = _exit_config(model_shift_pp=20)
+
+        # current prob 0.85, higher than entry 0.60 — model likes position more
+        with patch.object(_mod, "_compute_current_probability",
+                          return_value=(0.85, "NWS MIA high 90F, model prob=85%")):
+            result = _mod.evaluate_model_shift(pos, market, ec, entry_rec=entry_rec)
+        assert result is None
+
+    def test_no_trigger_marginal_drop(self):
+        """Should NOT trigger when drop is less than threshold (10pp < 20pp)."""
+        pos = {"ticker": "KXHIGHMIA-26FEB20-T86", "yes": 3, "no": 0}
+        market = {"yes_bid": 60, "yes_ask": 62}
+        entry_rec = {"source_bot": "weather", "model_prob": 0.70}
+        ec = _exit_config(model_shift_pp=20)
+
+        # current prob 0.60, drop is 10pp < 20pp threshold
+        with patch.object(_mod, "_compute_current_probability",
+                          return_value=(0.60, "NWS MIA high 83F, model prob=60%")):
             result = _mod.evaluate_model_shift(pos, market, ec, entry_rec=entry_rec)
         assert result is None
 
@@ -522,6 +536,16 @@ class TestComputeCurrentProbability:
         prob, reason = _mod._compute_current_probability("TICK-1", "unknown_xyz", "yes")
         assert prob is None
         assert reason is None
+
+    def test_economics_decision_path_is_correct(self):
+        """Regression: economics decision path must match file written by economics bot.
+
+        Line 492 of position-monitor.py uses 'kalshi-economics-trades-decisions.json'.
+        This test locks that path to prevent drift.
+        """
+        import inspect
+        source = inspect.getsource(_mod._compute_current_probability)
+        assert "kalshi-economics-trades-decisions.json" in source
 
 
 # ===================================================================
@@ -668,3 +692,405 @@ class TestStaleOrderCancellation:
         assert hasattr(_mod, 'ORDER_TTL_MINUTES')
         assert isinstance(_mod.ORDER_TTL_MINUTES, (int, float))
         assert _mod.ORDER_TTL_MINUTES > 0
+
+
+# ===================================================================
+# check_stale_positions tests
+# ===================================================================
+
+class TestCheckStalePositions:
+    """Test stale position detection (positions open >7 days and losing)."""
+
+    def _make_entry(self, ticker, price_cents, days_ago):
+        """Helper to create an entry record with a timestamp days_ago from now."""
+        import datetime
+        ts = (datetime.datetime.now() - datetime.timedelta(days=days_ago)).isoformat()
+        return {ticker: {"ticker": ticker, "price_cents": price_cents, "timestamp": ts}}
+
+    def test_flags_old_losing_position(self):
+        """Position open >7 days with negative P&L should be flagged."""
+        entries = self._make_entry("TICK-1", 60, days_ago=10)
+        positions = [{"ticker": "TICK-1", "yes": 3, "no": 0, "market_yes_bid": 40, "market_no_bid": 60}]
+        result = _mod.check_stale_positions(entries, positions, max_age_days=7)
+        assert len(result) == 1
+        assert result[0]["ticker"] == "TICK-1"
+        assert result[0]["age_days"] == 10
+        assert result[0]["unrealized_pnl_cents"] < 0
+
+    def test_ignores_young_position(self):
+        """Position open <7 days should not be flagged, even if losing."""
+        entries = self._make_entry("TICK-1", 60, days_ago=3)
+        positions = [{"ticker": "TICK-1", "yes": 3, "no": 0, "market_yes_bid": 40, "market_no_bid": 60}]
+        result = _mod.check_stale_positions(entries, positions, max_age_days=7)
+        assert len(result) == 0
+
+    def test_ignores_old_winning_position(self):
+        """Position open >7 days but profitable should not be flagged."""
+        entries = self._make_entry("TICK-1", 40, days_ago=10)
+        positions = [{"ticker": "TICK-1", "yes": 3, "no": 0, "market_yes_bid": 60, "market_no_bid": 40}]
+        result = _mod.check_stale_positions(entries, positions, max_age_days=7)
+        assert len(result) == 0
+
+    def test_no_entry_record_skipped(self):
+        """Position without matching entry record should be skipped."""
+        entries = {}  # no entry for TICK-1
+        positions = [{"ticker": "TICK-1", "yes": 3, "no": 0, "market_yes_bid": 40, "market_no_bid": 60}]
+        result = _mod.check_stale_positions(entries, positions, max_age_days=7)
+        assert len(result) == 0
+
+    def test_no_position_returns_empty(self):
+        """No positions should return empty list."""
+        entries = self._make_entry("TICK-1", 60, days_ago=10)
+        result = _mod.check_stale_positions(entries, [], max_age_days=7)
+        assert len(result) == 0
+
+    def test_custom_max_age(self):
+        """Should respect custom max_age_days parameter."""
+        entries = self._make_entry("TICK-1", 60, days_ago=5)
+        positions = [{"ticker": "TICK-1", "yes": 2, "no": 0, "market_yes_bid": 40, "market_no_bid": 60}]
+        # With 7-day default, 5-day-old position is not stale
+        result = _mod.check_stale_positions(entries, positions, max_age_days=7)
+        assert len(result) == 0
+        # With 3-day max, 5-day-old position IS stale
+        result = _mod.check_stale_positions(entries, positions, max_age_days=3)
+        assert len(result) == 1
+
+    def test_no_side_losing_position(self):
+        """NO position that is losing and stale should be flagged."""
+        entries = self._make_entry("TICK-1", 60, days_ago=10)
+        positions = [{"ticker": "TICK-1", "yes": 0, "no": 3, "market_yes_bid": 60, "market_no_bid": 40}]
+        result = _mod.check_stale_positions(entries, positions, max_age_days=7)
+        assert len(result) == 1
+        assert result[0]["unrealized_pnl_cents"] < 0
+
+
+# ===================================================================
+# Heartbeat regression test (Task 8.5)
+# ===================================================================
+
+class TestHeartbeat:
+    """Verify heartbeat is called at the start of each scan."""
+
+    def test_heartbeat_in_scan_positions(self):
+        """scan_positions should call health.record_bot_heartbeat at scan start.
+
+        Regression: heartbeat was stale (Feb 26 despite running Mar 7) because
+        it was only called at startup, not at the start of each scan cycle.
+        """
+        import inspect
+        source = inspect.getsource(_mod.scan_positions)
+        # Heartbeat should appear early in the function (before position fetching)
+        lines = source.split('\n')
+        heartbeat_line = None
+        positions_line = None
+        for i, line in enumerate(lines):
+            if 'record_bot_heartbeat' in line and heartbeat_line is None:
+                heartbeat_line = i
+            if 'get_open_positions' in line and positions_line is None:
+                positions_line = i
+        assert heartbeat_line is not None, "No heartbeat call found in scan_positions"
+        assert positions_line is not None, "No get_open_positions call found in scan_positions"
+        assert heartbeat_line < positions_line, (
+            f"Heartbeat (line {heartbeat_line}) should be called before "
+            f"get_open_positions (line {positions_line})"
+        )
+
+
+# ===================================================================
+# PositionScanMetrics tests (Task 8.6)
+# ===================================================================
+
+class TestPositionScanMetrics:
+    """Test per-scan metrics tracking and serialization."""
+
+    def test_initial_state(self):
+        """New metrics should have zero counts."""
+        m = _mod.PositionScanMetrics()
+        assert m.positions_checked == 0
+        assert m.total_exposure_cents == 0
+        assert m.largest_position_cents == 0
+        assert all(v == 0 for v in m.exits_by_type.values())
+
+    def test_record_position_updates_exposure(self):
+        """Recording positions should update exposure and count."""
+        m = _mod.PositionScanMetrics()
+        m.record_position("TICK-1", 3, 50)  # 3 contracts at 50c = 150c exposure
+        m.record_position("TICK-2", 5, 30)  # 5 contracts at 30c = 150c exposure
+        assert m.positions_checked == 2
+        assert m.total_exposure_cents == 300  # 150 + 150
+
+    def test_record_position_tracks_largest(self):
+        """Largest position should be updated correctly."""
+        m = _mod.PositionScanMetrics()
+        m.record_position("TICK-1", 3, 50)  # 150c
+        m.record_position("TICK-2", 10, 80)  # 800c
+        m.record_position("TICK-3", 2, 90)  # 180c
+        assert m.largest_position_cents == 800
+        assert m.largest_position_ticker == "TICK-2"
+
+    def test_record_position_none_price(self):
+        """None entry price should be treated as 0 (no exposure)."""
+        m = _mod.PositionScanMetrics()
+        m.record_position("TICK-1", 5, None)
+        assert m.positions_checked == 1
+        assert m.total_exposure_cents == 0
+
+    def test_record_exit_increments_type(self):
+        """Exit recording should increment the correct type counter."""
+        m = _mod.PositionScanMetrics()
+        m.record_exit("take_profit")
+        m.record_exit("stop_loss")
+        m.record_exit("take_profit")
+        assert m.exits_by_type["take_profit"] == 2
+        assert m.exits_by_type["stop_loss"] == 1
+        assert m.exits_by_type["model_shift"] == 0
+
+    def test_record_exit_unknown_type_ignored(self):
+        """Unknown exit types should be silently ignored."""
+        m = _mod.PositionScanMetrics()
+        m.record_exit("unknown_type")
+        assert all(v == 0 for v in m.exits_by_type.values())
+
+    def test_record_stale(self):
+        """Stale position count should be recorded."""
+        m = _mod.PositionScanMetrics()
+        m.record_stale(3)
+        assert m.stale_positions == 3
+
+    def test_to_dict_serialization(self):
+        """to_dict should produce a complete dict with all fields."""
+        m = _mod.PositionScanMetrics()
+        m.record_position("TICK-1", 5, 40)
+        m.record_exit("stop_loss")
+        m.record_stale(2)
+        d = m.to_dict()
+        assert d["positions_checked"] == 1
+        assert d["total_exits"] == 1
+        assert d["exits_by_type"]["stop_loss"] == 1
+        assert d["stale_positions_flagged"] == 2
+        assert d["total_exposure_cents"] == 200
+        assert d["largest_position_ticker"] == "TICK-1"
+        assert "timestamp" in d
+
+    def test_save_calls_atomic_write(self, tmp_path):
+        """save() should call _atomic_write_json with correct data."""
+        metrics_file = tmp_path / "metrics.json"
+        m = _mod.PositionScanMetrics()
+        m.record_position("TICK-1", 3, 50)
+
+        # Replace module-level _atomic_write_json with real file write
+        def _real_write(path, data):
+            path.write_text(json.dumps(data, indent=2))
+
+        with patch.object(_mod, "_atomic_write_json", side_effect=_real_write):
+            m.save(path=metrics_file)
+        assert metrics_file.exists()
+        data = json.loads(metrics_file.read_text())
+        assert isinstance(data, list)
+        assert len(data) == 1
+        assert data[0]["positions_checked"] == 1
+
+    def test_save_appends_to_existing(self, tmp_path):
+        """save() should append to existing history, not overwrite."""
+        metrics_file = tmp_path / "metrics.json"
+
+        def _real_write(path, data):
+            path.write_text(json.dumps(data, indent=2))
+
+        with patch.object(_mod, "_atomic_write_json", side_effect=_real_write):
+            # First scan
+            m1 = _mod.PositionScanMetrics()
+            m1.record_position("TICK-1", 3, 50)
+            m1.save(path=metrics_file)
+            # Second scan
+            m2 = _mod.PositionScanMetrics()
+            m2.record_position("TICK-2", 5, 30)
+            m2.record_exit("take_profit")
+            m2.save(path=metrics_file)
+        data = json.loads(metrics_file.read_text())
+        assert len(data) == 2
+        assert data[1]["exits_by_type"]["take_profit"] == 1
+
+
+# ===================================================================
+# Per-bot stop-loss and backtest tests (Task 8.7)
+# ===================================================================
+
+class TestGetEffectiveStopLoss:
+    """Test per-bot stop-loss threshold computation."""
+
+    def test_weather_uses_config_value(self):
+        """Non-strategy bots should use the configured stop-loss cents."""
+        result = _mod.get_effective_stop_loss("weather", 20, entry_price_cents=60)
+        assert result == 20
+
+    def test_crypto_uses_config_value(self):
+        """Crypto should use configured stop-loss."""
+        result = _mod.get_effective_stop_loss("crypto", 35, entry_price_cents=50)
+        assert result == 35
+
+    def test_strategy_uses_proportional(self):
+        """Strategy (longshot) positions should use proportional stop-loss.
+
+        With STRATEGY_STOP_LOSS_MULTIPLIER=2: entry 10c -> stop at 5c.
+        """
+        result = _mod.get_effective_stop_loss("strategy", 30, entry_price_cents=10)
+        assert result == 5  # 10 / 2 = 5
+
+    def test_strategy_cheap_position(self):
+        """Cheap strategy position: entry 3c -> stop at 1c (minimum 1)."""
+        result = _mod.get_effective_stop_loss("strategy", 30, entry_price_cents=3)
+        assert result == 1  # max(1, 3//2) = max(1, 1) = 1
+
+    def test_strategy_very_cheap_position(self):
+        """Very cheap strategy position: entry 1c -> stop at 1c (minimum)."""
+        result = _mod.get_effective_stop_loss("strategy", 30, entry_price_cents=1)
+        assert result == 1  # max(1, 1//2) = max(1, 0) = 1
+
+    def test_strategy_no_entry_price_uses_config(self):
+        """Strategy with no entry price should fall back to config value."""
+        result = _mod.get_effective_stop_loss("strategy", 30, entry_price_cents=None)
+        assert result == 30
+
+    def test_strategy_zero_entry_price_uses_config(self):
+        """Strategy with 0 entry price should fall back to config value."""
+        result = _mod.get_effective_stop_loss("strategy", 30, entry_price_cents=0)
+        assert result == 30
+
+    def test_unknown_bot_uses_config(self):
+        """Unknown bot should use configured value."""
+        result = _mod.get_effective_stop_loss("unknown", 25, entry_price_cents=50)
+        assert result == 25
+
+
+class TestStopLossDefaults:
+    """Verify STOP_LOSS_DEFAULTS has sensible per-bot values."""
+
+    def test_weather_tighter_than_crypto(self):
+        """Weather stop-loss should be tighter than crypto (less volatile)."""
+        assert _mod.STOP_LOSS_DEFAULTS["weather"] < _mod.STOP_LOSS_DEFAULTS["crypto"]
+
+    def test_economics_widest_fixed(self):
+        """Economics should have the widest fixed stop-loss (illiquid)."""
+        fixed_defaults = {k: v for k, v in _mod.STOP_LOSS_DEFAULTS.items() if v is not None}
+        assert _mod.STOP_LOSS_DEFAULTS["economics"] == max(fixed_defaults.values())
+
+    def test_strategy_is_proportional(self):
+        """Strategy should use proportional (None) stop-loss."""
+        assert _mod.STOP_LOSS_DEFAULTS["strategy"] is None
+
+    def test_all_bots_have_defaults(self):
+        """All known bot names should have a stop-loss default."""
+        expected_bots = {"weather", "source-monitor", "crypto", "economics",
+                         "strategy", "entertainment", "beatrelease", "monitor"}
+        assert expected_bots.issubset(set(_mod.STOP_LOSS_DEFAULTS.keys()))
+
+
+class TestEvaluateStopLossPerBot:
+    """Test evaluate_stop_loss with per-bot source_bot parameter."""
+
+    def test_strategy_proportional_stop_no_trigger(self):
+        """Strategy position at 5c entry, bid at 4c: proportional stop is 2c, no trigger."""
+        pos = {"ticker": "LONGSHOT-1", "yes": 10, "no": 0}
+        market = {"yes_bid": 4, "yes_ask": 6}
+        ec = _exit_config(stop_loss_cents=30)
+        result = _mod.evaluate_stop_loss(pos, market, ec, entry_price_cents=5, source_bot="strategy")
+        # Proportional stop = 5 / 2 = 2c; bid 4c > 2c, no trigger
+        assert result is None
+
+    def test_strategy_proportional_stop_triggers(self):
+        """Strategy position at 5c entry, bid at 2c: proportional stop is 2c, triggers."""
+        pos = {"ticker": "LONGSHOT-1", "yes": 10, "no": 0}
+        market = {"yes_bid": 2, "yes_ask": 4}
+        ec = _exit_config(stop_loss_cents=30)
+        result = _mod.evaluate_stop_loss(pos, market, ec, entry_price_cents=5, source_bot="strategy")
+        # Proportional stop = 5 / 2 = 2c; bid 2c <= 2c, triggers
+        assert result is not None
+        assert result["action"] == "stop_loss"
+        assert "bot=strategy" in result["reasoning"]
+
+    def test_non_strategy_uses_config_stop(self):
+        """Non-strategy bot should use config stop-loss, not proportional."""
+        pos = {"ticker": "KXHIGHMIA-1", "yes": 4, "no": 0}
+        market = {"yes_bid": 25, "yes_ask": 30}
+        ec = _exit_config(stop_loss_cents=30)
+        result = _mod.evaluate_stop_loss(pos, market, ec, entry_price_cents=60, source_bot="weather")
+        assert result is not None
+        assert result["action"] == "stop_loss"
+
+
+class TestBacktestStopLoss:
+    """Test stop-loss backtest analysis function."""
+
+    def test_identifies_premature_exit(self):
+        """Trade exited via stop-loss that would have won should be premature."""
+        trades = [
+            {"exit_type": "stop_loss", "settlement_result": "win"},
+        ]
+        result = _mod.backtest_stop_loss(trades)
+        assert result["premature_exits"] == 1
+        assert result["correct_exits"] == 0
+        assert result["whipsaw_rate"] == 1.0
+
+    def test_identifies_correct_exit(self):
+        """Trade exited via stop-loss that would have lost is a correct exit."""
+        trades = [
+            {"exit_type": "stop_loss", "settlement_result": "loss"},
+        ]
+        result = _mod.backtest_stop_loss(trades)
+        assert result["premature_exits"] == 0
+        assert result["correct_exits"] == 1
+        assert result["whipsaw_rate"] == 0.0
+
+    def test_mixed_results(self):
+        """Mix of premature and correct exits."""
+        trades = [
+            {"exit_type": "stop_loss", "settlement_result": "win"},
+            {"exit_type": "stop_loss", "settlement_result": "loss"},
+            {"exit_type": "stop_loss", "settlement_result": "loss"},
+            {"exit_type": "stop_loss", "settlement_result": "win"},
+        ]
+        result = _mod.backtest_stop_loss(trades)
+        assert result["premature_exits"] == 2
+        assert result["correct_exits"] == 2
+        assert result["total_evaluated"] == 4
+        assert result["whipsaw_rate"] == 0.5
+
+    def test_ignores_non_stop_loss_exits(self):
+        """Only stop_loss exits should be analyzed."""
+        trades = [
+            {"exit_type": "take_profit", "settlement_result": "win"},
+            {"exit_type": "model_shift", "settlement_result": "loss"},
+            {"exit_type": "stop_loss", "settlement_result": "loss"},
+        ]
+        result = _mod.backtest_stop_loss(trades)
+        assert result["total_evaluated"] == 1
+        assert result["correct_exits"] == 1
+
+    def test_handles_unknown_settlements(self):
+        """Trades without settlement data should be counted as unknown."""
+        trades = [
+            {"exit_type": "stop_loss", "settlement_result": None},
+            {"exit_type": "stop_loss"},  # no settlement_result key
+            {"exit_type": "stop_loss", "settlement_result": "loss"},
+        ]
+        result = _mod.backtest_stop_loss(trades)
+        assert result["unknown"] == 2
+        assert result["correct_exits"] == 1
+        assert result["total_evaluated"] == 1
+
+    def test_empty_trades(self):
+        """Empty trade list should return zeroes."""
+        result = _mod.backtest_stop_loss([])
+        assert result["premature_exits"] == 0
+        assert result["correct_exits"] == 0
+        assert result["unknown"] == 0
+        assert result["whipsaw_rate"] == 0.0
+
+    def test_exit_reason_field_also_works(self):
+        """Should also detect stop_loss from exit_reason field (legacy format)."""
+        trades = [
+            {"exit_reason": "stop_loss", "settlement_result": "win"},
+        ]
+        result = _mod.backtest_stop_loss(trades)
+        assert result["premature_exits"] == 1

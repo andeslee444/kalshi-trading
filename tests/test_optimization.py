@@ -47,6 +47,7 @@ from capital_allocator import (
     PortfolioAllocator, BudgetResponse, MAX_TICKER_FRACTION,
     MAX_CITY_FRACTION, _extract_city_key, DEFAULT_STATE_PATH,
 )
+from conftest import make_fake_auth, load_bot_module
 
 # Counter for unique temp state paths in tests
 _state_counter = 0
@@ -65,92 +66,43 @@ def _temp_state_path():
 
 def _load_beatrelease_scanner():
     """Import beatrelease-scanner.py with stubbed-out side effects."""
-    orig_auth = sys.modules.get("kalshi_auth")
-    orig_alloc = sys.modules.get("capital_allocator")
-
-    fake_auth = types.ModuleType("kalshi_auth")
-    fake_auth.KalshiClient = lambda *a, **kw: MagicMock()
-    fake_auth.setup_unbuffered = lambda: None
-    fake_auth.setup_signal_handlers = lambda: None
-    fake_auth.is_shutdown_requested = lambda: False
-    fake_auth.setup_logging = lambda *a, **kw: __import__("logging").getLogger("test")
-    fake_auth.PROJECT_DIR = Path("/tmp/fake_beatrelease")
-    fake_auth.fetch_parallel = lambda *a, **kw: {}
-    fake_auth.retry_request = lambda *a, **kw: None
-    fake_auth.TradeManager = type("TradeManager", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "place_order": lambda self, *a, **kw: None,
-    })
-    fake_auth.trim_trade_log = lambda *a, **kw: None
-    fake_auth.notify_whatsapp = lambda *a, **kw: False
-    fake_auth._atomic_write_json = lambda *a, **kw: None
-    fake_auth.HealthCheckMonitor = type("HealthCheckMonitor", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "record_bot_heartbeat": lambda self, *a, **kw: None,
-        "record_source_success": lambda self, *a, **kw: None,
-        "record_source_error": lambda self, *a, **kw: None,
-    })
-    fake_auth.ScanSummary = type("ScanSummary", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "markets_fetched": 0,
-        "markets_evaluated": 0,
-        "trades_placed": 0,
-        "skips": {},
-        "log_summary": lambda self: None,
-    })
-    fake_auth.load_trades = lambda *a, **kw: []
-    sys.modules["kalshi_auth"] = fake_auth
-
-    fake_alloc = types.ModuleType("capital_allocator")
-    _FakeBudget = type("BudgetResponse", (), {"approved": True, "reason": "", "max_cost_cents": 500, "bankroll_cents": 50000})
-    fake_alloc.PortfolioAllocator = type("PortfolioAllocator", (), {
-        "__init__": lambda self, *a, **kw: None,
-        "request_budget": lambda self, *a, **kw: _FakeBudget(),
-        "record_trade": lambda self, *a, **kw: None,
-    })
-    sys.modules["capital_allocator"] = fake_alloc
-
-    # Create config/data dirs and a minimal bots-config.json
-    config_dir = Path("/tmp/fake_beatrelease/config")
+    _fake_project = Path("/tmp/fake_beatrelease")
+    config_dir = _fake_project / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     keys_dir = config_dir / "keys"
     keys_dir.mkdir(parents=True, exist_ok=True)
-    deepseek_key = keys_dir / "deepseek.txt"
-    deepseek_key.write_text("test-key")
-    bots_config = config_dir / "bots-config.json"
-    bots_config.write_text(json.dumps({
+    (keys_dir / "deepseek.txt").write_text("test-key")
+    (config_dir / "bots-config.json").write_text(json.dumps({
         "beatrelease": {
             "checkIntervalHours": 1,
-            "maxTradeCents": 500,
+            "maxTradeAmount": 5,
             "maxDailyTrades": 10,
             "maxDailyLoss": 25,
             "blogUrls": ["https://www.beatrelease.com/blog"],
         }
     }))
-    data_dir = Path("/tmp/fake_beatrelease/data")
+    data_dir = _fake_project / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
-    pids_dir = data_dir / "pids"
-    pids_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "pids").mkdir(parents=True, exist_ok=True)
 
-    spec = importlib.util.spec_from_file_location(
-        "beatrelease_scanner",
-        str(Path(__file__).resolve().parent.parent / "src" / "kalshi" / "beatrelease-scanner.py"),
+    fake_auth = make_fake_auth(
+        PROJECT_DIR=_fake_project,
+        notify_whatsapp=lambda *a, **kw: False,
     )
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["beatrelease_scanner"] = mod
-    spec.loader.exec_module(mod)
 
-    if orig_auth is not None:
-        sys.modules["kalshi_auth"] = orig_auth
-    else:
-        del sys.modules["kalshi_auth"]
+    _FakeBudget = type("BudgetResponse", (), {
+        "approved": True, "reason": "", "max_cost_cents": 500, "bankroll_cents": 50000,
+    })
+    fake_alloc = types.ModuleType("capital_allocator")
+    fake_alloc.PortfolioAllocator = type("PortfolioAllocator", (), {
+        "__init__": lambda self, *a, **kw: None,
+        "request_budget": lambda self, *a, **kw: _FakeBudget(),
+        "record_trade": lambda self, *a, **kw: None,
+    })
 
-    if orig_alloc is not None:
-        sys.modules["capital_allocator"] = orig_alloc
-    elif "capital_allocator" in sys.modules:
-        del sys.modules["capital_allocator"]
-
-    return mod
+    return load_bot_module("beatrelease-scanner.py", fake_auth, extra_stubs={
+        "capital_allocator": fake_alloc,
+    })
 
 
 _br_mod = _load_beatrelease_scanner()
@@ -1253,13 +1205,15 @@ class TestCryptoPriceProbability:
 
     def test_ou_differs_from_gbm_short_horizon(self):
         """OU adjusts both vol and drift, producing different prob than GBM."""
+        # ou_target is required to activate OU mean-reversion (see probability.py line 1152)
         gbm = crypto_price_probability(70000, 69000, "above",
                                         time_horizon_minutes=60,
                                         realized_vol_pct=0.60)
         ou = crypto_price_probability(70000, 69000, "above",
                                        time_horizon_minutes=60,
                                        realized_vol_pct=0.60,
-                                       use_ou=True, ou_half_life_minutes=120)
+                                       use_ou=True, ou_half_life_minutes=120,
+                                       ou_target=68000)
         # OU reduces vol but also adds mean-reversion drift correction
         # Net effect depends on parameters — just verify they differ
         assert abs(ou - gbm) > 0.001, "OU should produce different prob than GBM"
@@ -1303,7 +1257,7 @@ class TestCryptoPriceProbability:
 # Kalshi fee helpers tests (Tier 2.3)
 # ===================================================================
 
-from probability import kalshi_fee_cents, edge_after_fees, KALSHI_FEE_RATE
+from probability import kalshi_fee_cents, KALSHI_FEE_RATE
 
 
 class TestKalshiFeeHelpers:
@@ -1326,18 +1280,6 @@ class TestKalshiFeeHelpers:
         """At 1c, fee = 0.07 * 0.01 * 0.99 * 100 = 0.0693c."""
         fee = kalshi_fee_cents(1)
         assert abs(fee - 0.0693) < 0.001
-
-    def test_edge_after_fees_positive(self):
-        """Net edge after fees should be less than raw edge."""
-        raw_edge = 0.10
-        net = edge_after_fees(raw_edge, 50)
-        assert net < raw_edge
-        assert net > 0
-
-    def test_edge_after_fees_can_go_negative(self):
-        """Very small edge can go negative after fees."""
-        net = edge_after_fees(0.005, 50)
-        assert net < 0
 
     def test_fee_rate_constant(self):
         assert KALSHI_FEE_RATE == 0.07
@@ -1512,40 +1454,6 @@ class TestQuarterKellyScaling:
 # ===================================================================
 # Fee-adjusted edge rollout tests
 # ===================================================================
-
-class TestFeeAdjustedEdgeRollout:
-
-    def test_edge_after_fees_reduces_edge(self):
-        """edge_after_fees(0.10, 50) should be less than 0.10."""
-        net = edge_after_fees(0.10, 50)
-        assert net < 0.10
-
-    def test_fee_impact_on_cheap_contracts(self):
-        """At 5c, fee = 0.33c, edge reduced by ~0.33%."""
-        fee = kalshi_fee_cents(5)
-        assert abs(fee - 0.3325) < 0.01
-        raw_edge = 0.10
-        net = edge_after_fees(raw_edge, 5)
-        assert abs(net - (raw_edge - fee / 100)) < 0.0001
-
-    def test_fee_impact_on_midprice(self):
-        """At 50c, fee = 1.75c, edge reduced by 1.75%."""
-        fee = kalshi_fee_cents(50)
-        assert abs(fee - 1.75) < 0.01
-        raw_edge = 0.10
-        net = edge_after_fees(raw_edge, 50)
-        assert abs(net - (raw_edge - 0.0175)) < 0.001
-
-    def test_zero_and_boundary_prices(self):
-        """edge_after_fees at 0c and 100c returns raw edge (fee = 0)."""
-        raw_edge = 0.10
-        assert edge_after_fees(raw_edge, 0) == raw_edge
-        assert edge_after_fees(raw_edge, 100) == raw_edge
-
-    def test_negative_edge_stays_negative(self):
-        """Fee adjustment on already-negative edge makes it more negative."""
-        net = edge_after_fees(-0.05, 50)
-        assert net < -0.05
 
 
 # ===================================================================
@@ -1927,7 +1835,6 @@ class TestSettlementAwareCleanup:
         fake_prob.compute_limit_price = lambda *a, **kw: 50
         fake_prob.weather_probability = lambda *a, **kw: 0.5
         fake_prob.nws_probability = lambda *a, **kw: 0.5
-        fake_prob.edge_after_fees = lambda *a, **kw: 0.0
         fake_prob.kalshi_fee_cents = lambda p: 0.07 * (p / 100) * (1 - p / 100) * 100
         fake_prob.crypto_price_probability = lambda *a, **kw: 0.5
         sys.modules["probability"] = fake_prob

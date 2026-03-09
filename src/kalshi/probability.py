@@ -5,6 +5,7 @@ plus generalized half-Kelly position sizing. Uses math.erf for normal CDF
 to avoid a scipy dependency.
 """
 
+import datetime
 import json
 import logging
 import math
@@ -252,7 +253,12 @@ def _load_calibration():
         return _calibration
     try:
         _calibration = json.loads(_CALIBRATION_PATH.read_text()) if _CALIBRATION_PATH.exists() else {}
-    except (json.JSONDecodeError, OSError):
+        if not isinstance(_calibration, dict):
+            _log.warning("calibration.json has wrong schema (expected dict, got %s), using defaults",
+                         type(_calibration).__name__)
+            _calibration = {}
+    except (json.JSONDecodeError, OSError) as e:
+        _log.warning("Failed to load calibration.json, using defaults: %s", e)
         _calibration = {}
     if _calibration:
         _log.info("Calibration loaded: %d cities, %d market types",
@@ -272,6 +278,23 @@ def _reset_calibration():
     """
     global _calibration
     _calibration = {}
+
+
+def check_calibration_freshness(max_age_days=7):
+    """Warn if calibration is older than max_age_days. Returns age in days or None."""
+    cal = _load_calibration()
+    generated = cal.get("generated_at")
+    if not generated:
+        return None
+    try:
+        gen_dt = datetime.datetime.fromisoformat(generated)
+        now = datetime.datetime.now()
+        age_days = (now - gen_dt).days
+        if age_days > max_age_days:
+            _log.warning("Calibration is %d days old (max %d). Run: npm run calibrate", age_days, max_age_days)
+        return age_days
+    except (ValueError, TypeError):
+        return None
 
 
 # ─── Probability models ───
@@ -991,11 +1014,12 @@ def cpi_nowcast_sigma(days_to_release, fed_ci_width=None):
 def gdp_nowcast_sigma(days_to_release):
     """Exponential decay for GDP nowcast uncertainty based on time to release.
 
-    Returns sigma in percentage points. Wider range than CPI (GDP is noisier).
-    floor=0.05 at release, range=0.15, k=0.12.
+    Returns sigma in percentage points. GDP is much noisier than CPI —
+    actual GDP forecast RMSE is 0.5-1.0 pp even close to release.
+    floor=0.15 at release, range=0.45, k=0.12.
 
-    sigma = 0.05 + 0.15 * (1 - exp(-0.12 * d))
-    d=0: 0.05, d=7: ~0.107, d=14: ~0.131, d=30: ~0.172
+    sigma = 0.15 + 0.45 * (1 - exp(-0.12 * d))
+    d=0: 0.15, d=7: ~0.41, d=14: ~0.52, d=30: ~0.59
     """
     cal = _load_calibration()
     gdp_cal = cal.get("gdp", {}).get("sigma_by_days", {})
@@ -1005,7 +1029,7 @@ def gdp_nowcast_sigma(days_to_release):
             return gdp_cal[key]
 
     d = max(0, days_to_release)
-    return 0.05 + 0.15 * (1 - math.exp(-0.12 * d))
+    return 0.15 + 0.45 * (1 - math.exp(-0.12 * d))
 
 
 def boxoffice_data_sigma(day_of_week, hours_since_publication=0):
@@ -1077,27 +1101,13 @@ def kalshi_fee_cents(price_cents):
     return KALSHI_FEE_RATE * p * (1 - p) * 100
 
 
-def _edge_after_fees(raw_edge, price_cents):
-    """DEPRECATED internal helper. Use raw edge + fee_cents param instead.
-
-    This function subtracts fee as a probability delta, but the mathematically
-    correct treatment is to reduce the payout (100 -> 100-fee) in the Kelly
-    formula. All bots now pass fee_cents directly to half_kelly/quarter_kelly.
-    """
-    fee = kalshi_fee_cents(price_cents)
-    return raw_edge - fee / 100
-
-
-# Backward-compatible alias — underscore prefix signals deprecation to developers
-edge_after_fees = _edge_after_fees
-
 
 # ─── Crypto probability model ───
 
 def crypto_price_probability(current_price, threshold, direction="above",
                               time_horizon_minutes=1440, realized_vol_pct=None,
                               iv_pct=None, use_ou=False, ou_half_life_minutes=None,
-                              drift_pct=0.0):
+                              drift_pct=0.0, ou_target=None):
     """Log-normal probability for crypto price markets (BTC/ETH).
 
     Uses geometric Brownian motion: ln(S_T/S_0) ~ N((drift-0.5*sigma^2)*T, sigma^2*T)
@@ -1115,6 +1125,8 @@ def crypto_price_probability(current_price, threshold, direction="above",
         iv_pct: implied volatility as decimal. Takes precedence over realized.
         drift_pct: annualized drift rate as decimal (default 0.0 = risk-neutral).
                    Pass positive value for physical measure (e.g. 0.30 = 30% annual).
+        ou_target: OU mean-reversion target price (e.g. trailing VWAP).
+                   If None, OU drift adjustment is skipped even when use_ou=True.
 
     Returns:
         Probability (0-1).
@@ -1137,7 +1149,7 @@ def crypto_price_probability(current_price, threshold, direction="above",
 
     # Ornstein-Uhlenbeck mean-reversion adjustment with smooth blend
     ou_drift_adj = 0.0  # Additional drift from mean-reversion
-    if use_ou:
+    if use_ou and ou_target is not None and ou_target > 0:
         half_life = ou_half_life_minutes or 120  # default 2-hour half-life
         theta_ou = math.log(2) / max(1, half_life)  # mean-reversion speed (per minute)
         two_theta_T = 2 * theta_ou * time_horizon_minutes
@@ -1145,11 +1157,11 @@ def crypto_price_probability(current_price, threshold, direction="above",
             # OU variance adjustment: Var[X_T] = sigma^2 * (1-e^{-2*theta*T}) / (2*theta*T)
             ou_factor = math.sqrt((1 - math.exp(-two_theta_T)) / two_theta_T)
 
-            # OU drift correction: mean-reversion pull toward long-run mean
+            # OU drift correction: mean-reversion pull toward ou_target (e.g. trailing VWAP)
             # For log-price OU: E[X_T] = X_0 * e^{-theta*T} + mu * (1 - e^{-theta*T})
-            # The correction reduces effective drift for deviations from mean
+            # Previously used threshold as target (bug: pulled toward every strike simultaneously)
             theta_T_min = theta_ou * time_horizon_minutes
-            ou_drift_adj = -(1 - math.exp(-theta_T_min)) * math.log(current_price / threshold)
+            ou_drift_adj = (1 - math.exp(-theta_T_min)) * math.log(ou_target / current_price)
 
             # Smooth blend: full OU below 180 min, linear taper to 1.0 at 300 min
             if time_horizon_minutes > 180:
@@ -1478,7 +1490,7 @@ def half_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None, fee_cents
     original_prob = our_prob
     our_prob = max(0.001, min(0.999, our_prob))
     if original_prob <= 0.001 or original_prob >= 0.999:
-        _log.warning("Probability clamped: %.6f → [0.001, 0.999]", original_prob)
+        _log.debug("Probability clamped: %.6f → [0.001, 0.999]", original_prob)
 
     # Kelly fraction: f = (b*p - q) / b
     # where b = win/loss ratio, p = win prob, q = 1 - p
@@ -1542,7 +1554,7 @@ def half_kelly_sell(edge, sell_price_cents, max_cost_cents, bankroll_cents=None,
     raw_p_true = implied_prob - edge
     p_true = max(0.001, min(0.999, raw_p_true))
     if raw_p_true <= 0.001 or raw_p_true >= 0.999:
-        _log.warning("Probability clamped (sell): %.6f → [0.001, 0.999]", raw_p_true)
+        _log.debug("Probability clamped (sell): %.6f → [0.001, 0.999]", raw_p_true)
 
     # Selling YES: win (sell_price - fee) cents with prob (1-p_true),
     #              lose (100-sell_price) cents with prob p_true
@@ -1745,6 +1757,30 @@ def high_conviction_kelly(edge, price_cents, max_cost_cents, bankroll_cents=None
     if return_details:
         return (contracts, risk, {"kelly_fraction": round(scaled_f, 6), "bankroll_used": bankroll_cents or 0})
     return (contracts, risk)
+
+
+def apply_kelly_multipliers(base_kelly_contracts, multipliers, floor_pct=0.25):
+    """Apply multiple Kelly reduction multipliers with a floor.
+
+    Prevents multiplicative crushing: 4 independent 0.7-0.9 factors can
+    reduce position to ~43% of optimal, but 4 independent 0.1 factors
+    would crush to 0.01%. The floor ensures positions stay meaningful.
+
+    Args:
+        base_kelly_contracts: Output from half_kelly/quarter_kelly (contracts or numeric).
+        multipliers: List of [0,1] reduction factors.
+        floor_pct: Minimum fraction of base Kelly to preserve (default 25%).
+
+    Returns:
+        Adjusted value, at least floor_pct * base_kelly_contracts.
+    """
+    if base_kelly_contracts <= 0:
+        return 0
+    adjusted = base_kelly_contracts
+    for m in multipliers:
+        adjusted *= m
+    floor = base_kelly_contracts * floor_pct
+    return max(adjusted, floor)
 
 
 # ─── Market filters ───

@@ -1,5 +1,12 @@
 """Tests for economics bot concentration limit logic."""
 import pytest
+import json
+import types
+import sys
+import math
+from unittest.mock import MagicMock
+from pathlib import Path
+from conftest import make_fake_auth, load_bot_module
 
 
 def _ticker_family(ticker):
@@ -89,3 +96,108 @@ class TestConcentrationLimits:
         bankroll = 500000
         total_cap = int(bankroll * 0.40)  # $2000 = 200000 cents
         assert total_cap == 200000
+
+
+# ---------------------------------------------------------------------------
+# Import economics-bot to test production constants directly
+# ---------------------------------------------------------------------------
+
+def _fake_atomic_write(path, data):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(data, indent=2))
+
+_fake_auth = make_fake_auth(
+    retry_request=lambda *a, **kw: MagicMock(),
+    _atomic_write_json=_fake_atomic_write,
+)
+
+_fake_prob = types.ModuleType("probability")
+_fake_prob.econ_nowcast_probability = lambda *a, **kw: 0.5
+_fake_prob.cpi_nowcast_sigma = lambda *a, **kw: 0.05
+_fake_prob.gdp_nowcast_sigma = lambda *a, **kw: 0.10
+_fake_prob.quarter_kelly = lambda *a, **kw: (0, 0)
+_fake_prob.uncertainty_kelly = lambda *a, **kw: (0, 0, {})
+_fake_prob.compute_limit_price = lambda *a, **kw: 50
+_fake_prob.kalshi_fee_cents = lambda *a, **kw: 1.0
+_fake_prob.gas_price_probability = lambda *a, **kw: 0.5
+_fake_prob.is_market_liquid = lambda *a, **kw: True
+_fake_prob._norm_cdf = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+_fake_alloc = types.ModuleType("capital_allocator")
+_fake_alloc.PortfolioAllocator = lambda *a, **kw: MagicMock()
+
+_fake_belief = types.ModuleType("cpi_belief_filter")
+_fake_belief.CPIBeliefFilter = type("CPIBeliefFilter", (), {
+    "__init__": lambda self, *a, **kw: None,
+    "update": lambda self, *a, **kw: None,
+    "posterior": property(lambda self: (2.8, 0.10)),
+})
+
+_fake_scenario = types.ModuleType("scenario_engine")
+_fake_scenario.compute_scenario_weights = lambda *a, **kw: {}
+_fake_scenario.scenario_probability = lambda *a, **kw: MagicMock(
+    probability=0.5, agreement=0.8, per_scenario={}, weights_used={})
+
+_fake_macro = types.ModuleType("macro_engine")
+_fake_macro.MacroEngine = None
+
+_econ = load_bot_module("economics-bot.py", _fake_auth, extra_stubs={
+    "probability": _fake_prob,
+    "capital_allocator": _fake_alloc,
+    "cpi_belief_filter": _fake_belief,
+    "scenario_engine": _fake_scenario,
+    "macro_engine": _fake_macro,
+})
+
+
+class TestProductionConcentrationConstants:
+    """Verify production constants match PM-corrected values (15%/40%)."""
+
+    def test_family_exposure_pct_is_fifteen(self):
+        """FAMILY_EXPOSURE_PCT should be 0.15 (15% per PM correction)."""
+        assert _econ.FAMILY_EXPOSURE_PCT == 0.15, \
+            f"FAMILY_EXPOSURE_PCT should be 0.15 (15%), got {_econ.FAMILY_EXPOSURE_PCT}"
+
+    def test_total_econ_pct_is_forty(self):
+        """TOTAL_ECON_PCT should be 0.40 (40% per PM correction)."""
+        assert _econ.TOTAL_ECON_PCT == 0.40, \
+            f"TOTAL_ECON_PCT should be 0.40 (40%), got {_econ.TOTAL_ECON_PCT}"
+
+    def test_check_concentration_blocks_over_family_limit(self):
+        """_check_concentration should block when family exposure >= 15%."""
+        bankroll = 100000  # $1000
+        # 15% of $1000 = $150 = 15000 cents
+        trades = [
+            {"ticker": "KXECON-26MAY-T2.0", "cost_cents": 16000},  # $160 > $150
+        ]
+        allowed, reason = _econ._check_concentration("KXECON-26MAY-T3.0", bankroll, trades)
+        assert not allowed, "Should block: $160 >= 15% of $1000"
+        assert "family_cap" in reason
+
+    def test_check_concentration_allows_under_family_limit(self):
+        """_check_concentration should allow when family exposure < 15%."""
+        bankroll = 100000  # $1000
+        trades = [
+            {"ticker": "KXECON-26MAY-T2.0", "cost_cents": 10000},  # $100 < $150
+        ]
+        allowed, _ = _econ._check_concentration("KXECON-26MAY-T3.0", bankroll, trades)
+        assert allowed, "Should allow: $100 < 15% of $1000"
+
+    def test_check_concentration_blocks_over_total_limit(self):
+        """_check_concentration should block when total econ exposure >= 40%."""
+        bankroll = 100000  # $1000
+        # 40% of $1000 = $400 = 40000 cents
+        trades = [
+            {"ticker": "KXECON-26MAY-T2.0", "cost_cents": 10000},
+            {"ticker": "KXECON-26JUN-T2.0", "cost_cents": 10000},
+            {"ticker": "KXCPI-26MAY-T3.0", "cost_cents": 10000},
+            {"ticker": "KXGDP-26Q1-T2.0", "cost_cents": 12000},
+        ]
+        # Total = 42000 > 40000
+        allowed, reason = _econ._check_concentration("KXECON-26JUL-T2.0", bankroll, trades)
+        assert not allowed, "Should block: $420 >= 40% of $1000"
+        assert "total_econ_cap" in reason
+
+    def test_max_contracts_per_order(self):
+        """MAX_CONTRACTS_PER_ORDER should be 200 (penny contract cap)."""
+        assert _econ.MAX_CONTRACTS_PER_ORDER == 200

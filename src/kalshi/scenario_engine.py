@@ -12,12 +12,10 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-# Use probability module's normal CDF
-try:
-    from probability import _norm_cdf
-except ImportError:
-    def _norm_cdf(x):
-        return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+from probability import _student_t_cdf, _norm_cdf
+
+# Default degrees of freedom — matches probability.py's econ_nowcast_probability default
+_ECON_DF = 5
 
 
 @dataclass
@@ -34,6 +32,7 @@ class ScenarioResult:
     agreement: float                          # 0-1, how much scenarios agree
     per_scenario: Dict[str, float]            # Per-scenario probabilities
     weights_used: Dict[str, float] = field(default_factory=dict)
+    weighted_std: float = 0.0                 # Weighted std of per-scenario probs
 
 
 # === Scenario Definitions ===
@@ -57,6 +56,24 @@ DEFAULT_WEIGHTS: Dict[str, float] = {
 }
 
 
+def _weighted_std(probs: Dict[str, float], weights: Dict[str, float],
+                  mixture_prob: float) -> float:
+    """Compute weighted standard deviation of per-scenario probabilities.
+
+    Better agreement metric than max-min: accounts for weight distribution.
+    A low-weight outlier scenario doesn't distort agreement.
+
+    Returns 0.0 when all scenarios agree, higher values for disagreement.
+    """
+    if not probs or not weights:
+        return 0.0
+    variance = 0.0
+    for name, p in probs.items():
+        w = weights.get(name, 0.0)
+        variance += w * (p - mixture_prob) ** 2
+    return math.sqrt(variance)
+
+
 def compute_scenario_weights(
     polymarket_data: Dict,
     fred_data: Dict,
@@ -64,7 +81,8 @@ def compute_scenario_weights(
     """Compute scenario weights from market-implied + proxy signals.
 
     Falls back to DEFAULT_WEIGHTS when no market data is available.
-    Always normalizes output to sum to 1.0.
+    Always normalizes output to sum to 1.0. Individual weights are
+    clamped to [0, 1] before normalization.
 
     Args:
         polymarket_data: Dict with optional keys:
@@ -104,6 +122,9 @@ def compute_scenario_weights(
     if gdpnow is not None and gdpnow < 0.5 and tips_trend is not None and tips_trend > 0:
         weights["stagflation"] += 0.08
 
+    # Clamp individual weights to [0, 1] before normalizing
+    weights = {k: max(0.0, min(1.0, v)) for k, v in weights.items()}
+
     # Normalize
     total = sum(weights.values())
     if total > 0:
@@ -134,7 +155,8 @@ def scenario_probability(
         scenario_weights: Pre-computed weights (or None for defaults)
 
     Returns:
-        ScenarioResult with mixture probability and agreement metric
+        ScenarioResult with mixture probability, agreement metric, and
+        weighted standard deviation of per-scenario probabilities.
     """
     if scenario_weights is None:
         scenario_weights = DEFAULT_WEIGHTS
@@ -143,7 +165,9 @@ def scenario_probability(
     per_scenario = {}
 
     for name, weight in scenario_weights.items():
-        config = SCENARIOS[name]
+        config = SCENARIOS.get(name)
+        if config is None:
+            continue  # Skip unknown scenarios gracefully
         shifted_mean = fused_nowcast + config.cpi_shift
         scaled_sigma = posterior_sigma * config.sigma_mult
 
@@ -152,10 +176,17 @@ def scenario_probability(
             scaled_sigma = 0.001
 
         z = (threshold - shifted_mean) / scaled_sigma
-        if direction == "above":
-            p = 1.0 - _norm_cdf(z)
+        # Use Student-t(df=5) for fatter tails — matches probability.py econ model
+        if _student_t_cdf is not None:
+            if direction == "above":
+                p = 1.0 - _student_t_cdf(z, _ECON_DF)
+            else:
+                p = _student_t_cdf(z, _ECON_DF)
         else:
-            p = _norm_cdf(z)
+            if direction == "above":
+                p = 1.0 - _norm_cdf(z)
+            else:
+                p = _norm_cdf(z)
 
         per_scenario[name] = p
         total_prob += weight * p
@@ -163,16 +194,27 @@ def scenario_probability(
     # Clamp probability
     total_prob = max(0.001, min(0.999, total_prob))
 
-    # Scenario agreement: 1.0 = all scenarios agree, 0.0 = total disagreement
+    # Scenario agreement: use weighted standard deviation
+    # agreement = 1 - 2*weighted_std (mapped to [0,1] range)
+    # weighted_std near 0 -> agreement near 1 (all scenarios agree)
+    # weighted_std near 0.5 -> agreement near 0 (total disagreement)
+    w_std = _weighted_std(per_scenario, scenario_weights, total_prob)
+
+    # Also compute the simpler max-min for backward compatibility comparison
     probs = list(per_scenario.values())
     if probs:
-        agreement = 1.0 - (max(probs) - min(probs))
+        range_agreement = 1.0 - (max(probs) - min(probs))
     else:
-        agreement = 0.0
+        range_agreement = 0.0
+
+    # Use the weighted std metric but clamp to [0, 1]
+    # Map: std=0 -> agreement=1.0, std>=0.5 -> agreement=0.0
+    agreement = max(0.0, min(1.0, 1.0 - 2.0 * w_std))
 
     return ScenarioResult(
         probability=total_prob,
-        agreement=max(0.0, agreement),
+        agreement=agreement,
         per_scenario=per_scenario,
         weights_used=scenario_weights,
+        weighted_std=w_std,
     )

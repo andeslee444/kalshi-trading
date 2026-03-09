@@ -3,7 +3,7 @@ import math
 import pytest
 from scenario_engine import (
     SCENARIOS, DEFAULT_WEIGHTS, compute_scenario_weights,
-    scenario_probability, ScenarioResult,
+    scenario_probability, ScenarioResult, _weighted_std,
 )
 
 
@@ -103,3 +103,68 @@ class TestScenarioProbability:
         )
         assert result.probability < 0.99, "Should not be fake certainty"
         assert result.probability > 0.50, "Should still be likely"
+
+    def test_weighted_std_populated(self):
+        """Result should include weighted_std field."""
+        result = scenario_probability(
+            fused_nowcast=2.41, posterior_sigma=0.15,
+            threshold=2.0, direction="above",
+            scenario_weights=DEFAULT_WEIGHTS,
+        )
+        assert hasattr(result, "weighted_std")
+        assert result.weighted_std >= 0.0
+
+    def test_agreement_uses_weighted_std(self):
+        """Agreement should decrease when scenarios disagree more (near threshold)."""
+        # Far from threshold: all scenarios agree
+        result_far = scenario_probability(
+            fused_nowcast=4.0, posterior_sigma=0.10,
+            threshold=2.0, direction="above",
+            scenario_weights=DEFAULT_WEIGHTS,
+        )
+        # Near threshold: scenarios disagree due to shifts
+        result_near = scenario_probability(
+            fused_nowcast=2.05, posterior_sigma=0.20,
+            threshold=2.0, direction="above",
+            scenario_weights=DEFAULT_WEIGHTS,
+        )
+        assert result_far.agreement > result_near.agreement
+        assert result_far.weighted_std < result_near.weighted_std
+
+    def test_unknown_scenario_in_weights_skipped(self):
+        """Unknown scenario name in weights should be skipped gracefully."""
+        weights = DEFAULT_WEIGHTS.copy()
+        weights["alien_invasion"] = 0.05
+        # Re-normalize
+        total = sum(weights.values())
+        weights = {k: v / total for k, v in weights.items()}
+
+        result = scenario_probability(
+            fused_nowcast=2.41, posterior_sigma=0.15,
+            threshold=2.0, direction="above",
+            scenario_weights=weights,
+        )
+        # Should still work, alien_invasion just skipped
+        assert 0.001 <= result.probability <= 0.999
+        assert "alien_invasion" not in result.per_scenario
+
+
+class TestWeightedStd:
+    def test_all_agree_returns_zero(self):
+        """When all scenarios have same probability, weighted_std = 0."""
+        probs = {"a": 0.5, "b": 0.5, "c": 0.5}
+        weights = {"a": 0.4, "b": 0.3, "c": 0.3}
+        assert _weighted_std(probs, weights, 0.5) == pytest.approx(0.0)
+
+    def test_disagreement_returns_positive(self):
+        """When scenarios disagree, weighted_std > 0."""
+        probs = {"a": 0.9, "b": 0.1}
+        weights = {"a": 0.5, "b": 0.5}
+        mixture = 0.5 * 0.9 + 0.5 * 0.1  # 0.5
+        std = _weighted_std(probs, weights, mixture)
+        assert std > 0.0
+        assert std == pytest.approx(0.4, abs=0.01)  # sqrt(0.5*0.16 + 0.5*0.16) = 0.4
+
+    def test_empty_returns_zero(self):
+        """Empty inputs return 0."""
+        assert _weighted_std({}, {}, 0.5) == 0.0

@@ -216,6 +216,93 @@ class TestBayesianEdgeEstimator:
         assert hasattr(result, "price_bucket")
         assert hasattr(result, "n_observations")
 
+    def test_time_decay_at_24h_is_full(self):
+        """At 24h to close, time factor should be 1.0 (no decay)."""
+        est = BayesianEdgeEstimator()
+        edge_24h = est.estimate_edge(5, "sports", hours_to_close=24)
+        edge_48h = est.estimate_edge(5, "sports", hours_to_close=48)
+        # Both should be capped at 1.0 time factor
+        assert abs(edge_24h.mu_edge - edge_48h.mu_edge) < 1e-10
+
+    def test_time_decay_at_2h_is_aggressive(self):
+        """At 2h to close, edge should be ~29% of the 24h edge (sqrt decay)."""
+        est = BayesianEdgeEstimator()
+        edge_24h = est.estimate_edge(5, "sports", hours_to_close=24)
+        edge_2h = est.estimate_edge(5, "sports", hours_to_close=2)
+        # time_factor at 2h = sqrt(2/24) = 0.289
+        ratio = edge_2h.mu_edge / edge_24h.mu_edge
+        assert abs(ratio - math.sqrt(2 / 24)) < 0.02, f"ratio={ratio:.3f}"
+
+    def test_time_decay_floor_at_20_percent(self):
+        """Time factor should floor at 20%, not go to zero."""
+        est = BayesianEdgeEstimator()
+        edge_24h = est.estimate_edge(5, "sports", hours_to_close=24)
+        edge_tiny = est.estimate_edge(5, "sports", hours_to_close=0.01)
+        ratio = edge_tiny.mu_edge / edge_24h.mu_edge
+        assert abs(ratio - 0.20) < 0.02, f"ratio={ratio:.3f}, expected ~0.20"
+
+    def test_time_decay_monotonically_decreasing(self):
+        """Edge should monotonically decrease as hours_to_close decreases."""
+        est = BayesianEdgeEstimator()
+        hours_list = [24, 12, 6, 3, 1, 0.5]
+        edges = [est.estimate_edge(5, "sports", hours_to_close=h).mu_edge for h in hours_list]
+        for i in range(len(edges) - 1):
+            assert edges[i] >= edges[i + 1], (
+                f"edge at {hours_list[i]}h ({edges[i]:.4f}) < edge at {hours_list[i+1]}h ({edges[i+1]:.4f})"
+            )
+
+    def test_category_penalty_applied_when_loss_rate_high(self):
+        """When category has >50% loss rate with >=10 observations,
+        edge should be penalized by 50%."""
+        est = BayesianEdgeEstimator()
+        # Get baseline edge with no data
+        baseline = est.estimate_edge(5, "sports", hours_to_close=24)
+
+        # Add 10 observations with 80% loss rate (2 wins, 8 losses)
+        for _ in range(2):
+            est.update_posterior("sports", 5, True)
+        for _ in range(8):
+            est.update_posterior("sports", 5, False)
+
+        penalized = est.estimate_edge(5, "sports", hours_to_close=24)
+        # With 80% loss rate and n=10, category_penalty should be 0.50
+        # The edge should be roughly half (accounting for posterior shrinkage
+        # which also changes alpha/delta)
+        assert penalized.mu_edge < baseline.mu_edge * 0.75, (
+            f"Expected significant penalty: penalized={penalized.mu_edge:.4f}, "
+            f"baseline={baseline.mu_edge:.4f}"
+        )
+
+    def test_category_penalty_not_applied_when_winning(self):
+        """When category has <=50% loss rate, no penalty should be applied."""
+        est = BayesianEdgeEstimator()
+        baseline = est.estimate_edge(5, "sports", hours_to_close=24)
+
+        # Add 10 observations with 20% loss rate (8 wins, 2 losses)
+        for _ in range(8):
+            est.update_posterior("sports", 5, True)
+        for _ in range(2):
+            est.update_posterior("sports", 5, False)
+
+        result = est.estimate_edge(5, "sports", hours_to_close=24)
+        # No category penalty applied, edge should not be drastically reduced
+        # (posterior shrinkage may still change it somewhat)
+        assert result.mu_edge > 0
+
+    def test_category_penalty_not_applied_with_few_observations(self):
+        """Category penalty should not apply with fewer than 10 observations."""
+        est = BayesianEdgeEstimator()
+        baseline = est.estimate_edge(5, "sports", hours_to_close=24)
+
+        # Add 5 observations with 100% loss rate
+        for _ in range(5):
+            est.update_posterior("sports", 5, False)
+
+        result = est.estimate_edge(5, "sports", hours_to_close=24)
+        # With n=5, penalty should NOT apply (n_obs < 10)
+        # Edge may change due to shrinkage but no 50% penalty
+        assert result.mu_edge > 0
+
 
 # ===================================================================
 # Dual-Tail Longshot
@@ -346,6 +433,20 @@ class TestCorrelationAwareSizer:
         sizer.reset_daily()
         # After reset, should allow full budget again
         assert sizer.check_category_cap("sports", 2500) is True
+
+    def test_kelly_scale_decreases_with_more_same_category(self):
+        """kelly_scale should decrease as n_same_category trades increases."""
+        sizer = CorrelationAwareSizer(daily_budget_cents=10000)
+        rho = sizer.get_intra_category_rho("sports")  # 0.15
+        scale_1 = sizer.kelly_scale(1, rho)
+        scale_3 = sizer.kelly_scale(3, rho)
+        scale_8 = sizer.kelly_scale(8, rho)
+        assert scale_1 == 1.0
+        assert scale_3 < scale_1
+        assert scale_8 < scale_3
+        # With rho=0.15 and n=8: effective_n = 8/(1+7*0.15) = 3.90
+        # kelly_scale = sqrt(3.90/8) = 0.698
+        assert abs(scale_8 - 0.698) < 0.01
 
 
 # ===================================================================

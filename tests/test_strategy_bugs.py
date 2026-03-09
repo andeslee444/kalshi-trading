@@ -1,19 +1,23 @@
-"""Regression tests for strategy bot bugs BUG-2, BUG-3, BUG-4.
+"""Regression tests for strategy bot bugs BUG-2, BUG-3, BUG-4, BUG-5.
 
 BUG-2: Reasoning string uses yes_ask instead of sell_price for implied_prob.
 BUG-3: find_near_settlement is dead code (no orders placed).
 BUG-4: compute_limit_price NO-side low-edge places near full ask for tight spreads.
+BUG-5: CPU spin from thousands of allocator.request_budget() calls per scan.
 """
 
 import math
+import json
 import sys
 import types
-import importlib.util
+import datetime
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from probability import longshot_edge, compute_limit_price, _reset_calibration
+from conftest import make_fake_auth, load_bot_module
 
 
 @pytest.fixture(autouse=True)
@@ -89,80 +93,26 @@ class TestBug3DeadCodeRemoval:
 
     def _load_strategy_trader(self):
         """Load strategy-trader.py with stubbed side effects."""
-        from unittest.mock import MagicMock
-
-        orig_auth = sys.modules.get("kalshi_auth")
-        orig_alloc = sys.modules.get("capital_allocator")
-        orig_prob = sys.modules.get("probability")
-
-        fake_auth = types.ModuleType("kalshi_auth")
-        fake_auth.KalshiClient = lambda *a, **kw: MagicMock()
-        fake_auth.setup_unbuffered = lambda: None
-        fake_auth.setup_signal_handlers = lambda: None
-        fake_auth.setup_logging = lambda *a, **kw: __import__("logging").getLogger("test")
-        fake_auth.PROJECT_DIR = Path("/tmp/fake_strategy_test")
-        fake_auth.TradeManager = type("TradeManager", (), {
-            "__init__": lambda self, *a, **kw: None,
-            "place_order": lambda self, *a, **kw: None,
-            "log_decision": lambda self, *a, **kw: None,
-        })
-        fake_auth.trim_trade_log = lambda *a, **kw: None
-        fake_auth._atomic_write_json = lambda *a, **kw: None
-        fake_auth.build_market_snapshot = lambda **kw: {}
-        fake_auth.HealthCheckMonitor = type("HealthCheckMonitor", (), {
-            "__init__": lambda self, *a, **kw: None,
-        })
-        fake_auth.OrderMonitor = type("OrderMonitor", (), {
-            "__init__": lambda self, *a, **kw: None,
-        })
-        fake_auth.ScanSummary = type("ScanSummary", (), {
-            "__init__": lambda self, *a, **kw: None,
-            "markets_fetched": 0,
-            "trades_placed": 0,
-            "finalize": lambda self: None,
-        })
-        sys.modules["kalshi_auth"] = fake_auth
-
-        fake_alloc = types.ModuleType("capital_allocator")
-        fake_alloc.PortfolioAllocator = type("PortfolioAllocator", (), {
-            "__init__": lambda self, *a, **kw: None,
-        })
-        sys.modules["capital_allocator"] = fake_alloc
-
-        # Create required dirs and config
-        config_dir = Path("/tmp/fake_strategy_test/config")
-        config_dir.mkdir(parents=True, exist_ok=True)
-        data_dir = Path("/tmp/fake_strategy_test/data")
-        data_dir.mkdir(parents=True, exist_ok=True)
-        import json
-        bots_config = config_dir / "bots-config.json"
-        bots_config.write_text(json.dumps({
+        _fake_project = Path("/tmp/fake_strategy_test")
+        (_fake_project / "config").mkdir(parents=True, exist_ok=True)
+        (_fake_project / "data").mkdir(parents=True, exist_ok=True)
+        (_fake_project / "config" / "bots-config.json").write_text(json.dumps({
             "strategy": {
-                "maxBetCents": 500,
+                "maxTradeAmount": 5,
                 "scanIntervalMinutes": 15,
                 "maxDailyTrades": 20,
                 "maxDailyLoss": 50,
             }
         }))
 
-        spec = importlib.util.spec_from_file_location(
-            "strategy_trader",
-            str(Path(__file__).resolve().parent.parent / "src" / "kalshi" / "strategy-trader.py"),
-        )
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        fake_auth = make_fake_auth(PROJECT_DIR=_fake_project)
 
-        # Restore original modules
-        if orig_auth is not None:
-            sys.modules["kalshi_auth"] = orig_auth
-        else:
-            del sys.modules["kalshi_auth"]
-        if orig_alloc is not None:
-            sys.modules["capital_allocator"] = orig_alloc
-        elif "capital_allocator" in sys.modules:
-            del sys.modules["capital_allocator"]
+        fake_alloc = types.ModuleType("capital_allocator")
+        fake_alloc.PortfolioAllocator = lambda *a, **kw: None
 
-        return mod
+        return load_bot_module("strategy-trader.py", fake_auth, extra_stubs={
+            "capital_allocator": fake_alloc,
+        })
 
     def test_find_near_settlement_removed(self):
         """find_near_settlement function should not exist in strategy-trader.py."""
@@ -245,3 +195,113 @@ class TestBug4NoSideLimitPrice:
         # yes_bid=50, yes_ask=50 -> no_bid=50, no_ask=50
         price = compute_limit_price(50, 50, "no", edge=0.03)
         assert price == 50
+
+
+# ===================================================================
+# BUG-5: Allocator calls must be deferred to top-N candidates only
+# ===================================================================
+
+class TestBug5DeferredAllocatorCalls:
+
+    def _load_strategy_trader(self):
+        """Load strategy-trader.py with stubbed side effects."""
+        _fake_project = Path("/tmp/fake_strategy_test_bug5")
+        (_fake_project / "config").mkdir(parents=True, exist_ok=True)
+        (_fake_project / "data").mkdir(parents=True, exist_ok=True)
+        (_fake_project / "config" / "bots-config.json").write_text(json.dumps({
+            "strategy": {
+                "maxTradeAmount": 5,
+                "scanIntervalMinutes": 15,
+                "maxDailyTrades": 20,
+                "maxDailyLoss": 50,
+                "bayesianEdge": True,
+                "enableBuyLongshots": True,
+                "sellMaxPrice": 30,
+                "buyMinPrice": 70,
+            }
+        }))
+
+        fake_auth = make_fake_auth(PROJECT_DIR=_fake_project)
+
+        # Create a mock allocator with a real request_budget that tracks calls
+        mock_allocator_instance = MagicMock()
+        budget_result = MagicMock()
+        budget_result.approved = True
+        budget_result.max_cost_cents = 500
+        budget_result.bankroll_cents = 10000
+        budget_result.reason = ""
+        mock_allocator_instance.request_budget = MagicMock(return_value=budget_result)
+
+        fake_alloc = types.ModuleType("capital_allocator")
+        fake_alloc.PortfolioAllocator = lambda *a, **kw: mock_allocator_instance
+
+        mod = load_bot_module("strategy-trader.py", fake_auth, extra_stubs={
+            "capital_allocator": fake_alloc,
+        })
+
+        # Inject the mock allocator into the loaded module
+        mod.allocator = mock_allocator_instance
+
+        return mod, mock_allocator_instance
+
+    def test_allocator_calls_bounded_by_top_n_sells(self):
+        """find_longshot_sells must call allocator.request_budget <= 20 times
+        even when thousands of markets pass the edge filter."""
+        mod, mock_allocator = self._load_strategy_trader()
+
+        # Create 500 markets that all pass the edge filter (price 5c, volume 100)
+        close_time = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=48)).isoformat()
+        markets = []
+        for i in range(500):
+            markets.append({
+                "ticker": f"KXNBA-TEST-{i:04d}",
+                "title": f"Test market {i}",
+                "subtitle": "",
+                "yes_bid": 3,
+                "yes_ask": 5,
+                "volume": 100 + i,
+                "close_time": close_time,
+            })
+
+        mock_allocator.request_budget.reset_mock()
+        sized, total_candidates, n_alloc_calls = mod.find_longshot_sells(markets, 10000)
+
+        # Allocator should be called at most 20 times (TOP_N), not 500
+        call_count = mock_allocator.request_budget.call_count
+        assert call_count <= 20, (
+            f"allocator.request_budget called {call_count} times, expected <= 20"
+        )
+        # The returned n_alloc_calls should match
+        assert n_alloc_calls == call_count
+        # total_candidates should reflect how many passed edge filter
+        assert total_candidates > 20, (
+            f"Expected >20 pre-filter candidates, got {total_candidates}"
+        )
+
+    def test_allocator_calls_bounded_by_top_n_buys(self):
+        """find_longshot_buys must call allocator.request_budget <= 20 times
+        even when thousands of markets pass the edge filter."""
+        mod, mock_allocator = self._load_strategy_trader()
+
+        # Create 500 markets that all pass the buy-side edge filter (YES 92c)
+        close_time = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=48)).isoformat()
+        markets = []
+        for i in range(500):
+            markets.append({
+                "ticker": f"KXNBA-BUY-{i:04d}",
+                "title": f"Test buy market {i}",
+                "subtitle": "",
+                "yes_bid": 92,
+                "yes_ask": 95,
+                "volume": 100 + i,
+                "close_time": close_time,
+            })
+
+        mock_allocator.request_budget.reset_mock()
+        sized, total_candidates, n_alloc_calls = mod.find_longshot_buys(markets, 10000)
+
+        call_count = mock_allocator.request_budget.call_count
+        assert call_count <= 20, (
+            f"allocator.request_budget called {call_count} times, expected <= 20"
+        )
+        assert n_alloc_calls == call_count
