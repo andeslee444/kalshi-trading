@@ -815,7 +815,7 @@ class AuditEngine:
                 "Fee treatment correct: raw edge + fee_cents in Kelly",
                 f"No bots call edge_after_fees(). {len(fee_passers)}/{len(bot_files)} bots "
                 f"pass fee_cents to Kelly functions (correct payout reduction). "
-                f"edge_after_fees() is deprecated in probability.py.",
+                f"edge_after_fees() has been removed from probability.py.",
                 {"bots_passing_fee_cents": fee_passers}
             ))
         elif callers:

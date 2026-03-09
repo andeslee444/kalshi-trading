@@ -21,7 +21,6 @@ import fcntl
 import json
 import os
 import re
-import tempfile
 import time
 import datetime
 import logging
@@ -34,20 +33,7 @@ from edge_monitor import EdgeMonitor
 _log = logging.getLogger("capital_allocator")
 
 
-def _atomic_write_json(path, data):
-    """Write JSON atomically using temp file + os.replace()."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp_path, str(path))
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+from kalshi_auth import atomic_write_json as _atomic_write_json
 
 
 # Default path for shared state file (all bots converge here)
@@ -623,7 +609,7 @@ class PortfolioAllocator:
         quality = compute_signal_quality(bot_name, edge)
         self._traded_tickers[ticker] = {
             "bot": bot_name,
-            "timestamp": datetime.datetime.now().isoformat(),
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "signal_quality": round(quality, 4),
             "edge": round(abs(edge), 4),
             "risk_cents": risk_cents,

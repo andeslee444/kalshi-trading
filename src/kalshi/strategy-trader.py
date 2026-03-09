@@ -89,6 +89,9 @@ def find_longshot_sells(markets, bankroll):
     Uses Bayesian edge model (when enabled) or category-adjusted Becker model
     via longshot_edge(). Expanded range from 15c to sellMaxPrice (default 30c).
     Applies copula-based correlation scaling and confidence-scaled Kelly.
+
+    Returns:
+        (sized_candidates, total_candidates_count, n_allocator_calls)
     """
     now = datetime.datetime.now(datetime.timezone.utc)
     candidates = []
@@ -291,6 +294,9 @@ def find_longshot_buys(markets, bankroll):
 
     When YES is priced 70-99c, the NO side (1-30c) is the overpriced longshot.
     Buy YES to profit from NO-side longshot bias.
+
+    Returns:
+        (sized_candidates, total_candidates_count, n_allocator_calls)
     """
     if not _buy_longshots_enabled:
         return [], 0, 0
@@ -890,13 +896,13 @@ def main():
         try:
             trades_placed = run_scan() or 0
             _atomic_write_json(PROJECT_DIR / "data" / "strategy-last-run.json", {
-                "timestamp": datetime.datetime.now().isoformat(),
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "status": "ok",
                 "trades_placed": trades_placed,
             })
         except Exception as e:
             _atomic_write_json(PROJECT_DIR / "data" / "strategy-last-run.json", {
-                "timestamp": datetime.datetime.now().isoformat(),
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "status": "error",
                 "error": str(e),
             })

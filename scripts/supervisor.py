@@ -604,6 +604,7 @@ class Supervisor:
                 self.bots[name].start()
             else:
                 log.error(f"Unknown bot: {name}")
+        self._save_state()
 
     def status(self):
         """Print status table for all bots."""

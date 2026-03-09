@@ -288,7 +288,10 @@ def check_calibration_freshness(max_age_days=7):
         return None
     try:
         gen_dt = datetime.datetime.fromisoformat(generated)
-        now = datetime.datetime.now()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        # Handle naive timestamps from older calibration files
+        if gen_dt.tzinfo is None:
+            gen_dt = gen_dt.replace(tzinfo=datetime.timezone.utc)
         age_days = (now - gen_dt).days
         if age_days > max_age_days:
             _log.warning("Calibration is %d days old (max %d). Run: npm run calibrate", age_days, max_age_days)

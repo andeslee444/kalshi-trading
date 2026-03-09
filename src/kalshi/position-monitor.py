@@ -418,7 +418,7 @@ def evaluate_trailing_stop(position, market, peak_info, exit_config):
     if current_bid > peak_bid:
         peak_info["peak_bid"] = current_bid
         peak_bid = current_bid
-    peak_info["last_updated"] = datetime.datetime.now().isoformat()
+    peak_info["last_updated"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     trailing_drop = exit_config["trailing_drop_cents"]
     trailing_min_profit = exit_config["trailing_min_profit_cents"]
@@ -865,7 +865,7 @@ class PositionScanMetrics:
     def to_dict(self):
         """Serialize metrics for JSON storage."""
         return {
-            "timestamp": datetime.datetime.now().isoformat(),
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "positions_checked": self.positions_checked,
             "exits_by_type": dict(self.exits_by_type),
             "total_exits": sum(self.exits_by_type.values()),
@@ -903,7 +903,7 @@ def scan_positions():
 
     ss = ScanSummary("position-monitor", log)
     metrics = PositionScanMetrics()
-    now = datetime.datetime.now()
+    now = datetime.datetime.now(datetime.timezone.utc)
     log.info(f"\n{'='*60}")
     log.info(f"[{now.isoformat()}] Position scan starting...")
 
@@ -943,14 +943,16 @@ def scan_positions():
         # New process detected — set fresh grace period
         _first_scan = True
         _metadata["pid"] = _current_pid
-        _metadata["grace_period_expires"] = (datetime.datetime.now() + datetime.timedelta(minutes=5)).isoformat()
+        _metadata["grace_period_expires"] = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5)).isoformat()
         peaks["_metadata"] = _metadata
         _save_peaks(peaks)
         log.info("  New process (pid=%s) — trailing stop grace period active (5 min)", _current_pid)
     elif grace_expires:
         try:
             expires_dt = datetime.datetime.fromisoformat(grace_expires)
-            if datetime.datetime.now() < expires_dt:
+            if expires_dt.tzinfo is None:
+                expires_dt = expires_dt.replace(tzinfo=datetime.timezone.utc)
+            if datetime.datetime.now(datetime.timezone.utc) < expires_dt:
                 _first_scan = True
                 log.info("  Grace period still active (expires %s)", grace_expires)
         except (ValueError, TypeError):
@@ -1007,8 +1009,8 @@ def scan_positions():
                     "peak_bid": 0,
                     "side": "yes" if yes_count > 0 else "no",
                     "source_bot": source_bot,
-                    "first_seen": datetime.datetime.now().isoformat(),
-                    "last_updated": datetime.datetime.now().isoformat(),
+                    "first_seen": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "last_updated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 }
             elif entry_price:
                 # Refresh entry price in case position was averaged up/down
@@ -1021,7 +1023,7 @@ def scan_positions():
                 current_bid = market.get("yes_bid", 0) if yes_count > 0 else (market.get("no_bid", 0) or (100 - market.get("yes_ask", 100)))
                 if current_bid > peaks[ticker].get("peak_bid", 0):
                     peaks[ticker]["peak_bid"] = current_bid
-                peaks[ticker]["last_updated"] = datetime.datetime.now().isoformat()
+                peaks[ticker]["last_updated"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         # 4. Model shift (per-bot threshold, multi-model routing)
         if not exit_signal:
