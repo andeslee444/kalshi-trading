@@ -61,7 +61,11 @@ python3 scripts/pnl-snapshot.py >> "$LOG_FILE" 2>&1 || true
 echo "$(date): Running daily report..." >> "$LOG_FILE"
 python3 scripts/daily-report.py --notify --with-backtest >> "$LOG_FILE" 2>&1
 
-# Step 5: Run daily backtest with drift detection
+# Step 5: Send daily iMessage report via BlueBubbles
+echo "$(date): Sending iMessage report..." >> "$LOG_FILE"
+python3 scripts/daily-imessage-report.py >> "$LOG_FILE" 2>&1 || true
+
+# Step 6: Run daily backtest with drift detection
 echo "$(date): Running daily backtest..." >> "$LOG_FILE"
 python3 scripts/daily-backtest.py >> "$LOG_FILE" 2>&1 || true
 

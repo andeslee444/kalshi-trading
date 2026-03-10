@@ -29,6 +29,7 @@
     "pipeline:dry": "python3 scripts/calibration-pipeline.py --dry-run",
     "report": "python3 scripts/daily-report.py",
     "report:notify": "python3 scripts/daily-report.py --notify --with-backtest",
+    "report:imessage": "python3 scripts/daily-imessage-report.py",
     "audit": "python3 scripts/audit.py",
     "reconcile": "python3 scripts/reconcile-trades.py",
     "supervisor": "python3 scripts/supervisor.py run",
