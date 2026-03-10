@@ -130,17 +130,52 @@
     <!-- ═══════════════════════════════════════════════ -->
     <div id="tab-overview" class="space-y-6">
 
-      <!-- Hero KPI Row -->
+      <!-- Ground Truth P&L (Primary) -->
+      <div class="card" style="background: linear-gradient(135deg, #111827 0%, #0f172a 100%); border: 1px solid #1e3a5f;">
+        <div class="flex items-center justify-between mb-4">
+          <div class="section-label mb-0">Ground Truth P&L</div>
+          <span id="snapshot-status" class="text-xs text-slate-600"></span>
+        </div>
+        <div class="grid grid-cols-2 lg:grid-cols-5 gap-6">
+          <div>
+            <div class="kpi-label">Total P&L</div>
+            <div id="kpi-total-pnl" class="kpi-value mono">--</div>
+            <div class="text-xs text-slate-600 mt-1">NAV − Deposits</div>
+          </div>
+          <div>
+            <div class="kpi-label">ROI</div>
+            <div id="kpi-roi" class="kpi-value mono">--</div>
+            <div id="kpi-roi-detail" class="text-xs text-slate-500 mt-1"></div>
+          </div>
+          <div>
+            <div class="kpi-label">Realized (Net)</div>
+            <div id="kpi-realized-net" class="kpi-value mono">--</div>
+            <div class="text-xs text-slate-600 mt-1">After fees</div>
+          </div>
+          <div>
+            <div class="kpi-label">Unrealized</div>
+            <div id="kpi-unrealized" class="kpi-value mono">--</div>
+            <div class="text-xs text-slate-600 mt-1">Total − Realized</div>
+          </div>
+          <div>
+            <div class="kpi-label">NAV</div>
+            <div id="kpi-nav" class="kpi-value mono">--</div>
+            <div id="kpi-nav-detail" class="text-xs text-slate-500 mt-1"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Secondary KPIs -->
       <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <div class="card">
-          <div class="kpi-label">Account Value</div>
-          <div id="kpi-account" class="kpi-value mono">--</div>
-          <div id="kpi-account-detail" class="text-xs text-slate-500 mt-1"></div>
-        </div>
-        <div class="card">
-          <div class="kpi-label">Realized P&L</div>
+          <div class="kpi-label">Realized P&L (Gross)</div>
           <div id="kpi-pnl" class="kpi-value mono">--</div>
           <div id="kpi-pnl-detail" class="text-xs text-slate-500 mt-1"></div>
+        </div>
+        <div class="card">
+          <div class="kpi-label">Fees Paid</div>
+          <div id="kpi-fees" class="kpi-value mono">--</div>
+          <div id="kpi-fees-detail" class="text-xs text-slate-500 mt-1"></div>
         </div>
         <div class="card">
           <div class="kpi-label">Hit Rate</div>
@@ -162,12 +197,20 @@
         </div>
       </div>
 
-      <!-- Strategy Performance + Daily Budget -->
-      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div class="card lg:col-span-2">
-          <div class="section-label">Strategy Performance</div>
-          <div id="strategy-table" class="text-sm">
-            <div class="text-slate-500">Loading...</div>
+      <!-- Strategy Performance (Combined View) -->
+      <div class="card">
+        <div class="section-label">Strategy Performance</div>
+        <div id="strategy-combined-table" class="text-sm overflow-x-auto">
+          <div class="text-slate-500">Loading...</div>
+        </div>
+      </div>
+
+      <!-- Daily P&L + Daily Budget -->
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="card">
+          <div class="section-label">Daily P&L (Last 7 Days)</div>
+          <div id="daily-pnl" class="space-y-2">
+            <div class="text-slate-500 text-sm">Loading...</div>
           </div>
         </div>
         <div class="card">
@@ -365,26 +408,64 @@ async function fetchJSON(url) {
 
 // ─── OVERVIEW TAB ───
 async function loadOverview() {
-  const [account, settlements, risk, positions, backtest, attribution] = await Promise.all([
+  const [account, settlements, risk, positions, backtest, attribution, snapshot] = await Promise.all([
     fetchJSON('/api/account'),
     fetchJSON('/api/settlements?limit=200'),
     fetchJSON('/api/risk'),
     fetchJSON('/api/positions'),
     fetchJSON('/api/backtest'),
     fetchJSON('/api/attribution'),
+    fetchJSON('/api/snapshot'),
   ]);
 
   cachedSettlements = settlements;
 
-  // KPI: Account Value
-  if (account && !account.error) {
-    const total = account.total_value || 0;
-    document.getElementById('kpi-account').textContent = cents(total);
-    document.getElementById('kpi-account-detail').textContent =
-      `${cents(account.balance)} cash · ${cents(account.portfolio_value)} positions`;
+  // Ground Truth P&L from snapshot
+  if (snapshot && !snapshot.error && snapshot.balance_check?.available) {
+    const bc = snapshot.balance_check;
+    const deposits = snapshot.deposits;
+
+    // Total P&L (NAV - deposits)
+    const totalPnl = document.getElementById('kpi-total-pnl');
+    totalPnl.textContent = `${pnlSign(bc.true_total_pnl_cents)}${cents(bc.true_total_pnl_cents)}`;
+    totalPnl.style.color = pnlColor(bc.true_total_pnl_cents);
+
+    // ROI
+    const roi = deposits?.roi_pct;
+    const roiEl = document.getElementById('kpi-roi');
+    if (roi != null) {
+      roiEl.textContent = `${roi >= 0 ? '+' : ''}${roi.toFixed(1)}%`;
+      roiEl.style.color = pnlColor(roi);
+      document.getElementById('kpi-roi-detail').textContent = `on ${cents(bc.net_funded_cents)} capital`;
+    }
+
+    // Realized (Net after fees)
+    const realizedNet = document.getElementById('kpi-realized-net');
+    realizedNet.textContent = `${pnlSign(bc.realized_net_cents)}${cents(bc.realized_net_cents)}`;
+    realizedNet.style.color = pnlColor(bc.realized_net_cents);
+
+    // Unrealized (implied)
+    const unrealized = document.getElementById('kpi-unrealized');
+    unrealized.textContent = `${pnlSign(bc.implied_unrealized_cents)}${cents(bc.implied_unrealized_cents)}`;
+    unrealized.style.color = pnlColor(bc.implied_unrealized_cents);
+
+    // NAV
+    const nav = document.getElementById('kpi-nav');
+    nav.textContent = cents(bc.nav_cents);
+    document.getElementById('kpi-nav-detail').textContent = `${cents(snapshot.account?.balance_cents)} cash`;
+
+    // Snapshot freshness
+    const snapshotAge = snapshot.generated_at ? timeAgo(snapshot.generated_at) : '';
+    document.getElementById('snapshot-status').innerHTML =
+      `<span class="text-slate-500">Snapshot: ${snapshotAge}</span>` +
+      (snapshot.verification?.status === 'ok' ? ' <span style="color:#10b981">✓</span>' :
+       snapshot.verification?.status === 'warnings' ? ' <span style="color:#eab308">⚠</span>' : '');
+  } else if (snapshot?.error) {
+    document.getElementById('snapshot-status').innerHTML =
+      `<span class="text-rose-400">Run: npm run snapshot</span>`;
   }
 
-  // KPI: Realized P&L
+  // KPI: Realized P&L (Gross)
   if (account?.pnl) {
     const p = account.pnl;
     const el = document.getElementById('kpi-pnl');
@@ -392,6 +473,16 @@ async function loadOverview() {
     el.style.color = pnlColor(p.realized_cents);
     document.getElementById('kpi-pnl-detail').innerHTML =
       `Today: <span style="color:${pnlColor(p.today_pnl_cents)}">${pnlSign(p.today_pnl_cents)}${cents(p.today_pnl_cents)}</span>`;
+  }
+
+  // KPI: Fees Paid
+  if (account?.pnl) {
+    const p = account.pnl;
+    const feesEl = document.getElementById('kpi-fees');
+    feesEl.textContent = cents(p.total_fees_cents || 0);
+    feesEl.style.color = '#f43f5e';
+    const feesPct = p.realized_cents > 0 ? ((p.total_fees_cents || 0) / p.realized_cents * 100).toFixed(1) : 0;
+    document.getElementById('kpi-fees-detail').textContent = `${feesPct}% of gross`;
   }
 
   // KPI: Hit Rate
@@ -411,14 +502,19 @@ async function loadOverview() {
     document.getElementById('kpi-exposure-detail').textContent = `${positions.length} open positions`;
   }
 
+  // Combined Strategy Performance Table (realized + unrealized)
+  if (snapshot && !snapshot.error) {
+    renderStrategyCombinedTable(snapshot, positions);
+  }
+
+  // Daily P&L (from verified snapshot)
+  if (snapshot && !snapshot.error && snapshot.realized_pnl?.by_day) {
+    renderDailyPnl(snapshot.realized_pnl.by_day);
+  }
+
   // Equity Curve
   if (settlements?.settlements) {
     renderEquityCurve(settlements.settlements);
-  }
-
-  // Strategy Performance Table
-  if (settlements?.settlements) {
-    renderStrategyTable(settlements.settlements);
   }
 
   // Daily Budget
@@ -430,6 +526,262 @@ async function loadOverview() {
   if (backtest && !backtest.error) {
     renderForecastAccuracy(backtest);
   }
+}
+
+// Bot strategy descriptions for fund manager context
+const BOT_STRATEGIES = {
+  weather: {
+    name: 'Weather',
+    description: 'Temperature forecasting using CDF model with NWS error distributions and per-city sigma calibration',
+    type: 'Forecast'
+  },
+  crypto: {
+    name: 'Crypto',
+    description: 'BTC/ETH price prediction using log-normal GBM model with IV/realized vol and horizon scaling',
+    type: 'Quant Model'
+  },
+  economics: {
+    name: 'Economics',
+    description: 'CPI/GDP/Jobs nowcasting using Cleveland Fed data with step-down sigma as release approaches',
+    type: 'Macro'
+  },
+  strategy: {
+    name: 'Strategy',
+    description: 'Longshot bias exploitation (Becker 2025) — 1¢ contracts overpriced ~57%, edge decays exponentially',
+    type: 'Statistical Arb'
+  },
+  entertainment: {
+    name: 'Entertainment',
+    description: 'Album sales data arbitrage using HITS Daily Double charts before Kalshi settlement',
+    type: 'Info Arb'
+  },
+  'source-monitor': {
+    name: 'Data Monitor',
+    description: 'Real-time info arbitrage when NWS actuals, HDD charts, or box office data confirm outcomes',
+    type: 'Info Arb'
+  },
+  'position-monitor': {
+    name: 'Position Mgmt',
+    description: 'Automated exits: take-profit, stop-loss, trailing stops, and model-shift triggers',
+    type: 'Risk Mgmt'
+  },
+  beatrelease: {
+    name: 'BeatRelease',
+    description: 'Music market scanner using blog content + DeepSeek LLM for sentiment extraction',
+    type: 'Info Arb'
+  },
+  other: {
+    name: 'Other',
+    description: 'Manual trades and unattributed activity',
+    type: 'Manual'
+  }
+};
+
+// Map ticker prefixes to bots for unrealized attribution
+function tickerToBot(ticker) {
+  if (!ticker) return 'other';
+  const t = ticker.toUpperCase();
+  if (t.startsWith('KXHIGH')) return 'weather';
+  if (t.startsWith('KXBTC') || t.startsWith('KXETH') || t.startsWith('KXXRP')) return 'crypto';
+  if (t.includes('CPI') || t.includes('GDP') || t.includes('JOBS') || t.startsWith('KXECONSTAT')) return 'economics';
+  if (t.includes('ALBUM') || t.includes('1ALBUM')) return 'entertainment';
+  return 'other';
+}
+
+function renderStrategyCombinedTable(snapshot, positions) {
+  const byBot = snapshot.realized_pnl?.by_bot || {};
+  const unrealizedPositions = snapshot.unrealized_pnl?.positions || [];
+
+  // Ground truth unrealized from balance check (NAV - deposits - realized)
+  const groundTruthUnrealized = snapshot.balance_check?.implied_unrealized_cents || 0;
+  // Per-position unrealized (limited - Kalshi doesn't provide MTM for most positions)
+  const positionUnrealized = snapshot.unrealized_pnl?.total_cents || 0;
+  // Unattributed unrealized = ground truth - what we can attribute from positions
+  const unattributedUnrealized = groundTruthUnrealized - positionUnrealized;
+
+  // Calculate unrealized P&L per bot from positions (what little data we have)
+  const unrealizedByBot = {};
+  for (const pos of unrealizedPositions) {
+    const bot = tickerToBot(pos.ticker);
+    if (!unrealizedByBot[bot]) unrealizedByBot[bot] = { total: 0, positions: 0, cost: 0 };
+    unrealizedByBot[bot].total += (pos.unrealized_cents || 0);
+    unrealizedByBot[bot].cost += (pos.cost_cents || 0);
+    unrealizedByBot[bot].positions++;
+  }
+
+  // Build rows for all bots
+  const allBots = new Set([...Object.keys(byBot), ...Object.keys(unrealizedByBot), ...Object.keys(BOT_STRATEGIES)]);
+  allBots.delete('other'); // We'll add 'other' at the end if it has data
+
+  const rows = [];
+  for (const bot of allBots) {
+    const realized = byBot[bot] || {};
+    const unrealized = unrealizedByBot[bot] || { total: 0, positions: 0 };
+    const strategy = BOT_STRATEGIES[bot] || { name: bot, description: '', type: '' };
+
+    const grossPnl = realized.pnl_cents || 0;
+    const fees = realized.fees_cents || 0;
+    const netRealized = grossPnl - fees;
+    const unrealizedPnl = unrealized.total;
+    const totalPnl = netRealized + unrealizedPnl;
+    const wins = realized.wins || 0;
+    const losses = realized.losses || 0;
+    const hitRate = realized.win_rate ? Math.round(realized.win_rate * 100) : (wins + losses > 0 ? Math.round(wins / (wins + losses) * 100) : 0);
+
+    // Skip bots with no activity at all
+    if (wins + losses === 0 && unrealized.positions === 0) continue;
+
+    rows.push({
+      bot,
+      name: strategy.name,
+      description: strategy.description,
+      type: strategy.type,
+      grossPnl,
+      fees,
+      netRealized,
+      unrealizedPnl,
+      totalPnl,
+      wins,
+      losses,
+      hitRate,
+      openPositions: unrealized.positions,
+    });
+  }
+
+  // Add 'other' if it has data
+  if (byBot.other || unrealizedByBot.other) {
+    const realized = byBot.other || {};
+    const unrealized = unrealizedByBot.other || { total: 0, positions: 0 };
+    const strategy = BOT_STRATEGIES.other;
+    const grossPnl = realized.pnl_cents || 0;
+    const fees = realized.fees_cents || 0;
+    const netRealized = grossPnl - fees;
+    const wins = realized.wins || 0;
+    const losses = realized.losses || 0;
+    if (wins + losses > 0 || unrealized.positions > 0) {
+      rows.push({
+        bot: 'other',
+        name: strategy.name,
+        description: strategy.description,
+        type: strategy.type,
+        grossPnl,
+        fees,
+        netRealized,
+        unrealizedPnl: unrealized.total,
+        totalPnl: netRealized + unrealized.total,
+        wins,
+        losses,
+        hitRate: wins + losses > 0 ? Math.round(wins / (wins + losses) * 100) : 0,
+        openPositions: unrealized.positions,
+      });
+    }
+  }
+
+  // Sort by total P&L
+  rows.sort((a, b) => b.totalPnl - a.totalPnl);
+
+  if (rows.length === 0) {
+    document.getElementById('strategy-combined-table').innerHTML = '<div class="text-slate-500">No strategy data</div>';
+    return;
+  }
+
+  let html = `<table class="w-full" style="min-width: 900px;"><thead>
+    <tr class="text-xs text-slate-500 border-b border-slate-800">
+      <th class="text-left py-2 font-medium" style="width: 120px;">Strategy</th>
+      <th class="text-left py-2 font-medium pl-3" style="width: 280px;">Description</th>
+      <th class="text-right py-2 font-medium">Total P&L</th>
+      <th class="text-right py-2 font-medium">Realized</th>
+      <th class="text-right py-2 font-medium">Unrealized</th>
+      <th class="text-right py-2 font-medium">Fees</th>
+      <th class="text-right py-2 font-medium">Hit Rate</th>
+      <th class="text-right py-2 font-medium">W/L</th>
+      <th class="text-right py-2 font-medium">Open</th>
+    </tr></thead><tbody>`;
+
+  for (const r of rows) {
+    const bgTint = r.totalPnl > 0 ? 'rgba(16,185,129,0.04)' : r.totalPnl < 0 ? 'rgba(244,63,94,0.04)' : '';
+    html += `<tr style="background:${bgTint}" class="border-b border-slate-800/50 group">
+      <td class="py-3">
+        <div>${strategyPill(r.bot, r.name)}</div>
+        <div class="text-[10px] text-slate-600 mt-0.5">${r.type}</div>
+      </td>
+      <td class="py-3 pl-3 text-xs text-slate-500 leading-tight">${r.description}</td>
+      <td class="text-right py-3 mono font-medium" style="color:${pnlColor(r.totalPnl)}">${pnlSign(r.totalPnl)}${cents(r.totalPnl)}</td>
+      <td class="text-right py-3 mono text-slate-400">${pnlSign(r.netRealized)}${cents(r.netRealized)}</td>
+      <td class="text-right py-3 mono" style="color:${pnlColor(r.unrealizedPnl)}">${r.unrealizedPnl !== 0 ? pnlSign(r.unrealizedPnl) + cents(r.unrealizedPnl) : '—'}</td>
+      <td class="text-right py-3 mono text-rose-400/70">${cents(r.fees)}</td>
+      <td class="text-right py-3 mono" style="color:${r.hitRate >= 50 ? '#10b981' : r.wins + r.losses > 0 ? '#f43f5e' : '#475569'}">${r.wins + r.losses > 0 ? r.hitRate + '%' : '—'}</td>
+      <td class="text-right py-3 mono text-slate-400">${r.wins + r.losses > 0 ? r.wins + '/' + r.losses : '—'}</td>
+      <td class="text-right py-3 mono text-slate-500">${r.openPositions > 0 ? r.openPositions : '—'}</td>
+    </tr>`;
+  }
+
+  // Totals row - use ground truth unrealized from balance check
+  const totals = rows.reduce((acc, r) => ({
+    netRealized: acc.netRealized + r.netRealized,
+    fees: acc.fees + r.fees,
+    wins: acc.wins + r.wins,
+    losses: acc.losses + r.losses,
+    openPositions: acc.openPositions + r.openPositions,
+  }), { netRealized: 0, fees: 0, wins: 0, losses: 0, openPositions: 0 });
+  const totalHitRate = totals.wins + totals.losses > 0 ? Math.round(totals.wins / (totals.wins + totals.losses) * 100) : 0;
+  // Use ground truth for total P&L and unrealized
+  const totalPnl = totals.netRealized + groundTruthUnrealized;
+
+  html += `<tr class="border-t-2 border-slate-700 font-medium">
+    <td class="py-3 text-slate-300">Total</td>
+    <td class="py-3 text-xs text-slate-600">Unrealized uses ground truth (NAV−deposits−realized)</td>
+    <td class="text-right py-3 mono" style="color:${pnlColor(totalPnl)}">${pnlSign(totalPnl)}${cents(totalPnl)}</td>
+    <td class="text-right py-3 mono text-slate-300">${pnlSign(totals.netRealized)}${cents(totals.netRealized)}</td>
+    <td class="text-right py-3 mono" style="color:${pnlColor(groundTruthUnrealized)}">${pnlSign(groundTruthUnrealized)}${cents(groundTruthUnrealized)}</td>
+    <td class="text-right py-3 mono text-rose-400">${cents(totals.fees)}</td>
+    <td class="text-right py-3 mono" style="color:${totalHitRate >= 50 ? '#10b981' : '#f43f5e'}">${totalHitRate}%</td>
+    <td class="text-right py-3 mono text-slate-300">${totals.wins}/${totals.losses}</td>
+    <td class="text-right py-3 mono text-slate-300">${totals.openPositions}</td>
+  </tr>`;
+
+  html += '</tbody></table>';
+  document.getElementById('strategy-combined-table').innerHTML = html;
+}
+
+function renderDailyPnl(byDay) {
+  // Get last 7 days sorted by date descending
+  const days = Object.entries(byDay)
+    .map(([date, pnl]) => ({ date, pnl }))
+    .sort((a, b) => b.date.localeCompare(a.date))
+    .slice(0, 7);
+
+  if (days.length === 0) {
+    document.getElementById('daily-pnl').innerHTML = '<div class="text-slate-500">No daily data</div>';
+    return;
+  }
+
+  // Find max for scaling bars
+  const maxAbs = Math.max(...days.map(d => Math.abs(d.pnl)), 1);
+
+  let html = '';
+  for (const d of days) {
+    const pct = Math.abs(d.pnl) / maxAbs * 100;
+    const color = d.pnl >= 0 ? '#10b981' : '#f43f5e';
+    const dateLabel = new Date(d.date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+
+    html += `<div class="flex items-center gap-3">
+      <span class="text-xs text-slate-500 w-20 shrink-0">${dateLabel}</span>
+      <div class="flex-1 h-5 bg-slate-800/50 rounded overflow-hidden relative">
+        <div class="absolute inset-y-0 ${d.pnl >= 0 ? 'left-1/2' : 'right-1/2'}" style="width:${pct/2}%;background:${color};${d.pnl >= 0 ? '' : 'right:50%;left:auto;'}"></div>
+      </div>
+      <span class="mono text-xs w-16 text-right" style="color:${color}">${pnlSign(d.pnl)}${cents(d.pnl)}</span>
+    </div>`;
+  }
+
+  // 7-day total
+  const total = days.reduce((s, d) => s + d.pnl, 0);
+  html += `<div class="flex items-center justify-between pt-2 mt-2 border-t border-slate-800">
+    <span class="text-xs text-slate-400">7-Day Total</span>
+    <span class="mono text-sm font-medium" style="color:${pnlColor(total)}">${pnlSign(total)}${cents(total)}</span>
+  </div>`;
+
+  document.getElementById('daily-pnl').innerHTML = html;
 }
 
 function renderEquityCurve(settlements) {
@@ -497,49 +849,6 @@ function renderEquityCurve(settlements) {
       interaction: { intersect: false, mode: 'index' },
     }
   });
-}
-
-function renderStrategyTable(settlements) {
-  // Group by strategy
-  const byStrategy = {};
-  for (const s of settlements) {
-    const key = s.strategy || s.bot || 'Unknown';
-    if (!byStrategy[key]) byStrategy[key] = { pnl: 0, wins: 0, losses: 0, trades: 0, bot: s.bot };
-    byStrategy[key].pnl += (s.profit || 0);
-    byStrategy[key].trades++;
-    if (s.profit > 0) byStrategy[key].wins++;
-    else if (s.profit < 0) byStrategy[key].losses++;
-  }
-
-  const rows = Object.entries(byStrategy)
-    .map(([strategy, d]) => ({
-      strategy, ...d,
-      hitRate: d.trades > 0 ? Math.round(d.wins / d.trades * 100) : 0,
-      avgReturn: d.trades > 0 ? d.pnl / d.trades : 0,
-    }))
-    .sort((a, b) => b.pnl - a.pnl);
-
-  let html = `<table class="w-full"><thead>
-    <tr class="text-xs text-slate-500 border-b border-slate-800">
-      <th class="text-left py-2 font-medium">Strategy</th>
-      <th class="text-right py-2 font-medium">Settled P&L</th>
-      <th class="text-right py-2 font-medium">Hit Rate</th>
-      <th class="text-right py-2 font-medium">Trades</th>
-      <th class="text-right py-2 font-medium">Avg Return</th>
-    </tr></thead><tbody>`;
-
-  for (const r of rows) {
-    const bgTint = r.pnl > 0 ? 'rgba(16,185,129,0.04)' : r.pnl < 0 ? 'rgba(244,63,94,0.04)' : '';
-    html += `<tr style="background:${bgTint}" class="border-b border-slate-800/50">
-      <td class="py-2.5">${strategyPill(r.bot, r.strategy)}</td>
-      <td class="text-right py-2.5 mono" style="color:${pnlColor(r.pnl)}">${pnlSign(r.pnl)}${cents(r.pnl)}</td>
-      <td class="text-right py-2.5 mono" style="color:${r.hitRate >= 50 ? '#10b981' : '#f43f5e'}">${r.hitRate}%</td>
-      <td class="text-right py-2.5 mono text-slate-400">${r.trades}</td>
-      <td class="text-right py-2.5 mono" style="color:${pnlColor(r.avgReturn)}">${pnlSign(r.avgReturn)}${cents(r.avgReturn)}</td>
-    </tr>`;
-  }
-  html += '</tbody></table>';
-  document.getElementById('strategy-table').innerHTML = html;
 }
 
 function renderDailyBudget(risk) {
