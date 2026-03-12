@@ -3,7 +3,7 @@
   "n_settlements": 212,
   "n_trades": 584,
   "weather": {
-    "global_sigma_intercept": 4.7,
+    "global_sigma_intercept": 5.01,
     "global_sigma_slope": 0.2,
     "df": 30,
     "global_brier": 0.314465,
@@ -11,39 +11,149 @@
     "global_pnl_cents": 36653,
     "per_city": {
       "LAX": {
-        "sigma_intercept": 3.98,
+        "sigma_intercept": 4.75,
         "sigma_slope": 0.2,
         "df": 8,
-        "n": 14,
-        "shrinkage_weight": 0.483
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 4.731
       },
       "DEN": {
-        "sigma_intercept": 3.68,
+        "sigma_intercept": 6.37,
         "sigma_slope": 0.2,
         "df": 7,
-        "n": 11,
-        "shrinkage_weight": 0.423
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 6.486
       },
       "AUS": {
-        "sigma_intercept": 4.38,
+        "sigma_intercept": 5.81,
         "sigma_slope": 0.2,
         "df": 5,
-        "n": 10,
-        "shrinkage_weight": 0.4
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 5.874
       },
       "CHI": {
-        "sigma_intercept": 4.31,
+        "sigma_intercept": 5.94,
         "sigma_slope": 1.02,
         "df": 5,
-        "n": 14,
-        "shrinkage_weight": 0.483
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 6.024
       },
       "NY": {
-        "sigma_intercept": 3.1,
+        "sigma_intercept": 5.36,
         "sigma_slope": 0.2,
         "df": 15,
-        "n": 15,
-        "shrinkage_weight": 0.5
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 5.385
+      },
+      "MIA": {
+        "sigma_intercept": 4.44,
+        "sigma_slope": 0.2,
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 4.397
+      },
+      "PHIL": {
+        "sigma_intercept": 5.51,
+        "sigma_slope": 0.2,
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 5.555
+      },
+      "HOU": {
+        "sigma_intercept": 4.23,
+        "sigma_slope": 0.2,
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 4.165
+      },
+      "ATL": {
+        "sigma_intercept": 5.22,
+        "sigma_slope": 0.2,
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 5.233
+      },
+      "BOS": {
+        "sigma_intercept": 5.27,
+        "sigma_slope": 0.2,
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 5.288
+      },
+      "SFO": {
+        "sigma_intercept": 3.87,
+        "sigma_slope": 0.2,
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 3.775
+      },
+      "SEA": {
+        "sigma_intercept": 3.33,
+        "sigma_slope": 0.2,
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 3.19
+      },
+      "LV": {
+        "sigma_intercept": 3.43,
+        "sigma_slope": 0.2,
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 3.3
+      },
+      "DAL": {
+        "sigma_intercept": 5.06,
+        "sigma_slope": 0.2,
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 5.061
+      },
+      "MIN": {
+        "sigma_intercept": 6.54,
+        "sigma_slope": 0.2,
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 6.664
+      },
+      "PHX": {
+        "sigma_intercept": 3.61,
+        "sigma_slope": 0.2,
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 3.493
+      },
+      "DC": {
+        "sigma_intercept": 5.25,
+        "sigma_slope": 0.2,
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 5.275
+      },
+      "NOLA": {
+        "sigma_intercept": 4.9,
+        "sigma_slope": 0.2,
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 4.895
+      },
+      "OKC": {
+        "sigma_intercept": 6.16,
+        "sigma_slope": 0.2,
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 6.26
+      },
+      "SATX": {
+        "sigma_intercept": 5.07,
+        "sigma_slope": 0.2,
+        "n": 178,
+        "shrinkage_weight": 0.922,
+        "raw_residual_std": 5.073
       }
     },
     "n": 81,
@@ -69,5 +179,6 @@
       "icon": 0.3927
     },
     "n": 12
-  }
+  },
+  "sigma_updated_at": "2026-03-12T01:17:46.332591"
 }
