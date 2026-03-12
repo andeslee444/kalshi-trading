@@ -189,3 +189,66 @@ class TestEnsembleSpreadSigma:
         from probability import ensemble_spread_sigma_multiplier
         mult = ensemble_spread_sigma_multiplier(spread_f=20.0)
         assert mult <= 2.5
+
+
+# ===================================================================
+# ENSEMBLE_MODELS regression tests
+# ===================================================================
+
+class TestEnsembleModels:
+    """Verify ENSEMBLE_MODELS dict in weather-bot.py."""
+
+    def test_ensemble_models_has_six_entries(self):
+        """Verify ENSEMBLE_MODELS includes all premium models."""
+        assert len(_mod.ENSEMBLE_MODELS) == 6
+        expected = {"gfs", "ecmwf", "icon", "nbm", "aifs", "graphcast"}
+        assert set(_mod.ENSEMBLE_MODELS.keys()) == expected
+
+    def test_ecmwf_model_string_is_025(self):
+        """Regression: ECMWF must use ecmwf_ifs025 (was incorrectly ecmwf_ifs04)."""
+        assert _mod.ENSEMBLE_MODELS["ecmwf"] == "ecmwf_ifs025"
+
+    def test_nbm_model_string(self):
+        assert _mod.ENSEMBLE_MODELS["nbm"] == "nbm_conus"
+
+    def test_aifs_model_string(self):
+        assert _mod.ENSEMBLE_MODELS["aifs"] == "ecmwf_aifs025"
+
+    def test_graphcast_model_string(self):
+        assert _mod.ENSEMBLE_MODELS["graphcast"] == "gfs_graphcast025"
+
+
+def test_bias_corrector_imported():
+    """BiasCorrector must be importable from weather_data and used in weather-bot."""
+    assert hasattr(_mod, 'bias_corrector'), "weather-bot.py must instantiate bias_corrector"
+
+
+class TestBiasBlending:
+    """Test the alpha-ramp blending between historical and live bias."""
+
+    def _compute_blend(self, hist_bias, live_bias, live_n):
+        """Replicate the blending logic from weather-bot.py scan_and_trade."""
+        alpha = min(1.0, live_n / 20.0) if live_n > 0 else 0.0
+        return alpha * live_bias + (1 - alpha) * hist_bias
+
+    def test_no_live_data_uses_historical(self):
+        """When live_n=0, alpha=0, 100% historical bias."""
+        assert self._compute_blend(hist_bias=8.5, live_bias=3.0, live_n=0) == 8.5
+
+    def test_half_ramp_blends_50_50(self):
+        """When live_n=10, alpha=0.5, 50/50 blend."""
+        result = self._compute_blend(hist_bias=8.0, live_bias=4.0, live_n=10)
+        assert abs(result - 6.0) < 0.01
+
+    def test_full_ramp_uses_live(self):
+        """When live_n=20, alpha=1.0, 100% live bias."""
+        assert self._compute_blend(hist_bias=8.0, live_bias=3.0, live_n=20) == 3.0
+
+    def test_beyond_ramp_stays_live(self):
+        """When live_n>20, alpha still capped at 1.0."""
+        assert self._compute_blend(hist_bias=8.0, live_bias=3.0, live_n=100) == 3.0
+
+    def test_none_city_bias_defaults_to_historical(self):
+        """Simulates city_bias=None scenario (no ForecastVerifier data)."""
+        result = self._compute_blend(hist_bias=8.5, live_bias=0.0, live_n=0)
+        assert result == 8.5

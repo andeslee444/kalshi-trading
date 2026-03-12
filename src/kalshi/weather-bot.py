@@ -11,7 +11,7 @@ from probability import weather_probability, weather_sigma, ensemble_weather_pro
 from ticker_utils import parse_weather_ticker as parse_ticker
 from capital_allocator import PortfolioAllocator
 from forecast_verifier import ForecastVerifier, DEFAULT_STATION_MAP
-from weather_data import EnsembleCollector, HRRRFetcher, OrderBookDepth, next_model_run, STATION_MAP, NWSForecastFetcher
+from weather_data import EnsembleCollector, HRRRFetcher, NAMFetcher, PreviousRunsFetcher, OrderBookDepth, next_model_run, STATION_MAP, NWSForecastFetcher, BiasCorrector
 
 setup_unbuffered()
 log = setup_logging("weather")
@@ -91,8 +91,11 @@ def record_local_trade(ticker):
 # Ensemble model endpoints for Open-Meteo
 ENSEMBLE_MODELS = {
     "gfs": "gfs_seamless",
-    "ecmwf": "ecmwf_ifs04",
+    "ecmwf": "ecmwf_ifs025",       # 0.25-degree (9km), was incorrectly ifs04
     "icon": "icon_seamless",
+    "nbm": "nbm_conus",            # NOAA bias-corrected consensus, 2.5km
+    "aifs": "ecmwf_aifs025",       # ECMWF AI model
+    "graphcast": "gfs_graphcast025",  # DeepMind AI model
 }
 ENSEMBLE_ENABLED = config.get("ensemble", {}).get("enabled", False)
 
@@ -191,6 +194,15 @@ ensemble_collector = EnsembleCollector(logger=log)
 # HRRR deterministic forecast fetcher (Phase 3)
 hrrr_fetcher = HRRRFetcher(logger=log, rate_limiter=_open_meteo_limiter.acquire)
 
+# NAM deterministic forecast fetcher (3km, 60h)
+nam_fetcher = NAMFetcher(logger=log, rate_limiter=_open_meteo_limiter.acquire)
+
+# Previous Runs convergence fetcher
+prev_runs_fetcher = PreviousRunsFetcher(logger=log, rate_limiter=_open_meteo_limiter.acquire)
+
+# Bias corrector — loads historical calibration for per-city per-model correction
+bias_corrector = BiasCorrector(logger=log)
+
 # NWS forecast fetcher (fallback when Open-Meteo fails)
 nws_fetcher = NWSForecastFetcher(logger=log)
 
@@ -250,8 +262,8 @@ def get_batch_forecasts(cities_dict):
 def get_batch_ensemble_forecasts(cities_dict):
     """Batch ensemble forecast for all cities in a single API call per model.
 
-    Returns {city_code: {date: {model: temp}}} using 1 API call per model
-    (3 total instead of 3*N_cities).
+    Fetches all models in ENSEMBLE_MODELS (GFS, ECMWF, ICON, NBM, AIFS, GraphCast).
+    Returns {city_code: {date: {model: temp}}} using 1 API call per model.
     """
     codes = list(cities_dict.keys())
     lats = ",".join(str(cities_dict[c]["lat"]) for c in codes)
@@ -720,6 +732,32 @@ def scan_and_trade():
         if hrrr_data:
             log.info("HRRR data available for %d cities", len(hrrr_data))
 
+    # Fetch NAM deterministic forecast (3km resolution, 60h horizon)
+    nam_data = {}  # {city_code: {date_str: max_temp_f}}
+    nam_cfg = config.get("nam", {})
+    if nam_cfg.get("enabled", False):
+        for code, info in CITIES.items():
+            try:
+                data = nam_fetcher.fetch_nam(info["lat"], info["lon"])
+                if data:
+                    nam_data[code] = data
+            except Exception as e:
+                log.warning("NAM fetch failed for %s: %s", code, e)
+        if nam_data:
+            log.info("NAM data available for %d cities", len(nam_data))
+
+    # Fetch previous runs for convergence signal
+    convergence_data = {}  # {city_code: {date_str: {current, previous, delta}}}
+    prev_runs_cfg = config.get("previousRuns", {})
+    if prev_runs_cfg.get("enabled", False):
+        try:
+            model = prev_runs_cfg.get("model", "gfs_seamless")
+            convergence_data = prev_runs_fetcher.fetch_convergence_batch(CITIES, model=model)
+            if convergence_data:
+                log.info("Convergence data available for %d cities", len(convergence_data))
+        except Exception as e:
+            log.warning("Previous runs fetch failed (non-blocking): %s", e)
+
     # Current hour for intra-day sigma (day-0 markets only)
     current_hour = now.hour
     log.info(f"Forecast data collected ({time.time()-t_forecast:.1f}s)")
@@ -764,8 +802,10 @@ def scan_and_trade():
             if not forecast_data:
                 ss.skip("empty_forecast")
                 continue
-            valid_temps = [t for t in forecast_data.values() if t is not None]
-            forecast_temp = sum(valid_temps) / len(valid_temps) if valid_temps else None  # mean for logging
+            # Bias-correct each model's forecast before computing mean
+            corrected_data = bias_corrector.correct_forecast_dict(city, forecast_data)
+            valid_temps = [t for t in corrected_data.values() if t is not None]
+            forecast_temp = sum(valid_temps) / len(valid_temps) if valid_temps else None
             if forecast_temp is None:
                 ss.skip("null_forecast")
                 continue
@@ -774,6 +814,10 @@ def scan_and_trade():
             if city in ensemble_members and date_str in ensemble_members.get(city, {}):
                 members = list(ensemble_members[city][date_str])  # copy to avoid mutation
                 if members and len(members) >= 10:
+                    # Snapshot original count so HRRR/NAM injection weights
+                    # are computed relative to the raw ensemble, not compounding
+                    n_original = len(members)
+
                     # Phase 3: Inject HRRR forecast as additional ensemble members
                     # with day-dependent weighting (60% day-0, 30% day-1)
                     if city in hrrr_data and date_str in hrrr_data.get(city, {}):
@@ -786,14 +830,36 @@ def scan_and_trade():
                             hrrr_weight = 0.0
 
                         if hrrr_weight > 0:
-                            # Replicate HRRR temp as fraction of existing member count
-                            n_inject = max(1, int(len(members) * hrrr_weight))
+                            n_inject = max(1, int(n_original * hrrr_weight))
                             members.extend([hrrr_temp] * n_inject)
                             log.info("  %s: HRRR temp %.1fF injected %d members (weight=%.0f%%, total=%d)",
                                      ticker, hrrr_temp, n_inject, hrrr_weight * 100, len(members))
 
-                    # Get station bias from verifier if available
-                    bias = city_bias.get(city, {}).get("bias_f", 0.0) if city_bias else 0.0
+                    # NAM injection (weight relative to original member count, not post-HRRR)
+                    if city in nam_data and date_str in nam_data.get(city, {}):
+                        nam_temp = nam_data[city][date_str]
+                        if days_out == 0:
+                            nam_weight = nam_cfg.get("weight_day0", 0.40)
+                        elif days_out == 1:
+                            nam_weight = nam_cfg.get("weight_day1", 0.20)
+                        else:
+                            nam_weight = 0.0
+
+                        if nam_weight > 0:
+                            n_inject = max(1, int(n_original * nam_weight))
+                            members.extend([nam_temp] * n_inject)
+                            log.info("  %s: NAM temp %.1fF injected %d members (weight=%.0f%%, total=%d)",
+                                     ticker, nam_temp, n_inject, nam_weight * 100, len(members))
+
+                    # Blend historical calibration bias with live ForecastVerifier bias
+                    hist_bias = bias_corrector.city_average_bias(city)
+                    live_bias = city_bias.get(city, {}).get("bias_f", 0.0) if city_bias else 0.0
+                    live_n = city_bias.get(city, {}).get("n", 0) if city_bias else 0
+                    alpha = min(1.0, live_n / 20.0) if live_n > 0 else 0.0
+                    bias = alpha * live_bias + (1 - alpha) * hist_bias
+                    if abs(bias) > 0.1:
+                        log.info("  %s: bias correction %.1fF (hist=%.1fF, live=%.1fF, alpha=%.2f)",
+                                 ticker, bias, hist_bias, live_bias, alpha)
                     our_prob = empirical_ensemble_probability(
                         members, parsed["threshold"], parsed["direction"],
                         bias_offset=bias
@@ -810,11 +876,15 @@ def scan_and_trade():
             # Fallback: parametric ensemble (v2 with adaptive weights)
             if not used_empirical:
                 # Phase 3: Blend HRRR into parametric forecast data
-                parametric_data = dict(forecast_data)
+                parametric_data = bias_corrector.correct_forecast_dict(city, dict(forecast_data))
                 if city in hrrr_data and date_str in hrrr_data.get(city, {}) and days_out <= 1:
                     parametric_data["hrrr"] = hrrr_data[city][date_str]
                     log.info("  %s: HRRR temp %.1fF added to parametric ensemble",
                              ticker, hrrr_data[city][date_str])
+                if city in nam_data and date_str in nam_data.get(city, {}) and days_out <= 1:
+                    parametric_data["nam"] = nam_data[city][date_str]
+                    log.info("  %s: NAM temp %.1fF added to parametric ensemble",
+                             ticker, nam_data[city][date_str])
 
                 # Compute spread multiplier once — widens sigma AND gates edge
                 pvalid = [t for t in parametric_data.values() if t is not None]
@@ -850,7 +920,9 @@ def scan_and_trade():
                 if not forecast_data:
                     ss.skip("empty_forecast")
                     continue
-                forecast_temp = list(forecast_data.values())[0]
+                # Get first model key and correct its temp
+                first_model = list(forecast_data.keys())[0]
+                forecast_temp = bias_corrector.correct(city, first_model, forecast_data[first_model])
             else:
                 forecast_temp = forecast_data
             if forecast_temp is None:
@@ -858,14 +930,19 @@ def scan_and_trade():
                 continue
             our_prob = compute_probability(forecast_temp, parsed["threshold"], parsed["direction"], days_out, city=city)
 
-        # Skip near-threshold coinflips (|forecast - threshold| < 4°F)
-        MIN_FORECAST_DISTANCE_F = 4.0
+        # Skip near-threshold coinflips — dynamic based on calibrated sigma
+        # With sigma=4.7F (global), min_distance=2.35F. For NY day-0 (sigma=3.1F), 1.55F.
+        # Floor of 1.0F prevents degenerate cases.
+        sigma = weather_sigma(days_out, city)
+        min_forecast_distance = max(1.0, 0.5 * sigma)
         distance = abs(forecast_temp - parsed["threshold"])
-        if distance < MIN_FORECAST_DISTANCE_F:
+        if distance < min_forecast_distance:
             ss.skip("near_threshold")
             trade_manager.log_decision(ticker, "skip", "skipped", "near_threshold",
                                        forecast=forecast_temp, threshold=parsed["threshold"],
-                                       distance=round(distance, 1))
+                                       distance=round(distance, 1),
+                                       min_distance=round(min_forecast_distance, 1),
+                                       sigma=round(sigma, 2))
             continue
 
         yes_ask = m.get("yes_ask", 0)
@@ -1058,6 +1135,18 @@ def scan_and_trade():
                 bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True,
             )
             sizing_label = "quarter-Kelly (uncalibrated)"
+
+        # Apply forecast convergence multiplier to Kelly count
+        if prev_runs_cfg.get("enabled", False) and city_code in convergence_data:
+            city_conv = convergence_data[city_code]
+            date_str_opp = opp["parsed"]["date"]
+            if date_str_opp in city_conv and city_conv[date_str_opp].get("delta") is not None:
+                conv_mult = PreviousRunsFetcher.convergence_multiplier(city_conv[date_str_opp]["delta"])
+                if conv_mult != 1.0:
+                    old_count = count
+                    count = max(1, int(count * conv_mult))
+                    log.info("  %s: convergence mult %.2f (delta=%.1fF), count %d->%d",
+                             ticker, conv_mult, city_conv[date_str_opp]["delta"], old_count, count)
 
         # Phase 3: Improve limit price using orderbook depth (after Kelly sizing for accurate qty)
         if depth_data and count > 0:
