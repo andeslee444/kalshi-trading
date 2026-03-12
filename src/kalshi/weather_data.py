@@ -6,6 +6,9 @@ Provides:
 - NWSForecastFetcher: Fetches NWS 7-day forecast as fallback data source
 - EnsembleCollector: Fetches raw ensemble member temperatures from Open-Meteo
 - HRRRFetcher: Fetches HRRR deterministic forecast data from Open-Meteo
+- NAMFetcher: Fetches NAM 3km deterministic forecast from Open-Meteo
+- PreviousRunsFetcher: Forecast convergence analysis from previous model runs
+- BiasCorrector: Per-city per-model systematic forecast bias correction
 - IEMFetcher: Fetches actual daily high temperatures from Iowa Environmental Mesonet
 - OrderBookDepth: Fetches and analyzes Kalshi order book depth
 - MODEL_RUN_SCHEDULE / next_model_run(): Model run timing awareness
@@ -767,7 +770,7 @@ class BiasCorrector:
         """Compute residual std: sqrt(RMSE^2 - bias^2).
 
         This is the forecast uncertainty AFTER bias removal.
-        If model is None, returns weighted average across models.
+        If model is None, returns average across models for the city.
         """
         per_city = self._data.get("per_city", {}).get(city, {})
         if model and model in per_city:
