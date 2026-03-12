@@ -1,4 +1,4 @@
-"""Tests for weather_data.py — STATION_MAP, EnsembleCollector, IEMFetcher, TrainingStore."""
+"""Tests for weather_data.py — STATION_MAP, EnsembleCollector, IEMFetcher, NAMFetcher, PreviousRunsFetcher, TrainingStore."""
 
 import sys
 import types
@@ -7,7 +7,7 @@ from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, "src/kalshi")
 
-from weather_data import STATION_MAP, EnsembleCollector, IEMFetcher, TrainingStore, NWSForecastFetcher, NWS_GRID_MAP
+from weather_data import STATION_MAP, EnsembleCollector, IEMFetcher, TrainingStore, NWSForecastFetcher, NWS_GRID_MAP, NAMFetcher, PreviousRunsFetcher, BiasCorrector
 
 
 # ===================================================================
@@ -178,6 +178,17 @@ class TestEnsembleCollector:
         assert result is not None
         # None members should be filtered out
         assert len(result["2026-03-01"]) == 2
+
+    @patch("weather_data._retry_request")
+    def test_ensemble_url_includes_icon_gem(self, mock_retry):
+        """Verify expanded ensemble models string includes ICON and GEM."""
+        mock_retry.return_value = self._make_mock_response(
+            {"daily": {"time": [], "temperature_2m_max_member00": []}})
+        ec = EnsembleCollector()
+        ec.fetch_ensemble(25.79, -80.29)
+        url = mock_retry.call_args[0][1]
+        assert "icon_global" in url
+        assert "gem_global" in url
 
 
 # ===================================================================
@@ -358,7 +369,7 @@ class TestHRRRFetcher:
 
     @patch("weather_data._retry_request")
     def test_fetch_hrrr_url_uses_hrrr_conus(self, mock_retry):
-        """Verify the URL uses the hrrr_conus model and auto timezone."""
+        """Verify the URL uses an hrrr_conus model variant and auto timezone."""
         mock_retry.return_value = self._make_mock_response(
             {"hourly": {"time": ["2026-03-05T00:00"], "temperature_2m": [72.0]}}
         )
@@ -367,7 +378,8 @@ class TestHRRRFetcher:
 
         call_args = mock_retry.call_args
         url = call_args[0][1]  # second positional arg is the URL
-        assert "models=hrrr_conus" in url
+        # Premium API uses ncep_hrrr_conus, free uses hrrr_conus
+        assert "hrrr_conus" in url
         assert "hourly=temperature_2m" in url
         assert "temperature_unit=fahrenheit" in url
         assert "timezone=auto" in url
@@ -478,9 +490,17 @@ class TestModelRunSchedule:
         assert "gfs" in MODEL_RUN_SCHEDULE
         assert "ecmwf" in MODEL_RUN_SCHEDULE
         assert "hrrr" in MODEL_RUN_SCHEDULE
+        assert "nbm" in MODEL_RUN_SCHEDULE
+        assert "nam" in MODEL_RUN_SCHEDULE
 
     def test_hrrr_runs_hourly(self):
         assert len(MODEL_RUN_SCHEDULE["hrrr"]["hours_utc"]) == 24
+
+    def test_nbm_runs_hourly(self):
+        assert len(MODEL_RUN_SCHEDULE["nbm"]["hours_utc"]) == 24
+
+    def test_nam_runs_4_times(self):
+        assert MODEL_RUN_SCHEDULE["nam"]["hours_utc"] == [0, 6, 12, 18]
 
     def test_gfs_runs_4_times(self):
         assert MODEL_RUN_SCHEDULE["gfs"]["hours_utc"] == [0, 6, 12, 18]
@@ -510,23 +530,23 @@ class TestModelRunSchedule:
 
     def test_next_model_run_skips_already_available(self):
         """Already-available runs should be skipped; only future runs returned."""
-        # At 01:00, HRRR 00Z was at 00:45 (already past, skip)
-        # HRRR 01Z will be at 01:45 (45min away)
+        # At 01:00: NBM 00Z at 01:30 (30 min away), HRRR 01Z at 01:45 (45 min)
         now = datetime.datetime(2026, 3, 5, 1, 0, 0)
         model, minutes = next_model_run(now)
         assert minutes > 0  # must be a future run
-        assert minutes == 45  # HRRR 01Z at 01:45
+        assert minutes == 30  # NBM 00Z at 01:30
 
     def test_next_model_run_prefers_soonest(self):
         """Should return the model run that becomes available soonest."""
         # At 05:00 UTC:
-        # HRRR 05Z available at 05:45 = 45 min away (soonest)
+        # NBM 04Z available at 05:30 = 30 min away (soonest)
+        # HRRR 05Z available at 05:45 = 45 min away
         # GFS 06Z available at 09:30 = 270 min away
         now = datetime.datetime(2026, 3, 5, 5, 0, 0)
         model, minutes = next_model_run(now)
         assert minutes > 0
-        assert model == "hrrr"
-        assert minutes == 45
+        assert model == "nbm"
+        assert minutes == 30
 
     def test_next_model_run_never_returns_zero(self):
         """next_model_run should never return 0 at any time of day."""
@@ -543,10 +563,10 @@ class TestModelRunSchedule:
         assert minutes == 2
 
     def test_next_model_run_after_last_hrrr(self):
-        """At 10:50 UTC, HRRR 10Z already past. Next is HRRR 11Z at 11:45 -> 55 min."""
+        """At 10:50 UTC, HRRR 10Z already past. NBM 10Z at 11:30 (40 min), HRRR 11Z at 11:45 (55 min)."""
         now = datetime.datetime(2026, 3, 5, 10, 50, 0)
         model, minutes = next_model_run(now)
-        assert minutes == 55
+        assert minutes == 40  # NBM 10Z at 11:30
 
 
 # ===================================================================
@@ -666,3 +686,303 @@ class TestNWSForecastFetcher:
         fetcher = NWSForecastFetcher()
         assert fetcher.cross_validate("MIA", 85.0, 81.0) is False  # 4F diff
         assert fetcher.cross_validate("MIA", 85.0, 90.0) is False  # 5F diff
+
+
+# ===================================================================
+# NAMFetcher tests (with mocked HTTP)
+# ===================================================================
+
+
+class TestNAMFetcher:
+
+    def _make_mock_response(self, json_data, status_code=200):
+        mock_resp = MagicMock()
+        mock_resp.status_code = status_code
+        mock_resp.json.return_value = json_data
+        return mock_resp
+
+    @patch("weather_data._retry_request")
+    def test_fetch_nam_parses_daily_max(self, mock_retry):
+        """NAM returns daily max temps directly (no hourly aggregation needed)."""
+        json_data = {
+            "daily": {
+                "time": ["2026-03-05", "2026-03-06", "2026-03-07"],
+                "temperature_2m_max": [85.0, 87.5, 83.2],
+            }
+        }
+        mock_retry.return_value = self._make_mock_response(json_data)
+        fetcher = NAMFetcher()
+        result = fetcher.fetch_nam(25.79, -80.29)
+        assert result == {"2026-03-05": 85.0, "2026-03-06": 87.5, "2026-03-07": 83.2}
+
+    @patch("weather_data._retry_request")
+    def test_fetch_nam_returns_none_on_failure(self, mock_retry):
+        mock_retry.return_value = self._make_mock_response({}, status_code=500)
+        fetcher = NAMFetcher()
+        result = fetcher.fetch_nam(25.79, -80.29)
+        assert result is None
+
+    @patch("weather_data._retry_request")
+    def test_fetch_nam_skips_none_values(self, mock_retry):
+        json_data = {
+            "daily": {
+                "time": ["2026-03-05", "2026-03-06"],
+                "temperature_2m_max": [85.0, None],
+            }
+        }
+        mock_retry.return_value = self._make_mock_response(json_data)
+        fetcher = NAMFetcher()
+        result = fetcher.fetch_nam(25.79, -80.29)
+        assert result == {"2026-03-05": 85.0}
+        assert "2026-03-06" not in result
+
+    @patch("weather_data._retry_request")
+    def test_fetch_nam_url_contains_nam_conus(self, mock_retry):
+        mock_retry.return_value = self._make_mock_response(
+            {"daily": {"time": [], "temperature_2m_max": []}})
+        fetcher = NAMFetcher()
+        fetcher.fetch_nam(25.79, -80.29)
+        url = mock_retry.call_args[0][1]
+        assert "nam_conus" in url
+
+    @patch("weather_data._retry_request")
+    def test_fetch_nam_returns_none_when_no_data(self, mock_retry):
+        json_data = {"daily": {"time": [], "temperature_2m_max": []}}
+        mock_retry.return_value = self._make_mock_response(json_data)
+        fetcher = NAMFetcher()
+        result = fetcher.fetch_nam(25.79, -80.29)
+        assert result is None
+
+    @patch("weather_data._retry_request")
+    def test_fetch_nam_returns_none_on_request_failure(self, mock_retry):
+        mock_retry.return_value = None
+        fetcher = NAMFetcher()
+        result = fetcher.fetch_nam(25.79, -80.29)
+        assert result is None
+
+
+# ===================================================================
+# PreviousRunsFetcher tests (with mocked HTTP)
+# ===================================================================
+
+
+class TestPreviousRunsFetcher:
+
+    def _make_mock_response(self, json_data, status_code=200):
+        mock_resp = MagicMock()
+        mock_resp.status_code = status_code
+        mock_resp.json.return_value = json_data
+        return mock_resp
+
+    @patch("weather_data._retry_request")
+    def test_fetch_convergence_batch_parses_response(self, mock_retry):
+        """Multi-location response with current + previous temps."""
+        json_data = [
+            {
+                "daily": {
+                    "time": ["2026-03-10", "2026-03-11"],
+                    "temperature_2m_max": [85.0, 87.0],
+                    "temperature_2m_max_previous_day1": [84.0, 88.5],
+                }
+            }
+        ]
+        mock_retry.return_value = self._make_mock_response(json_data)
+        fetcher = PreviousRunsFetcher()
+        result = fetcher.fetch_convergence_batch({"MIA": {"lat": 25.79, "lon": -80.29}})
+        assert "MIA" in result
+        assert result["MIA"]["2026-03-10"]["current"] == 85.0
+        assert result["MIA"]["2026-03-10"]["previous"] == 84.0
+        assert result["MIA"]["2026-03-10"]["delta"] == 1.0  # 85 - 84
+
+    @patch("weather_data._retry_request")
+    def test_fetch_convergence_batch_handles_missing_previous(self, mock_retry):
+        json_data = [{
+            "daily": {
+                "time": ["2026-03-10"],
+                "temperature_2m_max": [85.0],
+                "temperature_2m_max_previous_day1": [None],
+            }
+        }]
+        mock_retry.return_value = self._make_mock_response(json_data)
+        fetcher = PreviousRunsFetcher()
+        result = fetcher.fetch_convergence_batch({"MIA": {"lat": 25.79, "lon": -80.29}})
+        assert result["MIA"]["2026-03-10"]["previous"] is None
+        assert result["MIA"]["2026-03-10"]["delta"] is None
+
+    @patch("weather_data._retry_request")
+    def test_fetch_convergence_batch_single_location_dict(self, mock_retry):
+        """Single-location response returns dict, not list."""
+        json_data = {
+            "daily": {
+                "time": ["2026-03-10"],
+                "temperature_2m_max": [85.0],
+                "temperature_2m_max_previous_day1": [83.0],
+            }
+        }
+        mock_retry.return_value = self._make_mock_response(json_data)
+        fetcher = PreviousRunsFetcher()
+        result = fetcher.fetch_convergence_batch({"MIA": {"lat": 25.79, "lon": -80.29}})
+        assert "MIA" in result
+        assert result["MIA"]["2026-03-10"]["delta"] == 2.0
+
+    def test_convergence_multiplier_stable(self):
+        assert PreviousRunsFetcher.convergence_multiplier(0.5) == 1.2
+
+    def test_convergence_multiplier_unstable(self):
+        assert PreviousRunsFetcher.convergence_multiplier(4.0) == 0.6
+
+    def test_convergence_multiplier_moderate(self):
+        # At delta=2.0: 1.2 - (2.0 - 1.0) * 0.3 = 0.9
+        assert abs(PreviousRunsFetcher.convergence_multiplier(2.0) - 0.9) < 0.01
+
+    def test_convergence_multiplier_negative_delta(self):
+        """Negative delta (cooling) should use absolute value."""
+        assert PreviousRunsFetcher.convergence_multiplier(-0.5) == 1.2
+        assert PreviousRunsFetcher.convergence_multiplier(-4.0) == 0.6
+
+    def test_convergence_multiplier_boundary_1f(self):
+        """At exactly 1.0F, should be 1.2 (stable)."""
+        assert PreviousRunsFetcher.convergence_multiplier(1.0) == 1.2
+
+    def test_convergence_multiplier_boundary_3f(self):
+        """At exactly 3.0F, should be 0.6 (unstable)."""
+        assert PreviousRunsFetcher.convergence_multiplier(3.0) == 0.6
+
+    @patch("weather_data._retry_request")
+    def test_fetch_convergence_batch_api_failure(self, mock_retry):
+        mock_retry.return_value = self._make_mock_response({}, status_code=500)
+        fetcher = PreviousRunsFetcher()
+        result = fetcher.fetch_convergence_batch({"MIA": {"lat": 25.79, "lon": -80.29}})
+        assert result == {}
+
+    @patch("weather_data._retry_request")
+    def test_fetch_convergence_batch_request_none(self, mock_retry):
+        mock_retry.return_value = None
+        fetcher = PreviousRunsFetcher()
+        result = fetcher.fetch_convergence_batch({"MIA": {"lat": 25.79, "lon": -80.29}})
+        assert result == {}
+
+
+class TestBiasCorrector:
+    """Tests for BiasCorrector — per-city, per-model forecast bias correction."""
+
+    SAMPLE_CALIBRATION = {
+        "n_forecasts": 100,
+        "per_city": {
+            "MIA": {
+                "gfs": {"bias": 8.9, "rmse": 9.9, "mae": 8.9, "n": 178},
+                "ecmwf": {"bias": 7.0, "rmse": 8.3, "mae": 7.0, "n": 178},
+            },
+            "DEN": {
+                "gfs": {"bias": 18.1, "rmse": 19.3, "mae": 18.1, "n": 178},
+                "graphcast": {"bias": 14.8, "rmse": 16.3, "mae": 14.9, "n": 178},
+            },
+        },
+        "global": {
+            "gfs": {"bias": 10.4, "rmse": 12.1, "mae": 10.5, "n": 3560},
+            "ecmwf": {"bias": 9.3, "rmse": 11.2, "mae": 9.4, "n": 3417},
+        },
+    }
+
+    def _make_corrector(self, data=None):
+        from weather_data import BiasCorrector
+        bc = BiasCorrector.__new__(BiasCorrector)
+        bc.log = MagicMock()
+        bc._data = data if data is not None else self.SAMPLE_CALIBRATION
+        return bc
+
+    def test_correct_subtracts_city_model_bias(self):
+        bc = self._make_corrector()
+        assert bc.correct("MIA", "gfs", 85.0) == pytest.approx(85.0 - 8.9)
+
+    def test_correct_none_returns_none(self):
+        bc = self._make_corrector()
+        assert bc.correct("MIA", "gfs", None) is None
+
+    def test_correct_unknown_model_uses_city_average(self):
+        bc = self._make_corrector()
+        # MIA average: (8.9 + 7.0) / 2 = 7.95
+        assert bc.correct("MIA", "aifs", 85.0) == pytest.approx(85.0 - 7.95)
+
+    def test_correct_unknown_city_uses_global_model_bias(self):
+        bc = self._make_corrector()
+        assert bc.correct("SEA", "gfs", 55.0) == pytest.approx(55.0 - 10.4)
+
+    def test_correct_unknown_city_and_model_uses_global_average(self):
+        bc = self._make_corrector()
+        # global average: (10.4 + 9.3) / 2 = 9.85
+        assert bc.correct("SEA", "aifs", 55.0) == pytest.approx(55.0 - 9.85)
+
+    def test_correct_forecast_dict(self):
+        bc = self._make_corrector()
+        forecasts = {"gfs": 85.0, "ecmwf": 83.0}
+        result = bc.correct_forecast_dict("MIA", forecasts)
+        assert result["gfs"] == pytest.approx(85.0 - 8.9)
+        assert result["ecmwf"] == pytest.approx(83.0 - 7.0)
+
+    def test_correct_forecast_dict_preserves_none(self):
+        bc = self._make_corrector()
+        result = bc.correct_forecast_dict("MIA", {"gfs": None, "ecmwf": 83.0})
+        assert result["gfs"] is None
+        assert result["ecmwf"] == pytest.approx(83.0 - 7.0)
+
+    def test_city_average_bias(self):
+        bc = self._make_corrector()
+        assert bc.city_average_bias("MIA") == pytest.approx((8.9 + 7.0) / 2)
+
+    def test_city_average_bias_unknown_city_uses_global(self):
+        bc = self._make_corrector()
+        assert bc.city_average_bias("SEA") == pytest.approx((10.4 + 9.3) / 2)
+
+    def test_residual_std_specific_model(self):
+        bc = self._make_corrector()
+        import math
+        expected = math.sqrt(9.9**2 - 8.9**2)
+        assert bc.residual_std("MIA", "gfs") == pytest.approx(expected, abs=0.01)
+
+    def test_residual_std_city_average(self):
+        bc = self._make_corrector()
+        import math
+        r_gfs = math.sqrt(9.9**2 - 8.9**2)
+        r_ecmwf = math.sqrt(8.3**2 - 7.0**2)
+        expected = (r_gfs + r_ecmwf) / 2
+        assert bc.residual_std("MIA") == pytest.approx(expected, abs=0.01)
+
+    def test_residual_std_unknown_city_uses_global(self):
+        bc = self._make_corrector()
+        import math
+        r_gfs = math.sqrt(12.1**2 - 10.4**2)
+        r_ecmwf = math.sqrt(11.2**2 - 9.3**2)
+        expected = (r_gfs + r_ecmwf) / 2
+        assert bc.residual_std("SEA") == pytest.approx(expected, abs=0.01)
+
+    def test_empty_data_returns_raw_temp(self):
+        bc = self._make_corrector(data={})
+        assert bc.correct("MIA", "gfs", 85.0) == 85.0
+
+    def test_empty_data_residual_std_returns_default(self):
+        bc = self._make_corrector(data={})
+        assert bc.residual_std("MIA") == 4.7
+
+    def test_residual_std_floor(self):
+        """residual_std should never go below 0.5F (even when RMSE == bias)."""
+        data = {"per_city": {"TEST": {"model": {"bias": 5.0, "rmse": 5.0, "n": 100}}}}
+        bc = self._make_corrector(data=data)
+        assert bc.residual_std("TEST", "model") == 0.5
+
+    def test_constructor_missing_file(self):
+        """BiasCorrector with nonexistent path should work with no corrections."""
+        from weather_data import BiasCorrector
+        bc = BiasCorrector(calibration_path="/nonexistent/path.json")
+        assert bc.correct("MIA", "gfs", 85.0) == 85.0
+        assert bc.city_average_bias("MIA") == 0.0
+
+    def test_constructor_loads_real_calibration(self):
+        """BiasCorrector loads config/historical-calibration.json if it exists."""
+        from weather_data import BiasCorrector
+        import os
+        cal_path = os.path.join(os.path.dirname(__file__), "..", "config", "historical-calibration.json")
+        if os.path.exists(cal_path):
+            bc = BiasCorrector(calibration_path=cal_path)
+            # Should have loaded data — MIA bias should be > 0
+            assert bc.city_average_bias("MIA") > 0

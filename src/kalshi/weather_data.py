@@ -13,10 +13,13 @@ Provides:
 """
 
 import datetime
+import json
 import logging
+import math
 import os
 import sqlite3
 from collections import defaultdict
+from pathlib import Path
 
 _log = logging.getLogger("weather_data")
 
@@ -213,16 +216,19 @@ class EnsembleCollector:
             self.log.warning("retry_request not available")
             return None
 
+        api_key = os.environ.get("OPEN_METEO_API_KEY", "")
+        base = "https://customer-ensemble-api.open-meteo.com/v1/ensemble" if api_key else "https://ensemble-api.open-meteo.com/v1/ensemble"
         url = (
-            f"https://ensemble-api.open-meteo.com/v1/ensemble?"
+            f"{base}?"
             f"latitude={lat}&longitude={lon}"
             f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
             f"&timezone=America%2FNew_York&forecast_days={forecast_days}"
-            f"&models=gfs_seamless,ecmwf_ifs025"
+            f"&models=gfs_seamless,ecmwf_ifs025,icon_global,gem_global"
+            + (f"&apikey={api_key}" if api_key else "")
         )
 
         try:
-            resp = _retry_request("GET", url, timeout=15, max_retries=2)
+            resp = _retry_request("GET", url, timeout=20, max_retries=2)
             if resp is None or resp.status_code != 200:
                 self.log.warning(
                     "Ensemble API returned status %s",
@@ -447,11 +453,12 @@ class HRRRFetcher:
         # Use premium endpoint if API key is configured
         api_key = os.environ.get("OPEN_METEO_API_KEY", "")
         base = "https://customer-api.open-meteo.com/v1/forecast" if api_key else "https://api.open-meteo.com/v1/forecast"
+        model = "ncep_hrrr_conus" if api_key else "hrrr_conus"
         params = (
             f"latitude={lat}&longitude={lon}"
             f"&hourly=temperature_2m&temperature_unit=fahrenheit"
             f"&timezone=auto&forecast_days=2"
-            f"&models=hrrr_conus"
+            f"&models={model}"
         )
         url = f"{base}?{params}" + (f"&apikey={api_key}" if api_key else "")
 
@@ -499,6 +506,310 @@ class HRRRFetcher:
         except Exception as e:
             self.log.warning("HRRR API error: %s", e)
             return None
+
+
+class NAMFetcher:
+    """Fetches NAM 3km deterministic forecast (nam_conus model).
+
+    NAM (North American Mesoscale) provides 3km resolution forecasts up to 60 hours.
+    Updates 4x/day (00, 06, 12, 18 UTC). Unlike HRRR, NAM provides native daily
+    aggregation (temperature_2m_max), so no hourly->daily conversion needed.
+    """
+
+    def __init__(self, logger=None, rate_limiter=None):
+        self.log = logger or _log
+        self._rate_limiter = rate_limiter
+
+    def fetch_nam(self, lat, lon):
+        """Fetch NAM daily max temperatures.
+
+        Args:
+            lat: latitude
+            lon: longitude
+
+        Returns:
+            dict of {date_str: max_temp_f} for next ~2.5 days (60h horizon),
+            or None on API failure.
+        """
+        if _retry_request is None:
+            self.log.warning("retry_request not available")
+            return None
+
+        api_key = os.environ.get("OPEN_METEO_API_KEY", "")
+        base = "https://customer-api.open-meteo.com/v1/forecast" if api_key else "https://api.open-meteo.com/v1/forecast"
+        params = (
+            f"latitude={lat}&longitude={lon}"
+            f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
+            f"&timezone=America%2FNew_York&forecast_days=3"
+            f"&models=nam_conus"
+        )
+        url = f"{base}?{params}" + (f"&apikey={api_key}" if api_key else "")
+
+        try:
+            if self._rate_limiter is not None:
+                self._rate_limiter()
+            resp = _retry_request("GET", url, timeout=15, max_retries=2)
+            if resp is None or resp.status_code != 200:
+                self.log.warning(
+                    "NAM API returned status %s",
+                    getattr(resp, "status_code", "None"),
+                )
+                return None
+
+            data = resp.json()
+            daily = data.get("daily", {})
+            dates = daily.get("time", [])
+            temps = daily.get("temperature_2m_max", [])
+
+            if not dates or not temps:
+                self.log.warning("NAM API returned no daily data")
+                return None
+
+            result = {d: t for d, t in zip(dates, temps) if t is not None}
+            self.log.debug("NAM: %d dates (max temps: %s)", len(result),
+                          {d: f"{t:.1f}F" for d, t in result.items()})
+            return result
+
+        except Exception as e:
+            self.log.warning("NAM API error: %s", e)
+            return None
+
+
+class PreviousRunsFetcher:
+    """Compares current vs previous model run forecasts for convergence analysis.
+
+    When successive model runs converge on the same temperature, confidence is
+    higher. When they diverge, the atmosphere is in a chaotic regime and
+    forecast skill is lower.
+
+    Uses Open-Meteo Previous Runs API: the response includes both the current
+    forecast and the previous day's forecast for the same target dates.
+    """
+
+    def __init__(self, logger=None, rate_limiter=None):
+        self.log = logger or _log
+        self._rate_limiter = rate_limiter
+
+    def fetch_convergence_batch(self, cities_dict, model="gfs_seamless"):
+        """Batch fetch current + previous-day forecasts for all cities.
+
+        Args:
+            cities_dict: dict of {city_code: {"lat": float, "lon": float, ...}}
+            model: Open-Meteo model identifier
+
+        Returns:
+            dict of {city_code: {date_str: {"current": temp_f, "previous": temp_f, "delta": float}}}
+            Empty dict on failure.
+        """
+        if _retry_request is None:
+            self.log.warning("retry_request not available")
+            return {}
+
+        api_key = os.environ.get("OPEN_METEO_API_KEY", "")
+        base = ("https://customer-previous-runs-api.open-meteo.com/v1/forecast"
+                if api_key else "https://previous-runs-api.open-meteo.com/v1/forecast")
+
+        codes = list(cities_dict.keys())
+        lats = ",".join(str(cities_dict[c]["lat"]) for c in codes)
+        lons = ",".join(str(cities_dict[c]["lon"]) for c in codes)
+
+        params = (
+            f"latitude={lats}&longitude={lons}"
+            f"&daily=temperature_2m_max,temperature_2m_max_previous_day1"
+            f"&temperature_unit=fahrenheit"
+            f"&timezone=America%2FNew_York"
+            f"&forecast_days=7"
+            f"&models={model}"
+        )
+        url = f"{base}?{params}" + (f"&apikey={api_key}" if api_key else "")
+
+        try:
+            if self._rate_limiter is not None:
+                self._rate_limiter()
+            resp = _retry_request("GET", url, timeout=20, max_retries=2)
+            if resp is None or resp.status_code != 200:
+                self.log.warning("Previous Runs API returned status %s",
+                                getattr(resp, "status_code", "None"))
+                return {}
+
+            data = resp.json()
+
+            # Handle multi-location (list) vs single-location (dict) response
+            results = {}
+            if isinstance(data, list):
+                for i, city_data in enumerate(data):
+                    if i >= len(codes):
+                        break
+                    parsed = self._parse_convergence(city_data)
+                    if parsed:
+                        results[codes[i]] = parsed
+            else:
+                parsed = self._parse_convergence(data)
+                if parsed:
+                    results[codes[0]] = parsed
+
+            self.log.debug("Previous runs: convergence data for %d cities", len(results))
+            return results
+
+        except Exception as e:
+            self.log.warning("Previous Runs API error: %s", e)
+            return {}
+
+    def _parse_convergence(self, city_data):
+        """Parse a single city's previous runs response.
+
+        Returns:
+            dict of {date_str: {"current": float, "previous": float|None, "delta": float|None}}
+        """
+        daily = city_data.get("daily", {})
+        dates = daily.get("time", [])
+        current = daily.get("temperature_2m_max", [])
+        previous = daily.get("temperature_2m_max_previous_day1", [])
+
+        if not dates or not current:
+            return None
+
+        result = {}
+        for i, date_str in enumerate(dates):
+            cur = current[i] if i < len(current) else None
+            prev = previous[i] if i < len(previous) else None
+            if cur is not None:
+                entry = {"current": cur, "previous": prev, "delta": None}
+                if prev is not None:
+                    entry["delta"] = round(cur - prev, 2)
+                result[date_str] = entry
+
+        return result if result else None
+
+    @staticmethod
+    def convergence_multiplier(delta_f):
+        """Kelly sizing multiplier based on forecast run-to-run stability.
+
+        Args:
+            delta_f: temperature change between current and previous model run (F).
+
+        Returns:
+            float multiplier:
+            - 1.2: stable forecast (|delta| <= 1F), increase confidence
+            - 0.6: unstable forecast (|delta| >= 3F), reduce exposure
+            - Linear interpolation for 1F < |delta| < 3F
+        """
+        d = abs(delta_f)
+        if d <= 1.0:
+            return 1.2
+        elif d >= 3.0:
+            return 0.6
+        else:
+            return 1.2 - (d - 1.0) * 0.3
+
+
+class BiasCorrector:
+    """Corrects systematic forecast bias using historical calibration data.
+
+    Loads per-city, per-model bias from config/historical-calibration.json
+    and applies correction: corrected_temp = raw_temp - bias.
+
+    Fallback chain: per-city per-model > city average > global model > global average > 0.
+    """
+
+    def __init__(self, calibration_path=None, logger=None):
+        self.log = logger or _log
+        self._data = {}
+        self._load(calibration_path)
+
+    def _load(self, path=None):
+        if path is None:
+            path = Path(__file__).resolve().parent.parent.parent / "config" / "historical-calibration.json"
+        try:
+            p = Path(path)
+            if p.exists():
+                self._data = json.loads(p.read_text())
+                n = self._data.get("n_forecasts", 0)
+                self.log.info("BiasCorrector loaded: %d forecast pairs", n)
+        except Exception as e:
+            self.log.warning("BiasCorrector: failed to load calibration: %s", e)
+
+    def correct(self, city, model, temp):
+        """Apply per-city, per-model bias correction.
+
+        Returns corrected_temp = raw_temp - bias.
+        Falls back to city average bias if model not calibrated.
+        Returns raw temp if no calibration data available.
+        """
+        if temp is None:
+            return None
+        bias = self._get_bias(city, model)
+        return temp - bias
+
+    def correct_forecast_dict(self, city, forecasts):
+        """Correct all model temps in a {model: temp} dict.
+
+        Returns new dict with corrected temperatures.
+        """
+        return {
+            model: self.correct(city, model, temp)
+            for model, temp in forecasts.items()
+        }
+
+    def city_average_bias(self, city):
+        """Average bias across all calibrated models for a city.
+
+        Used for ensemble members where individual model attribution
+        is not possible (GEFS + ECMWF EPS mixed members).
+        """
+        per_city = self._data.get("per_city", {}).get(city, {})
+        if not per_city:
+            return self._global_average_bias()
+        biases = [m["bias"] for m in per_city.values() if "bias" in m]
+        return sum(biases) / len(biases) if biases else 0.0
+
+    def residual_std(self, city, model=None):
+        """Compute residual std: sqrt(RMSE^2 - bias^2).
+
+        This is the forecast uncertainty AFTER bias removal.
+        If model is None, returns weighted average across models.
+        """
+        per_city = self._data.get("per_city", {}).get(city, {})
+        if model and model in per_city:
+            return self._compute_residual(per_city[model])
+
+        residuals = []
+        for m_stats in per_city.values():
+            r = self._compute_residual(m_stats)
+            if r is not None:
+                residuals.append(r)
+        if residuals:
+            return sum(residuals) / len(residuals)
+
+        return self._global_residual_std()
+
+    def _get_bias(self, city, model):
+        per_city = self._data.get("per_city", {}).get(city, {})
+        if model in per_city:
+            return per_city[model].get("bias", 0.0)
+        if per_city:
+            return self.city_average_bias(city)
+        global_stats = self._data.get("global", {}).get(model, {})
+        if global_stats:
+            return global_stats.get("bias", 0.0)
+        return self._global_average_bias()
+
+    def _global_average_bias(self):
+        global_stats = self._data.get("global", {})
+        biases = [m["bias"] for m in global_stats.values() if "bias" in m]
+        return sum(biases) / len(biases) if biases else 0.0
+
+    def _compute_residual(self, stats):
+        if not stats or "rmse" not in stats or "bias" not in stats:
+            return None
+        sq = stats["rmse"] ** 2 - stats["bias"] ** 2
+        return max(0.5, math.sqrt(max(0, sq)))
+
+    def _global_residual_std(self):
+        global_stats = self._data.get("global", {})
+        residuals = [self._compute_residual(s) for s in global_stats.values()]
+        residuals = [r for r in residuals if r is not None]
+        return sum(residuals) / len(residuals) if residuals else 4.7
 
 
 class OrderBookDepth:
@@ -599,6 +910,8 @@ MODEL_RUN_SCHEDULE = {
     "gfs": {"hours_utc": [0, 6, 12, 18], "delay_minutes": 210},      # ~3.5h processing
     "ecmwf": {"hours_utc": [0, 12], "delay_minutes": 360},            # ~6h processing
     "hrrr": {"hours_utc": list(range(24)), "delay_minutes": 45},      # hourly, ~45min delay
+    "nbm": {"hours_utc": list(range(24)), "delay_minutes": 90},       # hourly, ~90min delay
+    "nam": {"hours_utc": [0, 6, 12, 18], "delay_minutes": 120},      # 4x/day, ~2h processing
 }
 
 
