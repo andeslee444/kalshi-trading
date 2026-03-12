@@ -30,7 +30,7 @@ from pathlib import Path
 # Add src/kalshi to path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"))
 
-from kalshi_auth import PROJECT_DIR, retry_request
+from kalshi_auth import PROJECT_DIR, retry_request, atomic_write_json
 from weather_data import STATION_MAP, IEMFetcher
 
 
@@ -152,7 +152,7 @@ def compute_residual_stds(all_city_stats):
     for city, models in all_city_stats.items():
         residuals = []
         for model, stats in models.items():
-            if stats and stats.get("rmse") and stats.get("bias"):
+            if stats and stats.get("rmse") is not None and stats.get("bias") is not None:
                 sq = stats["rmse"] ** 2 - stats["bias"] ** 2
                 if sq > 0:
                     residuals.append(math.sqrt(sq))
@@ -199,7 +199,7 @@ def write_sigma_to_calibration(residual_stds, shrinkage_k=15):
         city_cal["raw_residual_std"] = round(city_std, 3)
 
     cal["generated_at"] = datetime.datetime.now().isoformat()
-    cal_path.write_text(json.dumps(cal, indent=2))
+    atomic_write_json(cal_path, cal)
     print(f"\nSigma values written to {cal_path}")
     print(f"  Global sigma_intercept: {global_std:.2f}F")
     print(f"  Per-city sigmas: {len(residual_stds)} cities")
