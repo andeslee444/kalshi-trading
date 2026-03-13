@@ -98,12 +98,18 @@ def round_half_up(value):
 
 # Maps API v2 dollar-string fields to the legacy integer-cent field names.
 # Each entry: (new_field, old_field, conversion_fn)
+# Uses round_half_up for prices (arithmetic rounding: 0.5 rounds UP, matching
+# exchange tick behavior) and int(float()) for volume/OI (truncation).
+def _dollars_to_cents(v):
+    """Convert dollar string to integer cents with arithmetic rounding."""
+    return round_half_up(float(v) * 100)
+
 _MARKET_FIELD_MAP = [
-    ("yes_bid_dollars",   "yes_bid",       lambda v: round(float(v) * 100)),
-    ("yes_ask_dollars",   "yes_ask",       lambda v: round(float(v) * 100)),
-    ("no_bid_dollars",    "no_bid",        lambda v: round(float(v) * 100)),
-    ("no_ask_dollars",    "no_ask",        lambda v: round(float(v) * 100)),
-    ("last_price_dollars", "last_price",   lambda v: round(float(v) * 100)),
+    ("yes_bid_dollars",   "yes_bid",       _dollars_to_cents),
+    ("yes_ask_dollars",   "yes_ask",       _dollars_to_cents),
+    ("no_bid_dollars",    "no_bid",        _dollars_to_cents),
+    ("no_ask_dollars",    "no_ask",        _dollars_to_cents),
+    ("last_price_dollars", "last_price",   _dollars_to_cents),
     ("volume_fp",         "volume",        lambda v: int(float(v))),
     ("open_interest_fp",  "open_interest", lambda v: int(float(v))),
 ]

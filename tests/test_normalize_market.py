@@ -153,18 +153,33 @@ class TestEdgeCases:
         normalize_market(m)
         assert m["yes_bid"] == 0
 
-    def test_subpenny_rounding(self):
-        """Subpenny prices round correctly (Kalshi supports 0.1c ticks near extremes)."""
+    def test_subpenny_rounding_half_up(self):
+        """Subpenny prices use arithmetic rounding (0.5 rounds UP, not banker's)."""
         m = _make_api_v2_market(
-            yes_bid_dollars="0.0350",   # 3.5 cents → 4 (round half up)
-            yes_ask_dollars="0.9650",   # 96.5 cents → 96 (round half to even, but we use round())
+            yes_bid_dollars="0.0350",   # 3.5 cents → 4
+            yes_ask_dollars="0.9650",   # 96.5 cents → 97 (arithmetic), NOT 96 (banker's)
         )
         normalize_market(m)
-        # Python round() uses banker's rounding, but for trading we use round()
-        # which rounds 3.5 → 4, 96.5 → 96 (banker's) — but that's the behavior
-        # of the built-in round(). Our code uses round(float(v) * 100).
-        assert m["yes_bid"] == 4  # round(3.5) = 4
-        assert m["yes_ask"] == 96  # round(96.5) = 96 (banker's rounding)
+        assert m["yes_bid"] == 4    # round_half_up(3.5) = 4
+        assert m["yes_ask"] == 97   # round_half_up(96.5) = 97 (NOT 96 from banker's)
+
+    def test_subpenny_045_rounds_up(self):
+        """0.045 → 4.5 cents → 5 (arithmetic), NOT 4 (banker's)."""
+        m = _make_api_v2_market(yes_bid_dollars="0.0450")
+        normalize_market(m)
+        assert m["yes_bid"] == 5  # round_half_up(4.5) = 5
+
+    def test_subpenny_065_rounds_up(self):
+        """0.065 → 6.5 cents → 7 (arithmetic), NOT 6 (banker's)."""
+        m = _make_api_v2_market(yes_bid_dollars="0.0650")
+        normalize_market(m)
+        assert m["yes_bid"] == 7  # round_half_up(6.5) = 7
+
+    def test_subpenny_085_rounds_up(self):
+        """0.085 → 8.5 cents → 9 (arithmetic), NOT 8 (banker's)."""
+        m = _make_api_v2_market(yes_bid_dollars="0.0850")
+        normalize_market(m)
+        assert m["yes_bid"] == 9  # round_half_up(8.5) = 9
 
     def test_high_precision_dollars(self):
         """Extra decimal places handled correctly."""
