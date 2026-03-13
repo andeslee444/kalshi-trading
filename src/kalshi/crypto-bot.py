@@ -33,6 +33,7 @@ from particle_filter import FilterManager, FilterConfig, ci_kelly_multiplier
 from regime_detector import RegimeDetector, regime_kelly_multiplier
 from crypto_models import EnsembleModel, smooth_edge_threshold, horizon_kelly_fraction, horizon_vol_weights, AR1VolForecast, vol_skew_multiplier
 from vol_forecaster import GARCHForecaster, DCCCorrelation, intraday_vol_multiplier, correct_bid_ask_bounce
+from singleton_lock import acquire_process_singleton
 
 setup_unbuffered()
 log = setup_logging("crypto")
@@ -1251,6 +1252,10 @@ def main():
     parser = argparse.ArgumentParser(description="Kalshi Crypto Bot")
     parser.add_argument("--once", action="store_true", help="Run single scan and exit")
     args = parser.parse_args()
+
+    if not acquire_process_singleton("crypto", PROJECT_DIR, log):
+        log.warning("Duplicate crypto launch blocked; exiting.")
+        return
 
     log.info("=" * 60)
     log.info("Kalshi Crypto Bot (BTC/ETH/SOL/DOGE/XRP)")

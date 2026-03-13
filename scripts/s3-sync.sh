@@ -121,6 +121,9 @@ cmd_upload() {
   if [ -f "$PROJECT_DIR/config/calibration.json" ]; then
     aws s3 cp "$PROJECT_DIR/config/calibration.json" "s3://${BUCKET}/config/calibration.json"
   fi
+  if [ -f "$PROJECT_DIR/config/historical-calibration.json" ]; then
+    aws s3 cp "$PROJECT_DIR/config/historical-calibration.json" "s3://${BUCKET}/config/historical-calibration.json"
+  fi
   if [ -f "$PROJECT_DIR/config/bayes-params.json" ]; then
     aws s3 cp "$PROJECT_DIR/config/bayes-params.json" "s3://${BUCKET}/config/bayes-params.json"
   fi
@@ -249,6 +252,7 @@ print(int(dt.timestamp()))
 
   # Sync config files
   aws s3 cp "s3://${BUCKET}/config/calibration.json" "$PROJECT_DIR/config/calibration.json" 2>/dev/null || true
+  aws s3 cp "s3://${BUCKET}/config/historical-calibration.json" "$PROJECT_DIR/config/historical-calibration.json" 2>/dev/null || true
   aws s3 cp "s3://${BUCKET}/config/bayes-params.json" "$PROJECT_DIR/config/bayes-params.json" 2>/dev/null || true
 
   echo "Download complete."

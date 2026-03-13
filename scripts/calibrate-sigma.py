@@ -16,7 +16,6 @@ Usage:
 import argparse
 import json
 import math
-import re
 import shutil
 import sys
 from collections import defaultdict
@@ -29,17 +28,15 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 from probability import _norm_cdf, _student_t_cdf, half_kelly
 from trade_files import TRADE_FILES, ALL_TRADE_PATHS
+from ticker_utils import parse_weather_ticker as _parse_weather_ticker_shared
 
 CALIBRATION_PATH = PROJECT_DIR / "config" / "calibration.json"
 CALIBRATION_BACKUP_PATH = PROJECT_DIR / "config" / "calibration-backup.json"
+WEATHER_CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-config.json"
 
 # Minimum sample sizes for reliable calibration
 MIN_TRADES_PER_CITY = 10
 MIN_TRADES_GLOBAL = 30
-
-MONTHS = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-          "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
-
 
 def threshold_for_brier(brier):
     """Map Brier score to recommended edge threshold.
@@ -91,22 +88,37 @@ def fetch_settlements(client):
     return all_settlements
 
 
-def parse_weather_ticker(ticker):
-    """Parse KXHIGHMIA-26FEB16-T86 -> {city, date, direction, threshold}."""
-    m = re.match(r"KXHIGH([A-Z]+)-(\d{2})([A-Z]{3})(\d{2})-([TB])([\d.]+)", ticker)
-    if not m:
+def parse_weather_ticker(ticker, reference_date=None):
+    """Parse weather tickers via the shared parser."""
+    return _parse_weather_ticker_shared(ticker, reference_date=reference_date)
+
+
+def _trade_reference_date(trade):
+    ts = trade.get("timestamp", "")
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
+    except (ValueError, TypeError):
         return None
-    city = m.group(1)
-    yr, mon, day = int(m.group(2)), m.group(3), int(m.group(4))
-    month = MONTHS.get(mon)
-    if not month:
+
+
+def _actual_yes_outcome(trade, settlement_map):
+    """Return the event outcome in YES-probability space."""
+    side = str(trade.get("side", "")).lower()
+    if side not in ("yes", "no"):
         return None
-    return {
-        "city": city,
-        "date": f"{2000 + yr}-{month:02d}-{day:02d}",
-        "direction": m.group(5),
-        "threshold": float(m.group(6)),
-    }
+
+    local_result = trade.get("settlement_result")
+    if local_result in ("won", "lost"):
+        if side == "yes":
+            return 1 if local_result == "won" else 0
+        return 0 if local_result == "won" else 1
+
+    revenue = settlement_map.get(trade.get("ticker", ""))
+    if revenue is None:
+        return None
+    if side == "yes":
+        return 1 if revenue > 0 else 0
+    return 0 if revenue > 0 else 1
 
 
 def weather_prob_with_sigma(forecast_temp, threshold, direction, sigma, df=6):
@@ -212,6 +224,20 @@ def _backup_calibration():
         print(f"Backup saved to {CALIBRATION_BACKUP_PATH}")
 
 
+def _sync_runtime_weather_config(ensemble_cal):
+    """Update runtime weather ensemble weights in kalshi-config.json."""
+    if not ensemble_cal.get("weights") or not WEATHER_CONFIG_PATH.exists():
+        return
+    try:
+        config_data = json.loads(WEATHER_CONFIG_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return
+
+    config_data.setdefault("ensemble", {})
+    config_data["ensemble"]["weights"] = ensemble_cal["weights"]
+    WEATHER_CONFIG_PATH.write_text(json.dumps(config_data, indent=2) + "\n")
+
+
 def _print_diff(old_cal, new_cal):
     """Print a diff summary comparing old vs new calibration parameters."""
     print("\n--- Parameter Changes ---")
@@ -270,7 +296,8 @@ def calibrate_weather(trades, settlement_map):
     matched = []
     for t in trades:
         ticker = t.get("ticker", "")
-        parsed = parse_weather_ticker(ticker)
+        trade_date = _trade_reference_date(t)
+        parsed = parse_weather_ticker(ticker, reference_date=trade_date)
         if not parsed:
             continue
 
@@ -278,27 +305,17 @@ def calibrate_weather(trades, settlement_map):
         if forecast_temp is None:
             continue
 
-        # Determine outcome from settlement
-        revenue = settlement_map.get(ticker)
-        if revenue is None:
+        actual = _actual_yes_outcome(t, settlement_map)
+        if actual is None:
             continue
 
-        # Determine side: if we bought YES and won (revenue > 0), event occurred
         side = t.get("side", "").lower()
-        if side == "yes":
-            actual = 1 if revenue > 0 else 0
-        elif side == "no":
-            actual = 0 if revenue > 0 else 1
-        else:
-            continue
 
         # Compute days_out from trade timestamp and market date
-        ts = t.get("timestamp", "")
         try:
-            trade_date = datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
             market_date = datetime.strptime(parsed["date"], "%Y-%m-%d").date()
-            days = max(0, (market_date - trade_date).days)
-        except (ValueError, TypeError):
+            days = max(0, (market_date - trade_date).days) if trade_date else 0
+        except (ValueError, TypeError, TypeError):
             days = 0
 
         # Extract price for P&L tiebreaker computation
@@ -485,16 +502,8 @@ def calibrate_nws(trades, settlement_map):
         if "nws" not in strategy.lower() and "actual" not in t.get("reasoning", "").lower():
             continue
 
-        revenue = settlement_map.get(ticker)
-        if revenue is None:
-            continue
-
-        side = t.get("side", "").lower()
-        if side == "yes":
-            actual = 1 if revenue > 0 else 0
-        elif side == "no":
-            actual = 0 if revenue > 0 else 1
-        else:
+        actual = _actual_yes_outcome(t, settlement_map)
+        if actual is None:
             continue
 
         # Extract running_high and hour from trade data
@@ -503,7 +512,7 @@ def calibrate_nws(trades, settlement_map):
         if running_high is None or hour is None:
             continue
 
-        parsed = parse_weather_ticker(ticker)
+        parsed = parse_weather_ticker(ticker, reference_date=_trade_reference_date(t))
         if not parsed:
             continue
 
@@ -565,10 +574,6 @@ def calibrate_info_arb(trades, settlement_map, label):
     matched = []
     for t in trades:
         ticker = t.get("ticker", "")
-        revenue = settlement_map.get(ticker)
-        if revenue is None:
-            continue
-
         # Require exact source_type match to prevent NWS trades (which lack
         # source_type) from contaminating album/box_office calibration
         source_type = t.get("source_type", "")
@@ -582,12 +587,8 @@ def calibrate_info_arb(trades, settlement_map, label):
         if model_prob is None:
             continue
 
-        side = t.get("side", "").lower()
-        if side == "yes":
-            actual = 1 if revenue > 0 else 0
-        elif side == "no":
-            actual = 0 if revenue > 0 else 1
-        else:
+        actual = _actual_yes_outcome(t, settlement_map)
+        if actual is None:
             continue
 
         ts = t.get("timestamp", "")
@@ -679,28 +680,19 @@ def calibrate_ensemble_weights(trades, settlement_map):
         if not ensemble or not isinstance(ensemble, dict):
             continue
 
-        parsed = parse_weather_ticker(ticker)
+        trade_date = _trade_reference_date(t)
+        parsed = parse_weather_ticker(ticker, reference_date=trade_date)
         if not parsed:
             continue
 
-        revenue = settlement_map.get(ticker)
-        if revenue is None:
-            continue
-
-        side = t.get("side", "").lower()
-        if side == "yes":
-            actual = 1 if revenue > 0 else 0
-        elif side == "no":
-            actual = 0 if revenue > 0 else 1
-        else:
+        actual = _actual_yes_outcome(t, settlement_map)
+        if actual is None:
             continue
 
         # Compute days_out for sigma
-        ts = t.get("timestamp", "")
         try:
-            trade_date = datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
             market_date = datetime.strptime(parsed["date"], "%Y-%m-%d").date()
-            days = max(0, (market_date - trade_date).days)
+            days = max(0, (market_date - trade_date).days) if trade_date else 0
         except (ValueError, TypeError):
             days = 0
 
@@ -902,6 +894,7 @@ def main():
 
             CALIBRATION_PATH.parent.mkdir(parents=True, exist_ok=True)
             CALIBRATION_PATH.write_text(json.dumps(calibration, indent=2) + "\n")
+            _sync_runtime_weather_config(ensemble_cal)
 
             # Print diff summary
             if old_cal:

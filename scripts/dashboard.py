@@ -35,6 +35,8 @@ DATA_DIR = PROJECT_DIR / "data"
 PID_DIR = DATA_DIR / "pids"
 LOG_DIR = DATA_DIR / "logs"
 HEALTH_STATE_PATH = DATA_DIR / "health-state.json"
+SUPERVISOR_STATE_PATH = PID_DIR / "supervisor-state.json"
+WEATHER_VERIFICATION_PATH = DATA_DIR / "weather-verification.json"
 ALLOCATOR_STATE_PATH = DATA_DIR / "allocator-state.json"
 KILL_SWITCH_PATH = DATA_DIR / "HALT_TRADING"
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
@@ -51,6 +53,7 @@ STRATEGY_DISPLAY = {
     "monitor": "Data Monitor",
     "strategy": "Opportunistic",
     "hdd": "Data Scraper",
+    "hdd-monitor": "HDD Monitor",
     "arb": "Cross-Platform",
     "mm": "Market Making",
     "beatrelease": "Beat Release",
@@ -83,6 +86,14 @@ BOT_CONFIG_KEY = {
     "positions": "position_monitor",
     "mm": "market_maker",
     "arb": "cross_platform_arb",
+    "hdd-monitor": "hdd_monitor",
+}
+
+BOT_HEALTH_KEY = {
+    "positions": "position-monitor",
+    "monitor": "source-monitor",
+    "arb": "cross-platform-arb",
+    "mm": "market-maker",
 }
 
 # ─── Trade file definitions (derived from canonical trade_files.py) ───
@@ -94,8 +105,21 @@ TRADE_FILES = [
 # ─── Bot definitions (from supervisor.py) ───
 BOT_NAMES = [
     "weather", "entertainment", "crypto", "economics",
-    "positions", "monitor", "strategy", "hdd", "arb", "mm",
+    "positions", "monitor", "strategy", "hdd", "hdd-monitor", "arb", "mm", "beatrelease",
 ]
+
+BOT_SCAN_INTERVAL_DEFAULTS = {
+    "weather": 30,
+    "entertainment": 15,
+    "crypto": 5,
+    "economics": 360,
+    "positions": 15,
+    "monitor": 10,
+    "strategy": 15,
+    "hdd-monitor": 15,
+    "arb": 10,
+    "beatrelease": 60,
+}
 
 # Decision log files — bots that write decision logs
 DECISION_FILES = [
@@ -194,6 +218,26 @@ def load_json_safe(filepath: Path) -> dict | list | None:
         return None
 
 
+def get_weather_actual_source_summary() -> dict:
+    """Return recent NWS-vs-IEM actual-source mix for dashboard health display."""
+    try:
+        from forecast_verifier import ForecastVerifier
+    except Exception as e:
+        logger.warning("Failed to import ForecastVerifier for dashboard health: %s", e)
+        return {}
+
+    try:
+        verifier = ForecastVerifier(WEATHER_VERIFICATION_PATH, logger=logger)
+        verifier.load()
+        return {
+            "summary_7d": verifier.get_actual_source_summary(lookback_days=7),
+            "summary_30d": verifier.get_actual_source_summary(lookback_days=30),
+        }
+    except Exception as e:
+        logger.warning("Failed to load weather verification summary: %s", e)
+        return {}
+
+
 # ─── PID check (from supervisor.py) ───
 
 def is_bot_running(name: str) -> tuple[bool, int | None]:
@@ -207,7 +251,9 @@ def is_bot_running(name: str) -> tuple[bool, int | None]:
     try:
         os.kill(pid, 0)
         return True, pid
-    except (ProcessLookupError, PermissionError):
+    except PermissionError:
+        return True, pid
+    except ProcessLookupError:
         return False, pid
 
 
@@ -283,9 +329,55 @@ def _get_bot_config(name: str, bots_config: dict, weather_config: dict | None = 
     return bots_config.get(config_key, {})
 
 
+def _bot_scan_interval_minutes(name: str, bot_cfg: dict) -> int | None:
+    """Normalize different config interval fields into minutes."""
+    interval = bot_cfg.get("scanIntervalMinutes")
+    if interval is not None:
+        return interval
+    hours = bot_cfg.get("checkIntervalHours")
+    if hours is not None:
+        try:
+            return int(hours) * 60
+        except (TypeError, ValueError):
+            return None
+    return BOT_SCAN_INTERVAL_DEFAULTS.get(name)
+
+
+def _is_bot_disabled(name: str, bots_config: dict) -> bool:
+    """Mirror supervisor-style disabled state for dashboard display."""
+    if name in {"hdd", "mm"}:
+        return True
+    config_key = BOT_CONFIG_KEY.get(name, name)
+    bot_cfg = bots_config.get(config_key, {})
+    return isinstance(bot_cfg, dict) and ("enabled" in bot_cfg) and (not bot_cfg["enabled"])
+
+
+def _heartbeat_age_minutes(last_heartbeat: str | None) -> float | None:
+    """Return heartbeat age in minutes, or None if unavailable/unparseable."""
+    if not last_heartbeat:
+        return None
+    try:
+        from datetime import datetime, timezone
+        hb_time = datetime.fromisoformat(last_heartbeat.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - hb_time).total_seconds() / 60
+    except Exception:
+        return None
+
+
+def _runtime_age_minutes(started_at) -> float | None:
+    """Return runtime age in minutes from supervisor state, or None."""
+    try:
+        if started_at is None:
+            return None
+        return max(0.0, (time.time() - float(started_at)) / 60)
+    except (TypeError, ValueError):
+        return None
+
+
 @app.get("/api/bots")
 async def api_bots():
     health_data = load_json_safe(HEALTH_STATE_PATH) or {}
+    supervisor_state = load_json_safe(SUPERVISOR_STATE_PATH) or {}
     bots_config = load_json_safe(BOTS_CONFIG_PATH) or {}
     weather_config = load_json_safe(WEATHER_CONFIG_PATH) or {}
     bot_health = health_data.get("bots", {})
@@ -293,24 +385,27 @@ async def api_bots():
     result = []
     for name in BOT_NAMES:
         running, pid = is_bot_running(name)
-        h = bot_health.get(name, {})
+        health_key = BOT_HEALTH_KEY.get(name, name)
+        h = bot_health.get(health_key, {})
+        bot_state = supervisor_state.get(name, {}) if isinstance(supervisor_state, dict) else {}
         last_heartbeat = h.get("last_heartbeat")
 
-        # Stale check: if heartbeat > 2x scan interval, mark stale
-        status = "stopped"
         bot_cfg = _get_bot_config(name, bots_config, weather_config)
+        interval_min = _bot_scan_interval_minutes(name, bot_cfg)
+        stale_after_min = interval_min or 30
+        heartbeat_age_min = _heartbeat_age_minutes(last_heartbeat)
+        runtime_age_min = _runtime_age_minutes(bot_state.get("started_at"))
+        heartbeat_stale = False
+
+        status = "disabled" if _is_bot_disabled(name, bots_config) else "stopped"
         if running:
             status = "running"
-            if last_heartbeat:
-                try:
-                    from datetime import datetime, timezone
-                    hb_time = datetime.fromisoformat(last_heartbeat.replace("Z", "+00:00"))
-                    age_s = (datetime.now(timezone.utc) - hb_time).total_seconds()
-                    interval_min = bot_cfg.get("scanIntervalMinutes", 30)
-                    if age_s > interval_min * 60 * 2.5:
-                        status = "stale"
-                except Exception as e:
-                    logger.warning("Failed to parse heartbeat for %s: %s", name, e)
+            if heartbeat_age_min is not None and heartbeat_age_min > stale_after_min * 2.5:
+                heartbeat_stale = True
+            elif last_heartbeat is None and runtime_age_min is not None and runtime_age_min > stale_after_min * 2:
+                heartbeat_stale = True
+            if heartbeat_stale:
+                status = "stale"
 
         result.append({
             "name": name,
@@ -318,8 +413,11 @@ async def api_bots():
             "status": status,
             "pid": pid if running else None,
             "last_heartbeat": last_heartbeat,
-            "scan_interval_min": bot_cfg.get("scanIntervalMinutes"),
+            "scan_interval_min": interval_min,
             "error_count": h.get("error_count", 0),
+            "restart_count": int(bot_state.get("restart_count", 0) or 0),
+            "heartbeat_stale": heartbeat_stale,
+            "heartbeat_age_min": heartbeat_age_min,
         })
 
     return result
@@ -811,6 +909,9 @@ async def api_health():
         pass
 
     health_data["regime"] = regime_info
+    weather_actuals = get_weather_actual_source_summary()
+    if weather_actuals:
+        health_data["weather_actuals"] = weather_actuals
     return health_data
 
 

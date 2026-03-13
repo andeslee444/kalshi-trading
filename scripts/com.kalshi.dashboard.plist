@@ -3,12 +3,15 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.kalshi.supervisor</string>
+    <string>com.kalshi.dashboard</string>
     <key>ProgramArguments</key>
     <array>
         <string>/opt/homebrew/bin/python3</string>
-        <string>REPLACE_WITH_PROJECT_DIR/scripts/supervisor.py</string>
-        <string>run</string>
+        <string>REPLACE_WITH_PROJECT_DIR/scripts/dashboard.py</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>3456</string>
     </array>
     <key>WorkingDirectory</key>
     <string>REPLACE_WITH_PROJECT_DIR</string>
@@ -17,9 +20,9 @@
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>REPLACE_WITH_PROJECT_DIR/data/logs/supervisor-launchd.log</string>
+    <string>REPLACE_WITH_PROJECT_DIR/data/logs/dashboard-launchd.log</string>
     <key>StandardErrorPath</key>
-    <string>REPLACE_WITH_PROJECT_DIR/data/logs/supervisor-launchd.log</string>
+    <string>REPLACE_WITH_PROJECT_DIR/data/logs/dashboard-launchd.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>

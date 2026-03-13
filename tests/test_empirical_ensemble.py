@@ -136,6 +136,20 @@ class TestEmpiricalEnsembleProbability:
         prob = empirical_ensemble_probability(members, 85.0, "T")
         assert isinstance(prob, float)
 
+    def test_return_details_reports_effective_sample_size(self):
+        members = [80.0] * 82
+        prob, details = empirical_ensemble_probability(
+            members,
+            85.0,
+            "T",
+            extra_points=[{"temp": 90.0, "weight": 0.6, "label": "hrrr"}],
+            return_details=True,
+        )
+        assert prob is not None
+        assert details["center_temp"] > 80.0
+        assert details["effective_sample_size"] < len(members) + 1
+        assert details["extra_weights"]["hrrr"] == 0.6
+
     def test_invalid_direction_returns_none(self):
         members = [85.0] * 20
         prob = empirical_ensemble_probability(members, 85.0, "X")

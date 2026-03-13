@@ -117,6 +117,11 @@ class TestParseWeatherTicker:
         assert r is not None
         assert r["date"] == "2027-01-15"
 
+    def test_reference_date_disambiguates_old_format_days_25_to_31(self):
+        r = parse_weather_ticker("KXHIGHMIA-28FEB26-T86", reference_date="2026-02-20")
+        assert r is not None
+        assert r["date"] == "2026-02-28"
+
     # --- Invalid tickers ---
 
     def test_invalid_ticker_returns_none(self):

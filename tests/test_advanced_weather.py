@@ -204,6 +204,16 @@ class TestAdaptiveEnsembleWeights:
         weights = compute_adaptive_ensemble_weights(None, default_weights=defaults)
         assert weights == defaults
 
+    def test_fallback_to_inverse_mae_when_brier_missing(self):
+        verification_data = {
+            "gfs": {"mae": 2.0, "n": 25, "brier_predictions": []},
+            "ecmwf": {"mae": 3.0, "n": 25, "brier_predictions": []},
+            "icon": {"mae": 6.0, "n": 25, "brier_predictions": []},
+        }
+        weights = compute_adaptive_ensemble_weights(verification_data)
+        assert weights["gfs"] > weights["ecmwf"] > weights["icon"]
+        assert abs(sum(weights.values()) - 1.0) < 1e-6
+
 
 # ===================================================================
 # Ensemble disagreement score tests
@@ -240,6 +250,11 @@ class TestEnsembleDisagreement:
         score = ensemble_disagreement_score(model_probs)
         assert 0 < score < 0.3, f"Moderate disagreement should be in (0, 0.3), got {score}"
 
+    def test_symmetric_near_zero_and_one(self):
+        low_tail = ensemble_disagreement_score({"gfs": 0.01, "ecmwf": 0.02, "icon": 0.03})
+        high_tail = ensemble_disagreement_score({"gfs": 0.97, "ecmwf": 0.98, "icon": 0.99})
+        assert abs(low_tail - high_tail) < 1e-6
+
     def test_single_model_returns_zero(self):
         """With only one model, no disagreement possible."""
         score = ensemble_disagreement_score({"gfs": 0.75})
@@ -274,9 +289,11 @@ class TestEnsembleV2:
         prob, details = result
         assert isinstance(prob, float)
         assert isinstance(details, dict)
+        assert "center_temp" in details
         assert "disagreement_score" in details
         assert "weights_used" in details
         assert "per_model_probs" in details
+        assert "sigma_used" in details
 
     def test_backward_compatible_without_new_args(self):
         """Without new args, should produce similar results to v1."""
@@ -297,3 +314,22 @@ class TestEnsembleV2:
         # Both > 0.5, so afternoon should be higher
         assert prob_afternoon > prob_morning, \
             f"Afternoon prob ({prob_afternoon}) should be > morning ({prob_morning}) due to tighter sigma"
+
+    def test_static_weights_include_short_range_models(self):
+        forecasts = {"gfs": 88.0, "ecmwf": 87.0, "hrrr": 89.0, "nam": 88.5}
+        prob, details = ensemble_weather_probability_v2(forecasts, 86, "T", 0, return_details=True)
+        assert prob is not None
+        assert "hrrr" in details["weights_used"]
+        assert "nam" in details["weights_used"]
+
+    def test_city_specific_df_overrides_global(self, monkeypatch):
+        import probability as prob_mod
+        monkeypatch.setattr(prob_mod, "_load_calibration", lambda: {
+            "weather": {
+                "df": 30,
+                "per_city": {"MIA": {"df": 4}},
+            }
+        })
+        low_df_prob = weather_probability(86.0, 84.0, "T", city="MIA")
+        global_df_prob = weather_probability(86.0, 84.0, "T", city="NY")
+        assert low_df_prob != global_df_prob

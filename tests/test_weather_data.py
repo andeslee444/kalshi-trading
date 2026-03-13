@@ -1,5 +1,6 @@
 """Tests for weather_data.py — STATION_MAP, EnsembleCollector, IEMFetcher, NAMFetcher, PreviousRunsFetcher, TrainingStore."""
 
+import datetime
 import sys
 import types
 import pytest
@@ -7,7 +8,20 @@ from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, "src/kalshi")
 
-from weather_data import STATION_MAP, EnsembleCollector, IEMFetcher, TrainingStore, NWSForecastFetcher, NWS_GRID_MAP, NAMFetcher, PreviousRunsFetcher, BiasCorrector
+from weather_data import (
+    STATION_MAP,
+    EnsembleCollector,
+    IEMFetcher,
+    NWSClimateReportFetcher,
+    SettlementTemperatureFetcher,
+    TrainingStore,
+    NWSForecastFetcher,
+    NWS_GRID_MAP,
+    NAMFetcher,
+    PreviousRunsFetcher,
+    BiasCorrector,
+    latest_available_model_run,
+)
 
 
 # ===================================================================
@@ -235,6 +249,18 @@ KNYC,2026-03-01,M
         assert result is None
 
     @patch("weather_data._retry_request")
+    def test_fetch_daily_high_ignores_tmpf_header_row(self, mock_retry):
+        csv_text = """#DEBUG: 1 rows
+station,valid,tmpf
+KNYC,2026-03-01,72.5
+"""
+        mock_retry.return_value = self._make_mock_response(csv_text)
+
+        fetcher = IEMFetcher()
+        result = fetcher.fetch_daily_high("KNYC", "2026-03-01")
+        assert result == 72.5
+
+    @patch("weather_data._retry_request")
     def test_fetch_daily_high_handles_empty_csv(self, mock_retry):
         csv_text = """#DEBUG: 0 rows
 station,valid,max_tmpf
@@ -283,6 +309,107 @@ KMIA,2026-03-03,84.0
         assert result is None
 
 
+class TestNWSClimateReportFetcher:
+
+    def _make_mock_response(self, json_data, status_code=200):
+        mock_resp = MagicMock()
+        mock_resp.status_code = status_code
+        mock_resp.json.return_value = json_data
+        return mock_resp
+
+    def _product_text(self, summary_date, maximum):
+        return (
+            f"...THE CHICAGO-MIDWAY CLIMATE SUMMARY FOR {summary_date}...\n\n"
+            "TEMPERATURE (F)\n"
+            " YESTERDAY\n"
+            f"  MAXIMUM         {maximum}   1:48 AM\n"
+            "PRECIPITATION (IN)\n"
+        )
+
+    @patch("weather_data._retry_request")
+    def test_fetch_daily_high_uses_matching_cli_product(self, mock_retry):
+        list_resp = self._make_mock_response({
+            "@graph": [
+                {"id": "current", "issuanceTime": "2026-03-12T21:42:00+00:00"},
+                {"id": "final", "issuanceTime": "2026-03-12T06:37:00+00:00"},
+            ]
+        })
+        current_resp = self._make_mock_response({
+            "productText": self._product_text("MARCH 12 2026", "48")
+        })
+        final_resp = self._make_mock_response({
+            "productText": self._product_text("MARCH 11 2026", "45")
+        })
+        mock_retry.side_effect = [list_resp, current_resp, final_resp]
+
+        fetcher = NWSClimateReportFetcher()
+        result = fetcher.fetch_daily_high("KMDW", "2026-03-11")
+
+        assert result == 45.0
+        assert mock_retry.call_args_list[0].args[1].endswith("/products/types/CLI/locations/MDW")
+        assert mock_retry.call_args_list[2].args[1].endswith("/products/final")
+
+    @patch("weather_data._retry_request")
+    def test_fetch_daily_high_returns_none_when_no_matching_report(self, mock_retry):
+        list_resp = self._make_mock_response({
+            "@graph": [
+                {"id": "only", "issuanceTime": "2026-03-12T06:37:00+00:00"},
+            ]
+        })
+        only_resp = self._make_mock_response({
+            "productText": self._product_text("MARCH 12 2026", "48")
+        })
+        mock_retry.side_effect = [list_resp, only_resp]
+
+        fetcher = NWSClimateReportFetcher()
+        result = fetcher.fetch_daily_high("KMDW", "2026-03-11")
+
+        assert result is None
+
+
+class TestSettlementTemperatureFetcher:
+
+    def test_fetch_daily_high_falls_back_to_iem(self):
+        fetcher = SettlementTemperatureFetcher()
+        with patch.object(fetcher.nws, "fetch_daily_high", return_value=None), \
+             patch.object(fetcher.iem, "fetch_daily_high", return_value=71.5) as mock_iem:
+            result = fetcher.fetch_daily_high("KNYC", "2026-03-01", city_code="NY")
+
+        assert result == 71.5
+        mock_iem.assert_called_once_with("KNYC", "2026-03-01", city_code="NY")
+
+    def test_fetch_daily_highs_overlays_recent_nws_values(self):
+        fetcher = SettlementTemperatureFetcher()
+        end = datetime.date.today() - datetime.timedelta(days=1)
+        start = end - datetime.timedelta(days=1)
+        start_key = start.isoformat()
+        end_key = end.isoformat()
+
+        with patch.object(fetcher.iem, "fetch_daily_highs", return_value={start_key: 70.0, end_key: 71.0}), \
+             patch.object(fetcher.nws, "fetch_daily_high", side_effect=[72.0, None]):
+            result = fetcher.fetch_daily_highs("KNYC", start_key, end_key, city_code="NY")
+
+        assert result[start_key] == 72.0
+        assert result[end_key] == 71.0
+
+    def test_fetch_daily_high_with_source_prefers_nws(self):
+        fetcher = SettlementTemperatureFetcher()
+        with patch.object(fetcher.nws, "fetch_daily_high", return_value=69.0), \
+             patch.object(fetcher.iem, "fetch_daily_high") as mock_iem:
+            result = fetcher.fetch_daily_high_with_source("KNYC", "2026-03-01", city_code="NY")
+
+        assert result == (69.0, "nws_cli")
+        mock_iem.assert_not_called()
+
+    def test_fetch_daily_high_with_source_marks_iem_fallback(self):
+        fetcher = SettlementTemperatureFetcher()
+        with patch.object(fetcher.nws, "fetch_daily_high", return_value=None), \
+             patch.object(fetcher.iem, "fetch_daily_high", return_value=71.5):
+            result = fetcher.fetch_daily_high_with_source("KNYC", "2026-03-01", city_code="NY")
+
+        assert result == (71.5, "iem_fallback")
+
+
 # ===================================================================
 # HRRRFetcher tests (with mocked HTTP)
 # ===================================================================
@@ -329,6 +456,17 @@ class TestHRRRFetcher:
         fetcher = HRRRFetcher()
         result = fetcher.fetch_hrrr(25.7, -80.2)
         assert result is None
+
+    @patch("weather_data._retry_request")
+    def test_fetch_hrrr_tracks_http_status_on_error(self, mock_retry):
+        err = Exception("bad request")
+        err.response = MagicMock(status_code=400)
+        mock_retry.side_effect = err
+        fetcher = HRRRFetcher()
+        result = fetcher.fetch_hrrr(25.7, -80.2)
+        assert result is None
+        assert fetcher.last_status_code == 400
+        assert "bad request" in fetcher.last_error
 
     @patch("weather_data._retry_request")
     def test_fetch_hrrr_returns_none_on_bad_status(self, mock_retry):
@@ -568,6 +706,13 @@ class TestModelRunSchedule:
         model, minutes = next_model_run(now)
         assert minutes == 40  # NBM 10Z at 11:30
 
+    def test_latest_available_model_run_returns_current_cycle(self):
+        now = datetime.datetime(2026, 3, 5, 10, 50, 0)
+        assert latest_available_model_run("gfs", now) == datetime.datetime(2026, 3, 5, 6, 0, 0)
+
+    def test_latest_available_model_run_returns_none_for_unknown_model(self):
+        assert latest_available_model_run("unknown", datetime.datetime(2026, 3, 5, 10, 50, 0)) is None
+
 
 # ===================================================================
 # NWS_GRID_MAP and NWSForecastFetcher tests
@@ -721,6 +866,17 @@ class TestNAMFetcher:
         fetcher = NAMFetcher()
         result = fetcher.fetch_nam(25.79, -80.29)
         assert result is None
+
+    @patch("weather_data._retry_request")
+    def test_fetch_nam_tracks_http_status_on_error(self, mock_retry):
+        err = Exception("bad request")
+        err.response = MagicMock(status_code=400)
+        mock_retry.side_effect = err
+        fetcher = NAMFetcher()
+        result = fetcher.fetch_nam(25.79, -80.29)
+        assert result is None
+        assert fetcher.last_status_code == 400
+        assert "bad request" in fetcher.last_error
 
     @patch("weather_data._retry_request")
     def test_fetch_nam_skips_none_values(self, mock_retry):
@@ -899,19 +1055,17 @@ class TestBiasCorrector:
         bc = self._make_corrector()
         assert bc.correct("MIA", "gfs", None) is None
 
-    def test_correct_unknown_model_uses_city_average(self):
+    def test_correct_unknown_model_leaves_temp_unchanged(self):
         bc = self._make_corrector()
-        # MIA average: (8.9 + 7.0) / 2 = 7.95
-        assert bc.correct("MIA", "aifs", 85.0) == pytest.approx(85.0 - 7.95)
+        assert bc.correct("MIA", "aifs", 85.0) == 85.0
 
     def test_correct_unknown_city_uses_global_model_bias(self):
         bc = self._make_corrector()
         assert bc.correct("SEA", "gfs", 55.0) == pytest.approx(55.0 - 10.4)
 
-    def test_correct_unknown_city_and_model_uses_global_average(self):
+    def test_correct_unknown_city_and_model_leaves_temp_unchanged(self):
         bc = self._make_corrector()
-        # global average: (10.4 + 9.3) / 2 = 9.85
-        assert bc.correct("SEA", "aifs", 55.0) == pytest.approx(55.0 - 9.85)
+        assert bc.correct("SEA", "aifs", 55.0) == 55.0
 
     def test_correct_forecast_dict(self):
         bc = self._make_corrector()
@@ -925,6 +1079,12 @@ class TestBiasCorrector:
         result = bc.correct_forecast_dict("MIA", {"gfs": None, "ecmwf": 83.0})
         assert result["gfs"] is None
         assert result["ecmwf"] == pytest.approx(83.0 - 7.0)
+
+    def test_correct_exempt_models_leave_temp_unchanged(self):
+        bc = self._make_corrector()
+        assert bc.correct("MIA", "nws", 82.0) == 82.0
+        assert bc.correct("MIA", "hrrr", 82.0) == 82.0
+        assert bc.correct("MIA", "nam", 82.0) == 82.0
 
     def test_city_average_bias(self):
         bc = self._make_corrector()
@@ -986,3 +1146,26 @@ class TestBiasCorrector:
             bc = BiasCorrector(calibration_path=cal_path)
             # Should have loaded data — MIA bias should be > 0
             assert bc.city_average_bias("MIA") > 0
+
+    def test_constructor_loads_bias_section_from_calibration_json(self, tmp_path):
+        from weather_data import BiasCorrector
+        cal_path = tmp_path / "calibration.json"
+        cal_path.write_text("""
+{
+  "weather": {
+    "bias_correction": {
+      "n_forecasts": 10,
+      "per_city": {
+        "MIA": {
+          "gfs": {"bias": 8.0, "rmse": 9.0}
+        }
+      },
+      "global": {
+        "gfs": {"bias": 7.0, "rmse": 8.0}
+      }
+    }
+  }
+}
+""".strip())
+        bc = BiasCorrector(calibration_path=str(cal_path))
+        assert bc.correct("MIA", "gfs", 85.0) == pytest.approx(77.0)

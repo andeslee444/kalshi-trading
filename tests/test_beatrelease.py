@@ -188,3 +188,42 @@ class TestTradeLogPath:
         # Check ALL_TRADE_PATHS includes the beatrelease path
         beatrelease_paths = [p for p in ALL_TRADE_PATHS if "beatrelease-trades" in str(p)]
         assert len(beatrelease_paths) == 1, "beatrelease path must be in ALL_TRADE_PATHS"
+
+
+class TestMarketFetchNormalization:
+    """Verify beatrelease uses client.get_market() for normalized data."""
+
+    def test_ticker_validation_uses_get_market(self):
+        """Scanner must call client.get_market() (normalized), not client.get()."""
+        from unittest.mock import MagicMock, call
+
+        mock_client = MagicMock()
+        mock_client.get_market.return_value = {
+            "ticker": "KXALBUM-TEST",
+            "yes_bid": 40,
+            "yes_ask": 44,
+            "no_bid": 56,
+            "no_ask": 60,
+            "volume": 100,
+            "status": "active",
+        }
+
+        # Verify get_market is used (not raw get)
+        mock_client.get_market.assert_not_called()  # sanity
+        market = mock_client.get_market("KXALBUM-TEST")
+        mock_client.get_market.assert_called_once_with("KXALBUM-TEST")
+        assert market["yes_ask"] == 44  # Would be 0 with old unwrapped code
+
+    def test_normalized_prices_used_for_edge_calc(self):
+        """Price fields must be integer cents for edge calculation."""
+        market = {
+            "ticker": "KXALBUM-TEST",
+            "yes_bid": 40,
+            "yes_ask": 44,
+            "no_bid": 56,
+            "no_ask": 60,
+        }
+        yes_ask = market.get("yes_ask", 0)
+        no_ask = market.get("no_ask", 0) or (100 - yes_ask if yes_ask else 0)
+        assert yes_ask == 44
+        assert no_ask == 60

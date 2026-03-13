@@ -2,7 +2,8 @@
 """Backfill historical weather data for training the empirical ensemble model.
 
 Fetches historical forecasts from Open-Meteo Previous Runs API and actual
-temperatures from IEM ASOS, then stores matched pairs in a SQLite training DB.
+temperatures from the settlement fetcher (NWS climate reports with IEM fallback),
+then stores matched pairs in a SQLite training DB.
 
 Usage:
     python3 scripts/backfill-weather-data.py                 # All cities, 90 days
@@ -22,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"))
 
 from kalshi_auth import PROJECT_DIR, retry_request
-from weather_data import STATION_MAP, IEMFetcher, TrainingStore
+from weather_data import STATION_MAP, SettlementTemperatureFetcher, TrainingStore
 
 
 def get_city_coords():
@@ -90,7 +91,7 @@ def main():
 
     cities = get_city_coords()
     target_cities = {args.city: cities[args.city]} if args.city and args.city in cities else cities
-    iem = IEMFetcher()
+    actuals_fetcher = SettlementTemperatureFetcher()
 
     if args.dry_run:
         print("[DRY RUN] Would process these cities:")
@@ -115,11 +116,11 @@ def main():
         lat, lon = info["lat"], info["lon"]
         print(f"\n--- {code} ({info['name']}) -> {station} ---")
 
-        # 1. Fetch historical actuals from IEM
+        # 1. Fetch historical actuals from the settlement source path
         start_date = (today - datetime.timedelta(days=args.days)).isoformat()
         end_date = (today - datetime.timedelta(days=1)).isoformat()
         print(f"  Fetching IEM actuals: {start_date} to {end_date}")
-        actuals = iem.fetch_daily_highs(station, start_date, end_date)
+        actuals = actuals_fetcher.fetch_daily_highs(station, start_date, end_date, city_code=code)
         print(f"  Got {len(actuals)} actual observations")
 
         # 2. Fetch historical forecasts from Open-Meteo Previous Runs

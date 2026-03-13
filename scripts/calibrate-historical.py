@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Historical forecast calibration using Open-Meteo Historical Forecast API.
+"""Historical bias calibration using Open-Meteo Historical Forecast API.
 
-Fetches what models PREDICTED in the past, compares against IEM ASOS actuals,
-and computes per-city, per-model, per-lead-time error statistics for sigma
-calibration and optimal ensemble weights.
+Fetches what models PREDICTED in the past, compares against settlement actuals,
+and computes per-city, per-model systematic temperature bias priors.
 
 Unlike backfill-weather-data.py (which uses the Previous Runs API with ~90-day
 lookback), this uses the Historical Forecast API which provides forecast data
 going back to 2022 for all models including NBM, AIFS, and GraphCast.
+
+Important: Open-Meteo's Historical Forecast API is useful for station/grid bias
+estimation, but it is not lead-time matched to the horizons the live bot trades.
+Do not use this script to overwrite live sigma or ensemble weights.
 
 Usage:
     python3 scripts/calibrate-historical.py                          # All cities, 180 days
     python3 scripts/calibrate-historical.py --days 90                # 90 days
     python3 scripts/calibrate-historical.py --city MIA               # Single city
     python3 scripts/calibrate-historical.py --models gfs,ecmwf,nbm   # Specific models
-    python3 scripts/calibrate-historical.py --save                   # Write to config/historical-calibration.json
+    python3 scripts/calibrate-historical.py --save                   # Write audit artifact
+    python3 scripts/calibrate-historical.py --merge-bias             # Store bias priors in calibration.json
     python3 scripts/calibrate-historical.py --dry-run                # Preview only
 """
 
@@ -31,7 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"))
 
 from kalshi_auth import PROJECT_DIR, retry_request, atomic_write_json
-from weather_data import STATION_MAP, IEMFetcher
+from weather_data import STATION_MAP, SettlementTemperatureFetcher
 
 
 # Models to calibrate (Open-Meteo API identifiers)
@@ -161,51 +165,25 @@ def compute_residual_stds(all_city_stats):
     return result
 
 
-def write_sigma_to_calibration(residual_stds, shrinkage_k=15):
-    """Write per-city sigma_intercept to config/calibration.json.
-
-    Uses Bayesian shrinkage toward global average.
-    Preserves existing calibration.json fields.
-    """
+def write_bias_to_calibration(output):
+    """Write bias priors into config/calibration.json for live loading."""
     cal_path = PROJECT_DIR / "config" / "calibration.json"
     try:
         cal = json.loads(cal_path.read_text()) if cal_path.exists() else {}
     except (json.JSONDecodeError, OSError):
         cal = {}
 
-    # Compute global average residual std
-    all_stds = list(residual_stds.values())
-    if not all_stds:
-        print("No residual stds computed, skipping sigma write")
-        return
-    global_std = sum(all_stds) / len(all_stds)
-
-    # Update weather section
     weather = cal.setdefault("weather", {})
-    weather["global_sigma_intercept"] = round(global_std, 2)
-    weather["global_sigma_slope"] = weather.get("global_sigma_slope", 0.2)
-
-    per_city = weather.setdefault("per_city", {})
-    for city, city_std in residual_stds.items():
-        n = 178  # typical n from historical calibration
-        shrinkage_weight = round(n / (n + shrinkage_k), 3)
-        shrunk_std = round((n * city_std + shrinkage_k * global_std) / (n + shrinkage_k), 2)
-
-        city_cal = per_city.setdefault(city, {})
-        city_cal["sigma_intercept"] = shrunk_std
-        city_cal["sigma_slope"] = city_cal.get("sigma_slope", 0.2)
-        city_cal["n"] = n
-        city_cal["shrinkage_weight"] = shrinkage_weight
-        city_cal["raw_residual_std"] = round(city_std, 3)
-
-    cal["generated_at"] = datetime.datetime.now().isoformat()
+    weather["bias_correction"] = {
+        "generated_at": output["generated_at"],
+        "period": output["period"],
+        "n_forecasts": output["n_forecasts"],
+        "n_cities": output["n_cities"],
+        "per_city": output["per_city"],
+        "global": output["global"],
+    }
     atomic_write_json(cal_path, cal)
-    print(f"\nSigma values written to {cal_path}")
-    print(f"  Global sigma_intercept: {global_std:.2f}F")
-    print(f"  Per-city sigmas: {len(residual_stds)} cities")
-    for city in sorted(residual_stds.keys()):
-        city_data = per_city[city]
-        print(f"    {city}: {city_data['sigma_intercept']:.2f}F (raw={city_data['raw_residual_std']:.2f}F)")
+    print(f"\nBias priors written to {cal_path} (weather.bias_correction)")
 
 
 def main():
@@ -220,9 +198,16 @@ def main():
                         help="Write results to config/historical-calibration.json")
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview only, don't fetch data")
+    parser.add_argument("--merge-bias", action="store_true",
+                        help="Write bias priors to config/calibration.json")
     parser.add_argument("--write-sigma", action="store_true",
-                        help="Write per-city sigma values to config/calibration.json")
+                        help="Deprecated: historical API is not suitable for live sigma calibration")
     args = parser.parse_args()
+
+    if args.write_sigma:
+        print("Error: --write-sigma was removed because the historical forecast API is not lead-time matched.")
+        print("Use scripts/calibrate-sigma.py or live verification data for sigma calibration.")
+        sys.exit(2)
 
     cities = get_city_coords()
     if args.city:
@@ -265,7 +250,7 @@ def main():
         print(f"  Total API calls: {len(target_cities)} IEM + {len(target_cities) * len(target_models)} historical forecast")
         return
 
-    iem = IEMFetcher()
+    actuals_fetcher = SettlementTemperatureFetcher()
     all_city_stats = {}
     global_errors = {m: [] for m in target_models}
     total_forecasts = 0
@@ -281,7 +266,7 @@ def main():
 
         # Fetch IEM actuals
         print(f"  Fetching IEM actuals: {start_date} to {end_date}")
-        actuals = iem.fetch_daily_highs(station, start_date, end_date)
+        actuals = actuals_fetcher.fetch_daily_highs(station, start_date, end_date, city_code=code)
         print(f"  Got {len(actuals)} actual observations")
 
         if not actuals:
@@ -329,7 +314,7 @@ def main():
                 "n": n,
             }
 
-    optimal_weights = compute_optimal_weights(global_stats)
+    diagnostic_weights = compute_optimal_weights(global_stats)
 
     # Summary
     print(f"\n{'='*60}")
@@ -337,7 +322,7 @@ def main():
     print(f"{'='*60}")
     for model_short in sorted(global_stats.keys(), key=lambda m: global_stats[m]["mae"]):
         s = global_stats[model_short]
-        w = optimal_weights.get(model_short, 0)
+        w = diagnostic_weights.get(model_short, 0)
         print(f"  {model_short:12s}  Bias: {s['bias']:+.2f}F  MAE: {s['mae']:.2f}F  RMSE: {s['rmse']:.2f}F  Weight: {w:.1%}  (n={s['n']})")
 
     # Build output
@@ -348,18 +333,11 @@ def main():
         "n_cities": len(all_city_stats),
         "per_city": all_city_stats,
         "global": global_stats,
-        "optimal_weights": optimal_weights,
+        "diagnostic_inverse_mae_weights": diagnostic_weights,
     }
 
-    # Compute and optionally write sigma values
-    residual_stds = compute_residual_stds(all_city_stats)
-    if residual_stds:
-        print(f"\nResidual Std (post-bias forecast uncertainty):")
-        for city in sorted(residual_stds.keys()):
-            print(f"  {city}: {residual_stds[city]:.2f}F")
-
-    if args.write_sigma:
-        write_sigma_to_calibration(residual_stds)
+    if args.merge_bias:
+        write_bias_to_calibration(output)
 
     if args.save:
         out_path = PROJECT_DIR / "config" / "historical-calibration.json"

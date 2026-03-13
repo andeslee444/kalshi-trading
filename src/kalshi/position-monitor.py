@@ -25,6 +25,7 @@ from kalshi_auth import (
 from probability import weather_probability, nws_probability, half_kelly, kalshi_fee_cents, crypto_price_probability
 from ticker_utils import parse_weather_ticker as parse_temp_ticker, parse_crypto_ticker
 from capital_allocator import PortfolioAllocator
+from singleton_lock import acquire_process_singleton
 
 setup_unbuffered()
 log = setup_logging("position-monitor")
@@ -267,10 +268,9 @@ def get_open_positions():
 
 
 def get_market_data(ticker):
-    """Fetch current market data for a ticker."""
+    """Fetch current market data for a ticker (with API v2 field normalization)."""
     try:
-        data = client.get(f"/markets/{ticker}")
-        return data.get("market", data)
+        return client.get_market(ticker)
     except Exception as e:
         log.error(f"Failed to fetch market {ticker}: {e}")
         return None
@@ -519,8 +519,14 @@ def _compute_current_probability(ticker, source_bot, entry_side):
     Routes to the correct probability model by source_bot name.
     Returns (probability_for_our_side, reasoning_str) or (None, None) on failure.
     """
-    # Weather: parse ticker, fetch NWS running high
-    if source_bot in ("weather", "source-monitor"):
+    # Weather-bot positions were opened from a richer ensemble model than the
+    # position monitor can currently reconstruct. Skip model-shift exits rather
+    # than forcing them onto NWS nowcast logic.
+    if source_bot == "weather":
+        return None, None
+
+    # Source-monitor weather positions are NWS-nowcast-based and can be re-evaluated.
+    if source_bot == "source-monitor":
         parsed = parse_temp_ticker(ticker)
         if not parsed:
             return None, None
@@ -531,8 +537,11 @@ def _compute_current_probability(ticker, source_bot, entry_side):
         running_high = _fetch_nws_running_high(city)
         if running_high is None:
             return None, None
+        local_hour = datetime.datetime.now(
+            ZoneInfo(CITY_TIMEZONES.get(city, "America/New_York"))
+        ).hour
         prob = nws_probability(running_high, parsed["threshold"], parsed["direction"],
-                               datetime.datetime.now().hour)
+                               local_hour)
         return (prob if entry_side == "yes" else 1.0 - prob,
                 f"NWS {city} high {running_high}F, model prob={prob*100:.0f}%")
 
@@ -1143,6 +1152,10 @@ def main():
     parser = argparse.ArgumentParser(description="Kalshi Position Monitor")
     parser.add_argument("--once", action="store_true", help="Run single scan and exit")
     args = parser.parse_args()
+
+    if not acquire_process_singleton("positions", PROJECT_DIR, log, display_name="position-monitor"):
+        log.warning("Duplicate position-monitor launch blocked; exiting.")
+        return
 
     log.info("=" * 60)
     log.info("Kalshi Position Monitor")

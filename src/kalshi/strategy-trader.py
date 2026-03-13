@@ -14,6 +14,7 @@ from strategy_engine import (
     bayesian_kelly_multiplier, longshot_edge_sell, longshot_edge_buy, EdgeEstimate,
     ScheduledScanner, SettlementSourceChecker, FillProbabilityEstimator, InfoEdge,
 )
+from singleton_lock import acquire_process_singleton
 
 setup_unbuffered()
 log = setup_logging("strategy")
@@ -876,6 +877,10 @@ def main():
     parser = argparse.ArgumentParser(description="Kalshi Strategy Trader")
     parser.add_argument("--once", action="store_true", help="Run single scan and exit")
     args = parser.parse_args()
+
+    if not acquire_process_singleton("strategy", PROJECT_DIR, log):
+        log.warning("Duplicate strategy launch blocked; exiting.")
+        return
 
     log.info("=" * 60)
     log.info("Kalshi Strategy Trader (Longshot Bias)")

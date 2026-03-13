@@ -29,6 +29,7 @@ from probability import (
 from capital_allocator import PortfolioAllocator
 from cpi_belief_filter import CPIBeliefFilter
 from scenario_engine import compute_scenario_weights, scenario_probability
+from singleton_lock import acquire_process_singleton
 try:
     from macro_engine import MacroEngine
 except ImportError:
@@ -1368,6 +1369,10 @@ def main():
     parser = argparse.ArgumentParser(description="Kalshi Economics Bot")
     parser.add_argument("--once", action="store_true", help="Run single scan and exit")
     args = parser.parse_args()
+
+    if not acquire_process_singleton("economics", PROJECT_DIR, log):
+        log.warning("Duplicate economics launch blocked; exiting.")
+        return
 
     log.info("=" * 60)
     log.info("Kalshi Economics Bot (CPI/GDP/Jobs)")

@@ -117,6 +117,14 @@ class TestHeartbeatStaleness:
             assert bot_name in HEARTBEAT_NAMES, f"{bot_name} missing from HEARTBEAT_NAMES"
             assert bot_name in BOT_SCAN_INTERVALS, f"{bot_name} missing from BOT_SCAN_INTERVALS"
 
+    def test_strategy_is_daemon_and_hdd_is_disabled_oneshot(self):
+        """Strategy should be supervised as a daemon; HDD should remain opt-in one-shot."""
+        assert "strategy" in supervisor.DAEMON_BOTS
+        assert "hdd-monitor" in supervisor.DAEMON_BOTS
+        assert "hdd" not in supervisor.DAEMON_BOTS
+        assert "hdd" in supervisor.ONESHOT_BOTS
+        assert "hdd" in supervisor._ALWAYS_DISABLED
+
 
 class TestStatusHeartbeatLookup:
 
@@ -174,6 +182,79 @@ class TestStatusHeartbeatLookup:
 
         output = capsys.readouterr().out
         assert "STALE" in output
+
+    def test_status_handles_permission_denied_pid_probe_as_running(self, capsys):
+        """Permission-denied PID probes should not show a false stopped status."""
+        sup = Supervisor.__new__(Supervisor)
+        sup.bots = {}
+        sup._running = True
+        sup._last_calibration_check = 0
+
+        bot = BotProcess("weather", ["python3", "test.py"])
+        sup.bots["weather"] = bot
+
+        health = {"bots": {"weather": {"last_heartbeat": _minutes_ago_iso(1)}}}
+
+        with patch.object(bot, "_read_pid", return_value=12345), \
+             patch.object(supervisor.os, "kill", side_effect=PermissionError), \
+             patch.object(type(sup), "_load_health", return_value=health):
+            sup.status()
+
+        output = capsys.readouterr().out
+        assert "weather" in output
+        assert "running" in output
+        assert "12345" in output
+
+    def test_status_prints_weather_actual_source_summary(self, capsys, tmp_path):
+        """status() should include recent weather actual-source mix when available."""
+        sup = Supervisor.__new__(Supervisor)
+        sup.bots = {}
+        sup._running = True
+        sup._last_calibration_check = 0
+
+        bot = BotProcess("weather", ["python3", "test.py"])
+        sup.bots["weather"] = bot
+
+        health = {"bots": {"weather": {"last_heartbeat": _minutes_ago_iso(1)}}}
+        verification_path = tmp_path / "weather-verification.json"
+        verification_path.write_text(json.dumps({
+            "verified": [
+                {"city": "MIA", "date": datetime.date.today().isoformat(), "actual_source": "nws_cli"},
+                {"city": "NY", "date": datetime.date.today().isoformat(), "actual_source": "iem_fallback"},
+            ]
+        }))
+
+        with patch.object(bot, "is_running", return_value=True), \
+             patch.object(bot, "_read_pid", return_value=12345), \
+             patch.object(type(sup), "_load_health", return_value=health), \
+             patch.object(supervisor, "WEATHER_VERIFICATION_PATH", verification_path):
+            sup.status()
+
+        output = capsys.readouterr().out
+        assert "Weather actuals (7d): total=2" in output
+        assert "nws_cli=1 (50.0%)" in output
+        assert "iem_fallback=1 (50.0%)" in output
+
+    def test_status_uses_pgrep_fallback_when_pid_file_missing(self, capsys):
+        """status() should show running when pgrep finds a live worker but PID file is missing."""
+        sup = Supervisor.__new__(Supervisor)
+        sup.bots = {}
+        sup._running = True
+        sup._last_calibration_check = 0
+
+        bot = BotProcess("weather", ["python3", "src/kalshi/weather-bot.py"])
+        sup.bots["weather"] = bot
+        health = {"bots": {"weather": {"last_heartbeat": _minutes_ago_iso(1)}}}
+
+        with patch.object(bot, "_read_pid", return_value=None), \
+             patch.object(type(sup), "_load_health", return_value=health), \
+             patch.object(supervisor, "_find_bot_processes", return_value=[14595]):
+            sup.status()
+
+        output = capsys.readouterr().out
+        assert "weather" in output
+        assert "running" in output
+        assert "14595" in output
 
 
 class TestStatePersistence:
@@ -320,6 +401,74 @@ class TestOrphanCleanup:
         assert (1234, signal.SIGKILL) in kill_calls
 
 
+class TestIsRunning:
+
+    def test_is_running_returns_true_on_permission_denied(self):
+        bot = BotProcess("weather", ["python3", "test.py"])
+        with patch.object(bot, "_read_pid", return_value=12345), \
+             patch.object(supervisor.os, "kill", side_effect=PermissionError), \
+             patch.object(bot, "_remove_pid") as mock_remove:
+            assert bot.is_running() is True
+        mock_remove.assert_not_called()
+
+    def test_is_running_clears_exited_managed_process(self, tmp_path):
+        """Exited child processes should not keep the bot marked as running."""
+        bot = BotProcess("hdd", ["python3", "test.py"])
+        bot.pid_file = tmp_path / "hdd.pid"
+        bot.pid_file.write_text("12345")
+        bot.process = MagicMock(pid=12345)
+        bot.process.poll.return_value = 0
+
+        assert bot.is_running() is False
+        assert bot.process is None
+        assert not bot.pid_file.exists()
+
+
+class TestRestartAlerts:
+
+    def test_restart_warning_fires_at_threshold(self):
+        bot = BotProcess("weather", ["python3", "test.py"])
+        now = 1_700_000_000
+        bot.recent_crashes = [now - 100, now - 50]
+
+        with patch.object(bot, "start", return_value=True), \
+             patch.object(supervisor.time, "time", return_value=now), \
+             patch.object(supervisor, "notify_webhook") as mock_notify:
+            restarted = bot.check_and_restart()
+
+        assert restarted is True
+        mock_notify.assert_called_once()
+        assert "restarted 3x" in mock_notify.call_args.args[0]
+
+    def test_restart_warning_rate_limited(self):
+        bot = BotProcess("weather", ["python3", "test.py"])
+        now = 1_700_000_000
+        bot.recent_crashes = [now - 100, now - 50]
+        bot.last_restart_alert_at = now - 60
+
+        with patch.object(bot, "start", return_value=True), \
+             patch.object(supervisor.time, "time", return_value=now), \
+             patch.object(supervisor, "notify_webhook") as mock_notify:
+            restarted = bot.check_and_restart()
+
+        assert restarted is True
+        mock_notify.assert_not_called()
+
+
+class TestPidFileSafety:
+
+    def test_remove_pid_if_matches_preserves_newer_pid(self, tmp_path):
+        bot = BotProcess("weather", ["python3", "test.py"])
+        bot.pid_file = tmp_path / "weather.pid"
+        bot.pid_file.write_text("22222")
+
+        bot._remove_pid_if_matches(12345)
+        assert bot.pid_file.exists()
+
+        bot._remove_pid_if_matches(22222)
+        assert not bot.pid_file.exists()
+
+
 class TestProcessGroupShutdown:
     """Tests for process group shutdown (os.killpg).
 
@@ -404,7 +553,10 @@ class TestFindBotProcesses:
 
     def test_finds_matching_pids(self):
         """Should return PIDs from pgrep output."""
-        output = b"1234\n5678\n"
+        output = (
+            "1234 /opt/homebrew/Python src/kalshi/weather-bot.py\n"
+            "5678 /opt/homebrew/Python -u src/kalshi/weather-bot.py\n"
+        )
         with patch.object(supervisor.subprocess, "check_output", return_value=output), \
              patch.object(supervisor.os, "getpid", return_value=9999):
             pids = supervisor._find_bot_processes(["python3", "src/kalshi/weather-bot.py"])
@@ -412,7 +564,11 @@ class TestFindBotProcesses:
 
     def test_excludes_own_pid(self):
         """Should exclude the supervisor's own PID from results."""
-        output = b"1234\n9999\n5678\n"
+        output = (
+            "1234 /opt/homebrew/Python src/kalshi/weather-bot.py\n"
+            "9999 /opt/homebrew/Python src/kalshi/weather-bot.py\n"
+            "5678 /opt/homebrew/Python src/kalshi/weather-bot.py\n"
+        )
         with patch.object(supervisor.subprocess, "check_output", return_value=output), \
              patch.object(supervisor.os, "getpid", return_value=9999):
             pids = supervisor._find_bot_processes(["python3", "src/kalshi/weather-bot.py"])
@@ -428,11 +584,105 @@ class TestFindBotProcesses:
 
     def test_handles_blank_lines(self):
         """Should handle trailing newlines and blank lines."""
-        output = b"1234\n\n"
+        output = "1234 /opt/homebrew/Python src/kalshi/weather-bot.py\n\n"
         with patch.object(supervisor.subprocess, "check_output", return_value=output), \
              patch.object(supervisor.os, "getpid", return_value=9999):
             pids = supervisor._find_bot_processes(["python3", "src/kalshi/weather-bot.py"])
         assert pids == [1234]
+
+    def test_uses_script_path_pattern_for_python_bots(self):
+        """Python bot discovery should match by script path, not literal python3."""
+        with patch.object(supervisor.subprocess, "check_output", return_value="") as mock_check_output, \
+             patch.object(supervisor.os, "getpid", return_value=9999):
+            supervisor._find_bot_processes(["python3", "src/kalshi/weather-bot.py"])
+
+        mock_check_output.assert_called_once_with(
+            ["pgrep", "-fl", "src/kalshi/weather-bot.py"],
+            text=True,
+        )
+
+    def test_ignores_non_python_commands_that_reference_script(self):
+        """Editors or shells mentioning the script should not be treated as bot workers."""
+        output = (
+            "1234 vim src/kalshi/weather-bot.py\n"
+            "5678 /opt/homebrew/Python src/kalshi/weather-bot.py\n"
+            "6789 zsh -lc tail -f src/kalshi/weather-bot.py\n"
+        )
+        with patch.object(supervisor.subprocess, "check_output", return_value=output), \
+             patch.object(supervisor.os, "getpid", return_value=9999):
+            pids = supervisor._find_bot_processes(["python3", "src/kalshi/weather-bot.py"])
+        assert pids == [5678]
+
+    def test_ignores_malformed_pgrep_lines(self):
+        """Malformed command lines with embedded newlines should not crash parsing."""
+        output = (
+            "19696 /bin/zsh -c cd /repo\n"
+            "nohup python3 -u src/kalshi/weather-bot.py >> /tmp/out.log 2>&1 &\n"
+            "19697 /opt/homebrew/Python -u src/kalshi/weather-bot.py\n"
+        )
+        with patch.object(supervisor.subprocess, "check_output", return_value=output), \
+             patch.object(supervisor.os, "getpid", return_value=9999):
+            pids = supervisor._find_bot_processes(["python3", "src/kalshi/weather-bot.py"])
+        assert pids == [19697]
+
+    def test_matches_python_script_with_required_args(self):
+        """Commands sharing a script path should still be distinguishable by required args."""
+        output = (
+            "1234 /opt/homebrew/Python src/kalshi/hdd-scraper.py\n"
+            "5678 /opt/homebrew/Python src/kalshi/hdd-scraper.py monitor\n"
+            "6789 /opt/homebrew/Python src/kalshi/hdd-scraper.py monitor --interval 5\n"
+        )
+        with patch.object(supervisor.subprocess, "check_output", return_value=output), \
+             patch.object(supervisor.os, "getpid", return_value=9999):
+            pids = supervisor._find_bot_processes(["python3", "src/kalshi/hdd-scraper.py", "monitor"])
+        assert pids == [5678, 6789]
+
+    def test_base_python_script_does_not_match_invocations_with_extra_args(self):
+        """A bare script command should not absorb monitor-mode invocations of the same file."""
+        output = (
+            "1234 /opt/homebrew/Python src/kalshi/hdd-scraper.py\n"
+            "5678 /opt/homebrew/Python src/kalshi/hdd-scraper.py monitor\n"
+        )
+        with patch.object(supervisor.subprocess, "check_output", return_value=output), \
+             patch.object(supervisor.os, "getpid", return_value=9999):
+            pids = supervisor._find_bot_processes(["python3", "src/kalshi/hdd-scraper.py"])
+        assert pids == [1234]
+
+    def test_duplicate_block_detection_uses_mapped_log_name(self, tmp_path):
+        """Duplicate-block detection should read logger-name log files too."""
+        log_path = tmp_path / "source-monitor.log"
+        log_path.write_text("2026-03-13 [source-monitor] WARNING: Duplicate source-monitor launch blocked; exiting.\n")
+
+        with patch.object(supervisor, "LOG_DIR", tmp_path):
+            assert supervisor._log_contains_duplicate_block("monitor") is True
+
+    def test_duplicate_block_detection_uses_hdd_scraper_log_name(self, tmp_path):
+        """hdd-monitor duplicate checks should read the hdd-scraper log file."""
+        log_path = tmp_path / "hdd-scraper.log"
+        log_path.write_text("2026-03-13 [hdd-scraper] WARNING: Duplicate HDD monitor launch blocked; exiting.\n")
+
+        with patch.object(supervisor, "LOG_DIR", tmp_path):
+            assert supervisor._log_contains_duplicate_block("hdd-monitor") is True
+
+
+class TestSingletonBlockedStart:
+
+    def test_handle_singleton_blocked_start_adopts_existing_pid(self, tmp_path):
+        """A singleton-blocked launch should adopt the already-running worker."""
+        bot = BotProcess("monitor", ["python3", "src/kalshi/source-monitor.py"])
+        bot.pid_file = tmp_path / "monitor.pid"
+        bot.process = MagicMock(pid=99999)
+
+        log_path = tmp_path / "source-monitor.log"
+        log_path.write_text("2026-03-13 [source-monitor] WARNING: Duplicate source-monitor launch blocked; exiting.\n")
+
+        with patch.object(supervisor, "LOG_DIR", tmp_path), \
+             patch.object(supervisor, "_find_bot_processes", return_value=[14595]):
+            handled = bot.handle_singleton_blocked_start()
+
+        assert handled is True
+        assert bot._read_pid() == 14595
+        assert bot.process is None
 
 
 class TestSingletonLock:
@@ -545,3 +795,39 @@ class TestCheckAndRestartDedup:
 
         mock_start.assert_called_once()
         assert result is True
+
+    def test_adopts_single_running_pid_when_pid_file_missing(self):
+        """If a single worker exists, adopt its PID instead of restarting."""
+        bot = BotProcess("weather", ["python3", "src/kalshi/weather-bot.py"])
+        bot.recent_crashes = []
+
+        with patch.object(bot, "is_running", return_value=False), \
+             patch.object(bot, "adopt_running_pid", return_value=14595) as mock_adopt, \
+             patch.object(bot, "start") as mock_start:
+            result = bot.check_and_restart()
+
+        mock_adopt.assert_called_once()
+        mock_start.assert_not_called()
+        assert result is False
+
+
+class TestOneShotStartup:
+
+    def test_start_bots_treats_ok_oneshot_completion_as_success(self):
+        """One-shot bots that finish successfully should not trigger startup-failure alerts."""
+        sup = Supervisor.__new__(Supervisor)
+        sup.bots = {"hdd": BotProcess("hdd", ["python3", "src/kalshi/hdd-scraper.py"])}
+        sup._running = True
+        sup._last_calibration_check = 0
+        bot = sup.bots["hdd"]
+
+        with patch.object(bot, "start", return_value=True), \
+             patch.object(bot, "is_running", return_value=False), \
+             patch.object(bot, "check_oneshot_completion", return_value="ok"), \
+             patch.object(bot, "handle_singleton_blocked_start", return_value=False), \
+             patch.object(supervisor.time, "sleep"), \
+             patch.object(supervisor, "notify_webhook") as mock_notify, \
+             patch.object(sup, "_save_state"):
+            sup.start_bots(["hdd"])
+
+        mock_notify.assert_not_called()

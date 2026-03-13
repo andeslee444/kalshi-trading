@@ -11,6 +11,7 @@ from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, s
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, half_kelly, quarter_kelly, compute_limit_price, kalshi_fee_cents
 from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_threshold, configure_sanity
 from capital_allocator import PortfolioAllocator
+from singleton_lock import acquire_process_singleton
 
 setup_unbuffered()
 
@@ -21,9 +22,6 @@ SNAPSHOTS_DIR = PROJECT_DIR / "data" / "kalshi-source-snapshots"
 TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
 Path(PID_PATH).parent.mkdir(parents=True, exist_ok=True)
 SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-
-# Write PID
-Path(PID_PATH).write_text(str(os.getpid()))
 
 # Logging — auto file logging via setup_logging (writes to data/logs/entertainment.log)
 log = setup_logging("entertainment")
@@ -746,6 +744,12 @@ def main():
     parser = argparse.ArgumentParser(description="Entertainment markets trading bot")
     parser.add_argument("--once", action="store_true", help="Run single scan then exit")
     args = parser.parse_args()
+
+    if not acquire_process_singleton("entertainment", PROJECT_DIR, log):
+        log.warning("Duplicate entertainment launch blocked; exiting.")
+        return
+
+    Path(PID_PATH).write_text(str(os.getpid()))
 
     log.info("=" * 60)
     log.info("Kalshi Entertainment Markets Bot (DEMO)")

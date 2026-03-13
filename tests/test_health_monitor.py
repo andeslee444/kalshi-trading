@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from kalshi_auth import (
-    HealthCheckMonitor, KILL_SWITCH_PATH,
+    HealthCheckMonitor, KILL_SWITCH_PATH, BOT_SOURCE_MAP,
     notify_imessage, _reset_imessage_rate_limiter,
 )
 
@@ -100,6 +100,44 @@ class TestSourceTracking:
         hm.record_source_success("nws")
         assert hm._state["sources"]["nws"]["error_count"] == 0
 
+    @patch("kalshi_auth.notify_imessage")
+    @patch("kalshi_auth.notify_webhook")
+    def test_trip_source_breaker_opens_immediately(self, mock_webhook, mock_imessage, tmp_path):
+        hm = self._make_monitor(tmp_path, source_breaker_threshold=5)
+        hm.trip_source_breaker("open-meteo-nam", "status=400")
+        entry = hm._state["sources"]["open-meteo-nam"]
+        assert entry["error_count"] == 5
+        assert entry["opened_at"] is not None
+        mock_webhook.assert_called_once()
+        mock_imessage.assert_called_once()
+
+    @patch("kalshi_auth.notify_imessage")
+    @patch("kalshi_auth.notify_webhook")
+    def test_trip_source_breaker_includes_msg_in_alert(self, mock_webhook, mock_imessage, tmp_path):
+        """trip_source_breaker() should include the msg argument in the alert."""
+        hm = self._make_monitor(tmp_path, source_breaker_threshold=5)
+        hm.trip_source_breaker("open-meteo-batch", msg="HTTP 400 Bad Request")
+        alert_text = mock_webhook.call_args[0][0]
+        assert "HTTP 400 Bad Request" in alert_text
+
+    @patch("kalshi_auth.notify_imessage")
+    @patch("kalshi_auth.notify_webhook")
+    def test_trip_source_breaker_alerts_before_save(self, mock_webhook, mock_imessage, tmp_path):
+        """Alerts must fire before state is saved (if save crashes, alert still sent)."""
+        hm = self._make_monitor(tmp_path, source_breaker_threshold=5)
+        call_order = []
+        original_save = hm._save
+        def tracking_save():
+            call_order.append("save")
+            original_save()
+        hm._save = tracking_save
+        mock_webhook.side_effect = lambda *a, **kw: call_order.append("webhook")
+        mock_imessage.side_effect = lambda *a, **kw: call_order.append("imessage")
+
+        hm.trip_source_breaker("test-source")
+        # Alert should happen before save
+        assert call_order.index("webhook") < call_order.index("save")
+
     def test_five_errors_flagged_in_health(self, tmp_path):
         hm = self._make_monitor(tmp_path)
         for i in range(5):
@@ -139,7 +177,7 @@ class TestAutoHalt:
         # Create critical source failures for all weather sources
         old_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=30)).isoformat()
         hm._state["bots"]["weather"] = {"last_heartbeat": old_time}
-        for src in ["open-meteo-batch", "open-meteo-single", "open-meteo-ensemble", "nws-forecast"]:
+        for src in BOT_SOURCE_MAP["weather"]:
             for i in range(5):
                 hm.record_source_error(src, f"err{i}")
 

@@ -22,7 +22,16 @@ Kalshi KXALBUMSALES markets settle directly on the HDD Hits Top 50
 import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR
+from kalshi_auth import (
+    KalshiClient,
+    HealthCheckMonitor,
+    setup_unbuffered,
+    setup_signal_handlers,
+    setup_logging,
+    PROJECT_DIR,
+    _atomic_write_json,
+    is_shutdown_requested,
+)
 from probability import info_arb_probability, album_data_sigma
 from hdd_parser import (
     sanity_query, fetch_latest_chart, fetch_recent_articles,
@@ -30,9 +39,11 @@ from hdd_parser import (
     extract_sales_from_text, parse_album_threshold,
     SANITY_PROJECT, SANITY_DATASET, SANITY_BASE,
 )
+from singleton_lock import acquire_process_singleton
 
 # Unbuffered output
 setup_unbuffered()
+setup_signal_handlers()
 log = setup_logging("hdd-scraper")
 
 # === Paths ===
@@ -46,6 +57,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # === Kalshi Client ===
 client = KalshiClient()
+health = HealthCheckMonitor(logger=log)
 
 
 # ============================================================
@@ -377,27 +389,36 @@ def monitor_loop(interval_minutes: int = 15):
 
     while True:
         try:
+            health.record_bot_heartbeat("hdd-monitor")
             run_full_scan()
         except Exception as e:
             log.error("Scan error: %s", e, exc_info=True)
 
+        if is_shutdown_requested():
+            log.info("Graceful shutdown requested, exiting HDD monitor.")
+            break
+
         log.info(f"\nNext scan in {interval_minutes} minutes...")
-        time.sleep(interval_minutes * 60)
+        deadline = time.monotonic() + (interval_minutes * 60)
+        while time.monotonic() < deadline:
+            if is_shutdown_requested():
+                log.info("Graceful shutdown requested, exiting HDD monitor.")
+                return
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
 
 # ============================================================
 # CLI
 # ============================================================
 
-if __name__ == "__main__":
+def main(argv=None):
     import argparse
-    from kalshi_auth import _atomic_write_json
     parser = argparse.ArgumentParser(description="HDD Scraper for Kalshi Arbitrage")
     parser.add_argument("command", nargs="?", default="scan",
                        choices=["scan", "monitor", "charts", "articles", "markets"],
                        help="Command to run")
     parser.add_argument("--interval", type=int, default=15, help="Monitor interval (minutes)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.command == "scan":
         try:
@@ -414,6 +435,9 @@ if __name__ == "__main__":
             })
             raise
     elif args.command == "monitor":
+        if not acquire_process_singleton("hdd-monitor", PROJECT_DIR, log, display_name="hdd-monitor"):
+            log.warning("Duplicate HDD monitor launch blocked; exiting.")
+            return
         monitor_loop(args.interval)
     elif args.command == "charts":
         scan_charts()
@@ -421,3 +445,7 @@ if __name__ == "__main__":
         scan_articles()
     elif args.command == "markets":
         scan_kalshi_markets()
+
+
+if __name__ == "__main__":
+    main()
