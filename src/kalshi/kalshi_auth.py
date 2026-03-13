@@ -461,7 +461,8 @@ class KalshiClient:
             if market:
                 normalize_market(market)
             return market
-        except Exception:
+        except Exception as e:
+            _log.warning("get_market(%s) failed: %s", ticker, e)
             return None
 
     def get_balance(self):

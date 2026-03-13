@@ -264,3 +264,60 @@ class TestLiquidityFilterIntegration:
         normalize_market(m)
         # volume=7 >= 5 (near-settlement threshold)
         assert is_market_liquid(m, min_volume=5) is True
+
+
+class TestGetMarketErrorHandling:
+    """Verify get_market() logs errors instead of silently swallowing them."""
+
+    def test_get_market_logs_exception(self):
+        """get_market() must log the exception before returning None."""
+        import logging
+        from unittest.mock import patch, MagicMock
+
+        client = MagicMock()
+        # Make .get() raise a connection error
+        client.get.side_effect = ConnectionError("API unreachable")
+
+        # Attach a real KalshiClient.get_market to our mock
+        from kalshi_auth import KalshiClient
+        bound_method = KalshiClient.get_market.__get__(client, KalshiClient)
+
+        with patch("kalshi_auth._log") as mock_log:
+            result = bound_method("KXTEST-FAKE")
+            assert result is None
+            mock_log.warning.assert_called_once()
+            log_msg = mock_log.warning.call_args[0][0]
+            assert "KXTEST-FAKE" in log_msg % mock_log.warning.call_args[0][1:]
+
+    def test_get_market_returns_none_on_error(self):
+        """get_market() returns None on exception (not crash)."""
+        from unittest.mock import MagicMock
+        from kalshi_auth import KalshiClient
+
+        client = MagicMock()
+        client.get.side_effect = Exception("500 Internal Server Error")
+
+        bound_method = KalshiClient.get_market.__get__(client, KalshiClient)
+        result = bound_method("KXTEST-FAKE")
+        assert result is None
+
+    def test_get_market_normalizes_on_success(self):
+        """get_market() normalizes API v2 fields on success."""
+        from unittest.mock import MagicMock
+        from kalshi_auth import KalshiClient
+
+        client = MagicMock()
+        client.get.return_value = {
+            "market": {
+                "ticker": "KXHIGHLAX-26MAR12-T85",
+                "yes_bid_dollars": "0.8600",
+                "yes_ask_dollars": "0.8700",
+                "volume_fp": "100.00",
+            }
+        }
+
+        bound_method = KalshiClient.get_market.__get__(client, KalshiClient)
+        result = bound_method("KXHIGHLAX-26MAR12-T85")
+        assert result["yes_bid"] == 86
+        assert result["yes_ask"] == 87
+        assert result["volume"] == 100
