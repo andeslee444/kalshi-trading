@@ -507,6 +507,11 @@ class TestEvaluateModelShift:
 class TestComputeCurrentProbability:
     """Test multi-model routing in _compute_current_probability."""
 
+    def test_weather_returns_none_until_runtime_model_replay_exists(self):
+        prob, reason = _mod._compute_current_probability("KXHIGHMIA-26FEB20-T86", "weather", "yes")
+        assert prob is None
+        assert reason is None
+
     def test_entertainment_returns_none(self):
         """Entertainment source_bot should return (None, None)."""
         prob, reason = _mod._compute_current_probability("ALBUM-1", "entertainment", "yes")
@@ -1094,3 +1099,49 @@ class TestBacktestStopLoss:
         ]
         result = _mod.backtest_stop_loss(trades)
         assert result["premature_exits"] == 1
+
+
+class TestGetMarketDataNormalization:
+    """Verify get_market_data() returns normalized market dicts (v2 API fields -> cents)."""
+
+    def test_get_market_data_uses_get_market(self):
+        """get_market_data() must call client.get_market() (normalized path)."""
+        mock_client = MagicMock()
+        mock_client.get_market.return_value = {
+            "ticker": "KXHIGHLAX-26MAR12-T85",
+            "yes_bid": 86,
+            "yes_ask": 87,
+            "no_bid": 13,
+            "no_ask": 14,
+            "volume": 100,
+            "close_time": "2026-03-12T23:59:59Z",
+        }
+
+        fake = make_fake_auth()
+        fake.KalshiClient = lambda *a, **kw: mock_client
+
+        fake_prob = types.ModuleType("probability")
+        fake_prob.half_kelly = lambda *a, **kw: (0, 0)
+        fake_prob.weather_probability = lambda *a, **kw: 0.5
+        fake_prob.nws_probability = lambda *a, **kw: 0.5
+        fake_prob.crypto_price_probability = lambda *a, **kw: 0.5
+        fake_prob.kalshi_fee_cents = lambda p: 0.0
+
+        fake_ticker = types.ModuleType("ticker_utils")
+        fake_ticker.parse_weather_ticker = lambda ticker: None
+        fake_ticker.parse_crypto_ticker = lambda ticker: None
+
+        fake_alloc = types.ModuleType("capital_allocator")
+        fake_alloc.PortfolioAllocator = lambda *a, **kw: None
+
+        mod = load_bot_module("position-monitor.py", fake_auth=fake, extra_stubs={
+            "probability": fake_prob,
+            "ticker_utils": fake_ticker,
+            "capital_allocator": fake_alloc,
+        })
+        result = mod.get_market_data("KXHIGHLAX-26MAR12-T85")
+        assert result is not None
+        assert result["yes_bid"] == 86
+        assert result["yes_ask"] == 87
+        # Verify it called get_market (normalized path), not get("/markets/...")
+        mock_client.get_market.assert_called_once_with("KXHIGHLAX-26MAR12-T85")
