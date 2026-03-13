@@ -7,18 +7,18 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/andeslee/Documents/cursor-projects/kalshi-trading/scripts/boot-notify.sh</string>
+        <string>REPLACE_WITH_PROJECT_DIR/scripts/boot-notify.sh</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/andeslee/Documents/cursor-projects/kalshi-trading/data/logs/boot-notify.log</string>
+    <string>REPLACE_WITH_PROJECT_DIR/data/logs/boot-notify.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/andeslee/Documents/cursor-projects/kalshi-trading/data/logs/boot-notify.log</string>
+    <string>REPLACE_WITH_PROJECT_DIR/data/logs/boot-notify.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
-        <string>/Users/andeslee</string>
+        <string>REPLACE_WITH_HOME</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>

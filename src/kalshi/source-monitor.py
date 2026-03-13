@@ -17,6 +17,7 @@ from probability import info_arb_probability, album_data_sigma, boxoffice_data_s
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
 from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_threshold, check_sanity_health
 from capital_allocator import PortfolioAllocator
+from singleton_lock import acquire_process_singleton
 
 setup_unbuffered()
 log = setup_logging("source-monitor")
@@ -1206,6 +1207,10 @@ def main():
     parser = argparse.ArgumentParser(description="Settlement source monitor (info arbitrage)")
     parser.add_argument("--once", action="store_true", help="Run single scan of all sources then exit")
     args = parser.parse_args()
+
+    if not acquire_process_singleton("monitor", PROJECT_DIR, log, display_name="source-monitor"):
+        log.warning("Duplicate source-monitor launch blocked; exiting.")
+        return
 
     log.info("=" * 70)
     log.info("Kalshi Settlement Source Monitor -- Information Arbitrage Bot")

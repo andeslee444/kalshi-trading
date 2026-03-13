@@ -4,9 +4,11 @@ import json
 import sys
 import pytest
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from probability import _reset_calibration
 from conftest import make_fake_auth, load_bot_module
+import singleton_lock as _singleton_lock
 
 
 # ---------------------------------------------------------------------------
@@ -252,3 +254,83 @@ class TestBiasBlending:
         """Simulates city_bias=None scenario (no ForecastVerifier data)."""
         result = self._compute_blend(hist_bias=8.5, live_bias=0.0, live_n=0)
         assert result == 8.5
+
+
+class TestSourceBreakerRegression:
+
+    def test_record_source_failure_trips_breaker_on_bad_request(self):
+        _mod.health = MagicMock()
+        _mod._record_source_failure(
+            "open-meteo-nam",
+            "status=400",
+            status_code=400,
+            immediate_on_bad_request=True,
+        )
+        _mod.health.trip_source_breaker.assert_called_once_with("open-meteo-nam", "status=400")
+        _mod.health.record_source_error.assert_not_called()
+
+    def test_record_source_failure_uses_regular_error_path_for_non_400(self):
+        _mod.health = MagicMock()
+        _mod._record_source_failure(
+            "open-meteo-nam",
+            "status=503",
+            status_code=503,
+            immediate_on_bad_request=True,
+        )
+        _mod.health.record_source_error.assert_called_once_with("open-meteo-nam", "status=503")
+        _mod.health.trip_source_breaker.assert_not_called()
+
+
+class TestWeatherSingletonLock:
+
+    def teardown_method(self):
+        _mod._release_singleton_lock()
+
+    def test_acquire_singleton_lock_writes_metadata(self, tmp_path, monkeypatch):
+        lock_path = tmp_path / "weather.lock"
+        monkeypatch.setattr(_mod, "WEATHER_SINGLETON_LOCK_PATH", lock_path)
+        _mod._release_singleton_lock()
+
+        assert _mod._acquire_singleton_lock() is True
+
+        payload = json.loads(lock_path.read_text())
+        assert payload["pid"] == _mod.os.getpid()
+        assert payload["argv"]
+
+    def test_acquire_singleton_lock_returns_false_when_locked(self, tmp_path, monkeypatch):
+        lock_path = tmp_path / "weather.lock"
+        lock_path.write_text('{"pid":999,"started_at":"2026-03-13T00:00:00+00:00"}')
+        monkeypatch.setattr(_mod, "WEATHER_SINGLETON_LOCK_PATH", lock_path)
+        _mod._release_singleton_lock()
+
+        def _raise_blocking(fd, flags):
+            raise BlockingIOError()
+
+        monkeypatch.setattr(_singleton_lock.fcntl, "flock", _raise_blocking)
+
+        assert _mod._acquire_singleton_lock() is False
+
+    def test_acquire_singleton_lock_handles_corrupt_metadata(self, tmp_path, monkeypatch):
+        """Lock with corrupt JSON metadata should not crash — logs truncated raw data."""
+        lock_path = tmp_path / "weather.lock"
+        lock_path.write_text("CORRUPT{not-json")
+        monkeypatch.setattr(_mod, "WEATHER_SINGLETON_LOCK_PATH", lock_path)
+        _mod._release_singleton_lock()
+
+        def _raise_blocking(fd, flags):
+            raise BlockingIOError()
+
+        monkeypatch.setattr(_singleton_lock.fcntl, "flock", _raise_blocking)
+
+        # Should return False (locked) without crashing on corrupt metadata
+        assert _mod._acquire_singleton_lock() is False
+
+    def test_main_exits_before_auth_when_singleton_lock_unavailable(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_acquire_singleton_lock", lambda lock_path=None: False)
+        get_balance = MagicMock(return_value=(1000, {}))
+        monkeypatch.setattr(_mod.client, "get_balance", get_balance)
+        monkeypatch.setattr(sys, "argv", ["weather-bot.py", "--once"])
+
+        _mod.main()
+
+        get_balance.assert_not_called()

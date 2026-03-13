@@ -6,12 +6,14 @@ Scans KXHIGH temperature markets, compares to Open-Meteo forecasts, and places t
 import json, time, datetime, os, sys, re, threading
 import requests
 from pathlib import Path
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
-from probability import weather_probability, weather_sigma, ensemble_weather_probability, ensemble_spread_sigma_multiplier, ensemble_weather_probability_v2, empirical_ensemble_probability, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, _load_calibration
+from zoneinfo import ZoneInfo
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested, CITY_TIMEZONES, _local_today
+from probability import weather_probability, weather_sigma, weather_sigma_hourly, ensemble_weather_probability, ensemble_spread_sigma_multiplier, ensemble_weather_probability_v2, empirical_ensemble_probability, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, _load_calibration
 from ticker_utils import parse_weather_ticker as parse_ticker
 from capital_allocator import PortfolioAllocator
 from forecast_verifier import ForecastVerifier, DEFAULT_STATION_MAP
-from weather_data import EnsembleCollector, HRRRFetcher, NAMFetcher, PreviousRunsFetcher, OrderBookDepth, next_model_run, STATION_MAP, NWSForecastFetcher, BiasCorrector
+from weather_data import EnsembleCollector, HRRRFetcher, NAMFetcher, PreviousRunsFetcher, OrderBookDepth, next_model_run, latest_available_model_run, canonical_model_name, STATION_MAP, NWSForecastFetcher, BiasCorrector
+from singleton_lock import acquire_process_singleton, release_process_singleton
 
 setup_unbuffered()
 log = setup_logging("weather")
@@ -21,6 +23,7 @@ setup_signal_handlers()
 CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-config.json"
 TRADES_PATH = PROJECT_DIR / "data" / "kalshi-trades.json"
 TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
+WEATHER_SINGLETON_LOCK_PATH = PROJECT_DIR / "data" / "pids" / "weather-bot.lock"
 
 config = json.loads(CONFIG_PATH.read_text())
 CITIES = config["cities"]
@@ -37,6 +40,22 @@ trade_manager = TradeManager(client, TRADES_PATH, {
     "maxDailyLossPct": config.get("maxDailyLossPct"),
 }, logger=log, order_monitor=order_monitor, cooldown_hours=0.5, bot_name="weather")
 trim_trade_log(TRADES_PATH)
+
+
+def _release_singleton_lock():
+    """Release the weather singleton lock if held by this process."""
+    release_process_singleton("weather")
+
+
+def _acquire_singleton_lock(lock_path=None):
+    """Ensure only one weather bot instance can run at a time."""
+    return acquire_process_singleton(
+        "weather",
+        PROJECT_DIR,
+        log,
+        lock_path=lock_path or WEATHER_SINGLETON_LOCK_PATH,
+        display_name="weather bot",
+    )
 
 
 # === Days-out-aware dedup cooldown ===
@@ -85,6 +104,29 @@ def record_local_trade(ticker):
         expired = [k for k, v in _local_trade_times.items() if v < cutoff]
         for k in expired:
             del _local_trade_times[k]
+
+
+def _city_now(city_code):
+    """Return current datetime in the market city's local timezone."""
+    tz = ZoneInfo(CITY_TIMEZONES.get(city_code, "America/New_York"))
+    return datetime.datetime.now(tz)
+
+
+def _city_today(city_code):
+    """Return today's local settlement date for a city."""
+    try:
+        return datetime.date.fromisoformat(_local_today(city_code))
+    except Exception:
+        return _city_now(city_code).date()
+
+
+def _effective_weather_edge_threshold():
+    """Use the stricter of config and calibrated recommendations."""
+    recommended = _load_calibration().get("weather", {}).get("recommended_edge_threshold")
+    base = config.get("edgeThreshold", 0.06)
+    if isinstance(recommended, (int, float)) and recommended > 0:
+        return max(base, recommended)
+    return base
 
 # === Weather Forecast ===
 
@@ -181,6 +223,15 @@ def _cached_request(url, timeout=15, max_retries=2):
     return resp
 
 
+def _record_source_failure(source, message, status_code=None, immediate_on_bad_request=False):
+    """Record source failures and trip breakers immediately on deterministic 400s."""
+    if immediate_on_bad_request and status_code == 400 and hasattr(health, "trip_source_breaker"):
+        health.trip_source_breaker(source, message)
+        log.warning("%s returned HTTP 400, opening circuit breaker immediately", source)
+        return
+    health.record_source_error(source, message)
+
+
 # === Forecast Verification ===
 VERIFICATION_ENABLED = config.get("verification", {}).get("enabled", True)
 VERIFICATION_CONFIG = config.get("verification", {})
@@ -197,9 +248,6 @@ hrrr_fetcher = HRRRFetcher(logger=log, rate_limiter=_open_meteo_limiter.acquire)
 # NAM deterministic forecast fetcher (3km, 60h)
 nam_fetcher = NAMFetcher(logger=log, rate_limiter=_open_meteo_limiter.acquire)
 
-# Previous Runs convergence fetcher
-prev_runs_fetcher = PreviousRunsFetcher(logger=log, rate_limiter=_open_meteo_limiter.acquire)
-
 # Bias corrector — loads historical calibration for per-city per-model correction
 bias_corrector = BiasCorrector(logger=log)
 
@@ -212,7 +260,7 @@ orderbook = OrderBookDepth(logger=log)
 
 def get_forecast(lat, lon):
     """Single-model GFS forecast (fallback)."""
-    url = _open_meteo_url(f"latitude={lat}&longitude={lon}&daily=temperature_2m_max&temperature_unit=fahrenheit&timezone=America%2FNew_York&forecast_days=14")
+    url = _open_meteo_url(f"latitude={lat}&longitude={lon}&daily=temperature_2m_max&temperature_unit=fahrenheit&timezone=auto&forecast_days=14")
     r = _cached_request(url, timeout=10)
     d = r.json()["daily"]
     return dict(zip(d["time"], d["temperature_2m_max"]))
@@ -231,7 +279,7 @@ def get_batch_forecasts(cities_dict):
     url = _open_meteo_url(
         f"latitude={lats}&longitude={lons}"
         f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
-        f"&timezone=America%2FNew_York&forecast_days=14"
+        f"&timezone=auto&forecast_days=14"
     )
 
     try:
@@ -279,7 +327,7 @@ def get_batch_ensemble_forecasts(cities_dict):
         url = _open_meteo_url(
             f"latitude={lats}&longitude={lons}"
             f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
-            f"&timezone=America%2FNew_York&forecast_days=14"
+            f"&timezone=auto&forecast_days=14"
             f"&models={model_name}"
         )
 
@@ -304,7 +352,12 @@ def get_batch_ensemble_forecasts(cities_dict):
             health.record_source_success(f"open-meteo-{model_key}")
         except Exception as e:
             log.warning(f"Batch ensemble {model_key} failed: {e}")
-            health.record_source_error(f"open-meteo-{model_key}", str(e))
+            _record_source_failure(
+                f"open-meteo-{model_key}",
+                str(e),
+                status_code=getattr(getattr(e, "response", None), "status_code", None),
+                immediate_on_bad_request=True,
+            )
 
     if not model_results:
         return {}
@@ -352,7 +405,7 @@ def get_ensemble_forecast(lat, lon):
         url = _open_meteo_url(
             f"latitude={lat}&longitude={lon}"
             f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
-            f"&timezone=America%2FNew_York&forecast_days=14"
+            f"&timezone=auto&forecast_days=14"
             f"&models={model_name}"
         )
         urls[url] = model_key
@@ -377,8 +430,12 @@ def get_ensemble_forecast(lat, lon):
         model_key = urls[url]
         if response is None or response.status_code != 200:
             log.warning(f"Ensemble model {model_key} failed (status={getattr(response, 'status_code', 'None')})")
-            health.record_source_error(f"open-meteo-{model_key}",
-                                       f"status={getattr(response, 'status_code', 'None')}")
+            _record_source_failure(
+                f"open-meteo-{model_key}",
+                f"status={getattr(response, 'status_code', 'None')}",
+                status_code=getattr(response, "status_code", None),
+                immediate_on_bad_request=True,
+            )
             failed_models.append(model_key)
             continue
         try:
@@ -498,7 +555,6 @@ def compute_adaptive_interval(markets, config):
     if not markets:
         return day2_min
 
-    today = datetime.date.today()
     min_days_out = float("inf")
 
     for m in markets:
@@ -510,7 +566,11 @@ def compute_adaptive_interval(markets, config):
             continue
         try:
             market_date = datetime.date.fromisoformat(parsed["date"])
-            days_out = max(0, (market_date - today).days)
+            if "_local_today" in globals():
+                local_today = datetime.date.fromisoformat(_local_today(parsed.get("city")))
+            else:
+                local_today = datetime.date.today()
+            days_out = max(0, (market_date - local_today).days)
             min_days_out = min(min_days_out, days_out)
         except (ValueError, TypeError):
             continue
@@ -524,7 +584,7 @@ def compute_adaptive_interval(markets, config):
 
 
 def scan_and_trade():
-    now = datetime.datetime.now()
+    now = datetime.datetime.now(datetime.timezone.utc)
     ss = ScanSummary("weather", log)
     log.info(f"\n{'='*60}")
     log.info(f"[{now.isoformat()}] Market scan starting...")
@@ -669,6 +729,10 @@ def scan_and_trade():
             elif om_data is not None:
                 nws_fetcher.cross_validate(code, om_data, nws_temp)
 
+    model_run_tags = {}
+    convergence_data = {}  # {city_code: {date_str: {current, previous, delta}}}
+    prev_runs_cfg = config.get("previousRuns", {})
+
     # Forecast verification: verify past forecasts and record new ones
     if verifier:
         try:
@@ -676,13 +740,47 @@ def scan_and_trade():
         except Exception as e:
             log.warning("Verification check failed (non-blocking): %s", e)
 
+        # Track which model run each forecast came from so convergence only
+        # fires when the upstream model cycle actually changes.
+        model_run_tags = {}
+        for city_forecast in forecasts.values():
+            for model_data in city_forecast.values():
+                if not isinstance(model_data, dict):
+                    continue
+                for model_name in model_data.keys():
+                    if model_name in model_run_tags:
+                        continue
+                    run_dt = latest_available_model_run(model_name)
+                    if run_dt is not None:
+                        model_run_tags[model_name] = run_dt.isoformat()
+
+        if prev_runs_cfg.get("enabled", False):
+            model_name = canonical_model_name(prev_runs_cfg.get("model", "gfs"))
+            current_run_tag = model_run_tags.get(model_name)
+            if current_run_tag is not None:
+                try:
+                    convergence_data = verifier.get_run_to_run_deltas(
+                        forecasts,
+                        model_name,
+                        current_run_tag,
+                    )
+                    if convergence_data:
+                        log.info("Convergence data available for %d cities", len(convergence_data))
+                except Exception as e:
+                    log.warning("Convergence signal failed (non-blocking): %s", e)
+
         # Record current forecasts for later verification
         for code, info in CITIES.items():
             if code in forecasts:
                 city_forecast = forecasts[code]
                 for date_str, model_data in city_forecast.items():
                     if isinstance(model_data, dict):
-                        verifier.record_forecast(code, date_str, model_data)
+                        verifier.record_forecast(
+                            code,
+                            date_str,
+                            model_data,
+                            model_run_tags=model_run_tags,
+                        )
 
     # Get adaptive ensemble data from verification (if available)
     verification_summary = None
@@ -721,50 +819,73 @@ def scan_and_trade():
     # Fetch HRRR deterministic forecast (Phase 3: 3km resolution, hourly updates)
     hrrr_data = {}  # {city_code: {date_str: max_temp_f}}
     hrrr_cfg = config.get("hrrr", {})
-    if hrrr_cfg.get("enabled", False):
+    hrrr_source = "open-meteo-hrrr"
+    if hrrr_cfg.get("enabled", False) and not health.is_source_open(hrrr_source):
         for code, info in CITIES.items():
+            if health.is_source_open(hrrr_source):
+                log.info("HRRR circuit breaker open, skipping remaining cities")
+                break
             try:
                 data = hrrr_fetcher.fetch_hrrr(info["lat"], info["lon"])
                 if data:
                     hrrr_data[code] = data
+                    health.record_source_success(hrrr_source)
+                else:
+                    _record_source_failure(
+                        hrrr_source,
+                        getattr(hrrr_fetcher, "last_error", "empty response"),
+                        status_code=getattr(hrrr_fetcher, "last_status_code", None),
+                        immediate_on_bad_request=True,
+                    )
             except Exception as e:
                 log.warning("HRRR fetch failed for %s: %s", code, e)
+                _record_source_failure(
+                    hrrr_source,
+                    str(e),
+                    status_code=getattr(getattr(e, "response", None), "status_code", None),
+                    immediate_on_bad_request=True,
+                )
         if hrrr_data:
             log.info("HRRR data available for %d cities", len(hrrr_data))
 
     # Fetch NAM deterministic forecast (3km resolution, 60h horizon)
     nam_data = {}  # {city_code: {date_str: max_temp_f}}
     nam_cfg = config.get("nam", {})
-    if nam_cfg.get("enabled", False):
+    nam_source = "open-meteo-nam"
+    if nam_cfg.get("enabled", False) and not health.is_source_open(nam_source):
         for code, info in CITIES.items():
+            if health.is_source_open(nam_source):
+                log.info("NAM circuit breaker open, skipping remaining cities")
+                break
             try:
                 data = nam_fetcher.fetch_nam(info["lat"], info["lon"])
                 if data:
                     nam_data[code] = data
+                    health.record_source_success(nam_source)
+                else:
+                    _record_source_failure(
+                        nam_source,
+                        getattr(nam_fetcher, "last_error", "empty response"),
+                        status_code=getattr(nam_fetcher, "last_status_code", None),
+                        immediate_on_bad_request=True,
+                    )
             except Exception as e:
                 log.warning("NAM fetch failed for %s: %s", code, e)
+                _record_source_failure(
+                    nam_source,
+                    str(e),
+                    status_code=getattr(getattr(e, "response", None), "status_code", None),
+                    immediate_on_bad_request=True,
+                )
         if nam_data:
             log.info("NAM data available for %d cities", len(nam_data))
 
-    # Fetch previous runs for convergence signal
-    convergence_data = {}  # {city_code: {date_str: {current, previous, delta}}}
-    prev_runs_cfg = config.get("previousRuns", {})
-    if prev_runs_cfg.get("enabled", False):
-        try:
-            model = prev_runs_cfg.get("model", "gfs_seamless")
-            convergence_data = prev_runs_fetcher.fetch_convergence_batch(CITIES, model=model)
-            if convergence_data:
-                log.info("Convergence data available for %d cities", len(convergence_data))
-        except Exception as e:
-            log.warning("Previous runs fetch failed (non-blocking): %s", e)
-
-    # Current hour for intra-day sigma (day-0 markets only)
-    current_hour = now.hour
     log.info(f"Forecast data collected ({time.time()-t_forecast:.1f}s)")
 
     # Analyze markets
     t_analysis = time.time()
     opportunities = []
+    base_edge_threshold = _effective_weather_edge_threshold()
     for m in markets:
         ticker = m.get("ticker", "")
         # Filter non-weather KXHIGH tickers (e.g., KXHIGHINFLATION)
@@ -787,16 +908,25 @@ def scan_and_trade():
             continue
 
         forecast_data = forecasts[city][date_str]
+        city_now = _city_now(city)
         try:
             market_date = datetime.date.fromisoformat(date_str)
-            days_out = max(0, (market_date - datetime.date.today()).days)
+            days_out = max(0, (market_date - _city_today(city)).days)
         except (ValueError, TypeError):
             days_out = 0
+        hour_for_sigma = city_now.hour if days_out == 0 else None
 
         # Compute probability — empirical ensemble CDF > parametric ensemble > single-model
         spread_mult = 1.0
         disagreement_score = 0.0
         used_empirical = False
+        our_prob = None
+        forecast_temp = None
+        sigma_used = None
+        per_model_probs = {}
+        probability_method = "single_model"
+        weights_used = {}
+        market_record_models = dict(forecast_data) if isinstance(forecast_data, dict) else None
 
         if ENSEMBLE_ENABLED and isinstance(forecast_data, dict):
             if not forecast_data:
@@ -805,21 +935,16 @@ def scan_and_trade():
             # Bias-correct each model's forecast before computing mean
             corrected_data = bias_corrector.correct_forecast_dict(city, forecast_data)
             valid_temps = [t for t in corrected_data.values() if t is not None]
-            forecast_temp = sum(valid_temps) / len(valid_temps) if valid_temps else None
-            if forecast_temp is None:
+            if not valid_temps:
                 ss.skip("null_forecast")
                 continue
+            city_skew = city_bias.get(city, {}).get("skew_alpha", 0.0) if city_bias else 0.0
 
             # Primary model: empirical ensemble CDF (if member data available)
             if city in ensemble_members and date_str in ensemble_members.get(city, {}):
                 members = list(ensemble_members[city][date_str])  # copy to avoid mutation
                 if members and len(members) >= 10:
-                    # Snapshot original count so HRRR/NAM injection weights
-                    # are computed relative to the raw ensemble, not compounding
-                    n_original = len(members)
-
-                    # Phase 3: Inject HRRR forecast as additional ensemble members
-                    # with day-dependent weighting (60% day-0, 30% day-1)
+                    extra_points = []
                     if city in hrrr_data and date_str in hrrr_data.get(city, {}):
                         hrrr_temp = hrrr_data[city][date_str]
                         if days_out == 0:
@@ -830,12 +955,11 @@ def scan_and_trade():
                             hrrr_weight = 0.0
 
                         if hrrr_weight > 0:
-                            n_inject = max(1, int(n_original * hrrr_weight))
-                            members.extend([hrrr_temp] * n_inject)
-                            log.info("  %s: HRRR temp %.1fF injected %d members (weight=%.0f%%, total=%d)",
-                                     ticker, hrrr_temp, n_inject, hrrr_weight * 100, len(members))
+                            extra_points.append({"temp": hrrr_temp, "weight": hrrr_weight, "label": "hrrr"})
+                            market_record_models["hrrr"] = hrrr_temp
+                            log.info("  %s: HRRR temp %.1fF blended into empirical ensemble (relative weight=%.0f%%)",
+                                     ticker, hrrr_temp, hrrr_weight * 100)
 
-                    # NAM injection (weight relative to original member count, not post-HRRR)
                     if city in nam_data and date_str in nam_data.get(city, {}):
                         nam_temp = nam_data[city][date_str]
                         if days_out == 0:
@@ -846,30 +970,58 @@ def scan_and_trade():
                             nam_weight = 0.0
 
                         if nam_weight > 0:
-                            n_inject = max(1, int(n_original * nam_weight))
-                            members.extend([nam_temp] * n_inject)
-                            log.info("  %s: NAM temp %.1fF injected %d members (weight=%.0f%%, total=%d)",
-                                     ticker, nam_temp, n_inject, nam_weight * 100, len(members))
+                            extra_points.append({"temp": nam_temp, "weight": nam_weight, "label": "nam"})
+                            market_record_models["nam"] = nam_temp
+                            log.info("  %s: NAM temp %.1fF blended into empirical ensemble (relative weight=%.0f%%)",
+                                     ticker, nam_temp, nam_weight * 100)
 
                     # Blend historical calibration bias with live ForecastVerifier bias
-                    hist_bias = bias_corrector.city_average_bias(city)
                     live_bias = city_bias.get(city, {}).get("bias_f", 0.0) if city_bias else 0.0
                     live_n = city_bias.get(city, {}).get("n", 0) if city_bias else 0
-                    alpha = min(1.0, live_n / 20.0) if live_n > 0 else 0.0
-                    bias = alpha * live_bias + (1 - alpha) * hist_bias
+                    bias, hist_bias, alpha = bias_corrector.blend_live_bias(
+                        city,
+                        live_bias=live_bias,
+                        live_n=live_n,
+                    )
                     if abs(bias) > 0.1:
                         log.info("  %s: bias correction %.1fF (hist=%.1fF, live=%.1fF, alpha=%.2f)",
                                  ticker, bias, hist_bias, live_bias, alpha)
-                    our_prob = empirical_ensemble_probability(
+
+                    empirical_result = empirical_ensemble_probability(
                         members, parsed["threshold"], parsed["direction"],
-                        bias_offset=bias
+                        bias_offset=bias,
+                        extra_points=extra_points,
+                        return_details=True,
                     )
-                    if our_prob is not None:
-                        log.info("  %s: empirical CDF from %d members (bias=%.1fF) -> P=%.3f",
-                                 ticker, len(members), bias, our_prob)
+                    if empirical_result and empirical_result[0] is not None:
+                        our_prob, empirical_details = empirical_result
+                        forecast_temp = empirical_details.get("center_temp")
+                        sigma_used = empirical_details.get("sigma_used")
+                        probability_method = empirical_details.get("method", "empirical_ensemble")
+                        log.info("  %s: empirical CDF from %d members (bias=%.1fF, n_eff=%.1f) -> P=%.3f",
+                                 ticker, len(members), bias,
+                                 empirical_details.get("effective_sample_size", 0.0), our_prob)
                         used_empirical = True
                         # Empirical CDF already captures model disagreement
                         disagreement_score = 0.0
+                        empirical_model_inputs = dict(corrected_data)
+                        if city in hrrr_data and date_str in hrrr_data.get(city, {}) and days_out <= 1:
+                            empirical_model_inputs["hrrr"] = hrrr_data[city][date_str]
+                        if city in nam_data and date_str in nam_data.get(city, {}) and days_out <= 1:
+                            empirical_model_inputs["nam"] = nam_data[city][date_str]
+                        per_model_probs = {
+                            model_name: weather_probability(
+                                temp,
+                                parsed["threshold"],
+                                parsed["direction"],
+                                days_out,
+                                city=city,
+                                hour_of_day=hour_for_sigma,
+                                skew=city_skew,
+                            )
+                            for model_name, temp in empirical_model_inputs.items()
+                            if temp is not None
+                        }
                     else:
                         log.warning("  %s: empirical CDF returned None, falling back to parametric", ticker)
 
@@ -895,26 +1047,40 @@ def scan_and_trade():
                         log.info(f"  {ticker}: ensemble spread {spread:.1f}F (sigma_mult={spread_mult:.2f})")
 
                 # Use v2 ensemble with adaptive weights, hour-aware sigma, disagreement scoring
-                city_skew = city_bias.get(city, {}).get("skew_alpha", 0.0) if city_bias else 0.0
-                hour_for_sigma = current_hour if days_out == 0 else None
-
                 result = ensemble_weather_probability_v2(
                     parametric_data, parsed["threshold"], parsed["direction"],
                     days_out, city=city, sigma_multiplier=spread_mult,
                     hour_of_day=hour_for_sigma,
                     verification_data=verification_summary if verification_summary else None,
                     return_details=True,
+                    static_weights=config.get("ensemble", {}).get("weights"),
+                    skew=city_skew,
                 )
 
                 if result[0] is not None:
                     our_prob, ensemble_details = result
+                    forecast_temp = ensemble_details.get("center_temp")
+                    sigma_used = ensemble_details.get("sigma_used")
+                    probability_method = ensemble_details.get("method", "parametric_ensemble_v2")
                     disagreement_score = ensemble_details.get("disagreement_score", 0.0)
+                    per_model_probs = ensemble_details.get("per_model_probs", {})
+                    weights_used = ensemble_details.get("weights_used", {})
                     if disagreement_score > 0.3:
                         log.info(f"  {ticker}: high ensemble disagreement ({disagreement_score:.2f}), doubling edge threshold")
                 else:
                     # Ensemble failed (zero weight) — fall back to single-model
                     log.warning("Ensemble returned None for %s, falling back to single-model", ticker)
-                    our_prob = compute_probability(forecast_temp, parsed["threshold"], parsed["direction"], days_out, city=city)
+                    forecast_temp = sum(valid_temps) / len(valid_temps)
+                    our_prob = weather_probability(
+                        forecast_temp,
+                        parsed["threshold"],
+                        parsed["direction"],
+                        days_out,
+                        city=city,
+                        hour_of_day=hour_for_sigma,
+                        skew=city_skew,
+                    )
+                    sigma_used = weather_sigma_hourly(0, city, hour_for_sigma) if hour_for_sigma is not None else weather_sigma(days_out, city)
         else:
             if isinstance(forecast_data, dict):
                 if not forecast_data:
@@ -928,12 +1094,43 @@ def scan_and_trade():
             if forecast_temp is None:
                 ss.skip("null_forecast")
                 continue
-            our_prob = compute_probability(forecast_temp, parsed["threshold"], parsed["direction"], days_out, city=city)
+            our_prob = weather_probability(
+                forecast_temp,
+                parsed["threshold"],
+                parsed["direction"],
+                days_out,
+                city=city,
+                hour_of_day=hour_for_sigma,
+            )
+            sigma_used = weather_sigma_hourly(0, city, hour_for_sigma) if hour_for_sigma is not None else weather_sigma(days_out, city)
+
+        if our_prob is None or forecast_temp is None:
+            ss.skip("null_probability")
+            continue
+
+        if verifier and market_record_models:
+            try:
+                verifier.record_forecast(
+                    city,
+                    date_str,
+                    market_record_models,
+                    threshold=parsed["threshold"],
+                    direction=parsed["direction"],
+                    model_prob=our_prob,
+                    hour_of_day=hour_for_sigma,
+                    per_model_probs=per_model_probs or None,
+                    model_run_tags=model_run_tags,
+                    record_kind="market",
+                )
+            except Exception as e:
+                log.debug("Market verification record failed for %s: %s", ticker, e)
 
         # Skip near-threshold coinflips — dynamic based on calibrated sigma
         # With sigma=4.7F (global), min_distance=2.35F. For NY day-0 (sigma=3.1F), 1.55F.
         # Floor of 1.0F prevents degenerate cases.
-        sigma = weather_sigma(days_out, city)
+        sigma = sigma_used if isinstance(sigma_used, (int, float)) and sigma_used > 0 else (
+            weather_sigma_hourly(0, city, hour_for_sigma) if hour_for_sigma is not None else weather_sigma(days_out, city)
+        )
         min_forecast_distance = max(1.0, 0.5 * sigma)
         distance = abs(forecast_temp - parsed["threshold"])
         if distance < min_forecast_distance:
@@ -984,12 +1181,12 @@ def scan_and_trade():
             continue
 
         # Adjust edge threshold for high ensemble spread or disagreement (defense in depth)
-        effective_edge_threshold = config["edgeThreshold"]
+        effective_edge_threshold = base_edge_threshold
         disagree_mult = VERIFICATION_CONFIG.get("disagreement_edge_multiplier", 2.0)
         if disagreement_score > 0.3:
-            effective_edge_threshold = config["edgeThreshold"] * disagree_mult
+            effective_edge_threshold = base_edge_threshold * disagree_mult
         elif spread_mult > 1.5:
-            effective_edge_threshold = config["edgeThreshold"] * 2
+            effective_edge_threshold = base_edge_threshold * 2
 
         if edge_yes >= effective_edge_threshold:
             side = "yes" if our_prob > 0.5 else "no"
@@ -1002,6 +1199,10 @@ def scan_and_trade():
                 "city_name": city_name,
                 "yes_ask": yes_ask, "no_ask": no_ask,
                 "days_out": days_out, "city": city,
+                "per_model_probs": per_model_probs,
+                "probability_method": probability_method,
+                "sigma_used": sigma,
+                "weights_used": weights_used,
             })
         else:
             ss.skip("low_edge")
@@ -1013,7 +1214,7 @@ def scan_and_trade():
 
     # Sort by edge magnitude
     opportunities.sort(key=lambda x: x["edge"], reverse=True)
-    log.info(f"Found {len(opportunities)} opportunities with edge >= {config['edgeThreshold']*100:.0f}%")
+    log.info(f"Found {len(opportunities)} opportunities with edge >= {base_edge_threshold*100:.0f}%")
 
     for opp in opportunities:
         ticker = opp["ticker"]
@@ -1039,8 +1240,8 @@ def scan_and_trade():
             continue
 
         # Rec 1: Brackets require 2x edge threshold (higher model uncertainty)
-        if is_bracket and edge < config["edgeThreshold"] * 2:
-            log.info(f"  Skipping bracket {ticker}: edge {edge*100:.1f}% < {config['edgeThreshold']*200:.0f}% (2x threshold)")
+        if is_bracket and edge < base_edge_threshold * 2:
+            log.info(f"  Skipping bracket {ticker}: edge {edge*100:.1f}% < {base_edge_threshold*200:.0f}% (2x threshold)")
             ss.skip("bracket_low_edge")
             trade_manager.log_decision(ticker, opp["side"], "skipped",
                                        f"bracket edge {edge*100:.1f}% < 2x threshold",
@@ -1104,7 +1305,7 @@ def scan_and_trade():
         city_code = opp["parsed"]["city"]
         is_calibrated = bool(cal.get("weather", {}).get("per_city", {}).get(city_code))
 
-        sigma_val = weather_sigma(opp["days_out"], opp["city"])
+        sigma_val = opp.get("sigma_used") or weather_sigma(opp["days_out"], opp["city"])
         log.debug(f"  {ticker}: sigma={sigma_val:.2f} ({'calibrated' if is_calibrated else 'global'}) for {city_code}")
 
         if is_bracket:
@@ -1195,11 +1396,14 @@ def scan_and_trade():
             bankroll_used=kelly_details.get("bankroll_used"),
             ensemble_forecasts=ensemble_data,
             ensemble_models=list(ensemble_data.keys()) if ensemble_data else None,
-            sigma_used=round(weather_sigma(opp["days_out"], opp["city"]), 2),
+            sigma_used=round(opp.get("sigma_used") or weather_sigma(opp["days_out"], opp["city"]), 2),
             is_calibrated=is_calibrated,
             days_out=opp["days_out"],
             city=opp["city"],
             market_type="bracket" if is_bracket else "threshold",
+            probability_method=opp.get("probability_method"),
+            per_model_probs=opp.get("per_model_probs"),
+            weights_used=opp.get("weights_used"),
         )
         if result:
             ss.trades_placed += 1
@@ -1225,9 +1429,13 @@ def main():
     parser.add_argument("--once", action="store_true", help="Run single scan then exit")
     args = parser.parse_args()
 
+    if not _acquire_singleton_lock():
+        log.warning("Duplicate weather bot launch blocked; exiting.")
+        return
+
     log.info("=" * 60)
     log.info("Kalshi Weather Trading Bot (DEMO)")
-    log.info(f"Mode: {os.environ.get('KALSHI_MODE', 'demo')} | Max: ${config['maxTradeAmount']}/trade | Edge: {config['edgeThreshold']*100:.0f}%")
+    log.info(f"Mode: {os.environ.get('KALSHI_MODE', 'demo')} | Max: ${config['maxTradeAmount']}/trade | Edge: {_effective_weather_edge_threshold()*100:.0f}%")
     log.info("=" * 60)
 
     # Verify auth

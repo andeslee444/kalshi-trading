@@ -31,6 +31,10 @@
       "takeProfitFraction": 0.50
     }
   },
+  "hdd_monitor": {
+    "enabled": false,
+    "scanIntervalMinutes": 15
+  },
   "beatrelease": {
     "enabled": true,
     "checkIntervalHours": 1,

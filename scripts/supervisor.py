@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import fcntl
 import json
 import os
@@ -32,8 +33,10 @@ log = setup_logging("supervisor")
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 PID_DIR = PROJECT_DIR / "data" / "pids"
 PID_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR = PROJECT_DIR / "data" / "logs"
 HEALTH_STATE_PATH = PROJECT_DIR / "data" / "health-state.json"
 SUPERVISOR_STATE_PATH = PID_DIR / "supervisor-state.json"
+WEATHER_VERIFICATION_PATH = PROJECT_DIR / "data" / "weather-verification.json"
 
 # Bot definitions — maps name -> command (derived from package.json)
 BOT_COMMANDS = {
@@ -45,17 +48,18 @@ BOT_COMMANDS = {
     "monitor":       ["python3", "src/kalshi/source-monitor.py"],
     "strategy":      ["python3", "src/kalshi/strategy-trader.py"],
     "hdd":           ["python3", "src/kalshi/hdd-scraper.py"],
+    "hdd-monitor":   ["python3", "src/kalshi/hdd-scraper.py", "monitor"],
     "arb":           ["python3", "src/kalshi/cross-platform-arb.py"],
     "mm":            ["python3", "src/kalshi/market-maker.py"],
     "beatrelease":   ["python3", "src/kalshi/beatrelease-scanner.py"],
 }
 
 # Daemon bots auto-restart on crash; one-shot bots do not
-DAEMON_BOTS = {"weather", "crypto", "economics", "positions", "monitor", "beatrelease", "arb", "entertainment"}
-ONESHOT_BOTS = {"strategy", "hdd"}
+DAEMON_BOTS = {"weather", "crypto", "economics", "positions", "monitor", "beatrelease", "arb", "entertainment", "strategy", "hdd-monitor"}
+ONESHOT_BOTS = {"hdd"}
 
-# Bots that are always disabled (no config entry, experimental, or unsafe)
-_ALWAYS_DISABLED = {"mm", "demo"}
+# Bots that are always disabled (no config entry, experimental, unsafe, or utility one-shots)
+_ALWAYS_DISABLED = {"mm", "demo", "hdd"}
 
 def _load_disabled_bots():
     """Read bots-config.json to determine which bots are disabled.
@@ -65,9 +69,9 @@ def _load_disabled_bots():
     Falls back to a safe default set if config is unreadable.
     """
     # Config key mapping (some config keys differ from bot names)
-    CONFIG_KEY = {"arb": "cross_platform_arb", "mm": "market_maker"}
+    CONFIG_KEY = {"arb": "cross_platform_arb", "mm": "market_maker", "hdd-monitor": "hdd_monitor"}
     config_path = PROJECT_DIR / "config" / "bots-config.json"
-    fallback = {"mm", "demo", "entertainment", "beatrelease", "arb", "strategy"}
+    fallback = {"mm", "demo", "entertainment", "beatrelease", "arb", "strategy", "hdd-monitor"}
     try:
         with open(config_path) as f:
             config = json.load(f)
@@ -87,6 +91,7 @@ DISABLED_BY_DEFAULT = _load_disabled_bots()
 # Crash rate limiting
 MAX_CRASHES = 5
 CRASH_WINDOW = 600  # 10 minutes
+RESTART_ALERT_THRESHOLD = 3
 
 CHECK_INTERVAL = 30  # seconds
 
@@ -98,6 +103,8 @@ HEARTBEAT_NAMES = {
     "economics": "economics",
     "positions": "position-monitor",
     "monitor": "source-monitor",
+    "strategy": "strategy",
+    "hdd-monitor": "hdd-monitor",
     "arb": "cross-platform-arb",
     "mm": "market-maker",
     "beatrelease": "beatrelease",
@@ -111,35 +118,157 @@ BOT_SCAN_INTERVALS = {
     "economics": 360,
     "positions": 15,
     "monitor": 10,
+    "strategy": 15,
+    "hdd-monitor": 15,
     "arb": 10,
     "beatrelease": 60,
 }
 
 HEARTBEAT_GRACE_PERIOD = 300  # 5 min startup grace before checking heartbeats
 
+BOT_LOG_NAMES = {
+    "arb": "cross-platform-arb",
+    "monitor": "source-monitor",
+    "positions": "position-monitor",
+    "hdd-monitor": "hdd-scraper",
+}
+
 
 def _find_bot_processes(cmd):
     """Find PIDs of running processes matching a bot command.
 
-    Uses pgrep -f with the full command string. Excludes the current
-    process (supervisor) to avoid false positives.
+    For Python bots, matches on the script path rather than the literal
+    interpreter string so it still finds workers launched as
+    `/path/to/Python [-u] script.py`. Excludes the current process
+    (supervisor) to avoid false positives.
 
     Returns list of integer PIDs (may be empty).
     """
-    pattern = " ".join(cmd)
+    script_index = next((idx for idx, part in enumerate(cmd) if part.endswith(".py")), None)
+    script_path = cmd[script_index] if script_index is not None else None
+    script_args = cmd[script_index + 1:] if script_index is not None else []
+    pattern = script_path or " ".join(cmd)
     my_pid = os.getpid()
     try:
-        output = subprocess.check_output(["pgrep", "-f", pattern])
+        output = subprocess.check_output(["pgrep", "-fl", pattern], text=True)
         pids = []
-        for line in output.decode().strip().split("\n"):
+        for line in output.strip().split("\n"):
             line = line.strip()
             if line:
-                pid = int(line)
+                pid_str, _, command = line.partition(" ")
+                if not pid_str.isdigit():
+                    continue
+                pid = int(pid_str)
                 if pid != my_pid:
+                    if script_path:
+                        parts = command.split()
+                        if not parts:
+                            continue
+                        exe_name = Path(parts[0]).name.lower()
+                        if "python" not in exe_name:
+                            continue
+                        try:
+                            path_index = parts.index(script_path, 1)
+                        except ValueError:
+                            continue
+                        trailing_args = parts[path_index + 1:]
+                        if script_args:
+                            if trailing_args[:len(script_args)] != script_args:
+                                continue
+                        elif trailing_args:
+                            continue
                     pids.append(pid)
         return pids
     except subprocess.CalledProcessError:
         return []
+
+
+def _parse_iso_date(date_str):
+    if not date_str:
+        return None
+    try:
+        return datetime.date.fromisoformat(date_str)
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_weather_actual_source_summary(lookback_days=30):
+    """Load recent weather verification actual-source mix from disk."""
+    if not WEATHER_VERIFICATION_PATH.exists():
+        return None
+    try:
+        data = json.loads(WEATHER_VERIFICATION_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    cutoff = datetime.date.today() - datetime.timedelta(days=lookback_days)
+    counts = {}
+    total = 0
+    for record in data.get("verified", []):
+        record_date = _parse_iso_date(record.get("date"))
+        if record_date is None or record_date < cutoff:
+            continue
+        source = record.get("actual_source") or "missing"
+        counts[source] = counts.get(source, 0) + 1
+        total += 1
+
+    if total == 0:
+        return {
+            "lookback_days": lookback_days,
+            "total": 0,
+            "counts": {},
+            "shares": {},
+        }
+
+    shares = {
+        source: round(count / total, 3)
+        for source, count in sorted(counts.items())
+    }
+    return {
+        "lookback_days": lookback_days,
+        "total": total,
+        "counts": dict(sorted(counts.items())),
+        "shares": shares,
+    }
+
+
+def _format_actual_source_summary(summary):
+    """Human-readable weather actual-source mix."""
+    if not summary or summary.get("total", 0) == 0:
+        return None
+
+    parts = []
+    for source, count in summary.get("counts", {}).items():
+        share = summary.get("shares", {}).get(source, 0.0)
+        parts.append(f"{source}={count} ({share:.1%})")
+
+    return (
+        f"Weather actuals ({summary['lookback_days']}d): "
+        f"total={summary['total']} | " + ", ".join(parts)
+    )
+
+
+def _bot_log_paths(name):
+    """Possible log files for a bot (supervisor name + logger name)."""
+    basenames = [name]
+    mapped = BOT_LOG_NAMES.get(name)
+    if mapped and mapped not in basenames:
+        basenames.append(mapped)
+    return [LOG_DIR / f"{base}.log" for base in basenames]
+
+
+def _log_contains_duplicate_block(name, max_lines=50):
+    """Check recent bot logs for singleton-guard duplicate-block messages."""
+    for path in _bot_log_paths(name):
+        if not path.exists():
+            continue
+        try:
+            lines = path.read_text(errors="ignore").splitlines()[-max_lines:]
+        except OSError:
+            continue
+        if any("Duplicate " in line and "launch blocked; exiting." in line for line in lines):
+            return True
+    return False
 
 
 class BotProcess:
@@ -153,6 +282,7 @@ class BotProcess:
         self.started_at = None
         self.restart_count = 0
         self.recent_crashes = []  # timestamps
+        self.last_restart_alert_at = None
         self.per_bot_halted = False
 
     def is_heartbeat_stale(self, health_data):
@@ -210,16 +340,44 @@ class BotProcess:
 
     def is_running(self):
         """Check if bot is running via PID file + os.kill probe."""
+        if self.process is not None:
+            ret = self.process.poll()
+            if ret is not None:
+                pid = self._read_pid()
+                if pid is not None:
+                    self._remove_pid_if_matches(pid)
+                self.process = None
+                return False
+
         pid = self._read_pid()
         if pid is None:
             return False
         try:
             os.kill(pid, 0)
             return True
-        except (ProcessLookupError, PermissionError):
+        except PermissionError:
+            # Some environments can observe a PID file and fresh heartbeats but
+            # still be denied permission to probe the process directly.
+            # Treat that as "likely running" instead of deleting the PID file.
+            return True
+        except ProcessLookupError:
             # Stale PID file
-            self._remove_pid()
+            self._remove_pid_if_matches(pid)
             return False
+
+    def adopt_running_pid(self):
+        """Adopt a single running process when the PID file is missing/stale."""
+        if self._read_pid() is not None:
+            return None
+        pids = _find_bot_processes(self.cmd)
+        if len(pids) != 1:
+            return None
+        pid = pids[0]
+        self._write_pid(pid)
+        if self.started_at is None:
+            self.started_at = time.time()
+        log.info(f"  {self.name} adopted running PID {pid} from pgrep")
+        return pid
 
     def start(self):
         """Start the bot process, killing any existing instances first."""
@@ -306,7 +464,7 @@ class BotProcess:
                 except ProcessLookupError:
                     pass
 
-        self._remove_pid()
+        self._remove_pid_if_matches(pid)
         self.process = None
         log.info(f"  {self.name} stopped")
 
@@ -314,14 +472,39 @@ class BotProcess:
         """Check if one-shot bot wrote a completion/error marker."""
         marker_path = PROJECT_DIR / "data" / f"{self.name}-last-run.json"
         if not marker_path.exists():
-            return
+            return None
         try:
             data = json.loads(marker_path.read_text())
             status = data.get("status")
             if status == "error":
                 notify_webhook(f"One-shot bot {self.name} failed: {data.get('error', '?')}", level="warning")
+            return status
         except Exception:
-            pass
+            return None
+
+    def handle_singleton_blocked_start(self):
+        """Adopt an existing worker when this launch was rejected by a bot singleton."""
+        if not _log_contains_duplicate_block(self.name):
+            return False
+
+        existing = _find_bot_processes(self.cmd)
+        if not existing:
+            return False
+
+        if self.process is not None:
+            self._remove_pid_if_matches(self.process.pid)
+            self.process = None
+
+        adopted_pid = self.adopt_running_pid()
+        if adopted_pid is None and len(existing) == 1:
+            adopted_pid = existing[0]
+            self._write_pid(adopted_pid)
+            if self.started_at is None:
+                self.started_at = time.time()
+
+        live_pids = ", ".join(str(pid) for pid in existing)
+        log.warning(f"  {self.name} duplicate launch blocked by bot singleton; live PID(s): {live_pids}")
+        return True
 
     def check_and_restart(self, health_data=None):
         """Check if daemon crashed or hung and auto-restart with rate limiting.
@@ -345,8 +528,11 @@ class BotProcess:
         needs_restart = False
 
         if not self.is_running():
-            # Double-check: maybe process is running but PID file is stale
-            if _find_bot_processes(self.cmd):
+            # Double-check: maybe process is running but PID file is stale/missing
+            adopted_pid = self.adopt_running_pid()
+            if adopted_pid is not None:
+                needs_restart = False
+            elif _find_bot_processes(self.cmd):
                 log.info(f"  {self.name} PID file stale but process found by pgrep, skipping restart")
                 needs_restart = False
             else:
@@ -357,8 +543,10 @@ class BotProcess:
             if self.process is not None:
                 ret = self.process.poll()
                 if ret is not None:
+                    if self.handle_singleton_blocked_start():
+                        return False
                     log.warning(f"  {self.name} exited early (code {ret}) — check data/logs/{self.name}.log")
-                    self._remove_pid()
+                    self._remove_pid_if_matches(self.process.pid)
                     needs_restart = True
         elif health_data is not None:
             is_stale, age_min = self.is_heartbeat_stale(health_data)
@@ -383,6 +571,19 @@ class BotProcess:
         self.recent_crashes.append(now)
         self.restart_count += 1
         log.warning(f"  {self.name} down, restarting (attempt #{self.restart_count})")
+        if len(self.recent_crashes) >= RESTART_ALERT_THRESHOLD:
+            should_alert = (
+                self.last_restart_alert_at is None or
+                (now - self.last_restart_alert_at) >= CRASH_WINDOW
+            )
+            if should_alert:
+                self.last_restart_alert_at = now
+                msg = (
+                    f"Bot {self.name} restarted {len(self.recent_crashes)}x "
+                    f"in {CRASH_WINDOW}s — investigate stability"
+                )
+                log.warning(f"  {msg}")
+                notify_webhook(msg, level="warning")
         return self.start()
 
     def uptime_str(self):
@@ -415,6 +616,11 @@ class BotProcess:
             self.pid_file.unlink(missing_ok=True)
         except Exception:
             pass
+
+    def _remove_pid_if_matches(self, pid):
+        current = self._read_pid()
+        if current == pid:
+            self._remove_pid()
 
 
 class Supervisor:
@@ -578,6 +784,10 @@ class Supervisor:
         for name in targets:
             bot = self.bots[name]
             if not bot.is_running():
+                if name in ONESHOT_BOTS and bot.check_oneshot_completion() == "ok":
+                    continue
+                if bot.handle_singleton_blocked_start():
+                    continue
                 failed.append(name)
                 log.error(f"  {name} died immediately after start — check data/logs/{name}.log")
         if failed:
@@ -609,6 +819,8 @@ class Supervisor:
     def status(self):
         """Print status table for all bots."""
         health = self._load_health()
+        weather_summary_7d = _load_weather_actual_source_summary(lookback_days=7)
+        weather_summary_30d = _load_weather_actual_source_summary(lookback_days=30)
 
         print(f"\n{'Bot':<16} {'Status':<10} {'PID':<8} {'Uptime':<8} {'Restarts':<10} {'Last Heartbeat'}")
         print("-" * 75)
@@ -617,6 +829,13 @@ class Supervisor:
             bot = self.bots[name]
             pid = bot._read_pid()
             running = bot.is_running()
+            discovered_pids = []
+            if not running:
+                discovered_pids = _find_bot_processes(bot.cmd)
+                if discovered_pids:
+                    running = True
+                    if pid is None and len(discovered_pids) == 1:
+                        pid = discovered_pids[0]
 
             if name in DISABLED_BY_DEFAULT and not running:
                 status = "disabled"
@@ -642,6 +861,11 @@ class Supervisor:
                 heartbeat = f"{heartbeat} STALE"
 
             print(f"{name:<16} {status:<10} {pid_str:<8} {uptime:<8} {restarts:<10} {heartbeat}")
+
+        for summary in (weather_summary_7d, weather_summary_30d):
+            line = _format_actual_source_summary(summary)
+            if line:
+                print(line)
 
         print()
 

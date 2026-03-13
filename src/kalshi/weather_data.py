@@ -1,4 +1,4 @@
-"""Weather data infrastructure for ensemble collection, IEM station actuals, and training storage.
+"""Weather data infrastructure for ensemble collection, settlement actuals, and training storage.
 
 Provides:
 - STATION_MAP: Kalshi city code -> IEM ASOS station ID mapping
@@ -9,6 +9,8 @@ Provides:
 - NAMFetcher: Fetches NAM 3km deterministic forecast from Open-Meteo
 - PreviousRunsFetcher: Forecast convergence analysis from previous model runs
 - BiasCorrector: Per-city per-model systematic forecast bias correction
+- NWSClimateReportFetcher: Fetches final NWS Daily Climate Report actual highs
+- SettlementTemperatureFetcher: Uses NWS climate reports first, IEM as fallback
 - IEMFetcher: Fetches actual daily high temperatures from Iowa Environmental Mesonet
 - OrderBookDepth: Fetches and analyzes Kalshi order book depth
 - MODEL_RUN_SCHEDULE / next_model_run(): Model run timing awareness
@@ -20,6 +22,7 @@ import json
 import logging
 import math
 import os
+import re
 import sqlite3
 from collections import defaultdict
 from pathlib import Path
@@ -57,6 +60,60 @@ STATION_MAP = {
     "OKC": "KOKC",
     "SATX": "KSAT",
 }
+
+MODEL_NAME_ALIASES = {
+    "gfs": "gfs",
+    "gfs_seamless": "gfs",
+    "ecmwf": "ecmwf",
+    "ecmwf_ifs025": "ecmwf",
+    "ecmwf_ifs04": "ecmwf",
+    "icon": "icon",
+    "icon_seamless": "icon",
+    "graphcast": "graphcast",
+    "gfs_graphcast025": "graphcast",
+    "aifs": "aifs",
+    "ecmwf_aifs025": "aifs",
+    "nbm": "nbm",
+    "nbm_conus": "nbm",
+    "hrrr": "hrrr",
+    "hrrr_conus": "hrrr",
+    "ncep_hrrr_conus": "hrrr",
+    "nam": "nam",
+    "nam_conus": "nam",
+    "nws": "nws",
+}
+
+STATION_TO_CITY = {station: city for city, station in STATION_MAP.items()}
+
+
+def _city_timezone_name(city_code=None, station_id=None):
+    try:
+        from kalshi_auth import CITY_TIMEZONES
+        if city_code:
+            return CITY_TIMEZONES.get(city_code, "America/New_York")
+        if station_id:
+            city = STATION_TO_CITY.get(station_id)
+            if city:
+                return CITY_TIMEZONES.get(city, "America/New_York")
+    except ImportError:
+        pass
+    return "America/New_York"
+
+
+def canonical_model_name(model_name):
+    """Normalize API-specific model ids to internal short names."""
+    if not model_name:
+        return model_name
+    return MODEL_NAME_ALIASES.get(model_name, model_name)
+
+
+def _is_iem_header_row(parts):
+    """Return True for CSV header rows that sometimes repeat in IEM responses."""
+    if not parts:
+        return False
+    first = parts[0].strip().lower() if len(parts) >= 1 else ""
+    third = parts[2].strip().lower() if len(parts) >= 3 else ""
+    return first == "station" or third in {"max_tmpf", "tmpf"}
 
 
 # NWS API grid point mapping for 7-day forecast fallback.
@@ -225,7 +282,7 @@ class EnsembleCollector:
             f"{base}?"
             f"latitude={lat}&longitude={lon}"
             f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
-            f"&timezone=America%2FNew_York&forecast_days={forecast_days}"
+            f"&timezone=auto&forecast_days={forecast_days}"
             f"&models=gfs_seamless,ecmwf_ifs025,icon_global,gem_global"
             + (f"&apikey={api_key}" if api_key else "")
         )
@@ -284,13 +341,13 @@ class EnsembleCollector:
 class IEMFetcher:
     """Fetches actual daily high temperatures from Iowa Environmental Mesonet (IEM) ASOS.
 
-    IEM provides official ASOS station observations that match Kalshi settlement data.
+    IEM provides ASOS station observations used here as a proxy for Kalshi settlement.
     """
 
     def __init__(self, logger=None):
         self.log = logger or _log
 
-    def fetch_daily_high(self, station_id, date_str):
+    def fetch_daily_high(self, station_id, date_str, city_code=None):
         """Fetch actual daily high temperature for a single date.
 
         Args:
@@ -311,9 +368,10 @@ class IEMFetcher:
             self.log.warning("Invalid date format: %s", date_str)
             return None
 
+        tz_name = _city_timezone_name(city_code=city_code, station_id=station_id)
         url = (
             f"https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?"
-            f"station={station_id}&data=max_tmpf&tz=America/New_York"
+            f"station={station_id}&data=max_tmpf&tz={tz_name}"
             f"&format=comma&year1={year}&month1={month}&day1={day}"
             f"&year2={year}&month2={month}&day2={day}"
         )
@@ -334,7 +392,7 @@ class IEMFetcher:
             self.log.warning("IEM ASOS error for %s/%s: %s", station_id, date_str, e)
             return None
 
-    def fetch_daily_highs(self, station_id, start_date, end_date):
+    def fetch_daily_highs(self, station_id, start_date, end_date, city_code=None):
         """Fetch actual daily high temperatures for a date range.
 
         Args:
@@ -356,9 +414,10 @@ class IEMFetcher:
             self.log.warning("Invalid date format: %s to %s", start_date, end_date)
             return {}
 
+        tz_name = _city_timezone_name(city_code=city_code, station_id=station_id)
         url = (
             f"https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?"
-            f"station={station_id}&data=max_tmpf&tz=America/New_York"
+            f"station={station_id}&data=max_tmpf&tz={tz_name}"
             f"&format=comma&year1={s[0]}&month1={s[1]}&day1={s[2]}"
             f"&year2={e[0]}&month2={e[1]}&day2={e[2]}"
         )
@@ -384,9 +443,9 @@ class IEMFetcher:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            if "station" in line.lower() and "max_tmpf" in line.lower():
-                continue
             parts = line.split(",")
+            if _is_iem_header_row(parts):
+                continue
             if len(parts) >= 3:
                 max_tmpf = parts[2].strip()
                 if max_tmpf == "M" or max_tmpf == "":
@@ -404,9 +463,9 @@ class IEMFetcher:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            if "station" in line.lower() and "max_tmpf" in line.lower():
-                continue
             parts = line.split(",")
+            if _is_iem_header_row(parts):
+                continue
             if len(parts) >= 3:
                 # valid column is date string like "2026-03-01"
                 date_str = parts[1].strip()
@@ -423,6 +482,197 @@ class IEMFetcher:
         return result
 
 
+class NWSClimateReportFetcher:
+    """Fetches actual daily highs from NWS Daily Climate Report (CLI) products."""
+
+    MAX_RECENT_PRODUCTS = 40
+    SUMMARY_DATE_RE = re.compile(
+        r"\.\.\.THE .*? CLIMATE SUMMARY FOR ([A-Z]+ \d{1,2} \d{4})\.\.\."
+    )
+    TEMP_SECTION_RE = re.compile(
+        r"TEMPERATURE \(F\)(.*?)(?:PRECIPITATION|SNOWFALL|DEGREE DAYS|WIND \(MPH\)|SKY COVER|WEATHER CONDITIONS)",
+        re.DOTALL,
+    )
+    MAXIMUM_RE = re.compile(r"\bMAXIMUM\s+(-?\d+|MM)\b")
+
+    def __init__(self, logger=None):
+        self.log = logger or _log
+
+    def fetch_daily_high(self, station_id, date_str, city_code=None):
+        """Fetch actual high temperature from the final NWS climate report."""
+        if _retry_request is None:
+            self.log.warning("retry_request not available")
+            return None
+
+        try:
+            target_date = datetime.date.fromisoformat(date_str)
+        except ValueError:
+            self.log.warning("Invalid date format: %s", date_str)
+            return None
+
+        location_id = self._location_id(station_id, city_code)
+        products = self._fetch_recent_products(location_id)
+        if not products:
+            return None
+
+        for product in products[:self.MAX_RECENT_PRODUCTS]:
+            issue_time = self._parse_issue_time(product.get("issuanceTime"))
+            if issue_time and issue_time.date() < target_date:
+                break
+
+            product_id = product.get("id")
+            if not product_id:
+                continue
+
+            product_text = self._fetch_product_text(product_id)
+            if not product_text:
+                continue
+
+            report_date, maximum = self._parse_product(product_text)
+            if report_date == target_date:
+                return maximum
+
+        self.log.debug(
+            "No NWS climate report match for %s/%s (%s)",
+            station_id,
+            date_str,
+            location_id,
+        )
+        return None
+
+    def _location_id(self, station_id, city_code=None):
+        if station_id and station_id.startswith("K") and len(station_id) == 4:
+            return station_id[1:]
+        if station_id:
+            return station_id
+        return city_code or ""
+
+    def _fetch_recent_products(self, location_id):
+        url = f"https://api.weather.gov/products/types/CLI/locations/{location_id}"
+        try:
+            resp = _retry_request("GET", url, timeout=10, max_retries=2)
+            if resp is None:
+                return []
+            data = resp.json()
+            products = data.get("@graph", [])
+            return sorted(
+                products,
+                key=lambda p: p.get("issuanceTime", ""),
+                reverse=True,
+            )
+        except Exception as e:
+            self.log.warning("NWS CLI product list error for %s: %s", location_id, e)
+            return []
+
+    def _fetch_product_text(self, product_id):
+        url = f"https://api.weather.gov/products/{product_id}"
+        try:
+            resp = _retry_request("GET", url, timeout=10, max_retries=2)
+            if resp is None:
+                return None
+            return resp.json().get("productText")
+        except Exception as e:
+            self.log.warning("NWS CLI product fetch error for %s: %s", product_id, e)
+            return None
+
+    def _parse_issue_time(self, value):
+        if not value:
+            return None
+        try:
+            return datetime.datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    def _parse_product(self, product_text):
+        if not product_text:
+            return None, None
+
+        summary_match = self.SUMMARY_DATE_RE.search(product_text)
+        if not summary_match:
+            return None, None
+
+        try:
+            report_date = datetime.datetime.strptime(
+                summary_match.group(1).title(),
+                "%B %d %Y",
+            ).date()
+        except ValueError:
+            return None, None
+
+        temp_section_match = self.TEMP_SECTION_RE.search(product_text)
+        if not temp_section_match:
+            return report_date, None
+
+        maximum_match = self.MAXIMUM_RE.search(temp_section_match.group(1))
+        if not maximum_match:
+            return report_date, None
+
+        maximum = maximum_match.group(1)
+        if maximum == "MM":
+            return report_date, None
+
+        try:
+            return report_date, float(maximum)
+        except ValueError:
+            return report_date, None
+
+
+class SettlementTemperatureFetcher:
+    """Fetch settlement temperatures from NWS climate reports with IEM fallback."""
+
+    NWS_LOOKBACK_DAYS = 14
+
+    def __init__(self, logger=None):
+        self.log = logger or _log
+        self.nws = NWSClimateReportFetcher(logger=self.log)
+        self.iem = IEMFetcher(logger=self.log)
+
+    def fetch_daily_high(self, station_id, date_str, city_code=None):
+        """Fetch actual high, preferring the final NWS climate report."""
+        value, _ = self.fetch_daily_high_with_source(
+            station_id,
+            date_str,
+            city_code=city_code,
+        )
+        return value
+
+    def fetch_daily_high_with_source(self, station_id, date_str, city_code=None):
+        """Fetch actual high and the source used."""
+        nws_value = self.nws.fetch_daily_high(station_id, date_str, city_code=city_code)
+        if nws_value is not None:
+            return nws_value, "nws_cli"
+        iem_value = self.iem.fetch_daily_high(station_id, date_str, city_code=city_code)
+        if iem_value is not None:
+            return iem_value, "iem_fallback"
+        return None, None
+
+    def fetch_daily_highs(self, station_id, start_date, end_date, city_code=None):
+        """Fetch actual highs for a range, overlaying recent NWS report values."""
+        actuals = self.iem.fetch_daily_highs(
+            station_id,
+            start_date,
+            end_date,
+            city_code=city_code,
+        )
+
+        try:
+            start = datetime.date.fromisoformat(start_date)
+            end = datetime.date.fromisoformat(end_date)
+        except ValueError:
+            return actuals
+
+        recent_cutoff = datetime.date.today() - datetime.timedelta(days=self.NWS_LOOKBACK_DAYS)
+        current = max(start, recent_cutoff)
+        while current <= end:
+            date_key = current.isoformat()
+            nws_value = self.nws.fetch_daily_high(station_id, date_key, city_code=city_code)
+            if nws_value is not None:
+                actuals[date_key] = nws_value
+            current += datetime.timedelta(days=1)
+
+        return actuals
+
+
 class HRRRFetcher:
     """Fetches HRRR deterministic forecast from Open-Meteo (hrrr_conus model).
 
@@ -434,6 +684,8 @@ class HRRRFetcher:
     def __init__(self, logger=None, rate_limiter=None):
         self.log = logger or _log
         self._rate_limiter = rate_limiter
+        self.last_status_code = None
+        self.last_error = None
 
     def fetch_hrrr(self, lat, lon):
         """Fetch HRRR hourly temps and compute daily max temperatures.
@@ -452,6 +704,8 @@ class HRRRFetcher:
         if _retry_request is None:
             self.log.warning("retry_request not available")
             return None
+        self.last_status_code = None
+        self.last_error = None
 
         # Use premium endpoint if API key is configured
         api_key = os.environ.get("OPEN_METEO_API_KEY", "")
@@ -470,6 +724,8 @@ class HRRRFetcher:
                 self._rate_limiter()
             resp = _retry_request("GET", url, timeout=15, max_retries=2)
             if resp is None or resp.status_code != 200:
+                self.last_status_code = getattr(resp, "status_code", None)
+                self.last_error = f"status={self.last_status_code}"
                 self.log.warning(
                     "HRRR API returned status %s",
                     getattr(resp, "status_code", "None"),
@@ -507,6 +763,8 @@ class HRRRFetcher:
             return result
 
         except Exception as e:
+            self.last_status_code = getattr(getattr(e, "response", None), "status_code", None)
+            self.last_error = str(e)
             self.log.warning("HRRR API error: %s", e)
             return None
 
@@ -522,6 +780,8 @@ class NAMFetcher:
     def __init__(self, logger=None, rate_limiter=None):
         self.log = logger or _log
         self._rate_limiter = rate_limiter
+        self.last_status_code = None
+        self.last_error = None
 
     def fetch_nam(self, lat, lon):
         """Fetch NAM daily max temperatures.
@@ -537,13 +797,15 @@ class NAMFetcher:
         if _retry_request is None:
             self.log.warning("retry_request not available")
             return None
+        self.last_status_code = None
+        self.last_error = None
 
         api_key = os.environ.get("OPEN_METEO_API_KEY", "")
         base = "https://customer-api.open-meteo.com/v1/forecast" if api_key else "https://api.open-meteo.com/v1/forecast"
         params = (
             f"latitude={lat}&longitude={lon}"
             f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
-            f"&timezone=America%2FNew_York&forecast_days=3"
+            f"&timezone=auto&forecast_days=3"
             f"&models=nam_conus"
         )
         url = f"{base}?{params}" + (f"&apikey={api_key}" if api_key else "")
@@ -553,6 +815,8 @@ class NAMFetcher:
                 self._rate_limiter()
             resp = _retry_request("GET", url, timeout=15, max_retries=2)
             if resp is None or resp.status_code != 200:
+                self.last_status_code = getattr(resp, "status_code", None)
+                self.last_error = f"status={self.last_status_code}"
                 self.log.warning(
                     "NAM API returned status %s",
                     getattr(resp, "status_code", "None"),
@@ -574,6 +838,8 @@ class NAMFetcher:
             return result
 
         except Exception as e:
+            self.last_status_code = getattr(getattr(e, "response", None), "status_code", None)
+            self.last_error = str(e)
             self.log.warning("NAM API error: %s", e)
             return None
 
@@ -620,7 +886,7 @@ class PreviousRunsFetcher:
             f"latitude={lats}&longitude={lons}"
             f"&daily=temperature_2m_max,temperature_2m_max_previous_day1"
             f"&temperature_unit=fahrenheit"
-            f"&timezone=America%2FNew_York"
+            f"&timezone=auto"
             f"&forecast_days=7"
             f"&models={model}"
         )
@@ -712,8 +978,12 @@ class BiasCorrector:
     Loads per-city, per-model bias from config/historical-calibration.json
     and applies correction: corrected_temp = raw_temp - bias.
 
-    Fallback chain: per-city per-model > city average > global model > global average > 0.
+    Fallback chain for direct model correction: per-city per-model > global model > raw temp.
+    City-average bias is reserved for mixed-member ensembles where model attribution
+    is unavailable.
     """
+
+    EXEMPT_MODELS = {"hrrr", "nam", "nws"}
 
     def __init__(self, calibration_path=None, logger=None):
         self.log = logger or _log
@@ -721,16 +991,29 @@ class BiasCorrector:
         self._load(calibration_path)
 
     def _load(self, path=None):
-        if path is None:
-            path = Path(__file__).resolve().parent.parent.parent / "config" / "historical-calibration.json"
-        try:
-            p = Path(path)
-            if p.exists():
-                self._data = json.loads(p.read_text())
+        config_dir = Path(__file__).resolve().parent.parent.parent / "config"
+        if path is not None:
+            candidates = [Path(path)]
+        else:
+            candidates = [
+                config_dir / "historical-calibration.json",
+                config_dir / "calibration.json",
+            ]
+
+        for candidate in candidates:
+            try:
+                if not candidate.exists():
+                    continue
+                raw = json.loads(candidate.read_text())
+                data = self._extract_bias_data(raw)
+                if not data:
+                    continue
+                self._data = data
                 n = self._data.get("n_forecasts", 0)
-                self.log.info("BiasCorrector loaded: %d forecast pairs", n)
-        except Exception as e:
-            self.log.warning("BiasCorrector: failed to load calibration: %s", e)
+                self.log.info("BiasCorrector loaded from %s: %d forecast pairs", candidate.name, n)
+                return
+            except Exception as e:
+                self.log.warning("BiasCorrector: failed to load %s: %s", candidate, e)
 
     def correct(self, city, model, temp):
         """Apply per-city, per-model bias correction.
@@ -741,7 +1024,9 @@ class BiasCorrector:
         """
         if temp is None:
             return None
-        bias = self._get_bias(city, model)
+        bias = self._get_model_bias(city, model)
+        if bias is None:
+            return temp
         return temp - bias
 
     def correct_forecast_dict(self, city, forecasts):
@@ -766,6 +1051,14 @@ class BiasCorrector:
         biases = [m["bias"] for m in per_city.values() if "bias" in m]
         return sum(biases) / len(biases) if biases else 0.0
 
+    def blend_live_bias(self, city, live_bias=None, live_n=0, ramp_n=20):
+        """Blend historical city bias with live verification bias."""
+        hist_bias = self.city_average_bias(city)
+        if live_bias is None or live_n <= 0:
+            return hist_bias, hist_bias, 0.0
+        alpha = min(1.0, float(live_n) / max(1.0, float(ramp_n)))
+        return alpha * live_bias + (1.0 - alpha) * hist_bias, hist_bias, alpha
+
     def residual_std(self, city, model=None):
         """Compute residual std: sqrt(RMSE^2 - bias^2).
 
@@ -786,16 +1079,28 @@ class BiasCorrector:
 
         return self._global_residual_std()
 
-    def _get_bias(self, city, model):
+    def _extract_bias_data(self, raw):
+        if not isinstance(raw, dict):
+            return {}
+        if "per_city" in raw and "global" in raw:
+            return raw
+        weather = raw.get("weather", {})
+        bias_data = weather.get("bias_correction", {})
+        if isinstance(bias_data, dict) and "per_city" in bias_data and "global" in bias_data:
+            return bias_data
+        return {}
+
+    def _get_model_bias(self, city, model):
+        model = canonical_model_name(model)
+        if model in self.EXEMPT_MODELS:
+            return 0.0
         per_city = self._data.get("per_city", {}).get(city, {})
         if model in per_city:
             return per_city[model].get("bias", 0.0)
-        if per_city:
-            return self.city_average_bias(city)
         global_stats = self._data.get("global", {}).get(model, {})
         if global_stats:
             return global_stats.get("bias", 0.0)
-        return self._global_average_bias()
+        return None
 
     def _global_average_bias(self):
         global_stats = self._data.get("global", {})
@@ -916,6 +1221,28 @@ MODEL_RUN_SCHEDULE = {
     "nbm": {"hours_utc": list(range(24)), "delay_minutes": 90},       # hourly, ~90min delay
     "nam": {"hours_utc": [0, 6, 12, 18], "delay_minutes": 120},      # 4x/day, ~2h processing
 }
+
+
+def latest_available_model_run(model_name, now_utc=None):
+    """Return the most recent run initialization time available right now."""
+    model_key = canonical_model_name(model_name)
+    schedule = MODEL_RUN_SCHEDULE.get(model_key)
+    if schedule is None:
+        return None
+
+    now = now_utc or datetime.datetime.utcnow()
+    if now.tzinfo is not None:
+        now = now.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+
+    latest = None
+    delay = datetime.timedelta(minutes=schedule["delay_minutes"])
+    for day_offset in (-1, 0):
+        run_date = now.date() + datetime.timedelta(days=day_offset)
+        for run_hour in schedule["hours_utc"]:
+            run_start = datetime.datetime.combine(run_date, datetime.time(hour=run_hour))
+            if run_start + delay <= now and (latest is None or run_start > latest):
+                latest = run_start
+    return latest
 
 
 def next_model_run(now_utc=None):

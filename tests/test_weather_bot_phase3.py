@@ -156,41 +156,32 @@ class TestAdaptiveInterval:
         assert compute(markets, config) == 30
 
 
-class TestHRRRMemberInjection:
-    """Test HRRR member injection via empirical_ensemble_probability."""
+class TestHRRRWeightedBlend:
+    """Test deterministic short-range models blend by weight, not pseudo-members."""
 
-    def test_hrrr_injection_shifts_probability(self):
-        """Injecting HRRR temps into ensemble should shift probability toward HRRR value."""
-        # Base ensemble: 82 members all at 80F
+    def test_hrrr_weighted_blend_shifts_probability_without_fake_sample_size(self):
+        from probability import empirical_ensemble_probability
+
         base_members = [80.0] * 82
-        # HRRR says 90F — injecting should raise probability of exceeding 85F threshold
-        hrrr_temp = 90.0
-        hrrr_weight = 0.60
-        n_inject = max(1, int(len(base_members) * hrrr_weight))
-        assert n_inject == 49
+        base_prob, base_details = empirical_ensemble_probability(
+            base_members, 85.0, "T", return_details=True
+        )
+        blended_prob, blended_details = empirical_ensemble_probability(
+            base_members,
+            85.0,
+            "T",
+            extra_points=[{"temp": 90.0, "weight": 0.60, "label": "hrrr"}],
+            return_details=True,
+        )
 
-        injected = base_members + [hrrr_temp] * n_inject
-        assert len(injected) == 131
+        assert blended_prob > base_prob
+        assert blended_details["center_temp"] > base_details["center_temp"]
+        assert blended_details["effective_sample_size"] < len(base_members) + 1
 
-        # Empirical CDF: fraction above 85F should increase after injection
-        above_threshold_base = sum(1 for t in base_members if t >= 85) / len(base_members)
-        above_threshold_injected = sum(1 for t in injected if t >= 85) / len(injected)
-        assert above_threshold_base == 0.0
-        assert above_threshold_injected > 0.3  # 49/131 ≈ 0.374
-
-    def test_small_ensemble_injects_at_least_1(self):
-        """Even with tiny ensemble, inject at least 1 HRRR member."""
-        members = [80.0]
-        hrrr_weight = 0.30
-        n_inject = max(1, int(len(members) * hrrr_weight))
-        assert n_inject == 1
-
-    def test_day2_no_injection(self):
-        """Day-2+: weight=0, no injection."""
-        members = [80.0] * 82
+    def test_day2_no_short_range_blend(self):
+        """Day-2+: weight=0 means no short-range model contribution."""
         hrrr_weight = 0.0
-        n_inject = max(1, int(len(members) * hrrr_weight)) if hrrr_weight > 0 else 0
-        assert n_inject == 0
+        assert hrrr_weight == 0.0
 
 
 class TestModelRunTimingOverride:
@@ -301,7 +292,7 @@ class TestConfigPhase3:
 
     def test_hrrr_config_present(self):
         assert "hrrr" in self.config
-        assert self.config["hrrr"]["enabled"] is False  # disabled on free Open-Meteo tier
+        assert self.config["hrrr"]["enabled"] is True
         assert self.config["hrrr"]["weight_day0"] == 0.60
         assert self.config["hrrr"]["weight_day1"] == 0.30
 
@@ -324,7 +315,7 @@ class TestConfigPhase3:
         assert self.config["maxTradeAmount"] == 30
         assert self.config["edgeThreshold"] == 0.06
         assert len(self.config["cities"]) == 20
-        assert self.config["ensemble"]["enabled"] is False  # disabled on free Open-Meteo tier
+        assert self.config["ensemble"]["enabled"] is True
         assert self.config["verification"]["enabled"] is True
 
 

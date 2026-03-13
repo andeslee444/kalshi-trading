@@ -8,12 +8,12 @@
           "losses": 0
         },
         "6-10": {
-          "wins": 422,
-          "losses": 91
+          "wins": 481,
+          "losses": 111
         },
         "11-15": {
-          "wins": 413,
-          "losses": 168
+          "wins": 447,
+          "losses": 182
         },
         "16-20": {
           "wins": 0,
@@ -30,12 +30,12 @@
     "default": {
       "buckets": {
         "1-5": {
-          "wins": 64,
+          "wins": 368,
           "losses": 74
         },
         "6-10": {
-          "wins": 370,
-          "losses": 465
+          "wins": 2174,
+          "losses": 1033
         },
         "11-15": {
           "wins": 0,

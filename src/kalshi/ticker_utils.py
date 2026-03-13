@@ -3,6 +3,7 @@
 All bots should use these parsers instead of inline implementations.
 """
 
+import datetime as _dt
 import re
 
 MONTHS = {
@@ -11,7 +12,38 @@ MONTHS = {
 }
 
 
-def parse_weather_ticker(ticker):
+_WEATHER_FORMAT_SWITCH_DATE = _dt.date(2026, 2, 22)
+
+
+def _coerce_reference_date(reference_date):
+    if reference_date is None:
+        return None
+    if isinstance(reference_date, _dt.datetime):
+        return reference_date.date()
+    if isinstance(reference_date, _dt.date):
+        return reference_date
+    if isinstance(reference_date, str):
+        try:
+            return _dt.date.fromisoformat(reference_date)
+        except ValueError:
+            return None
+    return None
+
+
+def _build_weather_result(city, day, month, year, direction, threshold):
+    try:
+        parsed = _dt.date(2000 + year, month, day)
+    except ValueError:
+        return None
+    return {
+        "city": city,
+        "date": parsed.isoformat(),
+        "direction": direction,
+        "threshold": threshold,
+    }
+
+
+def parse_weather_ticker(ticker, reference_date=None):
     """Parse KXHIGH weather temperature tickers.
 
     Handles both old and new Kalshi formats:
@@ -22,27 +54,43 @@ def parse_weather_ticker(ticker):
         KXHIGHMIA-26FEB28-T86   -> {"city": "MIA", "date": "2026-02-28", "direction": "T", "threshold": 86.0}
         KXHIGHTATL-26MAR01-B70.5 -> {"city": "ATL", "date": "2026-03-01", "direction": "B", "threshold": 70.5}
     """
-    m = re.match(r"KXHIGHT?([A-Z]+)-(\d{2})([A-Z]{3})(\d{2})-([TB])([\d.]+)", ticker)
+    m = re.match(r"KXHIGH(T?)([A-Z]+)-(\d{2})([A-Z]{3})(\d{2})-([TB])([\d.]+)", ticker)
     if not m:
         return None
-    city = m.group(1)
-    g2, mon, g4 = int(m.group(2)), m.group(3), int(m.group(4))
-    direction = m.group(5)
-    threshold = float(m.group(6))
+    has_t_prefix = bool(m.group(1))
+    city = m.group(2)
+    g2, mon, g4 = int(m.group(3)), m.group(4), int(m.group(5))
+    direction = m.group(6)
+    threshold = float(m.group(7))
     month = MONTHS.get(mon)
     if not month:
         return None
-    # Detect format: if first number >= 25 it's a year (YYMONDD), otherwise a day (DDMONYY)
+
+    current_format = _build_weather_result(city, g4, month, g2, direction, threshold)
+    old_format = _build_weather_result(city, g2, month, g4, direction, threshold)
+
+    if has_t_prefix:
+        return current_format
+    if current_format is None:
+        return old_format
+    if old_format is None:
+        return current_format
+
+    ref_date = _coerce_reference_date(reference_date)
+    if ref_date is not None:
+        current_date = _dt.date.fromisoformat(current_format["date"])
+        old_date = _dt.date.fromisoformat(old_format["date"])
+        current_distance = abs((current_date - ref_date).days)
+        old_distance = abs((old_date - ref_date).days)
+        if current_distance != old_distance:
+            return current_format if current_distance < old_distance else old_format
+        return current_format if current_date >= _WEATHER_FORMAT_SWITCH_DATE else old_format
+
     if g2 >= 25:
-        yr, day = g2, g4
-    else:
-        day, yr = g2, g4
-    return {
-        "city": city,
-        "date": f"{2000+yr}-{month:02d}-{day:02d}",
-        "direction": direction,
-        "threshold": threshold,
-    }
+        return current_format
+    if g4 >= 25:
+        return old_format
+    return current_format
 
 
 def parse_crypto_ticker(ticker):

@@ -26,6 +26,7 @@ from kalshi_auth import (
 from polymarket_client import PolymarketClient
 from capital_allocator import PortfolioAllocator
 from probability import quarter_kelly, compute_limit_price, kalshi_fee_cents
+from singleton_lock import acquire_process_singleton
 
 setup_unbuffered()
 log = setup_logging("cross-platform-arb")
@@ -393,6 +394,10 @@ def main():
     parser = argparse.ArgumentParser(description="Kalshi Cross-Platform Arbitrage Monitor")
     parser.add_argument("--once", action="store_true", help="Run single scan and exit")
     args = parser.parse_args()
+
+    if not acquire_process_singleton("arb", PROJECT_DIR, log, display_name="cross-platform-arb"):
+        log.warning("Duplicate cross-platform-arb launch blocked; exiting.")
+        return
 
     log.info("=" * 60)
     log.info("Kalshi Cross-Platform Arbitrage")

@@ -14,7 +14,6 @@ Usage:
 import argparse
 import json
 import math
-import re
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -43,10 +42,6 @@ TRADE_FILES = [
     {"label": tf["bot"], "path": DATA_DIR / tf["filename"]}
     for tf in _CANONICAL_TRADE_FILES
 ]
-
-MONTHS = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-          "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
-
 
 # ─── Helpers ───
 
@@ -137,22 +132,9 @@ def fetch_fills(client):
     return all_fills
 
 
-def parse_weather_ticker(ticker):
-    """Parse KXHIGHMIA-26FEB16-T86 -> {city, date, direction, threshold}."""
-    m = re.match(r"KXHIGH([A-Z]+)-(\d{2})([A-Z]{3})(\d{2})-([TB])([\d.]+)", ticker)
-    if not m:
-        return None
-    city = m.group(1)
-    yr, mon, day = int(m.group(2)), m.group(3), int(m.group(4))
-    month = MONTHS.get(mon)
-    if not month:
-        return None
-    return {
-        "city": city,
-        "date": f"{2000 + yr}-{month:02d}-{day:02d}",
-        "direction": m.group(5),
-        "threshold": float(m.group(6)),
-    }
+def parse_weather_ticker(ticker, reference_date=None):
+    """Parse weather tickers via the shared parser."""
+    return _parse_weather_ticker_shared(ticker, reference_date=reference_date)
 
 
 # ─── Pure functions (tested separately) ───
@@ -219,12 +201,14 @@ def calibration_table(predictions, n_bins=10):
 def reeval_weather_trade(trade, settlement_revenue):
     """Re-evaluate a weather trade using current model. Returns dict or None."""
     ticker = trade.get("ticker", "")
-    parsed = parse_weather_ticker(ticker)
-    if not parsed:
-        return None
+    ts = trade.get("timestamp", "")
+    try:
+        trade_date = datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
+    except (ValueError, TypeError):
+        trade_date = None
 
-    forecast_temp = trade.get("forecast_temp")
-    if forecast_temp is None:
+    parsed = parse_weather_ticker(ticker, reference_date=trade_date)
+    if not parsed:
         return None
 
     # Determine actual outcome
@@ -233,18 +217,22 @@ def reeval_weather_trade(trade, settlement_revenue):
     if actual is None:
         return None
 
+    forecast_temp = trade.get("forecast_temp")
+
     # Compute days_out
-    ts = trade.get("timestamp", "")
     try:
-        trade_date = datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
         market_date = datetime.strptime(parsed["date"], "%Y-%m-%d").date()
-        days_out = max(0, (market_date - trade_date).days)
+        days_out = max(0, (market_date - trade_date).days) if trade_date else 0
     except (ValueError, TypeError):
         days_out = 0
 
+    if trade.get("model_prob") is not None:
+        predicted = float(trade["model_prob"])
+    elif forecast_temp is None:
+        return None
+
     # Use trade-time sigma if stored, otherwise fall back to current model
-    sigma_used = trade.get("sigma_used")
-    if sigma_used and sigma_used > 0:
+    elif (sigma_used := trade.get("sigma_used")) and sigma_used > 0:
         # Re-derive probability using the sigma that was active at trade time
         from probability import _student_t_cdf
         cal_weather = {}
