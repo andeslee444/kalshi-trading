@@ -37,7 +37,14 @@ RETRY_BACKOFF_BASE = 1.0  # seconds
 KILL_SWITCH_PATH = PROJECT_DIR / "data" / "HALT_TRADING"
 PER_BOT_HALT_PREFIX = "HALT_bot_"
 BOT_SOURCE_MAP = {
-    "weather": ["open-meteo-batch", "open-meteo-single", "open-meteo-ensemble", "nws-forecast"],
+    "weather": [
+        "open-meteo-batch",
+        "open-meteo-single",
+        "open-meteo-ensemble",
+        "open-meteo-hrrr",
+        "open-meteo-nam",
+        "nws-forecast",
+    ],
     "crypto": ["coinbase", "deribit"],
     "economics": ["cleveland-fed", "gdpnow", "cme-fedwatch"],
     "entertainment": ["hdd", "boxoffice"],
@@ -81,6 +88,57 @@ def round_half_up(value):
     and running high comparisons, arithmetic rounding matches NWS behavior.
     """
     return int(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+# === Kalshi API v2 field normalization ===
+#
+# The Kalshi API v2 returns prices as dollar-amount strings (e.g., "0.86")
+# in fields suffixed with _dollars/_fp, but all bot code reads integer-cent
+# fields (e.g., yes_bid=86). This normalizer bridges the gap.
+
+# Maps API v2 dollar-string fields to the legacy integer-cent field names.
+# Each entry: (new_field, old_field, conversion_fn)
+_MARKET_FIELD_MAP = [
+    ("yes_bid_dollars",   "yes_bid",       lambda v: round(float(v) * 100)),
+    ("yes_ask_dollars",   "yes_ask",       lambda v: round(float(v) * 100)),
+    ("no_bid_dollars",    "no_bid",        lambda v: round(float(v) * 100)),
+    ("no_ask_dollars",    "no_ask",        lambda v: round(float(v) * 100)),
+    ("last_price_dollars", "last_price",   lambda v: round(float(v) * 100)),
+    ("volume_fp",         "volume",        lambda v: int(float(v))),
+    ("open_interest_fp",  "open_interest", lambda v: int(float(v))),
+]
+
+
+def normalize_market(m):
+    """Convert Kalshi API v2 dollar-string fields to integer-cent fields.
+
+    Mutates the dict in-place for performance (avoids copying thousands of
+    market dicts per scan). Also returns the dict for convenience.
+
+    Idempotent: if a legacy field already has a non-None value, it is not
+    overwritten. Safe to call on already-normalized data, cached data, or
+    test fixtures that use the old field names directly.
+    """
+    for new_field, old_field, convert in _MARKET_FIELD_MAP:
+        # Skip if legacy field already populated (idempotent guard)
+        existing = m.get(old_field)
+        if existing is not None:
+            continue
+        raw = m.get(new_field)
+        if raw is None:
+            continue
+        try:
+            m[old_field] = convert(raw)
+        except (ValueError, TypeError):
+            m[old_field] = 0
+    return m
+
+
+def normalize_markets(markets):
+    """Normalize a list of market dicts in-place. Returns the same list."""
+    for m in markets:
+        normalize_market(m)
+    return markets
 
 
 _log = logging.getLogger("kalshi_auth")
@@ -366,6 +424,9 @@ class KalshiClient:
                 "Increase max_pages if needed.", max_pages, len(all_markets)
             )
 
+        # 3b. Normalize API v2 dollar-string fields to integer cents
+        normalize_markets(all_markets)
+
         # 4. Update caches
         if cache_ttl > 0:
             self._market_cache[cache_key] = (time.time(), all_markets)
@@ -387,6 +448,21 @@ class KalshiClient:
                 _log.debug("Failed to write shared market cache: %s", e)
 
         return all_markets
+
+    def get_market(self, ticker):
+        """Fetch a single market by ticker with field normalization.
+
+        Returns the normalized market dict, or None if not found.
+        Handles the API's ``{"market": {...}}`` wrapper automatically.
+        """
+        try:
+            data = self.get(f"/markets/{ticker}")
+            market = data.get("market", data)
+            if market:
+                normalize_market(market)
+            return market
+        except Exception:
+            return None
 
     def get_balance(self):
         """Get portfolio balance. Returns (balance_cents, available_cents).
@@ -478,7 +554,14 @@ def read_market_cache(prefix=None, max_age=MARKET_CACHE_TTL):
             return None
         markets = data.get("markets", {})
         if prefix is not None:
-            return markets.get(prefix)
+            result = markets.get(prefix)
+            if isinstance(result, list):
+                normalize_markets(result)
+            return result
+        # Normalize all prefixes when returning full cache
+        for pfx, mkt_list in markets.items():
+            if isinstance(mkt_list, list):
+                normalize_markets(mkt_list)
         return markets
     except (json.JSONDecodeError, OSError, KeyError):
         return None
@@ -1738,6 +1821,24 @@ class HealthCheckMonitor:
             notify_imessage(alert_msg, logger=self.log)
         self._dirty_sources.add(source)
         self._save()
+
+    def trip_source_breaker(self, source, msg="", error_count=None):
+        """Open a source circuit breaker immediately for deterministic failures."""
+        if source not in self._state["sources"]:
+            self._state["sources"][source] = {"last_success": None, "last_error": None, "error_count": 0}
+        data = self._state["sources"][source]
+        threshold = error_count if isinstance(error_count, int) and error_count > 0 else self.source_breaker_threshold
+        was_open = data.get("error_count", 0) >= threshold and data.get("opened_at") is not None
+        data["last_error"] = _utc_now_iso()
+        data["error_count"] = max(data.get("error_count", 0), threshold)
+        data["opened_at"] = time.time()
+        self._dirty_sources.add(source)
+        self._save()
+        if not was_open:
+            self.log.warning("Source circuit breaker opened immediately for %s", source)
+            alert_msg = f"Source circuit breaker opened: {source} (deterministic failure)"
+            notify_webhook(alert_msg, level="warning", logger=self.log)
+            notify_imessage(alert_msg, logger=self.log)
 
     def is_source_open(self, source):
         """Return True if source has tripped the circuit breaker (callers should skip).
