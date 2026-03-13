@@ -16,6 +16,7 @@ from bs4 import BeautifulSoup
 
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, notify_whatsapp, _atomic_write_json, HealthCheckMonitor, ScanSummary, load_trades, is_shutdown_requested
 from capital_allocator import PortfolioAllocator
+from singleton_lock import acquire_process_singleton
 
 # Unbuffered output
 setup_unbuffered()
@@ -585,19 +586,12 @@ def scan_cycle():
             side = "yes" if t["direction"].upper() == "YES" else "no"
             ticker = t["ticker"]
 
-            # Validate ticker exists on Kalshi
-            try:
-                market = client.get(f"/markets/{ticker}")
-                if not market:
-                    log.warning(f"  Ticker {ticker} not found on Kalshi — skipping")
-                    ss.skip("ticker_not_found")
-                    trade_manager.log_decision(ticker, side, "skipped", "ticker_not_found",
-                                               price_cents=t["price_cents"])
-                    continue
-            except Exception as e:
-                log.warning(f"  Could not validate ticker {ticker}: {e}")
-                ss.skip("ticker_validation_error")
-                trade_manager.log_decision(ticker, side, "skipped", "ticker_validation_error",
+            # Validate ticker exists on Kalshi (with API v2 field normalization)
+            market = client.get_market(ticker)
+            if not market:
+                log.warning(f"  Ticker {ticker} not found on Kalshi — skipping")
+                ss.skip("ticker_not_found")
+                trade_manager.log_decision(ticker, side, "skipped", "ticker_not_found",
                                            price_cents=t["price_cents"])
                 continue
 
@@ -767,6 +761,10 @@ def run_daemon():
 
 
 if __name__ == "__main__":
+    if not acquire_process_singleton("beatrelease", PROJECT_DIR, log):
+        log.warning("Duplicate beatrelease launch blocked; exiting.")
+        sys.exit(0)
+
     if "--once" in sys.argv:
         log.info("Running single scan (--once mode)")
         try:
