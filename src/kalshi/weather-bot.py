@@ -733,41 +733,41 @@ def scan_and_trade():
     convergence_data = {}  # {city_code: {date_str: {current, previous, delta}}}
     prev_runs_cfg = config.get("previousRuns", {})
 
+    # Track which model run each forecast came from so convergence only
+    # fires when the upstream model cycle actually changes.
+    for city_forecast in forecasts.values():
+        for model_data in city_forecast.values():
+            if not isinstance(model_data, dict):
+                continue
+            for model_name in model_data.keys():
+                if model_name in model_run_tags:
+                    continue
+                run_dt = latest_available_model_run(model_name)
+                if run_dt is not None:
+                    model_run_tags[model_name] = run_dt.isoformat()
+
+    # Previous-runs convergence (independent of verification system)
+    if prev_runs_cfg.get("enabled", False) and verifier:
+        model_name = canonical_model_name(prev_runs_cfg.get("model", "gfs"))
+        current_run_tag = model_run_tags.get(model_name)
+        if current_run_tag is not None:
+            try:
+                convergence_data = verifier.get_run_to_run_deltas(
+                    forecasts,
+                    model_name,
+                    current_run_tag,
+                )
+                if convergence_data:
+                    log.info("Convergence data available for %d cities", len(convergence_data))
+            except Exception as e:
+                log.warning("Convergence signal failed (non-blocking): %s", e)
+
     # Forecast verification: verify past forecasts and record new ones
     if verifier:
         try:
             verifier.verify_past_forecasts(station_map=DEFAULT_STATION_MAP)
         except Exception as e:
             log.warning("Verification check failed (non-blocking): %s", e)
-
-        # Track which model run each forecast came from so convergence only
-        # fires when the upstream model cycle actually changes.
-        model_run_tags = {}
-        for city_forecast in forecasts.values():
-            for model_data in city_forecast.values():
-                if not isinstance(model_data, dict):
-                    continue
-                for model_name in model_data.keys():
-                    if model_name in model_run_tags:
-                        continue
-                    run_dt = latest_available_model_run(model_name)
-                    if run_dt is not None:
-                        model_run_tags[model_name] = run_dt.isoformat()
-
-        if prev_runs_cfg.get("enabled", False):
-            model_name = canonical_model_name(prev_runs_cfg.get("model", "gfs"))
-            current_run_tag = model_run_tags.get(model_name)
-            if current_run_tag is not None:
-                try:
-                    convergence_data = verifier.get_run_to_run_deltas(
-                        forecasts,
-                        model_name,
-                        current_run_tag,
-                    )
-                    if convergence_data:
-                        log.info("Convergence data available for %d cities", len(convergence_data))
-                except Exception as e:
-                    log.warning("Convergence signal failed (non-blocking): %s", e)
 
         # Record current forecasts for later verification
         for code, info in CITIES.items():

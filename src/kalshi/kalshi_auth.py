@@ -41,9 +41,10 @@ BOT_SOURCE_MAP = {
         "open-meteo-batch",
         "open-meteo-single",
         "open-meteo-ensemble",
-        "open-meteo-hrrr",
-        "open-meteo-nam",
         "nws-forecast",
+        # NOTE: open-meteo-hrrr and open-meteo-nam are excluded — they are optional
+        # feeds that may be disabled in config. Including them here would prevent
+        # the halt from triggering (absent sources default to error_count=0).
     ],
     "crypto": ["coinbase", "deribit"],
     "economics": ["cleveland-fed", "gdpnow", "cme-fedwatch"],
