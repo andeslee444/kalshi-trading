@@ -1839,13 +1839,14 @@ class HealthCheckMonitor:
         data["last_error"] = _utc_now_iso()
         data["error_count"] = max(data.get("error_count", 0), threshold)
         data["opened_at"] = time.time()
-        self._dirty_sources.add(source)
-        self._save()
         if not was_open:
             self.log.warning("Source circuit breaker opened immediately for %s", source)
-            alert_msg = f"Source circuit breaker opened: {source} (deterministic failure)"
+            detail = f" ({msg})" if msg else ""
+            alert_msg = f"Source circuit breaker opened: {source} (deterministic failure){detail}"
             notify_webhook(alert_msg, level="warning", logger=self.log)
             notify_imessage(alert_msg, logger=self.log)
+        self._dirty_sources.add(source)
+        self._save()
 
     def is_source_open(self, source):
         """Return True if source has tripped the circuit breaker (callers should skip).
