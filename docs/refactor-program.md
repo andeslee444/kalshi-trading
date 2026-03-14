@@ -267,6 +267,11 @@ Target split:
 - `ops/notifications.py`
 - `storage/json_atomic.py`
 
+Current bridge state:
+
+- Slice 1 is implemented in `storage.py` first, because the repo already ships a top-level `storage.py` module
+- The later package split to `storage/json_atomic.py` should happen only after the existing `storage.py` module is broken into a package without changing public behavior
+
 Rules:
 
 - Keep compatibility imports during the transition

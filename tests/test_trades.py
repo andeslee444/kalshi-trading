@@ -1,50 +1,7 @@
-"""Tests for load_trades() and save_trade() in kalshi_auth.py."""
+"""Tests for trade JSON helpers in storage.py."""
 
 import json
-import types
-import sys
-import pytest
-from pathlib import Path
-
-
-# ---------------------------------------------------------------------------
-# Import the functions under test.
-#
-# kalshi_auth.py imports ``cryptography``, which is a real dependency.
-# The two utility functions we want to test (load_trades, save_trade) are
-# pure-Python helpers that don't touch the crypto layer, so we import the
-# module directly -- conftest.py already added src/kalshi to sys.path.
-#
-# If the ``cryptography`` package is not installed in the test environment
-# we fall back to a minimal stub so the tests can still run.
-# ---------------------------------------------------------------------------
-
-try:
-    from kalshi_auth import load_trades, save_trade
-except ImportError:
-    # Provide a stub cryptography module so kalshi_auth can be imported
-    # even when cryptography is missing.
-    _crypto_pkg = types.ModuleType("cryptography")
-    _haz = types.ModuleType("cryptography.hazmat")
-    _prim = types.ModuleType("cryptography.hazmat.primitives")
-    _hash = types.ModuleType("cryptography.hazmat.primitives.hashes")
-    _ser = types.ModuleType("cryptography.hazmat.primitives.serialization")
-    _asym = types.ModuleType("cryptography.hazmat.primitives.asymmetric")
-    _pad = types.ModuleType("cryptography.hazmat.primitives.asymmetric.padding")
-    _back = types.ModuleType("cryptography.hazmat.backends")
-    for name, mod in [
-        ("cryptography", _crypto_pkg),
-        ("cryptography.hazmat", _haz),
-        ("cryptography.hazmat.primitives", _prim),
-        ("cryptography.hazmat.primitives.hashes", _hash),
-        ("cryptography.hazmat.primitives.serialization", _ser),
-        ("cryptography.hazmat.primitives.asymmetric", _asym),
-        ("cryptography.hazmat.primitives.asymmetric.padding", _pad),
-        ("cryptography.hazmat.backends", _back),
-    ]:
-        sys.modules.setdefault(name, mod)
-    # Now retry the import
-    from kalshi_auth import load_trades, save_trade
+from storage import load_trades, save_trade
 
 
 # ===================================================================

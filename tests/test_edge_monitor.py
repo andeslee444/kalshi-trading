@@ -5,6 +5,8 @@ Observations are provided as fixture data.
 """
 
 import math
+from datetime import datetime, timedelta
+
 import pytest
 from edge_monitor import EdgeMonitor, _linear_regression
 
@@ -23,15 +25,20 @@ def _obs(timestamp, market_type, model_prob, market_price_cents, won):
     }
 
 
+def _days_ago(days):
+    ts = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0)
+    return (ts - timedelta(days=days)).isoformat()
+
+
 # Stable edge: consistent ~15% gap, high win rate
 STABLE_OBSERVATIONS = [
-    _obs(f"2026-02-{d:02d}T10:00:00", "weather", 0.70, 55, d % 3 != 0)
+    _obs(_days_ago(28 - d), "weather", 0.70, 55, d % 3 != 0)
     for d in range(1, 29)
 ]
 
 # Decaying edge: gap shrinks from 20% to 5% over 4 weeks
 DECAYING_OBSERVATIONS = [
-    _obs(f"2026-02-{d:02d}T10:00:00", "crypto",
+    _obs(_days_ago(28 - d), "crypto",
          0.60 - d * 0.005,           # model_prob decreases slightly
          int((0.40 + d * 0.005) * 100),  # market catches up
          d < 15)                     # stops winning in second half
@@ -40,9 +47,9 @@ DECAYING_OBSERVATIONS = [
 
 # Sudden competitor: stable for 2 weeks, then gap collapses
 COMPETITOR_OBSERVATIONS = (
-    [_obs(f"2026-02-{d:02d}T10:00:00", "economics", 0.75, 60, True)
+    [_obs(_days_ago(28 - d), "economics", 0.75, 60, True)
      for d in range(1, 15)]
-    + [_obs(f"2026-02-{d:02d}T10:00:00", "economics", 0.72, 70, d % 2 == 0)
+    + [_obs(_days_ago(28 - d), "economics", 0.72, 70, d % 2 == 0)
        for d in range(15, 29)]
 )
 
