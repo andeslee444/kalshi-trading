@@ -12,9 +12,10 @@ Usage:
     python3 src/kalshi/position-monitor.py --once    # single scan
 """
 
-import json, time, datetime, os, sys, re, argparse
+import json, time, datetime, os, sys, re, argparse, logging
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from app_bootstrap import AppContext, install_app_context
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, TradeManager, trim_trade_log, CITY_TIMEZONES, _local_today,
@@ -27,27 +28,21 @@ from ticker_utils import parse_weather_ticker as parse_temp_ticker, parse_crypto
 from capital_allocator import PortfolioAllocator
 from singleton_lock import acquire_process_singleton
 
-setup_unbuffered()
-log = setup_logging("position-monitor")
-setup_signal_handlers()
-
 # === Paths ===
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
 WEATHER_CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-config.json"
 TRADES_PATH = PROJECT_DIR / "data" / "kalshi-position-trades.json"
 METRICS_PATH = PROJECT_DIR / "data" / "position-monitor-metrics.json"
-TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-# Load config
-bots_config = json.loads(BOTS_CONFIG_PATH.read_text())
-pm_config = bots_config.get("position_monitor", {})
-
-TAKE_PROFIT_THRESHOLD = pm_config.get("takeProfitThreshold", 0.85)
-STOP_LOSS_THRESHOLD = pm_config.get("stopLossThreshold", 0.20)
-MODEL_SHIFT_THRESHOLD = pm_config.get("modelShiftThreshold", 0.25)
-MAX_DAILY_EXITS = pm_config.get("maxDailyExits", 20)
-SCAN_INTERVAL = pm_config.get("scanIntervalMinutes", 15)
-ORDER_TTL_MINUTES = pm_config.get("orderTtlMinutes", 120)
+_APP_CONTEXT = None
+log = logging.getLogger("position-monitor")
+bots_config = {}
+pm_config = {}
+TAKE_PROFIT_THRESHOLD = 0.85
+STOP_LOSS_THRESHOLD = 0.20
+MODEL_SHIFT_THRESHOLD = 0.25
+MAX_DAILY_EXITS = 20
+SCAN_INTERVAL = 15
+ORDER_TTL_MINUTES = 120
 
 # Source bot name -> bots-config.json key mapping
 BOT_CONFIG_MAP = {
@@ -226,21 +221,11 @@ def _save_peaks(peaks):
 
 # Load NWS station config for model-shift evaluation
 MONITOR_CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-monitor-config.json"
-try:
-    _monitor_cfg = json.loads(MONITOR_CONFIG_PATH.read_text())
-    NWS_STATIONS = _monitor_cfg.get("sources", {}).get("nws", {}).get("stations", {})
-except (FileNotFoundError, json.JSONDecodeError):
-    NWS_STATIONS = {}
-
-client = KalshiClient()
-allocator = PortfolioAllocator(client, logger=log)
-health = HealthCheckMonitor(logger=log)
-trade_manager = TradeManager(client, TRADES_PATH, {
-    "maxTradeAmount": pm_config.get("maxTradeAmount", 50),  # exits can be larger
-    "maxDailyTrades": MAX_DAILY_EXITS,
-    "maxDailyLoss": pm_config.get("maxDailyLoss", 100),
-}, logger=log, bot_name="positions")
-trim_trade_log(TRADES_PATH)
+NWS_STATIONS = {}
+client = None
+allocator = None
+health = None
+trade_manager = None
 
 # === Position Fetching ===
 
@@ -1148,10 +1133,71 @@ def scan_positions():
 
 # === Entry Point ===
 
+def load_config(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    return json.loads((project_dir / "config" / "bots-config.json").read_text())
+
+
+def build_app(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    setup_unbuffered()
+    logger = setup_logging("position-monitor")
+    setup_signal_handlers()
+    bots_config_path = project_dir / "config" / "bots-config.json"
+    weather_config_path = project_dir / "config" / "kalshi-config.json"
+    trades_path = project_dir / "data" / "kalshi-position-trades.json"
+    metrics_path = project_dir / "data" / "position-monitor-metrics.json"
+    trailing_state_path = project_dir / "data" / "trailing-state.json"
+    old_peaks_path = project_dir / "data" / "position-peaks.json"
+    monitor_config_path = project_dir / "config" / "kalshi-monitor-config.json"
+    trades_path.parent.mkdir(parents=True, exist_ok=True)
+    loaded_bots_config = load_config(project_dir)
+    loaded_pm_config = loaded_bots_config.get("position_monitor", {})
+    try:
+        monitor_cfg = json.loads(monitor_config_path.read_text())
+        nws_stations = monitor_cfg.get("sources", {}).get("nws", {}).get("stations", {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        nws_stations = {}
+    client_obj = KalshiClient()
+    allocator_obj = PortfolioAllocator(client_obj, logger=logger)
+    health_monitor = HealthCheckMonitor(logger=logger)
+    trade_manager_obj = TradeManager(client_obj, trades_path, {
+        "maxTradeAmount": loaded_pm_config.get("maxTradeAmount", 50),
+        "maxDailyTrades": loaded_pm_config.get("maxDailyExits", 20),
+        "maxDailyLoss": loaded_pm_config.get("maxDailyLoss", 100),
+    }, logger=logger, bot_name="positions")
+    trim_trade_log(trades_path)
+    return install_app_context(globals(), AppContext({
+        "PROJECT_DIR": project_dir,
+        "BOTS_CONFIG_PATH": bots_config_path,
+        "WEATHER_CONFIG_PATH": weather_config_path,
+        "TRADES_PATH": trades_path,
+        "METRICS_PATH": metrics_path,
+        "TRAILING_STATE_PATH": trailing_state_path,
+        "_OLD_PEAKS_PATH": old_peaks_path,
+        "MONITOR_CONFIG_PATH": monitor_config_path,
+        "log": logger,
+        "bots_config": loaded_bots_config,
+        "pm_config": loaded_pm_config,
+        "TAKE_PROFIT_THRESHOLD": loaded_pm_config.get("takeProfitThreshold", 0.85),
+        "STOP_LOSS_THRESHOLD": loaded_pm_config.get("stopLossThreshold", 0.20),
+        "MODEL_SHIFT_THRESHOLD": loaded_pm_config.get("modelShiftThreshold", 0.25),
+        "MAX_DAILY_EXITS": loaded_pm_config.get("maxDailyExits", 20),
+        "SCAN_INTERVAL": loaded_pm_config.get("scanIntervalMinutes", 15),
+        "ORDER_TTL_MINUTES": loaded_pm_config.get("orderTtlMinutes", 120),
+        "NWS_STATIONS": nws_stations,
+        "client": client_obj,
+        "allocator": allocator_obj,
+        "health": health_monitor,
+        "trade_manager": trade_manager_obj,
+    }))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Kalshi Position Monitor")
     parser.add_argument("--once", action="store_true", help="Run single scan and exit")
     args = parser.parse_args()
+    build_app()
 
     if not acquire_process_singleton("positions", PROJECT_DIR, log, display_name="position-monitor"):
         log.warning("Duplicate position-monitor launch blocked; exiting.")

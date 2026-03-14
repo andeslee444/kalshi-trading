@@ -6,6 +6,7 @@ Strategies: Longshot bias selling, maker-only limit orders, info arbitrage near 
 import json, time, datetime, os, sys, math, argparse, statistics
 import requests
 from pathlib import Path
+from app_bootstrap import AppContext, install_app_context
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log, _atomic_write_json, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
 from probability import quarter_kelly_sell, quarter_kelly, half_kelly, longshot_edge, compute_limit_price, kalshi_fee_cents, classify_ticker_category
 from capital_allocator import PortfolioAllocator
@@ -16,70 +17,36 @@ from strategy_engine import (
 )
 from singleton_lock import acquire_process_singleton
 
-setup_unbuffered()
-log = setup_logging("strategy")
-setup_signal_handlers()
-
 DATA_DIR = PROJECT_DIR / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
-_bots_cfg = json.loads(BOTS_CONFIG_PATH.read_text())["strategy"]
-MAX_BET = _bots_cfg.get("maxTradeAmount", 10) * 100  # dollars → cents
+_APP_CONTEXT = None
+log = None
+_bots_cfg = {}
+MAX_BET = 1000  # dollars → cents
+client = None
+allocator = None
+health = None
+order_monitor = None
+SCAN_INTERVAL = 15
 
-client = KalshiClient()
-allocator = PortfolioAllocator(client, logger=log)
-health = HealthCheckMonitor(logger=log)
-order_monitor = OrderMonitor(client, log=log)
-
-SCAN_INTERVAL = _bots_cfg.get("scanIntervalMinutes", 15)
-
-# Bayesian edge estimator (online learning from settlements)
 BAYES_PARAMS_PATH = PROJECT_DIR / "config" / "bayes-params.json"
-edge_estimator = BayesianEdgeEstimator(params_path=BAYES_PARAMS_PATH)
-
-# Correlation-aware sizer (copula-based Kelly + category caps)
-_daily_budget = _bots_cfg.get("maxDailyLoss", 100) * 100  # convert to cents
-_category_cap = _bots_cfg.get("categoryCap", 0.30)
-_single_trade_cap = _bots_cfg.get("singleTradeCap", 0.05)
-correlation_sizer = CorrelationAwareSizer(
-    daily_budget_cents=_daily_budget,
-    category_cap_pct=_category_cap,
-    single_trade_cap_pct=_single_trade_cap,
-)
-
-# Intraday wave scheduler
-_wave_scheduling_enabled = _bots_cfg.get("waveScheduling", True)
-_wave_daily_budget = _bots_cfg.get("dailyBudgetCents", _bots_cfg.get("maxDailyLoss", 100) * 100)
-scheduler = ScheduledScanner(daily_budget_cents=_wave_daily_budget) if _wave_scheduling_enabled else None
-
-# Settlement source checker
-_settlement_sources_enabled = _bots_cfg.get("settlementSources", True)
-settlement_checker = SettlementSourceChecker() if _settlement_sources_enabled else None
-
-# Fill probability model
-_fill_model_enabled = _bots_cfg.get("fillModel", True)
-FILL_MODEL_PATH = DATA_DIR / _bots_cfg.get("fillModelPath", "strategy-fill-model.json")
-fill_estimator = FillProbabilityEstimator(betas_path=FILL_MODEL_PATH) if _fill_model_enabled else None
-
-# Config flags for new features
-_bayesian_edge_enabled = _bots_cfg.get("bayesianEdge", True)
-_buy_longshots_enabled = _bots_cfg.get("enableBuyLongshots", True)
-_sell_max_price = _bots_cfg.get("sellMaxPrice", 30)
-_buy_min_price = _bots_cfg.get("buyMinPrice", 70)
+edge_estimator = None
+correlation_sizer = None
+scheduler = None
+settlement_checker = None
+FILL_MODEL_PATH = DATA_DIR / "strategy-fill-model.json"
+fill_estimator = None
+_bayesian_edge_enabled = True
+_buy_longshots_enabled = True
+_sell_max_price = 30
+_buy_min_price = 70
 
 SPORTS_PREFIXES = ["KXNBA", "KXNFL", "KXNHL", "KXMLB", "KXUFC", "KXNCAA", "KXSPORT", "KXSOCCER", "KXMARMAD"]
 
 TRADES_JSON_PATH = DATA_DIR / "kalshi-strategy-trades.json"
 METRICS_PATH = DATA_DIR / "strategy-metrics.json"
-trade_manager = TradeManager(client, TRADES_JSON_PATH, {
-    "maxTradeAmount": MAX_BET / 100,
-    "maxTradeAmountPct": _bots_cfg.get("maxTradeAmountPct"),
-    "maxDailyTrades": _bots_cfg.get("maxDailyTrades", 20),
-    "maxDailyLoss": _bots_cfg.get("maxDailyLoss", 50),
-    "maxDailyLossPct": _bots_cfg.get("maxDailyLossPct"),
-}, logger=log, order_monitor=order_monitor, bot_name="strategy")
-trim_trade_log(TRADES_JSON_PATH)
+trade_manager = None
 
 # Multi-outcome futures where longshot bias model doesn't apply
 TOURNAMENT_PREFIXES = ("KXMARMAD-",)
@@ -873,10 +840,92 @@ def run_scan():
 
     return len(trades_executed)
 
+
+def load_config(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    return json.loads((project_dir / "config" / "bots-config.json").read_text())
+
+
+def build_app(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    setup_unbuffered()
+    logger = setup_logging("strategy")
+    setup_signal_handlers()
+    data_dir = project_dir / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    bots_config_path = project_dir / "config" / "bots-config.json"
+    strategy_cfg = load_config(project_dir)["strategy"]
+    max_bet = strategy_cfg.get("maxTradeAmount", 10) * 100
+    scan_interval = strategy_cfg.get("scanIntervalMinutes", 15)
+    bayes_params_path = project_dir / "config" / "bayes-params.json"
+    fill_model_path = data_dir / strategy_cfg.get("fillModelPath", "strategy-fill-model.json")
+    edge_estimator_obj = BayesianEdgeEstimator(params_path=bayes_params_path)
+    daily_budget = strategy_cfg.get("maxDailyLoss", 100) * 100
+    category_cap = strategy_cfg.get("categoryCap", 0.30)
+    single_trade_cap = strategy_cfg.get("singleTradeCap", 0.05)
+    correlation_sizer_obj = CorrelationAwareSizer(
+        daily_budget_cents=daily_budget,
+        category_cap_pct=category_cap,
+        single_trade_cap_pct=single_trade_cap,
+    )
+    wave_scheduling_enabled = strategy_cfg.get("waveScheduling", True)
+    wave_daily_budget = strategy_cfg.get("dailyBudgetCents", strategy_cfg.get("maxDailyLoss", 100) * 100)
+    scheduler_obj = ScheduledScanner(daily_budget_cents=wave_daily_budget) if wave_scheduling_enabled else None
+    settlement_sources_enabled = strategy_cfg.get("settlementSources", True)
+    settlement_checker_obj = SettlementSourceChecker() if settlement_sources_enabled else None
+    fill_model_enabled = strategy_cfg.get("fillModel", True)
+    fill_estimator_obj = FillProbabilityEstimator(betas_path=fill_model_path) if fill_model_enabled else None
+    client_obj = KalshiClient()
+    allocator_obj = PortfolioAllocator(client_obj, logger=logger)
+    health_monitor = HealthCheckMonitor(logger=logger)
+    order_monitor_obj = OrderMonitor(client_obj, log=logger)
+    trades_json_path = data_dir / "kalshi-strategy-trades.json"
+    trade_manager_obj = TradeManager(client_obj, trades_json_path, {
+        "maxTradeAmount": max_bet / 100,
+        "maxTradeAmountPct": strategy_cfg.get("maxTradeAmountPct"),
+        "maxDailyTrades": strategy_cfg.get("maxDailyTrades", 20),
+        "maxDailyLoss": strategy_cfg.get("maxDailyLoss", 50),
+        "maxDailyLossPct": strategy_cfg.get("maxDailyLossPct"),
+    }, logger=logger, order_monitor=order_monitor_obj, bot_name="strategy")
+    trim_trade_log(trades_json_path)
+    return install_app_context(globals(), AppContext({
+        "PROJECT_DIR": project_dir,
+        "DATA_DIR": data_dir,
+        "BOTS_CONFIG_PATH": bots_config_path,
+        "_bots_cfg": strategy_cfg,
+        "MAX_BET": max_bet,
+        "log": logger,
+        "client": client_obj,
+        "allocator": allocator_obj,
+        "health": health_monitor,
+        "order_monitor": order_monitor_obj,
+        "SCAN_INTERVAL": scan_interval,
+        "BAYES_PARAMS_PATH": bayes_params_path,
+        "edge_estimator": edge_estimator_obj,
+        "correlation_sizer": correlation_sizer_obj,
+        "_wave_scheduling_enabled": wave_scheduling_enabled,
+        "_wave_daily_budget": wave_daily_budget,
+        "scheduler": scheduler_obj,
+        "_settlement_sources_enabled": settlement_sources_enabled,
+        "settlement_checker": settlement_checker_obj,
+        "_fill_model_enabled": fill_model_enabled,
+        "FILL_MODEL_PATH": fill_model_path,
+        "fill_estimator": fill_estimator_obj,
+        "_bayesian_edge_enabled": strategy_cfg.get("bayesianEdge", True),
+        "_buy_longshots_enabled": strategy_cfg.get("enableBuyLongshots", True),
+        "_sell_max_price": strategy_cfg.get("sellMaxPrice", 30),
+        "_buy_min_price": strategy_cfg.get("buyMinPrice", 70),
+        "TRADES_JSON_PATH": trades_json_path,
+        "METRICS_PATH": data_dir / "strategy-metrics.json",
+        "trade_manager": trade_manager_obj,
+    }))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Kalshi Strategy Trader")
     parser.add_argument("--once", action="store_true", help="Run single scan and exit")
     args = parser.parse_args()
+    build_app()
 
     if not acquire_process_singleton("strategy", PROJECT_DIR, log):
         log.warning("Duplicate strategy launch blocked; exiting.")

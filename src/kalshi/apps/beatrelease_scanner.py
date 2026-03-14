@@ -13,14 +13,11 @@ import json, time, datetime, os, sys, re, signal, hashlib
 import requests
 from pathlib import Path
 from bs4 import BeautifulSoup
+from app_bootstrap import AppContext, install_app_context
 
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, notify_whatsapp, _atomic_write_json, HealthCheckMonitor, ScanSummary, load_trades, is_shutdown_requested
 from capital_allocator import PortfolioAllocator
 from singleton_lock import acquire_process_singleton
-
-# Unbuffered output
-setup_unbuffered()
-log = setup_logging("beatrelease")
 
 # === Config ===
 DEEPSEEK_KEY_PATH = PROJECT_DIR / "config" / "keys" / "deepseek.txt"
@@ -30,25 +27,16 @@ DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 LLM_LOG_PATH = PROJECT_DIR / "data" / "beatrelease-llm-log.json"
 
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
-_bots_cfg = json.loads(BOTS_CONFIG_PATH.read_text())["beatrelease"]
-CHECK_INTERVAL_HOURS = _bots_cfg["checkIntervalHours"]
-MAX_TRADE_CENTS = _bots_cfg.get("maxTradeAmount", 15) * 100  # dollars → cents
-BLOG_URLS = _bots_cfg["blogUrls"]
-
-STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-# === Kalshi Client ===
-client = KalshiClient()
-trade_manager = TradeManager(client, TRADES_PATH, {
-    "maxTradeAmount": MAX_TRADE_CENTS / 100,
-    "maxTradeAmountPct": _bots_cfg.get("maxTradeAmountPct"),
-    "maxDailyTrades": _bots_cfg.get("maxDailyTrades", 10),
-    "maxDailyLoss": _bots_cfg.get("maxDailyLoss", 25),
-    "maxDailyLossPct": _bots_cfg.get("maxDailyLossPct"),
-}, logger=log, bot_name="beatrelease")
-allocator = PortfolioAllocator(client, logger=log)
-health = HealthCheckMonitor(logger=log)
-trim_trade_log(TRADES_PATH)
+_APP_CONTEXT = None
+log = None
+_bots_cfg = {}
+CHECK_INTERVAL_HOURS = 1
+MAX_TRADE_CENTS = 1500
+BLOG_URLS = []
+client = None
+trade_manager = None
+allocator = None
+health = None
 
 
 # === State ===
@@ -760,7 +748,52 @@ def run_daemon():
         time.sleep(CHECK_INTERVAL_HOURS * 3600)
 
 
+def load_config(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    return json.loads((project_dir / "config" / "bots-config.json").read_text())
+
+
+def build_app(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    setup_unbuffered()
+    logger = setup_logging("beatrelease")
+    bots_cfg = load_config(project_dir)["beatrelease"]
+    state_path = project_dir / "data" / "beatrelease-state.json"
+    trades_path = project_dir / "data" / "beatrelease-trades.json"
+    llm_log_path = project_dir / "data" / "beatrelease-llm-log.json"
+    deepseek_key_path = project_dir / "config" / "keys" / "deepseek.txt"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    client_obj = KalshiClient()
+    trade_manager_obj = TradeManager(client_obj, trades_path, {
+        "maxTradeAmount": bots_cfg.get("maxTradeAmount", 15),
+        "maxTradeAmountPct": bots_cfg.get("maxTradeAmountPct"),
+        "maxDailyTrades": bots_cfg.get("maxDailyTrades", 10),
+        "maxDailyLoss": bots_cfg.get("maxDailyLoss", 25),
+        "maxDailyLossPct": bots_cfg.get("maxDailyLossPct"),
+    }, logger=logger, bot_name="beatrelease")
+    allocator_obj = PortfolioAllocator(client_obj, logger=logger)
+    health_monitor = HealthCheckMonitor(logger=logger)
+    trim_trade_log(trades_path)
+    return install_app_context(globals(), AppContext({
+        "PROJECT_DIR": project_dir,
+        "DEEPSEEK_KEY_PATH": deepseek_key_path,
+        "STATE_PATH": state_path,
+        "TRADES_PATH": trades_path,
+        "LLM_LOG_PATH": llm_log_path,
+        "log": logger,
+        "_bots_cfg": bots_cfg,
+        "CHECK_INTERVAL_HOURS": bots_cfg["checkIntervalHours"],
+        "MAX_TRADE_CENTS": bots_cfg.get("maxTradeAmount", 15) * 100,
+        "BLOG_URLS": bots_cfg["blogUrls"],
+        "client": client_obj,
+        "trade_manager": trade_manager_obj,
+        "allocator": allocator_obj,
+        "health": health_monitor,
+    }))
+
+
 def main(argv=None):
+    build_app()
     args = list(sys.argv[1:] if argv is None else argv)
     if not acquire_process_singleton("beatrelease", PROJECT_DIR, log):
         log.warning("Duplicate beatrelease launch blocked; exiting.")

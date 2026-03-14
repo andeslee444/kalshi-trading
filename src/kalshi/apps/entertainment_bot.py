@@ -7,40 +7,25 @@ DEMO API ONLY — $5 max per trade.
 import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
+from app_bootstrap import AppContext, install_app_context
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, half_kelly, quarter_kelly, compute_limit_price, kalshi_fee_cents
 from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_threshold, configure_sanity
 from capital_allocator import PortfolioAllocator
 from singleton_lock import acquire_process_singleton
 
-setup_unbuffered()
-
 TRADES_PATH = PROJECT_DIR / "data" / "kalshi-entertainment-trades.json"
 PID_PATH = PROJECT_DIR / "data" / "pids" / "kalshi-entertainment.pid"
 SNAPSHOTS_DIR = PROJECT_DIR / "data" / "kalshi-source-snapshots"
-
-TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
-Path(PID_PATH).parent.mkdir(parents=True, exist_ok=True)
-SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-
-# Logging — auto file logging via setup_logging (writes to data/logs/entertainment.log)
-log = setup_logging("entertainment")
-setup_signal_handlers()
-
-# === Config from file ===
+_APP_CONTEXT = None
+log = None
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
-_bots_cfg = json.loads(BOTS_CONFIG_PATH.read_text())["entertainment"]
-MAX_TRADE_AMOUNT = _bots_cfg["maxTradeAmount"]
-MAX_DAILY_TRADES = _bots_cfg["maxDailyTrades"]
-CONFIDENCE_THRESHOLD = _bots_cfg["confidenceThreshold"]
-SCAN_INTERVAL_MINUTES = _bots_cfg["scanIntervalMinutes"]
-ENTERTAINMENT_TICKERS = _bots_cfg["tickers"]
-
-# Configure Sanity CMS connection from config (defaults used if keys absent)
-configure_sanity(
-    project_id=_bots_cfg.get("sanityProject"),
-    api_version=_bots_cfg.get("sanityApiVersion"),
-)
+_bots_cfg = {}
+MAX_TRADE_AMOUNT = 5
+MAX_DAILY_TRADES = 10
+CONFIDENCE_THRESHOLD = 0.5
+SCAN_INTERVAL_MINUTES = 15
+ENTERTAINMENT_TICKERS = []
 
 MIN_EDGE_CONFIRMED = 0.04  # 4% when sigma <= 5% (confirmed data)
 MIN_EDGE_UNCERTAIN = 0.10  # 10% when sigma > 5% (projections/articles)
@@ -82,18 +67,11 @@ def _select_kelly_sizer(sigma):
     else:
         return _eighth_kelly, "eighth_kelly"
 
-client = KalshiClient()
-allocator = PortfolioAllocator(client, logger=log)
-health = HealthCheckMonitor(logger=log)
-order_monitor = OrderMonitor(client, log=log)
-trade_manager = TradeManager(client, TRADES_PATH, {
-    "maxTradeAmount": MAX_TRADE_AMOUNT,
-    "maxTradeAmountPct": _bots_cfg.get("maxTradeAmountPct"),
-    "maxDailyTrades": MAX_DAILY_TRADES,
-    "maxDailyLoss": _bots_cfg.get("maxDailyLoss", 25),
-    "maxDailyLossPct": _bots_cfg.get("maxDailyLossPct"),
-}, logger=log, order_monitor=order_monitor, bot_name="entertainment")
-trim_trade_log(TRADES_PATH)
+client = None
+allocator = None
+health = None
+order_monitor = None
+trade_manager = None
 
 # === Data Freshness ===
 def _check_hdd_staleness(album_data):
@@ -739,8 +717,62 @@ def scan():
              f"markets={len(markets)}")
     ss.finalize()
 
+def load_config(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    return json.loads((project_dir / "config" / "bots-config.json").read_text())
+
+
+def build_app(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    setup_unbuffered()
+    logger = setup_logging("entertainment")
+    setup_signal_handlers()
+    trades_path = project_dir / "data" / "kalshi-entertainment-trades.json"
+    pid_path = project_dir / "data" / "pids" / "kalshi-entertainment.pid"
+    snapshots_dir = project_dir / "data" / "kalshi-source-snapshots"
+    trades_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshots_dir.mkdir(parents=True, exist_ok=True)
+    bots_cfg = load_config(project_dir)["entertainment"]
+    configure_sanity(
+        project_id=bots_cfg.get("sanityProject"),
+        api_version=bots_cfg.get("sanityApiVersion"),
+    )
+    client_obj = KalshiClient()
+    allocator_obj = PortfolioAllocator(client_obj, logger=logger)
+    health_monitor = HealthCheckMonitor(logger=logger)
+    order_monitor_obj = OrderMonitor(client_obj, log=logger)
+    trade_manager_obj = TradeManager(client_obj, trades_path, {
+        "maxTradeAmount": bots_cfg["maxTradeAmount"],
+        "maxTradeAmountPct": bots_cfg.get("maxTradeAmountPct"),
+        "maxDailyTrades": bots_cfg["maxDailyTrades"],
+        "maxDailyLoss": bots_cfg.get("maxDailyLoss", 25),
+        "maxDailyLossPct": bots_cfg.get("maxDailyLossPct"),
+    }, logger=logger, order_monitor=order_monitor_obj, bot_name="entertainment")
+    trim_trade_log(trades_path)
+    return install_app_context(globals(), AppContext({
+        "PROJECT_DIR": project_dir,
+        "TRADES_PATH": trades_path,
+        "PID_PATH": pid_path,
+        "SNAPSHOTS_DIR": snapshots_dir,
+        "log": logger,
+        "_bots_cfg": bots_cfg,
+        "MAX_TRADE_AMOUNT": bots_cfg["maxTradeAmount"],
+        "MAX_DAILY_TRADES": bots_cfg["maxDailyTrades"],
+        "CONFIDENCE_THRESHOLD": bots_cfg["confidenceThreshold"],
+        "SCAN_INTERVAL_MINUTES": bots_cfg["scanIntervalMinutes"],
+        "ENTERTAINMENT_TICKERS": bots_cfg["tickers"],
+        "client": client_obj,
+        "allocator": allocator_obj,
+        "health": health_monitor,
+        "order_monitor": order_monitor_obj,
+        "trade_manager": trade_manager_obj,
+    }))
+
+
 def main():
     import argparse
+    build_app()
     parser = argparse.ArgumentParser(description="Entertainment markets trading bot")
     parser.add_argument("--once", action="store_true", help="Run single scan then exit")
     args = parser.parse_args()

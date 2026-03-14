@@ -14,9 +14,10 @@ Usage:
     python3 src/kalshi/cross-platform-arb.py --once    # single scan
 """
 
-import json, time, datetime, os, sys, re, argparse
+import json, time, datetime, os, sys, re, argparse, logging
 from pathlib import Path
 from difflib import SequenceMatcher
+from app_bootstrap import AppContext, install_app_context
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, TradeManager, trim_trade_log, build_market_snapshot,
@@ -28,42 +29,29 @@ from capital_allocator import PortfolioAllocator
 from probability import quarter_kelly, compute_limit_price, kalshi_fee_cents
 from singleton_lock import acquire_process_singleton
 
-setup_unbuffered()
-log = setup_logging("cross-platform-arb")
-setup_signal_handlers()
-
 # === Paths ===
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
 TRADES_PATH = PROJECT_DIR / "data" / "kalshi-arb-trades.json"
 SPREADS_LOG = PROJECT_DIR / "data" / "arb-spread-log.json"
-TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-# Load config
-bots_config = json.loads(BOTS_CONFIG_PATH.read_text())
-arb_config = bots_config.get("cross_platform_arb", {})
-
-SCAN_INTERVAL = arb_config.get("scanIntervalMinutes", 30)
-MIN_SPREAD_PCT = arb_config.get("minSpreadPct", 0.02)  # 2% minimum spread
-EXECUTION_ENABLED = arb_config.get("executionEnabled", False)  # Phase 1: monitoring only
-MAX_TRADE = arb_config.get("maxTradeAmount", 10)
-MAX_DAILY_TRADES = arb_config.get("maxDailyTrades", 10)
-MAX_DAILY_LOSS = arb_config.get("maxDailyLoss", 25)
+_APP_CONTEXT = None
+log = logging.getLogger("cross-platform-arb")
+bots_config = {}
+arb_config = {}
+SCAN_INTERVAL = 30
+MIN_SPREAD_PCT = 0.02  # 2% minimum spread
+EXECUTION_ENABLED = False  # Phase 1: monitoring only
+MAX_TRADE = 10
+MAX_DAILY_TRADES = 10
+MAX_DAILY_LOSS = 25
 
 # Polymarket fee ~2% (taker fee on CLOB); Kalshi fee is price-dependent via kalshi_fee_cents()
 POLYMARKET_FEE = 0.02
 
-client = KalshiClient()
-pm_client = PolymarketClient()
-allocator = PortfolioAllocator(client, logger=log)
-health = HealthCheckMonitor(logger=log)
-trade_manager = TradeManager(client, TRADES_PATH, {
-    "maxTradeAmount": MAX_TRADE,
-    "maxTradeAmountPct": arb_config.get("maxTradeAmountPct"),
-    "maxDailyTrades": MAX_DAILY_TRADES,
-    "maxDailyLoss": MAX_DAILY_LOSS,
-    "maxDailyLossPct": arb_config.get("maxDailyLossPct"),
-}, logger=log, bot_name="arb")
-trim_trade_log(TRADES_PATH)
+client = None
+pm_client = None
+allocator = None
+health = None
+trade_manager = None
 
 
 # === Fuzzy Matching ===
@@ -390,10 +378,64 @@ def scan_spreads():
 
 # === Entry Point ===
 
+def load_config(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    return json.loads((project_dir / "config" / "bots-config.json").read_text())
+
+
+def build_app(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    setup_unbuffered()
+    logger = setup_logging("cross-platform-arb")
+    setup_signal_handlers()
+    bots_config_path = project_dir / "config" / "bots-config.json"
+    trades_path = project_dir / "data" / "kalshi-arb-trades.json"
+    spreads_log = project_dir / "data" / "arb-spread-log.json"
+    trades_path.parent.mkdir(parents=True, exist_ok=True)
+    loaded_bots_config = load_config(project_dir)
+    loaded_arb_config = loaded_bots_config.get("cross_platform_arb", {})
+    max_trade = loaded_arb_config.get("maxTradeAmount", 10)
+    max_daily_trades = loaded_arb_config.get("maxDailyTrades", 10)
+    max_daily_loss = loaded_arb_config.get("maxDailyLoss", 25)
+    client_obj = KalshiClient()
+    polymarket_client = PolymarketClient()
+    allocator_obj = PortfolioAllocator(client_obj, logger=logger)
+    health_monitor = HealthCheckMonitor(logger=logger)
+    trade_manager_obj = TradeManager(client_obj, trades_path, {
+        "maxTradeAmount": max_trade,
+        "maxTradeAmountPct": loaded_arb_config.get("maxTradeAmountPct"),
+        "maxDailyTrades": max_daily_trades,
+        "maxDailyLoss": max_daily_loss,
+        "maxDailyLossPct": loaded_arb_config.get("maxDailyLossPct"),
+    }, logger=logger, bot_name="arb")
+    trim_trade_log(trades_path)
+    return install_app_context(globals(), AppContext({
+        "PROJECT_DIR": project_dir,
+        "BOTS_CONFIG_PATH": bots_config_path,
+        "TRADES_PATH": trades_path,
+        "SPREADS_LOG": spreads_log,
+        "log": logger,
+        "bots_config": loaded_bots_config,
+        "arb_config": loaded_arb_config,
+        "SCAN_INTERVAL": loaded_arb_config.get("scanIntervalMinutes", 30),
+        "MIN_SPREAD_PCT": loaded_arb_config.get("minSpreadPct", 0.02),
+        "EXECUTION_ENABLED": loaded_arb_config.get("executionEnabled", False),
+        "MAX_TRADE": max_trade,
+        "MAX_DAILY_TRADES": max_daily_trades,
+        "MAX_DAILY_LOSS": max_daily_loss,
+        "client": client_obj,
+        "pm_client": polymarket_client,
+        "allocator": allocator_obj,
+        "health": health_monitor,
+        "trade_manager": trade_manager_obj,
+    }))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Kalshi Cross-Platform Arbitrage Monitor")
     parser.add_argument("--once", action="store_true", help="Run single scan and exit")
     args = parser.parse_args()
+    build_app()
 
     if not acquire_process_singleton("arb", PROJECT_DIR, log, display_name="cross-platform-arb"):
         log.warning("Duplicate cross-platform-arb launch blocked; exiting.")

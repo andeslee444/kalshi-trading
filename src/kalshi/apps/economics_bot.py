@@ -15,6 +15,7 @@ import json, time, datetime, os, sys, re, argparse, math
 import requests
 from bs4 import BeautifulSoup
 from pathlib import Path
+from app_bootstrap import AppContext, install_app_context
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot,
@@ -35,25 +36,19 @@ try:
 except ImportError:
     MacroEngine = None
 
-setup_unbuffered()
-log = setup_logging("economics")
-setup_signal_handlers()
-
 # === Paths ===
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
 TRADES_PATH = PROJECT_DIR / "data" / "kalshi-economics-trades.json"
-TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-# Load config
-bots_config = json.loads(BOTS_CONFIG_PATH.read_text())
-econ_config = bots_config.get("economics", {})
-
-MAX_TRADE = econ_config.get("maxTradeAmount", 15)
-MAX_DAILY_TRADES = econ_config.get("maxDailyTrades", 5)
-MAX_DAILY_LOSS = econ_config.get("maxDailyLoss", 30)
-SCAN_INTERVAL = econ_config.get("scanIntervalMinutes", 360)
-EDGE_THRESHOLD = econ_config.get("edgeThreshold", 0.08)
-GAS_EDGE_THRESHOLD = econ_config.get("gasEdgeThreshold", 0.04)
+_APP_CONTEXT = None
+log = None
+bots_config = {}
+econ_config = {}
+MAX_TRADE = 15
+MAX_DAILY_TRADES = 5
+MAX_DAILY_LOSS = 30
+SCAN_INTERVAL = 360
+EDGE_THRESHOLD = 0.08
+GAS_EDGE_THRESHOLD = 0.04
 
 
 def _horizon_edge_threshold(days_to_release, base=None):
@@ -89,19 +84,12 @@ def _adaptive_scan_interval(days_to_release=None):
     return SCAN_INTERVAL
 
 
-client = KalshiClient()
-allocator = PortfolioAllocator(client, logger=log)
-health = HealthCheckMonitor(logger=log)
-macro = MacroEngine(config=econ_config.get("macro", {})) if MacroEngine else None
-order_monitor = OrderMonitor(client, log=log)
-trade_manager = TradeManager(client, TRADES_PATH, {
-    "maxTradeAmount": MAX_TRADE,
-    "maxTradeAmountPct": econ_config.get("maxTradeAmountPct"),
-    "maxDailyTrades": MAX_DAILY_TRADES,
-    "maxDailyLoss": MAX_DAILY_LOSS,
-    "maxDailyLossPct": econ_config.get("maxDailyLossPct"),
-}, logger=log, order_monitor=order_monitor, bot_name="economics")
-trim_trade_log(TRADES_PATH)
+client = None
+allocator = None
+health = None
+macro = None
+order_monitor = None
+trade_manager = None
 
 def _classify_econ_market(ticker):
     """Classify economics market type from ticker."""
@@ -1422,10 +1410,64 @@ def _estimate_nearest_release_days():
 
 # === Entry Point ===
 
+def load_config(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    return json.loads((project_dir / "config" / "bots-config.json").read_text())
+
+
+def build_app(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    setup_unbuffered()
+    logger = setup_logging("economics")
+    setup_signal_handlers()
+    bots_config_path = project_dir / "config" / "bots-config.json"
+    trades_path = project_dir / "data" / "kalshi-economics-trades.json"
+    trades_path.parent.mkdir(parents=True, exist_ok=True)
+    loaded_bots_config = load_config(project_dir)
+    loaded_econ_config = loaded_bots_config.get("economics", {})
+    max_trade = loaded_econ_config.get("maxTradeAmount", 15)
+    max_daily_trades = loaded_econ_config.get("maxDailyTrades", 5)
+    max_daily_loss = loaded_econ_config.get("maxDailyLoss", 30)
+    client_obj = KalshiClient()
+    allocator_obj = PortfolioAllocator(client_obj, logger=logger)
+    health_monitor = HealthCheckMonitor(logger=logger)
+    macro_engine = MacroEngine(config=loaded_econ_config.get("macro", {})) if MacroEngine else None
+    order_monitor_obj = OrderMonitor(client_obj, log=logger)
+    trade_manager_obj = TradeManager(client_obj, trades_path, {
+        "maxTradeAmount": max_trade,
+        "maxTradeAmountPct": loaded_econ_config.get("maxTradeAmountPct"),
+        "maxDailyTrades": max_daily_trades,
+        "maxDailyLoss": max_daily_loss,
+        "maxDailyLossPct": loaded_econ_config.get("maxDailyLossPct"),
+    }, logger=logger, order_monitor=order_monitor_obj, bot_name="economics")
+    trim_trade_log(trades_path)
+    return install_app_context(globals(), AppContext({
+        "PROJECT_DIR": project_dir,
+        "BOTS_CONFIG_PATH": bots_config_path,
+        "TRADES_PATH": trades_path,
+        "log": logger,
+        "bots_config": loaded_bots_config,
+        "econ_config": loaded_econ_config,
+        "MAX_TRADE": max_trade,
+        "MAX_DAILY_TRADES": max_daily_trades,
+        "MAX_DAILY_LOSS": max_daily_loss,
+        "SCAN_INTERVAL": loaded_econ_config.get("scanIntervalMinutes", 360),
+        "EDGE_THRESHOLD": loaded_econ_config.get("edgeThreshold", 0.08),
+        "GAS_EDGE_THRESHOLD": loaded_econ_config.get("gasEdgeThreshold", 0.04),
+        "client": client_obj,
+        "allocator": allocator_obj,
+        "health": health_monitor,
+        "macro": macro_engine,
+        "order_monitor": order_monitor_obj,
+        "trade_manager": trade_manager_obj,
+    }))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Kalshi Economics Bot")
     parser.add_argument("--once", action="store_true", help="Run single scan and exit")
     args = parser.parse_args()
+    build_app()
 
     if not acquire_process_singleton("economics", PROJECT_DIR, log):
         log.warning("Duplicate economics launch blocked; exiting.")

@@ -22,6 +22,7 @@ Kalshi KXALBUMSALES markets settle directly on the HDD Hits Top 50
 import json, time, datetime, os, sys, re
 import requests
 from pathlib import Path
+from app_bootstrap import AppContext, install_app_context
 from kalshi_auth import (
     KalshiClient,
     HealthCheckMonitor,
@@ -41,23 +42,14 @@ from hdd_parser import (
 )
 from singleton_lock import acquire_process_singleton
 
-# Unbuffered output
-setup_unbuffered()
-setup_signal_handlers()
-log = setup_logging("hdd-scraper")
-
 # === Paths ===
 DATA_DIR = PROJECT_DIR / "data"
 SNAPSHOTS_DIR = DATA_DIR / "kalshi-source-snapshots" / "hdd"
 ARTICLES_PATH = DATA_DIR / "hdd-articles.json"
-
-# Ensure dirs
-SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-# === Kalshi Client ===
-client = KalshiClient()
-health = HealthCheckMonitor(logger=log)
+_APP_CONTEXT = None
+log = None
+client = None
+health = None
 
 
 # ============================================================
@@ -411,8 +403,32 @@ def monitor_loop(interval_minutes: int = 15):
 # CLI
 # ============================================================
 
+def build_app(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    setup_unbuffered()
+    setup_signal_handlers()
+    logger = setup_logging("hdd-scraper")
+    data_dir = project_dir / "data"
+    snapshots_dir = data_dir / "kalshi-source-snapshots" / "hdd"
+    articles_path = data_dir / "hdd-articles.json"
+    snapshots_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    client_obj = KalshiClient()
+    health_monitor = HealthCheckMonitor(logger=logger)
+    return install_app_context(globals(), AppContext({
+        "PROJECT_DIR": project_dir,
+        "DATA_DIR": data_dir,
+        "SNAPSHOTS_DIR": snapshots_dir,
+        "ARTICLES_PATH": articles_path,
+        "log": logger,
+        "client": client_obj,
+        "health": health_monitor,
+    }))
+
+
 def main(argv=None):
     import argparse
+    build_app()
     parser = argparse.ArgumentParser(description="HDD Scraper for Kalshi Arbitrage")
     parser.add_argument("command", nargs="?", default="scan",
                        choices=["scan", "monitor", "charts", "articles", "markets"],

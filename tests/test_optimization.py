@@ -1870,6 +1870,7 @@ class TestSettlementAwareCleanup:
         )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
+        mod.build_app(project_dir=fake_auth.PROJECT_DIR)
 
         # Restore original modules
         for mod_name in ("kalshi_auth", "probability", "capital_allocator"):

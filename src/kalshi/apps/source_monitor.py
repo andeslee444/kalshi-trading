@@ -12,6 +12,7 @@ Sources:
 import json, time, datetime, os, sys, re, hashlib
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from app_bootstrap import AppContext, install_app_context
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, quarter_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, nws_sigma_for_hour
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
@@ -19,35 +20,19 @@ from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_thre
 from capital_allocator import PortfolioAllocator
 from singleton_lock import acquire_process_singleton
 
-setup_unbuffered()
-log = setup_logging("source-monitor")
-setup_signal_handlers()
-
 # === Paths ===
 CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-monitor-config.json"
 TRADES_PATH = PROJECT_DIR / "data" / "kalshi-monitor-trades.json"
 SNAPSHOTS_DIR = PROJECT_DIR / "data" / "kalshi-source-snapshots"
 METRICS_PATH = PROJECT_DIR / "data" / "source-monitor-metrics.json"
-
-# Ensure dirs
-TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
-SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-
-# Load config
-config = json.loads(CONFIG_PATH.read_text())
-
-client = KalshiClient()
-allocator = PortfolioAllocator(client, logger=log)
-health = HealthCheckMonitor(logger=log)
-order_monitor = OrderMonitor(client, log=log)
-trade_manager = TradeManager(client, TRADES_PATH, {
-    "maxTradeAmount": config["maxTradeAmount"],
-    "maxTradeAmountPct": config.get("maxTradeAmountPct"),
-    "maxDailyTrades": config["maxDailyTrades"],
-    "maxDailyLoss": config["maxDailyLoss"],
-    "maxDailyLossPct": config.get("maxDailyLossPct"),
-}, logger=log, order_monitor=order_monitor, bot_name="source-monitor")
-trim_trade_log(TRADES_PATH)
+_APP_CONTEXT = None
+log = None
+config = {}
+client = None
+allocator = None
+health = None
+order_monitor = None
+trade_manager = None
 
 def save_snapshot(source_name, content, ext="html"):
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1202,8 +1187,54 @@ def _nws_interval_seconds(config):
 # MAIN LOOP
 # ============================================================
 
+def load_config(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    return json.loads((project_dir / "config" / "kalshi-monitor-config.json").read_text())
+
+
+def build_app(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    setup_unbuffered()
+    logger = setup_logging("source-monitor")
+    setup_signal_handlers()
+    config_path = project_dir / "config" / "kalshi-monitor-config.json"
+    trades_path = project_dir / "data" / "kalshi-monitor-trades.json"
+    snapshots_dir = project_dir / "data" / "kalshi-source-snapshots"
+    metrics_path = project_dir / "data" / "source-monitor-metrics.json"
+    trades_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshots_dir.mkdir(parents=True, exist_ok=True)
+    loaded_config = load_config(project_dir)
+    client_obj = KalshiClient()
+    allocator_obj = PortfolioAllocator(client_obj, logger=logger)
+    health_monitor = HealthCheckMonitor(logger=logger)
+    order_monitor_obj = OrderMonitor(client_obj, log=logger)
+    trade_manager_obj = TradeManager(client_obj, trades_path, {
+        "maxTradeAmount": loaded_config["maxTradeAmount"],
+        "maxTradeAmountPct": loaded_config.get("maxTradeAmountPct"),
+        "maxDailyTrades": loaded_config["maxDailyTrades"],
+        "maxDailyLoss": loaded_config["maxDailyLoss"],
+        "maxDailyLossPct": loaded_config.get("maxDailyLossPct"),
+    }, logger=logger, order_monitor=order_monitor_obj, bot_name="source-monitor")
+    trim_trade_log(trades_path)
+    return install_app_context(globals(), AppContext({
+        "PROJECT_DIR": project_dir,
+        "CONFIG_PATH": config_path,
+        "TRADES_PATH": trades_path,
+        "SNAPSHOTS_DIR": snapshots_dir,
+        "METRICS_PATH": metrics_path,
+        "log": logger,
+        "config": loaded_config,
+        "client": client_obj,
+        "allocator": allocator_obj,
+        "health": health_monitor,
+        "order_monitor": order_monitor_obj,
+        "trade_manager": trade_manager_obj,
+    }))
+
+
 def main():
     import argparse
+    build_app()
     parser = argparse.ArgumentParser(description="Settlement source monitor (info arbitrage)")
     parser.add_argument("--once", action="store_true", help="Run single scan of all sources then exit")
     args = parser.parse_args()
