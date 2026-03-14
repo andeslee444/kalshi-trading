@@ -24,12 +24,13 @@ from cryptography.hazmat.backends import default_backend
 from dotenv import load_dotenv
 
 from artifact_contracts import normalize_health_state, normalize_health_summary
-from event_ledger import get_event_ledger
 from storage import (
-    DecisionStore,
     MetricsStore,
     TradeStore,
     atomic_write_json as storage_atomic_write_json,
+    load_trades as storage_load_trades,
+    save_decision as storage_save_decision,
+    save_trade as storage_save_trade,
 )
 
 # === Constants ===
@@ -497,7 +498,7 @@ class KalshiClient:
 
 def load_trades(trades_path: Path) -> list:
     """Load trades from a JSON file. Returns [] on missing/corrupt file."""
-    return TradeStore(trades_path, logger=_log).load()
+    return storage_load_trades(trades_path, logger=_log)
 
 
 def atomic_write_json(path: Path, data):
@@ -510,11 +511,7 @@ _atomic_write_json = atomic_write_json
 
 def save_trade(trades_path: Path, trade: dict):
     """Append a trade to a JSON trades file (atomic write with file lock)."""
-    TradeStore(trades_path, logger=_log).append(trade)
-    try:
-        get_event_ledger(logger=_log).record_order_submitted(trade, source_path=trades_path)
-    except Exception as e:
-        _log.warning("Failed to dual-write trade to event ledger: %s", e)
+    storage_save_trade(trades_path, trade, logger=_log)
 
 
 # === Shared market data cache ===
@@ -1794,14 +1791,7 @@ def save_decision(decisions_path: Path, decision: dict):
 
     Uses fcntl.LOCK_EX to prevent concurrent writes from multiple bots.
     """
-    try:
-        DecisionStore(decisions_path, logger=_log).append(decision)
-        try:
-            get_event_ledger(logger=_log).record_trade_decision(decision, source_path=decisions_path)
-        except Exception as e:
-            _log.warning("Failed to dual-write decision to event ledger: %s", e)
-    except Exception as e:
-        _log.warning("Failed to save decision: %s", e)
+    storage_save_decision(decisions_path, decision, logger=_log)
 
 
 # === Notification ===

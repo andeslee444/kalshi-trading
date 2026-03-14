@@ -1,4 +1,4 @@
-"""Phase 3 storage adapters that preserve the current JSON artifacts."""
+"""Storage helpers that preserve the current JSON artifacts and append flows."""
 
 from __future__ import annotations
 
@@ -232,6 +232,44 @@ class MetricsStore(_RecordListStore):
         )
 
 
+def load_trades(trades_path: Path, logger=None) -> list:
+    """Load trades from a JSON file. Returns [] on missing/corrupt file."""
+    return TradeStore(trades_path, logger=logger or _log).load()
+
+
+def save_trade(trades_path: Path, trade: dict, logger=None):
+    """Append a trade to a JSON trades file and dual-write to the ledger."""
+    log = logger or _log
+    TradeStore(trades_path, logger=log).append(trade)
+    try:
+        from event_ledger import get_event_ledger
+
+        get_event_ledger(logger=log).record_order_submitted(
+            trade,
+            source_path=trades_path,
+        )
+    except Exception as e:
+        log.warning("Failed to dual-write trade to event ledger: %s", e)
+
+
+def save_decision(decisions_path: Path, decision: dict, logger=None):
+    """Append a decision to the decisions log and dual-write to the ledger."""
+    log = logger or _log
+    try:
+        DecisionStore(decisions_path, logger=log).append(decision)
+        try:
+            from event_ledger import get_event_ledger
+
+            get_event_ledger(logger=log).record_trade_decision(
+                decision,
+                source_path=decisions_path,
+            )
+        except Exception as e:
+            log.warning("Failed to dual-write decision to event ledger: %s", e)
+    except Exception as e:
+        log.warning("Failed to save decision: %s", e)
+
+
 __all__ = [
     "DecisionStore",
     "MetricsStore",
@@ -239,4 +277,7 @@ __all__ = [
     "StateStore",
     "TradeStore",
     "atomic_write_json",
+    "load_trades",
+    "save_decision",
+    "save_trade",
 ]
