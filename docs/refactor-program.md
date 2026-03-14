@@ -1,7 +1,7 @@
 # Refactor Program
 
 Generated: 2026-03-14
-Status: Active. Phases 0, 1, 2, and 3 complete on 2026-03-14.
+Status: Active. Phases 0, 1, 2, and 3 complete on 2026-03-14. Phase 4 implementation is complete on 2026-03-14; parity observation is now pending.
 
 This program is optimized for three goals:
 
@@ -209,6 +209,8 @@ Estimated size:
 ## Phase 4: Add A Canonical Event Ledger
 
 Objective: create one source of truth for research, audit, and ops.
+
+Status: implementation complete on 2026-03-14. The 2-week parity observation window starts after rollout.
 
 Recommended first implementation:
 

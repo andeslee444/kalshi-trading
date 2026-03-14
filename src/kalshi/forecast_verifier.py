@@ -17,6 +17,7 @@ from artifact_contracts import (
     WEATHER_VERIFICATION_SCHEMA_VERSION,
     normalize_verification_state,
 )
+from event_ledger import get_event_ledger
 from storage import StateStore
 from weather_data import SettlementTemperatureFetcher
 
@@ -69,6 +70,7 @@ class ForecastVerifier:
         self.state_path = Path(state_path)
         self.log = logger or _log
         self._settlement_fetcher = SettlementTemperatureFetcher(logger=self.log)
+        self._ledger = get_event_ledger(logger=self.log)
         self._state_store = StateStore(
             self.state_path,
             logger=self.log,
@@ -130,6 +132,14 @@ class ForecastVerifier:
             if self._record_identity(p) != record_id
         ]
         self.state["pending"].append(record)
+        try:
+            self._ledger.record_forecast_snapshot(
+                record,
+                source_path=self.state_path,
+                category="weather_forecast",
+            )
+        except Exception as e:
+            self.log.warning("Failed to dual-write forecast snapshot: %s", e)
 
     def verify_past_forecasts(self, city_coords=None, station_map=None):
         """Check forecasts from 2+ days ago against actual temperatures.
@@ -239,6 +249,14 @@ class ForecastVerifier:
                 verified_record["hour_of_day"] = record["hour_of_day"]
 
             verified_this_scan.append(verified_record)
+            try:
+                self._ledger.record_verification_result(
+                    verified_record,
+                    source_path=self.state_path,
+                    category="weather_verification",
+                )
+            except Exception as e:
+                self.log.warning("Failed to dual-write verification result: %s", e)
 
         self.state["pending"] = remaining
         self.state["verified"].extend(verified_this_scan)
@@ -754,6 +772,14 @@ class NWSCrossCheckVerifier(ForecastVerifier):
             if self._comparison_identity(existing) != record_id
         ]
         self.state["pending"].append(record)
+        try:
+            self._ledger.record_forecast_snapshot(
+                record,
+                source_path=self.state_path,
+                category="weather_nws_crosscheck_snapshot",
+            )
+        except Exception as e:
+            self.log.warning("Failed to dual-write NWS cross-check snapshot: %s", e)
 
     def verify_past_comparisons(self, station_map=None, max_calls=5):
         """Resolve older cross-check records against settlement actual highs."""
@@ -823,6 +849,14 @@ class NWSCrossCheckVerifier(ForecastVerifier):
             )
             verified_record["verified_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             verified_this_scan.append(verified_record)
+            try:
+                self._ledger.record_verification_result(
+                    verified_record,
+                    source_path=self.state_path,
+                    category="weather_nws_crosscheck",
+                )
+            except Exception as e:
+                self.log.warning("Failed to dual-write NWS cross-check verification: %s", e)
 
         self.state["pending"] = remaining
         self.state["verified"].extend(verified_this_scan)

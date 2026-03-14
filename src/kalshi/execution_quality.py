@@ -15,6 +15,7 @@ import json
 import logging
 from pathlib import Path
 
+from event_ledger import get_event_ledger
 from pnl_attribution import _load_trades_safe
 
 log = logging.getLogger("execution-quality")
@@ -23,14 +24,20 @@ log = logging.getLogger("execution-quality")
 class ExecutionAnalyzer:
     """Compute execution quality metrics from trade records."""
 
-    def __init__(self, trade_file_paths=None):
+    def __init__(self, trade_file_paths=None, ledger_path=None):
         self._trade_file_paths = trade_file_paths
+        self._ledger_path = ledger_path
         self._trades = []
 
     def load_trades(self, trades=None):
         """Load trades from files or accept pre-loaded list."""
         if trades is not None:
             self._trades = list(trades)
+        elif self._ledger_path and self._trade_file_paths:
+            ledger = get_event_ledger(path=self._ledger_path, logger=log)
+            self._trades = []
+            for tf in self._trade_file_paths:
+                self._trades.extend(ledger.get_trade_records(tf["path"]))
         elif self._trade_file_paths:
             self._trades = []
             for tf in self._trade_file_paths:

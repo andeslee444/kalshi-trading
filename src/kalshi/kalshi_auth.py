@@ -24,6 +24,7 @@ from cryptography.hazmat.backends import default_backend
 from dotenv import load_dotenv
 
 from artifact_contracts import normalize_health_state, normalize_health_summary
+from event_ledger import get_event_ledger
 from storage import (
     DecisionStore,
     MetricsStore,
@@ -510,6 +511,10 @@ _atomic_write_json = atomic_write_json
 def save_trade(trades_path: Path, trade: dict):
     """Append a trade to a JSON trades file (atomic write with file lock)."""
     TradeStore(trades_path, logger=_log).append(trade)
+    try:
+        get_event_ledger(logger=_log).record_order_submitted(trade, source_path=trades_path)
+    except Exception as e:
+        _log.warning("Failed to dual-write trade to event ledger: %s", e)
 
 
 # === Shared market data cache ===
@@ -1791,6 +1796,10 @@ def save_decision(decisions_path: Path, decision: dict):
     """
     try:
         DecisionStore(decisions_path, logger=_log).append(decision)
+        try:
+            get_event_ledger(logger=_log).record_trade_decision(decision, source_path=decisions_path)
+        except Exception as e:
+            _log.warning("Failed to dual-write decision to event ledger: %s", e)
     except Exception as e:
         _log.warning("Failed to save decision: %s", e)
 
