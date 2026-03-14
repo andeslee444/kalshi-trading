@@ -30,12 +30,12 @@
     "default": {
       "buckets": {
         "1-5": {
-          "wins": 502,
+          "wins": 460,
           "losses": 74
         },
         "6-10": {
-          "wins": 2911,
-          "losses": 1368
+          "wins": 2680,
+          "losses": 1263
         },
         "11-15": {
           "wins": 0,
@@ -56,8 +56,8 @@
     "crypto": {
       "buckets": {
         "1-5": {
-          "wins": 30,
-          "losses": 8
+          "wins": 15,
+          "losses": 2
         },
         "6-10": {
           "wins": 0,
@@ -135,11 +135,11 @@
       "buckets": {
         "1-5": {
           "wins": 0,
-          "losses": 43
+          "losses": 22
         },
         "6-10": {
-          "wins": 35,
-          "losses": 51
+          "wins": 20,
+          "losses": 24
         },
         "11-15": {
           "wins": 0,
