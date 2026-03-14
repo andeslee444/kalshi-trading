@@ -642,7 +642,39 @@ def ensemble_spread_sigma_multiplier(spread_f):
     return min(raw, 2.5)  # Cap at 2.5x
 
 
-def compute_adaptive_ensemble_weights(verification_data, default_weights=None):
+def _blend_weight_maps(default_weights, adaptive_weights, alpha):
+    """Blend adaptive weights back toward defaults when sample support is thin."""
+    alpha = max(0.0, min(1.0, alpha))
+    if alpha <= 0:
+        return dict(default_weights)
+    if alpha >= 1:
+        return dict(adaptive_weights)
+
+    merged = {}
+    for model_name in set(default_weights) | set(adaptive_weights):
+        merged[model_name] = (
+            (1.0 - alpha) * default_weights.get(model_name, 0.0)
+            + alpha * adaptive_weights.get(model_name, 0.0)
+        )
+    normalized = _normalize_weights(merged)
+    return normalized or dict(default_weights)
+
+
+def _adaptive_sample_confidence(model_payload, source):
+    """Estimate how much trust to place in adaptive weights from recent samples."""
+    pending_market_n = max(0, int(model_payload.get("pending_market_n", 0) or 0))
+    pending_snapshot_n = max(0, int(model_payload.get("pending_snapshot_n", 0) or 0))
+    if source == "brier":
+        resolved = max(0, int(model_payload.get("market_n", 0) or len(model_payload.get("brier_predictions", []))))
+        effective = resolved + 0.10 * min(pending_market_n, 50)
+        return min(1.0, effective / 40.0)
+
+    resolved = max(0, int(model_payload.get("n", 0) or 0))
+    effective = resolved + 0.05 * min(pending_snapshot_n, 50) + 0.10 * min(pending_market_n, 50)
+    return min(1.0, effective / 60.0)
+
+
+def compute_adaptive_ensemble_weights(verification_data, default_weights=None, return_details=False):
     """Compute model weights from recent forecast verification data.
 
     Uses inverse-Brier weighting when threshold-specific probabilities are
@@ -656,13 +688,24 @@ def compute_adaptive_ensemble_weights(verification_data, default_weights=None):
             verification data is insufficient.
 
     Returns:
-        dict of {model_name: weight} summing to 1.0.
+        dict of {model_name: weight} summing to 1.0, or ``(weights, details)``
+        if ``return_details=True``.
     """
     if default_weights is None:
         default_weights = {"gfs": 0.40, "ecmwf": 0.40, "icon": 0.20}
 
+    def _finalize(weights, method, blend_alpha, sample_confidence):
+        details = {
+            "method": method,
+            "blend_alpha": round(blend_alpha, 4),
+            "sample_confidence": round(sample_confidence, 4),
+        }
+        if return_details:
+            return weights, details
+        return weights
+
     if not verification_data:
-        return default_weights
+        return _finalize(default_weights, "default", 0.0, 0.0)
 
     # Compute Brier score per model when threshold-specific probabilities are available
     model_briers = {}
@@ -686,15 +729,29 @@ def compute_adaptive_ensemble_weights(verification_data, default_weights=None):
             if isinstance(mae, (int, float)) and mae > 0 and n >= min_mae_samples:
                 model_maes[model_name] = mae
         if len(model_maes) < 2:
-            return default_weights
+            return _finalize(default_weights, "default", 0.0, 0.0)
         inv_mae = {m: 1.0 / mae for m, mae in model_maes.items()}
         total = sum(inv_mae.values())
-        return {m: w / total for m, w in inv_mae.items()}
+        adaptive_weights = {m: w / total for m, w in inv_mae.items()}
+        confidences = [
+            _adaptive_sample_confidence(verification_data[m], "mae")
+            for m in adaptive_weights
+        ]
+        blend_alpha = sum(confidences) / len(confidences) if confidences else 0.0
+        weights = _blend_weight_maps(default_weights, adaptive_weights, blend_alpha)
+        return _finalize(weights, "inverse_mae", blend_alpha, blend_alpha)
 
     # Inverse-Brier weighting
     inv_brier = {m: 1.0 / b for m, b in model_briers.items()}
     total = sum(inv_brier.values())
-    return {m: w / total for m, w in inv_brier.items()}
+    adaptive_weights = {m: w / total for m, w in inv_brier.items()}
+    confidences = [
+        _adaptive_sample_confidence(verification_data[m], "brier")
+        for m in adaptive_weights
+    ]
+    blend_alpha = sum(confidences) / len(confidences) if confidences else 0.0
+    weights = _blend_weight_maps(default_weights, adaptive_weights, blend_alpha)
+    return _finalize(weights, "inverse_brier", blend_alpha, blend_alpha)
 
 
 def ensemble_disagreement_score(model_probs):
@@ -764,8 +821,13 @@ def ensemble_weather_probability_v2(forecasts, threshold, direction, days_out=0,
             ensemble_cal,
             static_weights=static_weights,
         )
-        weights = compute_adaptive_ensemble_weights(verification_data, default_weights=defaults)
+        weights, adaptive_details = compute_adaptive_ensemble_weights(
+            verification_data,
+            default_weights=defaults,
+            return_details=True,
+        )
     else:
+        adaptive_details = {"method": "static", "blend_alpha": 0.0, "sample_confidence": 0.0}
         brier_data = _load_backtest_brier()
         if brier_data:
             inv_brier = {}
@@ -775,6 +837,7 @@ def ensemble_weather_probability_v2(forecasts, threshold, direction, days_out=0,
             if len(inv_brier) >= 2:
                 total_inv = sum(inv_brier.values())
                 weights = {k: v / total_inv for k, v in inv_brier.items()}
+                adaptive_details = {"method": "backtest_brier", "blend_alpha": 1.0, "sample_confidence": 1.0}
             else:
                 brier_data = None
 
@@ -838,14 +901,16 @@ def ensemble_weather_probability_v2(forecasts, threshold, direction, days_out=0,
     )
 
     if return_details:
-        return (final_prob, {
-            "center_temp": center_temp,
-            "disagreement_score": disagreement,
-            "method": "parametric_ensemble_v2",
-            "weights_used": {k: v for k, v in weights.items() if k in per_model_probs},
-            "per_model_probs": per_model_probs,
-            "sigma_used": sigma_used,
-        })
+            return (final_prob, {
+                "center_temp": center_temp,
+                "disagreement_score": disagreement,
+                "method": "parametric_ensemble_v2",
+                "weights_used": {k: v for k, v in weights.items() if k in per_model_probs},
+                "per_model_probs": per_model_probs,
+                "sigma_used": sigma_used,
+                "weight_method": adaptive_details.get("method", "static"),
+                "verification_confidence": adaptive_details.get("sample_confidence", 0.0),
+            })
     return final_prob
 
 
@@ -1452,6 +1517,10 @@ def crypto_price_probability_heston(
     from scipy import integrate
 
     T = time_horizon_minutes / (365.25 * 24 * 60)
+    if current_price <= 0 or threshold <= 0:
+        if direction == "above":
+            return 0.999 if current_price > threshold else 0.001
+        return 0.999 if current_price < threshold else 0.001
     if T <= 0:
         if direction == "above":
             return 0.999 if current_price > threshold else 0.001

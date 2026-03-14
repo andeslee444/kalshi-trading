@@ -164,27 +164,18 @@ def parse_crypto_ticker(ticker):
             "market_type": market_type,
         }
 
-    m = re.match(r"KX(BTC|ETH|SOL|DOGE|XRP|CRYPTO)(\w*)-(\d{2})([A-Z]{3})(\d{2,4})-([TB])([\d.]+)", ticker)
+    m = re.match(r"KX(BTC|ETH|SOL|DOGE|XRP)(?:([DEY]))?-(\d{2})([A-Z]{3})(\d{2,4})-([TB])([\d.]+)", ticker)
+    if not m:
+        m = re.match(r"KX(CRYPTO)(\w*)-(\d{2})([A-Z]{3})(\d{2,4})-([TB])([\d.]+)", ticker)
     if not m:
         # Try simpler format without date
-        m2 = re.match(r"KX(BTC|ETH|SOL|DOGE|XRP).*-([TB])([\d.]+)$", ticker)
+        m2 = re.match(r"KX(BTC|ETH|SOL|DOGE|XRP)(?:[DEY])?(?:-[^-]+)*-([TB])([\d.]+)$", ticker)
         if m2:
             return {
                 "asset": m2.group(1),
                 "date": None,
                 "direction": m2.group(2),
                 "threshold": float(m2.group(3)),
-                "market_type": None,
-            }
-        # Try bare threshold format (no T/B prefix): KXBTCMAXMON-BTC-26MAR31-8750000
-        # This is already handled above, but catch any remaining unmatched crypto tickers
-        m3 = re.match(r"KX(BTC|ETH|SOL|DOGE|XRP)\w*-.*?-(\d+\.?\d*)$", ticker)
-        if m3:
-            return {
-                "asset": m3.group(1),
-                "date": None,
-                "direction": "T",
-                "threshold": float(m3.group(2)),
                 "market_type": None,
             }
         return None

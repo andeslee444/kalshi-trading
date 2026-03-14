@@ -25,6 +25,7 @@ import pytest
 from unittest.mock import MagicMock
 from pathlib import Path
 
+from artifact_contracts import ALLOCATOR_STATE_ARTIFACT
 from probability import (
     longshot_edge,
     classify_ticker_category,
@@ -1580,6 +1581,8 @@ class TestAllocatorSharedState:
 
         state_path = tmp_path / "allocator-state.json"
         data = json.loads(state_path.read_text())
+        assert data["artifact_type"] == ALLOCATOR_STATE_ARTIFACT
+        assert data["schema_version"] == 1
         assert "TICK-1" in data["traded_tickers"]
         assert data["bot_spend"]["weather"] == 500
 
@@ -1867,6 +1870,7 @@ class TestSettlementAwareCleanup:
         )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
+        mod.build_app(project_dir=fake_auth.PROJECT_DIR)
 
         # Restore original modules
         for mod_name in ("kalshi_auth", "probability", "capital_allocator"):

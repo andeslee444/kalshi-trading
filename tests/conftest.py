@@ -65,6 +65,8 @@ def make_fake_auth(**overrides):
     mod.retry_request = MagicMock(return_value=None)
     mod.notify_whatsapp = MagicMock()
     mod.notify_webhook = MagicMock()
+    mod.normalize_market = MagicMock(side_effect=lambda market: market)
+    mod.normalize_markets = MagicMock(side_effect=lambda markets: markets)
 
     # Constants
     mod.PROJECT_DIR = PROJECT_DIR
@@ -79,13 +81,14 @@ def make_fake_auth(**overrides):
     return mod
 
 
-def load_bot_module(bot_filename, fake_auth=None, extra_stubs=None):
+def load_bot_module(bot_filename, fake_auth=None, extra_stubs=None, initialize=True):
     """Load a hyphenated bot module (e.g., 'weather-bot.py') with fake kalshi_auth.
 
     Args:
         bot_filename: e.g., 'weather-bot.py'
         fake_auth: Optional pre-configured fake_auth module. If None, creates default.
         extra_stubs: Optional dict of {module_name: fake_module} for additional stubs.
+        initialize: If True, call ``build_app()`` after import when available.
 
     Returns:
         The loaded bot module.
@@ -111,6 +114,9 @@ def load_bot_module(bot_filename, fake_auth=None, extra_stubs=None):
         )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
+        if initialize and hasattr(mod, "build_app"):
+            project_dir = getattr(fake_auth, "PROJECT_DIR", None)
+            mod.build_app(project_dir=project_dir)
         return mod
     finally:
         for mod_name, original in saved_modules.items():

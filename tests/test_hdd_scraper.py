@@ -53,6 +53,7 @@ def _load_module(tmp_path):
         spec = importlib.util.spec_from_file_location("hdd_scraper_test_mod", str(MODULE_PATH))
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        module.build_app(project_dir=tmp_path)
 
     return module, mock_auth, mock_singleton
 

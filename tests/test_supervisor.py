@@ -14,6 +14,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
+from artifact_contracts import SUPERVISOR_STATE_ARTIFACT
+
 import importlib.util
 spec = importlib.util.spec_from_file_location(
     "supervisor",
@@ -307,6 +309,8 @@ class TestStatePersistence:
             sup._save_state()
 
         data = json.loads(state_file.read_text())
+        assert data["artifact_type"] == SUPERVISOR_STATE_ARTIFACT
+        assert data["schema_version"] == 1
         assert data["weather"]["started_at"] == started
         assert data["weather"]["restart_count"] == 2
 

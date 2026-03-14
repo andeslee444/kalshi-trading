@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from artifact_contracts import FINANCIAL_SNAPSHOT_ARTIFACT, FINANCIAL_SNAPSHOT_REQUIRED_FIELDS
+
 # Load pnl-snapshot.py (hyphenated filename) as pnl_snapshot module
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 _spec = importlib.util.spec_from_file_location(
@@ -386,13 +388,9 @@ class TestBuildSnapshot:
             local_trades=SAMPLE_LOCAL_TRADES,
             deposits_path=None,
         )
-        assert "generated_at" in snapshot
-        assert "sources_used" in snapshot
-        assert "account" in snapshot
-        assert "realized_pnl" in snapshot
-        assert "unrealized_pnl" in snapshot
-        assert "verification" in snapshot
-        assert "deposits" in snapshot
+        assert set(FINANCIAL_SNAPSHOT_REQUIRED_FIELDS).issubset(snapshot)
+        assert snapshot["artifact_type"] == FINANCIAL_SNAPSHOT_ARTIFACT
+        assert snapshot["schema_version"] == 1
 
     def test_account_section(self):
         snapshot = build_snapshot(

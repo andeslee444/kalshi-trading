@@ -301,6 +301,14 @@
       <!-- Status Banner -->
       <div id="system-banner" class="card"></div>
 
+      <!-- Operator Signals -->
+      <div class="card">
+        <div class="section-label">Operator Signals</div>
+        <div id="operator-signals" class="space-y-2">
+          <div class="text-slate-500 text-sm">Loading...</div>
+        </div>
+      </div>
+
       <!-- Strategy Engines -->
       <div class="card">
         <div class="section-label">Strategy Engines</div>
@@ -321,6 +329,14 @@
       <div class="card">
         <div class="section-label">Weather Settlement Actuals</div>
         <div id="weather-actual-sources" class="space-y-2">
+          <div class="text-slate-500 text-sm">Loading...</div>
+        </div>
+      </div>
+
+      <!-- Weather Forecast Cross-Check -->
+      <div class="card">
+        <div class="section-label">Weather Forecast Cross-Check</div>
+        <div id="weather-nws-crosscheck" class="space-y-3">
           <div class="text-slate-500 text-sm">Loading...</div>
         </div>
       </div>
@@ -415,6 +431,31 @@ function formatSourceMix(summary) {
     return `<span class="text-slate-400">${name}</span> <span class="mono text-slate-200">${count}</span> <span class="text-slate-500">(${share.toFixed(1)}%)</span>`;
   });
   return `<span class="text-slate-500">total</span> <span class="mono text-slate-200">${summary.total}</span>${parts.length ? ' · ' + parts.join(' · ') : ''}`;
+}
+
+function formatFloat(value, digits = 2) {
+  if (value == null || Number.isNaN(Number(value))) return '--';
+  return Number(value).toFixed(digits);
+}
+
+function modePill(mode) {
+  const label = (mode || 'gridpoint').replace(/_/g, ' ');
+  if (mode === 'disabled') return `<span class="pill" style="background:rgba(244,63,94,0.15);color:#f43f5e">${label}</span>`;
+  if (mode === 'advisory_only') return `<span class="pill" style="background:rgba(234,179,8,0.15);color:#fbbf24">${label}</span>`;
+  return `<span class="pill" style="background:rgba(59,130,246,0.15);color:#60a5fa">${label}</span>`;
+}
+
+function crosscheckKpi(summary) {
+  if (!summary || !summary.overall || !summary.overall.n) {
+    return `<span class="text-slate-500">No verified records</span>`;
+  }
+  const overall = summary.overall;
+  return [
+    `<span class="text-slate-500">n</span> <span class="mono text-slate-200">${overall.n}</span>`,
+    `<span class="text-slate-500">OM MAE</span> <span class="mono text-slate-200">${formatFloat(overall.open_meteo_mae)}F</span>`,
+    `<span class="text-slate-500">NWS MAE</span> <span class="mono text-slate-200">${formatFloat(overall.nws_mae)}F</span>`,
+    `<span class="text-slate-500">OM win</span> <span class="mono text-slate-200">${formatFloat((overall.open_meteo_better_share || 0) * 100, 1)}%</span>`
+  ].join(' · ');
 }
 
 // ─── Data Fetching ───
@@ -1161,36 +1202,60 @@ async function loadSystem() {
 
   cachedBots = bots || [];
 
-  // Status Banner
-  if (risk && !risk.error) {
-    const killSwitch = risk.kill_switch;
-    const cbOpen = risk.circuit_breaker_open;
-    const staleBots = (bots || []).filter(b => b.status === 'stale');
-    const stoppedBots = (bots || []).filter(b => b.status === 'stopped');
-    const runningBots = (bots || []).filter(b => b.status === 'running');
+  const killSwitch = !!(risk && !risk.error && risk.kill_switch);
+  const cbOpen = !!(risk && !risk.error && risk.circuit_breaker_open);
+  const staleBots = (bots || []).filter(b => b.status === 'stale');
+  const stoppedBots = (bots || []).filter(b => b.status === 'stopped');
+  const runningBots = (bots || []).filter(b => b.status === 'running');
+  const sourceEntries = Object.entries(health?.sources || {});
+  const degradedSources = sourceEntries.filter(([_, info]) => {
+    const status = String(info?.status || '').toLowerCase();
+    return info?.fresh === false || (status && !['ok', 'healthy', 'fresh'].includes(status)) || (Number(info?.error_count || 0) > 0);
+  });
+  const crosscheck = health?.weather_nws_crosscheck || null;
+  const actionableWeather = Object.values(crosscheck?.actionable || {});
 
-    let bannerHtml, bannerBg;
-    if (killSwitch) {
-      bannerBg = 'rgba(244,63,94,0.1)'; bannerHtml = `<div class="flex items-center gap-3"><span class="dot dot-red"></span><span class="font-medium text-rose-400">Trading Paused — Emergency Stop Active</span></div>`;
-    } else if (cbOpen) {
-      bannerBg = 'rgba(234,179,8,0.1)'; bannerHtml = `<div class="flex items-center gap-3"><span class="dot dot-yellow"></span><span class="font-medium text-yellow-400">Circuit Breaker Open — API Errors Detected</span></div>`;
-    } else if (staleBots.length > 0) {
-      bannerBg = 'rgba(234,179,8,0.1)'; bannerHtml = `<div class="flex items-center gap-3"><span class="dot dot-yellow"></span><span class="font-medium text-yellow-400">${staleBots.length} Strategy Delayed</span></div>`;
-    } else if (runningBots.length > 0) {
-      bannerBg = 'rgba(16,185,129,0.08)'; bannerHtml = `<div class="flex items-center gap-3"><span class="dot dot-green"></span><span class="font-medium text-emerald-400">All Systems Running</span></div>`;
-    } else {
-      bannerBg = 'rgba(100,116,139,0.1)'; bannerHtml = `<div class="flex items-center gap-3"><span class="dot dot-gray"></span><span class="font-medium text-slate-400">No Bots Running</span></div>`;
-    }
-    document.getElementById('system-banner').style.background = bannerBg;
-    document.getElementById('system-banner').innerHTML = bannerHtml;
-
-    // Update header badge
-    const badge = document.getElementById('system-badge');
-    if (killSwitch) { badge.textContent = 'Paused'; badge.className = 'pill'; badge.style.cssText = 'background:rgba(244,63,94,0.15);color:#f43f5e;font-size:0.6875rem;padding:2px 10px;border-radius:9999px;font-weight:600;'; }
-    else if (staleBots.length > 0 || cbOpen) { badge.textContent = 'Warning'; badge.className = 'pill'; badge.style.cssText = 'background:rgba(234,179,8,0.15);color:#eab308;font-size:0.6875rem;padding:2px 10px;border-radius:9999px;font-weight:600;'; }
-    else if (runningBots.length > 0) { badge.textContent = 'Live'; badge.className = 'pill'; badge.style.cssText = 'background:rgba(16,185,129,0.15);color:#10b981;font-size:0.6875rem;padding:2px 10px;border-radius:9999px;font-weight:600;'; }
-    else { badge.textContent = 'Offline'; badge.className = 'pill pill-default'; badge.style.cssText = ''; }
+  let bannerHtml, bannerBg;
+  if (killSwitch) {
+    bannerBg = 'rgba(244,63,94,0.1)';
+    bannerHtml = `<div class="space-y-2">
+      <div class="flex items-center gap-3"><span class="dot dot-red"></span><span class="font-medium text-rose-400">Trading Paused — Emergency Stop Active</span></div>
+      <div class="text-xs text-slate-400">No new risk should be added until the halt file is cleared.</div>
+    </div>`;
+  } else if (cbOpen) {
+    bannerBg = 'rgba(234,179,8,0.1)';
+    bannerHtml = `<div class="space-y-2">
+      <div class="flex items-center gap-3"><span class="dot dot-yellow"></span><span class="font-medium text-yellow-400">Circuit Breaker Open — API Errors Detected</span></div>
+      <div class="text-xs text-slate-400">${runningBots.length} live · ${staleBots.length} stale · ${degradedSources.length} degraded sources</div>
+    </div>`;
+  } else if (staleBots.length > 0 || actionableWeather.length > 0 || degradedSources.length > 0) {
+    bannerBg = 'rgba(234,179,8,0.1)';
+    bannerHtml = `<div class="space-y-2">
+      <div class="flex items-center gap-3"><span class="dot dot-yellow"></span><span class="font-medium text-yellow-400">Operator Attention Needed</span></div>
+      <div class="text-xs text-slate-400">${runningBots.length} live · ${staleBots.length} stale · ${degradedSources.length} degraded sources · ${actionableWeather.length} weather review actions</div>
+    </div>`;
+  } else if (runningBots.length > 0) {
+    bannerBg = 'rgba(16,185,129,0.08)';
+    bannerHtml = `<div class="space-y-2">
+      <div class="flex items-center gap-3"><span class="dot dot-green"></span><span class="font-medium text-emerald-400">All Systems Running</span></div>
+      <div class="text-xs text-slate-400">${runningBots.length} live · ${stoppedBots.length} stopped · ${sourceEntries.length} sources monitored</div>
+    </div>`;
+  } else {
+    bannerBg = 'rgba(100,116,139,0.1)';
+    bannerHtml = `<div class="space-y-2">
+      <div class="flex items-center gap-3"><span class="dot dot-gray"></span><span class="font-medium text-slate-400">No Bots Running</span></div>
+      <div class="text-xs text-slate-400">Supervisor appears idle or all strategies are stopped.</div>
+    </div>`;
   }
+  document.getElementById('system-banner').style.background = bannerBg;
+  document.getElementById('system-banner').innerHTML = bannerHtml;
+
+  // Update header badge
+  const badge = document.getElementById('system-badge');
+  if (killSwitch) { badge.textContent = 'Paused'; badge.className = 'pill'; badge.style.cssText = 'background:rgba(244,63,94,0.15);color:#f43f5e;font-size:0.6875rem;padding:2px 10px;border-radius:9999px;font-weight:600;'; }
+  else if (staleBots.length > 0 || cbOpen || actionableWeather.length > 0 || degradedSources.length > 0) { badge.textContent = 'Warning'; badge.className = 'pill'; badge.style.cssText = 'background:rgba(234,179,8,0.15);color:#eab308;font-size:0.6875rem;padding:2px 10px;border-radius:9999px;font-weight:600;'; }
+  else if (runningBots.length > 0) { badge.textContent = 'Live'; badge.className = 'pill'; badge.style.cssText = 'background:rgba(16,185,129,0.15);color:#10b981;font-size:0.6875rem;padding:2px 10px;border-radius:9999px;font-weight:600;'; }
+  else { badge.textContent = 'Offline'; badge.className = 'pill pill-default'; badge.style.cssText = ''; }
 
   // Strategy Engines
   if (Array.isArray(bots)) {
@@ -1236,14 +1301,21 @@ async function loadSystem() {
     for (const [name, info] of Object.entries(sources)) {
       const lastUpdate = info.last_update || info.last_check || '';
       const fresh = info.fresh !== false;
-      const dotClass = fresh ? 'dot-green' : 'dot-yellow';
+      const status = String(info.status || (fresh ? 'ok' : 'stale')).toLowerCase();
+      const errorCount = Number(info.error_count || 0);
+      const dotClass = (fresh && ['ok', 'healthy', 'fresh'].includes(status) && errorCount === 0) ? 'dot-green' : 'dot-yellow';
       const displayName = name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+      const statusColor = ['ok', 'healthy', 'fresh'].includes(status) && errorCount === 0 ? '#94a3b8' : '#fbbf24';
+      const statusText = `${status}${errorCount > 0 ? ` · ${errorCount} err` : ''}`;
       html += `<div class="flex items-center justify-between py-1.5">
         <div class="flex items-center gap-2">
           <span class="dot ${dotClass}"></span>
           <span class="text-sm text-slate-300">${displayName}</span>
         </div>
-        <span class="text-xs text-slate-500">${lastUpdate ? timeAgo(lastUpdate) : 'Unknown'}</span>
+        <div class="text-xs text-right">
+          <div style="color:${statusColor}">${statusText}</div>
+          <div class="text-slate-500">${lastUpdate ? timeAgo(lastUpdate) : 'Unknown'}</div>
+        </div>
       </div>`;
     }
     document.getElementById('data-sources').innerHTML = html || '<div class="text-slate-500 text-sm">No source data</div>';
@@ -1273,6 +1345,70 @@ async function loadSystem() {
   } else {
     document.getElementById('weather-actual-sources').innerHTML =
       '<div class="text-slate-500 text-sm">No verification data</div>';
+  }
+
+  // Operator Signals
+  const signals = [];
+  if (killSwitch) {
+    signals.push('<div class="flex items-start gap-3 py-1"><span class="dot dot-red mt-1"></span><div><div class="text-sm text-rose-300">Trading halt is active</div><div class="text-xs text-slate-500">Clear the kill switch before expecting any new orders.</div></div></div>');
+  }
+  if (cbOpen) {
+    signals.push('<div class="flex items-start gap-3 py-1"><span class="dot dot-yellow mt-1"></span><div><div class="text-sm text-yellow-300">Circuit breaker is open</div><div class="text-xs text-slate-500">Check recent source failures and retry paths before trusting silent bots.</div></div></div>');
+  }
+  if (staleBots.length > 0) {
+    const names = staleBots.map(b => b.display_name || b.name).join(', ');
+    signals.push(`<div class="flex items-start gap-3 py-1"><span class="dot dot-yellow mt-1"></span><div><div class="text-sm text-yellow-200">Stale bots: ${names}</div><div class="text-xs text-slate-500">Heartbeat age exceeded expected scan cadence.</div></div></div>`);
+  }
+  if (degradedSources.length > 0) {
+    const names = degradedSources.slice(0, 4).map(([name]) => name).join(', ');
+    signals.push(`<div class="flex items-start gap-3 py-1"><span class="dot dot-yellow mt-1"></span><div><div class="text-sm text-yellow-200">Degraded sources: ${names}${degradedSources.length > 4 ? ' +' + (degradedSources.length - 4) : ''}</div><div class="text-xs text-slate-500">Source freshness or error status is outside normal operating range.</div></div></div>`);
+  }
+  if (actionableWeather.length > 0) {
+    for (const rec of actionableWeather.slice(0, 4)) {
+      signals.push(`<div class="flex items-start gap-3 py-1"><span class="dot dot-yellow mt-1"></span><div><div class="text-sm text-yellow-100">${rec.city}: ${rec.current_mode.replace(/_/g, ' ')} → ${rec.recommended_mode.replace(/_/g, ' ')}</div><div class="text-xs text-slate-500">${rec.reason}</div></div></div>`);
+    }
+  }
+  document.getElementById('operator-signals').innerHTML =
+    signals.join('') || '<div class="flex items-start gap-3 py-1"><span class="dot dot-green mt-1"></span><div><div class="text-sm text-emerald-300">No immediate operator action</div><div class="text-xs text-slate-500">Bots, sources, and weather cross-check controls look consistent.</div></div></div>';
+
+  // Weather NWS cross-check
+  if (crosscheck) {
+    const rows = [];
+    if (crosscheck.summary_7d) {
+      rows.push(`<div class="flex items-center justify-between py-1.5"><span class="text-sm text-slate-300">Last 7d</span><span class="text-xs">${crosscheckKpi(crosscheck.summary_7d)}</span></div>`);
+    }
+    if (crosscheck.summary_30d) {
+      rows.push(`<div class="flex items-center justify-between py-1.5"><span class="text-sm text-slate-300">Last 30d</span><span class="text-xs">${crosscheckKpi(crosscheck.summary_30d)}</span></div>`);
+    }
+    rows.push(`<div class="text-xs text-slate-500">verified ${crosscheck.verified_count || 0} · pending ${crosscheck.pending_count || 0}${crosscheck.last_verification ? ` · updated ${timeAgo(crosscheck.last_verification)}` : ''}</div>`);
+
+    const recRows = Object.values(crosscheck.recommendations || {})
+      .filter(rec => (rec.n || 0) > 0)
+      .sort((a, b) => {
+        const aAction = a.recommended_mode !== a.current_mode ? 1 : 0;
+        const bAction = b.recommended_mode !== b.current_mode ? 1 : 0;
+        if (aAction !== bAction) return bAction - aAction;
+        return (b.n || 0) - (a.n || 0);
+      })
+      .slice(0, 8)
+      .map(rec => `
+        <div class="border-t border-slate-800/60 pt-3">
+          <div class="flex items-center justify-between gap-3">
+            <div class="text-sm text-slate-200">${rec.city}</div>
+            <div class="flex items-center gap-2 text-xs">
+              ${modePill(rec.current_mode)}
+              ${rec.recommended_mode !== rec.current_mode ? '<span class="text-slate-500">→</span>' + modePill(rec.recommended_mode) : ''}
+            </div>
+          </div>
+          <div class="mt-1 text-xs text-slate-400">n=${rec.n} · OM ${formatFloat(rec.open_meteo_mae)}F · NWS ${formatFloat(rec.nws_mae)}F · OM win ${formatFloat((rec.open_meteo_better_share || 0) * 100, 1)}%</div>
+          <div class="mt-1 text-xs text-slate-500">${rec.reason}</div>
+        </div>
+      `);
+    rows.push(recRows.join('') || '<div class="text-slate-500 text-sm">No city-level recommendations yet</div>');
+    document.getElementById('weather-nws-crosscheck').innerHTML = rows.join('');
+  } else {
+    document.getElementById('weather-nws-crosscheck').innerHTML =
+      '<div class="text-slate-500 text-sm">No NWS cross-check audit data</div>';
   }
 }
 

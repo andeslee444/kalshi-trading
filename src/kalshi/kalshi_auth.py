@@ -23,6 +23,15 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
 from dotenv import load_dotenv
 
+from artifact_contracts import normalize_health_state, normalize_health_summary
+from event_ledger import get_event_ledger
+from storage import (
+    DecisionStore,
+    MetricsStore,
+    TradeStore,
+    atomic_write_json as storage_atomic_write_json,
+)
+
 # === Constants ===
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 load_dotenv(PROJECT_DIR / ".env")
@@ -53,6 +62,7 @@ BOT_SOURCE_MAP = {
     "beatrelease": ["beatrelease"],
 }
 SCAN_SUMMARIES_PATH = PROJECT_DIR / "data" / "scan-summaries.json"
+ZERO_TRADE_ALERT_STREAK = 6
 
 # Shared market cache — cross-process file cache for market data
 MARKET_CACHE_PATH = PROJECT_DIR / "data" / "market-cache.json"
@@ -487,29 +497,12 @@ class KalshiClient:
 
 def load_trades(trades_path: Path) -> list:
     """Load trades from a JSON file. Returns [] on missing/corrupt file."""
-    if trades_path.exists():
-        try:
-            return json.loads(trades_path.read_text())
-        except (json.JSONDecodeError, ValueError) as e:
-            _log.warning("Corrupt trades file %s: %s", trades_path, e)
-            return []
-    return []
+    return TradeStore(trades_path, logger=_log).load()
 
 
 def atomic_write_json(path: Path, data):
     """Write JSON data to a file atomically using a temp file + os.replace()."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp_path, str(path))
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    storage_atomic_write_json(path, data)
 
 # Backward-compatible alias
 _atomic_write_json = atomic_write_json
@@ -517,16 +510,11 @@ _atomic_write_json = atomic_write_json
 
 def save_trade(trades_path: Path, trade: dict):
     """Append a trade to a JSON trades file (atomic write with file lock)."""
-    trades_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = trades_path.with_suffix(".lock")
-    with open(lock_path, "w") as lock_fd:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        try:
-            trades = load_trades(trades_path)
-            trades.append(trade)
-            _atomic_write_json(trades_path, trades)
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    TradeStore(trades_path, logger=_log).append(trade)
+    try:
+        get_event_ledger(logger=_log).record_order_submitted(trade, source_path=trades_path)
+    except Exception as e:
+        _log.warning("Failed to dual-write trade to event ledger: %s", e)
 
 
 # === Shared market data cache ===
@@ -969,22 +957,49 @@ def _append_scan_summary(summary):
     clobbering each other's data.
     """
     try:
-        SCAN_SUMMARIES_PATH.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = SCAN_SUMMARIES_PATH.with_suffix(".lock")
-        with open(lock_path, "w") as lock_fd:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            try:
-                existing = []
-                if SCAN_SUMMARIES_PATH.exists():
-                    existing = json.loads(SCAN_SUMMARIES_PATH.read_text())
-                existing.append(summary)
-                if len(existing) > 2000:
-                    existing = existing[-1500:]
-                _atomic_write_json(SCAN_SUMMARIES_PATH, existing)
-            finally:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        store = MetricsStore(SCAN_SUMMARIES_PATH, logger=_log)
+
+        def _append(existing):
+            summaries = list(existing)
+            summaries.append(summary)
+            _maybe_alert_on_scan_summary(summaries, summary)
+            return store._trim_records(
+                summaries,
+                max_records=store.max_records,
+                trim_to=store.trim_to,
+            )
+
+        store.update(_append)
     except Exception as e:
         _log.warning("Failed to append scan summary: %s", e)
+
+
+def _maybe_alert_on_scan_summary(summaries, latest):
+    bot = latest.get("bot")
+    if not bot:
+        return
+    bot_summaries = [s for s in summaries if s.get("bot") == bot]
+    streak = 0
+    for entry in reversed(bot_summaries):
+        if entry.get("trades_placed", 0) == 0 and entry.get("markets_evaluated", 0) > 0:
+            streak += 1
+            continue
+        break
+    if streak != ZERO_TRADE_ALERT_STREAK:
+        return
+    skip_totals = {}
+    for entry in bot_summaries[-ZERO_TRADE_ALERT_STREAK:]:
+        for reason, count in entry.get("skips", {}).items():
+            skip_totals[reason] = skip_totals.get(reason, 0) + count
+    top_skip = "none"
+    if skip_totals:
+        top_skip = max(skip_totals.items(), key=lambda item: item[1])[0]
+    notify_webhook(
+        f"{bot}: 0 trades across {ZERO_TRADE_ALERT_STREAK} consecutive scans "
+        f"(top skip={top_skip})",
+        level="warning",
+        logger=_log,
+    )
 
 
 # === Order Monitor ===
@@ -1133,6 +1148,12 @@ class TradeManager:
         self._daily_spend_cents = 0
         self._daily_date = None
         self._daily_loss_alerted = False
+        self._daily_loss_block_count = 0
+        self._daily_loss_first_blocked_at = None
+        self._daily_loss_escalated = False
+        self.last_error_code = None
+        self.last_error_message = ""
+        self._local_alerts = {}
 
         # Balance cache for bankroll-proportional limits (30s TTL)
         self._cached_balance_cents = None
@@ -1140,6 +1161,7 @@ class TradeManager:
 
         # Write-ahead log for crash recovery
         self._wal_path = self.trades_path.with_suffix(".wal.json")
+        self._wal_store = TradeStore(self._wal_path, logger=self.log)
         self._recover_wal()
 
         # Log if percentage-based scaling is active
@@ -1155,7 +1177,31 @@ class TradeManager:
             self._daily_spend_cents = 0
             self._daily_date = today
             self._daily_loss_alerted = False
+            self._daily_loss_block_count = 0
+            self._daily_loss_first_blocked_at = None
+            self._daily_loss_escalated = False
             self._rebuild_daily_counters_from_log(today)
+
+    def remaining_daily_trade_slots(self):
+        """Return how many trade slots remain today after syncing from the log."""
+        self._reset_daily_if_needed()
+        return max(0, int(self.config["maxDailyTrades"]) - self._daily_trades)
+
+    def _clear_last_error(self):
+        self.last_error_code = None
+        self.last_error_message = ""
+
+    def _set_last_error(self, code, message):
+        self.last_error_code = code
+        self.last_error_message = message
+
+    def _should_send_local_alert(self, key, cooldown_seconds=1800):
+        now = time.time()
+        last_sent = self._local_alerts.get(key, 0)
+        if (now - last_sent) < cooldown_seconds:
+            return False
+        self._local_alerts[key] = now
+        return True
 
     def _rebuild_daily_counters_from_log(self, today_str):
         """Reconstruct daily counters from trade log after restart."""
@@ -1216,28 +1262,23 @@ class TradeManager:
 
     def _write_wal(self, entry):
         """Write a pending trade entry to the WAL file."""
-        entries = self._read_wal()
-        entries.append(entry)
-        _atomic_write_json(self._wal_path, entries)
+        self._wal_store.append(entry)
 
     def _read_wal(self):
         """Read all WAL entries. Returns [] if missing/corrupt."""
-        if not self._wal_path.exists():
-            return []
-        try:
-            data = json.loads(self._wal_path.read_text())
-            return data if isinstance(data, list) else []
-        except (json.JSONDecodeError, OSError):
-            return []
+        return self._wal_store.load()
 
     def _clear_wal(self, order_id):
         """Remove a confirmed entry from the WAL by order_id."""
-        entries = self._read_wal()
-        entries = [e for e in entries if e.get("order_id") != order_id]
-        if entries:
-            _atomic_write_json(self._wal_path, entries)
-        elif self._wal_path.exists():
-            self._wal_path.unlink()
+        with self._wal_store.lock():
+            entries = [
+                entry for entry in self._wal_store.load_unlocked()
+                if entry.get("order_id") != order_id
+            ]
+            if entries:
+                self._wal_store.save_unlocked(entries)
+            elif self._wal_path.exists():
+                self._wal_path.unlink()
 
     def _recover_wal(self):
         """On startup, check WAL for trades that were sent but not logged."""
@@ -1273,7 +1314,7 @@ class TradeManager:
         if failed_entries:
             self.log.warning("WAL recovery: %d entries unverified, retaining for next startup",
                              len(failed_entries))
-            _atomic_write_json(self._wal_path, failed_entries)
+            self._wal_store.save(failed_entries)
         elif self._wal_path.exists():
             self._wal_path.unlink()
 
@@ -1397,69 +1438,54 @@ class TradeManager:
                 - allocator_denied: Capital allocator rejected the request
         """
         self._reset_daily_if_needed()
+        self._clear_last_error()
         caps_applied = []
 
         if side not in ("yes", "no"):
             self.log.error("Invalid side '%s' — must be 'yes' or 'no'", side)
+            self._set_last_error("invalid_side", side)
             return None
 
         # Validate price range
         if price_cents < 1 or price_cents > 99:
             self.log.error("Invalid price_cents=%d — must be 1-99. Skipping %s", price_cents, ticker)
+            self._set_last_error("invalid_price", str(price_cents))
             return None
         if count < 1:
             self.log.error("Invalid count=%d — must be >= 1. Skipping %s", count, ticker)
+            self._set_last_error("invalid_count", str(count))
             return None
 
         # 1. Kill switch
         if check_kill_switch(self.kill_switch_path):
             self.log.warning("KILL SWITCH ACTIVE — refusing trade on %s", ticker)
             notify_webhook("Kill switch ACTIVE — trades blocked", level="critical")
+            self._set_last_error("kill_switch", "kill switch active")
             return None
 
         # 1b. Per-bot halt
         if self._per_bot_halt_path and self._per_bot_halt_path.exists():
             self.log.warning("PER-BOT HALT active for %s — refusing trade on %s", self.bot_name, ticker)
+            self._set_last_error("per_bot_halt", f"{self.bot_name} halted")
             return None
 
         # 2. Circuit breaker
         if self.breaker.is_open():
             self.log.warning("Circuit breaker OPEN — skipping trade on %s", ticker)
+            self._set_last_error("circuit_breaker", "circuit breaker open")
             return None
 
         # 3. Daily trade limit
         max_daily = self.config["maxDailyTrades"]
         if self._daily_trades >= max_daily:
             self.log.warning("Daily trade limit (%d) reached — skipping %s", max_daily, ticker)
-            return None
-
-        # 4. Daily loss/spend limit (risk = purchase price per contract for both YES and NO)
-        max_loss_cents = self._effective_max_daily_loss_cents()
-        if side == "no":
-            # Buying NO: max loss per contract is the purchase price
-            risk_per_contract = price_cents
-        else:
-            # Buying YES: max loss per contract is price_cents
-            risk_per_contract = price_cents
-        risk_cents = risk_per_contract * count
-        if self._daily_spend_cents + risk_cents > max_loss_cents:
-            self.log.warning(
-                "Daily loss limit ($%.2f) would be exceeded — risked $%.2f + $%.2f > $%.2f. Skipping %s",
-                max_loss_cents / 100,
-                self._daily_spend_cents / 100, risk_cents / 100,
-                max_loss_cents / 100, ticker
-            )
-            if not self._daily_loss_alerted:
-                notify_webhook(
-                    f"Daily loss limit (${max_loss_cents/100:.0f}) reached — trades blocked",
-                    level="warning",
-                )
-                self._daily_loss_alerted = True
+            self._set_last_error("daily_trade_limit", f"maxDailyTrades={max_daily}")
             return None
 
         # 5. Dedup
         if self.tracker.is_recent(ticker):
             self.log.info("Skipping %s — traded recently (dedup)", ticker)
+            self._set_last_error("dedup", "traded recently")
             return None
 
         # 6. Cost cap (adjust count down if needed, using risk-adjusted cost)
@@ -1472,6 +1498,41 @@ class TradeManager:
             self.log.info("Cost cap: %dx → %dx on %s (max $%.2f)",
                           original_count, count, ticker, max_cost_cents / 100)
 
+        # 6a. Daily loss/spend limit, using the post-cap size.
+        max_loss_cents = self._effective_max_daily_loss_cents()
+        risk_cents = price_cents * count
+        if self._daily_spend_cents + risk_cents > max_loss_cents:
+            self.log.warning(
+                "Daily loss limit ($%.2f) would be exceeded — risked $%.2f + $%.2f > $%.2f. Skipping %s",
+                max_loss_cents / 100,
+                self._daily_spend_cents / 100, risk_cents / 100,
+                max_loss_cents / 100, ticker
+            )
+            self._set_last_error("daily_loss_limit", f"daily loss limit ${max_loss_cents/100:.0f} reached")
+            if self._daily_loss_first_blocked_at is None:
+                self._daily_loss_first_blocked_at = time.time()
+            self._daily_loss_block_count += 1
+            if not self._daily_loss_alerted:
+                notify_webhook(
+                    f"Daily loss limit (${max_loss_cents/100:.0f}) reached — trades blocked",
+                    level="warning",
+                )
+                self._daily_loss_alerted = True
+            blocked_for = time.time() - self._daily_loss_first_blocked_at
+            if (
+                not self._daily_loss_escalated
+                and self._daily_loss_block_count >= 3
+                and blocked_for >= 900
+            ):
+                label = self.bot_name or self.log.name
+                notify_webhook(
+                    f"{label}: daily loss limit still blocking trades after {int(blocked_for // 60)}m "
+                    f"({self._daily_loss_block_count} blocked attempts)",
+                    level="warning",
+                )
+                self._daily_loss_escalated = True
+            return None
+
         # 7. Balance check (optional)
         cost_cents = cost_per_contract * count
         if available_balance_cents is not None and cost_cents > available_balance_cents:
@@ -1479,6 +1540,7 @@ class TradeManager:
                 "Insufficient balance: need %dc but only %dc available. Skipping %s",
                 cost_cents, available_balance_cents, ticker
             )
+            self._set_last_error("balance", f"need={cost_cents} available={available_balance_cents}")
             return None
 
         # 8. Stale data check (optional)
@@ -1487,11 +1549,13 @@ class TradeManager:
                 "Market data is %.0fs old (>600s stale threshold). Skipping %s",
                 market_data_age_seconds, ticker
             )
+            self._set_last_error("stale_data", f"age={market_data_age_seconds}")
             return None
 
         # 8b. Final kill switch re-check
         if check_kill_switch(self.kill_switch_path):
             self.log.warning("KILL SWITCH ACTIVE (late check) — refusing trade on %s", ticker)
+            self._set_last_error("kill_switch", "kill switch active")
             return None
 
         # 9. Build and place order
@@ -1513,11 +1577,31 @@ class TradeManager:
             self.breaker.record_success()
         except requests.exceptions.HTTPError as e:
             self.breaker.record_failure()
+            error_code = "api_error"
+            error_message = e.response.text[:300] if e.response is not None else str(e)
+            if e.response is not None:
+                try:
+                    payload = e.response.json()
+                    err = payload.get("error", {})
+                    error_code = err.get("code", error_code)
+                    error_message = err.get("message", error_message)
+                except ValueError:
+                    pass
+            self._set_last_error(error_code, error_message)
             self.log.error("Order failed for %s: %s %s", ticker,
-                           e.response.status_code, e.response.text[:300])
+                           getattr(e.response, "status_code", "?"), error_message)
+            if error_code == "market_not_found":
+                alert_key = f"market_not_found:{self.bot_name or self.log.name}:{ticker}"
+                if self._should_send_local_alert(alert_key):
+                    notify_webhook(
+                        f"{self.bot_name or self.log.name}: market_not_found on {ticker}",
+                        level="warning",
+                        logger=self.log,
+                    )
             return None
         except Exception as e:
             self.breaker.record_failure()
+            self._set_last_error("api_error", str(e))
             self.log.error("Order failed for %s: %s", ticker, e)
             return None
 
@@ -1528,6 +1612,9 @@ class TradeManager:
             ticker, side, price_cents, count, cost_cents,
             reasoning, order_info, **extra_fields
         )
+        order_info["count"] = count
+        order_info["cost_cents"] = cost_cents
+        order_info["caps_applied"] = list(caps_applied)
         if order_id:
             try:
                 self._write_wal({"order_id": order_id, "ticker": ticker, "record": trade_record})
@@ -1540,6 +1627,9 @@ class TradeManager:
             self._daily_spend_cents += price_cents * count
         else:
             self._daily_spend_cents += cost_cents
+        self._daily_loss_block_count = 0
+        self._daily_loss_first_blocked_at = None
+        self._daily_loss_escalated = False
 
         # 11. Register with order monitor for fill tracking
         if self.order_monitor and order_id:
@@ -1704,20 +1794,12 @@ def save_decision(decisions_path: Path, decision: dict):
 
     Uses fcntl.LOCK_EX to prevent concurrent writes from multiple bots.
     """
-    decisions_path = Path(decisions_path)
-    decisions_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = decisions_path.with_suffix(".lock")
     try:
-        with open(lock_path, "w") as lock_fd:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            try:
-                decisions = load_trades(decisions_path)
-                if len(decisions) >= 5000:
-                    decisions = decisions[-4000:]
-                decisions.append(decision)
-                _atomic_write_json(decisions_path, decisions)
-            finally:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        DecisionStore(decisions_path, logger=_log).append(decision)
+        try:
+            get_event_ledger(logger=_log).record_trade_decision(decision, source_path=decisions_path)
+        except Exception as e:
+            _log.warning("Failed to dual-write decision to event ledger: %s", e)
     except Exception as e:
         _log.warning("Failed to save decision: %s", e)
 
@@ -1755,10 +1837,7 @@ class HealthCheckMonitor:
         self._halt_transitions = {}  # bot_name -> timestamp of last halt/unhalt
         self.source_breaker_threshold = source_breaker_threshold
         self.source_breaker_cooldown_seconds = source_breaker_cooldown_seconds
-        self._state = {
-            "sources": {},      # source -> {"last_success": ts, "last_error": ts, "error_count": int}
-            "bots": {},         # bot -> {"last_heartbeat": ts}
-        }
+        self._state = normalize_health_state(None)
         self._dirty_bots = set()      # bot names modified by this process
         self._dirty_sources = set()   # source names modified by this process
         self._load()
@@ -1766,7 +1845,7 @@ class HealthCheckMonitor:
     def _load(self):
         if self.state_path.exists():
             try:
-                self._state = json.loads(self.state_path.read_text())
+                self._state = normalize_health_state(json.loads(self.state_path.read_text()))
             except (json.JSONDecodeError, OSError):
                 pass
 
@@ -1782,10 +1861,10 @@ class HealthCheckMonitor:
             with open(lock_path, "w") as lock_fd:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 try:
-                    on_disk = {"bots": {}, "sources": {}}
+                    on_disk = normalize_health_state(None)
                     if self.state_path.exists():
                         try:
-                            on_disk = json.loads(self.state_path.read_text())
+                            on_disk = normalize_health_state(json.loads(self.state_path.read_text()))
                         except (json.JSONDecodeError, OSError):
                             pass
                     # Only write back entries this process has modified, to avoid
@@ -1798,11 +1877,42 @@ class HealthCheckMonitor:
                     for source in self._dirty_sources:
                         if source in self._state.get("sources", {}):
                             on_disk_sources[source] = self._state["sources"][source]
+                    on_disk = normalize_health_state(on_disk)
                     _atomic_write_json(self.state_path, on_disk)
                 finally:
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
         except Exception as e:
             self.log.warning("Failed to save health state: %s", e)
+
+    @staticmethod
+    def _parse_state_time(value):
+        if not value:
+            return None
+        try:
+            parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+            return parsed
+        except (ValueError, TypeError, AttributeError):
+            return None
+
+    def _source_issue_active(self, data, threshold=1, now=None):
+        error_count = data.get("error_count", 0)
+        if error_count < threshold:
+            return False
+        opened_at = data.get("opened_at")
+        if opened_at is not None:
+            try:
+                if (time.time() - float(opened_at)) < (self.source_breaker_cooldown_seconds * 2):
+                    return True
+            except (TypeError, ValueError):
+                pass
+        now = now or datetime.datetime.now(datetime.timezone.utc)
+        last_error = self._parse_state_time(data.get("last_error"))
+        if last_error is None:
+            return False
+        active_window = max(self.source_breaker_cooldown_seconds * 2, 6 * 3600)
+        return (now - last_error).total_seconds() <= active_window
 
     def record_source_success(self, source):
         """Record a successful data source fetch. Clears circuit breaker if open."""
@@ -1896,9 +2006,12 @@ class HealthCheckMonitor:
         summary = {"sources": {}, "bots": {}, "overall": "healthy"}
 
         issues = 0
+        now = datetime.datetime.now(datetime.timezone.utc)
         for source, data in self._state.get("sources", {}).items():
             error_count = data.get("error_count", 0)
-            status = "error" if error_count >= 5 else ("warning" if error_count > 0 else "ok")
+            active_error = self._source_issue_active(data, threshold=self.source_breaker_threshold, now=now)
+            active_warning = self._source_issue_active(data, threshold=1, now=now)
+            status = "error" if active_error else ("warning" if active_warning else "ok")
             if status == "error":
                 issues += 1
             summary["sources"][source] = {
@@ -1933,7 +2046,7 @@ class HealthCheckMonitor:
         elif issues >= 1:
             summary["overall"] = "degraded"
 
-        return summary
+        return normalize_health_summary(summary)
 
     def check_health(self, staleness_minutes=None):
         """Check for health issues. Returns list of issue strings.
@@ -1963,7 +2076,7 @@ class HealthCheckMonitor:
         # Check source errors
         for source, info in self._state.get("sources", {}).items():
             error_count = info.get("error_count", 0)
-            if error_count >= 5:
+            if self._source_issue_active(info, threshold=self.source_breaker_threshold, now=now):
                 issues.append(f"source/{source} failing: {error_count} consecutive errors")
 
         # Webhook alert for critical health issues

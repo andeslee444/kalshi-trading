@@ -23,8 +23,19 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR / "src" / "kalshi"))
 
 from pnl_attribution import PnLAttributor, _classify_market_type
+from bot_registry import (
+    ALWAYS_DISABLED_BOT_IDS,
+    BOT_CONFIG_KEY_MAP,
+    BOT_DEFAULT_SCAN_INTERVAL_MAP,
+    BOT_DISPLAY_NAMES,
+    BOT_HEALTH_KEY_MAP,
+    DASHBOARD_BOT_IDS,
+    DECISION_FILE_SPECS,
+)
 from edge_monitor import EdgeMonitor
+from event_ledger import DEFAULT_LEDGER_PATH, get_event_ledger
 from execution_quality import ExecutionAnalyzer
+from storage import SnapshotStore, TradeStore
 from ticker_utils import format_ticker_human
 from trade_files import TRADE_FILES as _CANONICAL_FILES
 
@@ -37,27 +48,14 @@ LOG_DIR = DATA_DIR / "logs"
 HEALTH_STATE_PATH = DATA_DIR / "health-state.json"
 SUPERVISOR_STATE_PATH = PID_DIR / "supervisor-state.json"
 WEATHER_VERIFICATION_PATH = DATA_DIR / "weather-verification.json"
+WEATHER_NWS_CROSSCHECK_PATH = DATA_DIR / "weather-nws-cross-check.json"
 ALLOCATOR_STATE_PATH = DATA_DIR / "allocator-state.json"
 KILL_SWITCH_PATH = DATA_DIR / "HALT_TRADING"
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
 WEATHER_CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-config.json"
 STARTING_BALANCE_CENTS = int(os.environ.get("STARTING_BALANCE_CENTS", "50000"))  # $500 default
 
-# ─── Strategy display names ───
-STRATEGY_DISPLAY = {
-    "weather": "Weather",
-    "entertainment": "Entertainment",
-    "crypto": "Crypto",
-    "economics": "Economics",
-    "positions": "Position Mgmt",
-    "monitor": "Data Monitor",
-    "strategy": "Opportunistic",
-    "hdd": "Data Scraper",
-    "hdd-monitor": "HDD Monitor",
-    "arb": "Cross-Platform",
-    "mm": "Market Making",
-    "beatrelease": "Beat Release",
-}
+STRATEGY_DISPLAY = BOT_DISPLAY_NAMES
 
 # ─── Human-readable decision skip reasons ───
 SKIP_REASON_MAP = [
@@ -81,20 +79,8 @@ def _human_reason(raw_reason: str) -> str:
     return raw_reason
 
 
-# ─── Config key mapping: bot name → bots-config.json key ───
-BOT_CONFIG_KEY = {
-    "positions": "position_monitor",
-    "mm": "market_maker",
-    "arb": "cross_platform_arb",
-    "hdd-monitor": "hdd_monitor",
-}
-
-BOT_HEALTH_KEY = {
-    "positions": "position-monitor",
-    "monitor": "source-monitor",
-    "arb": "cross-platform-arb",
-    "mm": "market-maker",
-}
+BOT_CONFIG_KEY = BOT_CONFIG_KEY_MAP
+BOT_HEALTH_KEY = BOT_HEALTH_KEY_MAP
 
 # ─── Trade file definitions (derived from canonical trade_files.py) ───
 TRADE_FILES = [
@@ -102,47 +88,42 @@ TRADE_FILES = [
     for f in _CANONICAL_FILES
 ]
 
-# ─── Bot definitions (from supervisor.py) ───
-BOT_NAMES = [
-    "weather", "entertainment", "crypto", "economics",
-    "positions", "monitor", "strategy", "hdd", "hdd-monitor", "arb", "mm", "beatrelease",
-]
+BOT_NAMES = list(DASHBOARD_BOT_IDS)
+BOT_SCAN_INTERVAL_DEFAULTS = BOT_DEFAULT_SCAN_INTERVAL_MAP
 
-BOT_SCAN_INTERVAL_DEFAULTS = {
-    "weather": 30,
-    "entertainment": 15,
-    "crypto": 5,
-    "economics": 360,
-    "positions": 15,
-    "monitor": 10,
-    "strategy": 15,
-    "hdd-monitor": 15,
-    "arb": 10,
-    "beatrelease": 60,
-}
-
-# Decision log files — bots that write decision logs
 DECISION_FILES = [
-    {"bot": bot, "path": DATA_DIR / f"{bot}-decisions.json"}
-    for bot in BOT_NAMES
+    {"bot": spec["bot"], "path": DATA_DIR / spec["filename"]}
+    for spec in DECISION_FILE_SPECS
+    if spec["bot"] in BOT_NAMES
 ]
+
+
+def _dashboard_data_source() -> str:
+    value = (os.environ.get("KALSHI_DASHBOARD_DATA_SOURCE", "legacy") or "legacy").strip().lower()
+    return value if value in ("legacy", "ledger") else "legacy"
+
+
+def _use_ledger_reads() -> bool:
+    return _dashboard_data_source() == "ledger"
+
+
+def _ledger():
+    return get_event_ledger(path=DEFAULT_LEDGER_PATH, logger=logger)
 
 
 # ─── Helpers (from analyze-performance.py) ───
 
 def load_trades_safe(filepath: Path) -> list | None:
-    if not filepath.exists():
-        return None
-    try:
-        text = filepath.read_text().strip()
-        if not text:
-            return None
-        data = json.loads(text)
-        if not isinstance(data, list):
-            return None
-        return data
-    except (json.JSONDecodeError, ValueError, OSError):
-        return None
+    if _use_ledger_reads():
+        path_str = str(Path(filepath))
+        trade_paths = {str(Path(tf["path"])) for tf in TRADE_FILES}
+        decision_paths = {str(Path(df["path"])) for df in DECISION_FILES}
+        ledger = _ledger()
+        if path_str in trade_paths:
+            return ledger.get_trade_records(filepath)
+        if path_str in decision_paths:
+            return ledger.get_decision_records(filepath)
+    return TradeStore(filepath, logger=logger).load(default=None)
 
 
 def extract_side(trade: dict) -> str:
@@ -207,19 +188,21 @@ def extract_timestamp(trade: dict) -> str | None:
 
 
 def load_json_safe(filepath: Path) -> dict | list | None:
-    if not filepath.exists():
-        return None
-    try:
-        text = filepath.read_text().strip()
-        if not text:
-            return None
-        return json.loads(text)
-    except (json.JSONDecodeError, ValueError, OSError):
-        return None
+    return SnapshotStore(filepath, logger=logger).load(default=None)
 
 
 def get_weather_actual_source_summary() -> dict:
     """Return recent NWS-vs-IEM actual-source mix for dashboard health display."""
+    if _use_ledger_reads():
+        try:
+            ledger = _ledger()
+            return {
+                "summary_7d": ledger.get_actual_source_summary(lookback_days=7),
+                "summary_30d": ledger.get_actual_source_summary(lookback_days=30),
+            }
+        except Exception as e:
+            logger.warning("Failed to load ledger actual-source summary: %s", e)
+            return {}
     try:
         from forecast_verifier import ForecastVerifier
     except Exception as e:
@@ -235,6 +218,121 @@ def get_weather_actual_source_summary() -> dict:
         }
     except Exception as e:
         logger.warning("Failed to load weather verification summary: %s", e)
+        return {}
+
+
+def _weather_crosscheck_mode_recommendation(city: str, stats: dict, current_mode: str) -> dict:
+    """Heuristic recommendation for whether NWS gridpoint cross-check should remain enabled."""
+    n = int(stats.get("n", 0) or 0)
+    om_mae = stats.get("open_meteo_mae")
+    nws_mae = stats.get("nws_mae")
+    om_win = float(stats.get("open_meteo_better_share") or 0.0)
+    nws_win = float(stats.get("nws_better_share") or 0.0)
+
+    recommendation = {
+        "city": city,
+        "current_mode": current_mode,
+        "recommended_mode": current_mode,
+        "action": "hold",
+        "confidence": "low" if n < 8 else "medium",
+        "reason": "Waiting for more verified cross-check records",
+        "n": n,
+        "open_meteo_mae": om_mae,
+        "nws_mae": nws_mae,
+        "open_meteo_better_share": stats.get("open_meteo_better_share"),
+        "nws_better_share": stats.get("nws_better_share"),
+    }
+    if n < 5 or om_mae is None or nws_mae is None:
+        return recommendation
+
+    if om_win >= 0.70 and (nws_mae - om_mae) >= 1.0:
+        recommendation["recommended_mode"] = "disabled" if current_mode != "disabled" else "disabled"
+        recommendation["action"] = "tighten" if recommendation["recommended_mode"] != current_mode else "hold"
+        recommendation["confidence"] = "high" if n >= 10 else "medium"
+        recommendation["reason"] = (
+            f"Open-Meteo is materially better against settlement "
+            f"(MAE {om_mae:.2f}F vs {nws_mae:.2f}F, win {om_win:.0%}, n={n})"
+        )
+        return recommendation
+
+    if om_win >= 0.60 and (nws_mae - om_mae) >= 0.5:
+        recommendation["recommended_mode"] = "advisory_only" if current_mode != "disabled" else "disabled"
+        recommendation["action"] = "tighten" if recommendation["recommended_mode"] != current_mode else "hold"
+        recommendation["confidence"] = "medium"
+        recommendation["reason"] = (
+            f"Open-Meteo is outperforming NWS vs settlement "
+            f"(MAE {om_mae:.2f}F vs {nws_mae:.2f}F, win {om_win:.0%}, n={n})"
+        )
+        return recommendation
+
+    if nws_win >= 0.60 and (om_mae - nws_mae) >= 0.5:
+        recommendation["recommended_mode"] = "gridpoint"
+        recommendation["action"] = "promote" if current_mode != "gridpoint" else "hold"
+        recommendation["confidence"] = "high" if n >= 10 else "medium"
+        recommendation["reason"] = (
+            f"NWS is adding signal against settlement "
+            f"(MAE {nws_mae:.2f}F vs {om_mae:.2f}F, win {nws_win:.0%}, n={n})"
+        )
+        return recommendation
+
+    recommendation["confidence"] = "medium" if n >= 8 else "low"
+    recommendation["reason"] = (
+        f"No clear winner yet (OM MAE {om_mae:.2f}F, NWS MAE {nws_mae:.2f}F, n={n})"
+    )
+    return recommendation
+
+
+def get_weather_nws_crosscheck_summary() -> dict:
+    """Return recent Open-Meteo vs NWS cross-check performance for dashboard display."""
+    if _use_ledger_reads():
+        try:
+            ledger = _ledger()
+            return {
+                "summary_7d": ledger.get_nws_crosscheck_summary(lookback_days=7),
+                "summary_30d": ledger.get_nws_crosscheck_summary(lookback_days=30),
+            }
+        except Exception as e:
+            logger.warning("Failed to load ledger NWS cross-check summary: %s", e)
+            return {}
+    try:
+        from forecast_verifier import NWSCrossCheckVerifier
+    except Exception as e:
+        logger.warning("Failed to import NWSCrossCheckVerifier for dashboard health: %s", e)
+        return {}
+
+    try:
+        verifier = NWSCrossCheckVerifier(WEATHER_NWS_CROSSCHECK_PATH, logger=logger)
+        verifier.load()
+        weather_cfg = load_json_safe(WEATHER_CONFIG_PATH) or {}
+        cross_cfg = weather_cfg.get("nwsCrossValidation", {}) if isinstance(weather_cfg, dict) else {}
+        default_mode = str(cross_cfg.get("defaultMode", "gridpoint"))
+        city_modes = cross_cfg.get("cityModes") or cross_cfg.get("modes") or {}
+
+        summary_7d = verifier.get_summary(lookback_days=7)
+        summary_30d = verifier.get_summary(lookback_days=30)
+
+        recommendations = {}
+        for city, stats in (summary_30d.get("per_city") or {}).items():
+            current_mode = str(city_modes.get(city, default_mode))
+            recommendations[city] = _weather_crosscheck_mode_recommendation(city, stats, current_mode)
+
+        actionable = {
+            city: rec for city, rec in recommendations.items()
+            if rec.get("recommended_mode") != rec.get("current_mode")
+        }
+
+        return {
+            "summary_7d": summary_7d,
+            "summary_30d": summary_30d,
+            "recommendations": recommendations,
+            "actionable": actionable,
+            "pending_count": len(verifier.state.get("pending", [])),
+            "verified_count": len(verifier.state.get("verified", [])),
+            "last_verification": verifier.state.get("stats", {}).get("last_verification"),
+            "default_mode": default_mode,
+        }
+    except Exception as e:
+        logger.warning("Failed to load weather NWS cross-check summary: %s", e)
         return {}
 
 
@@ -345,7 +443,7 @@ def _bot_scan_interval_minutes(name: str, bot_cfg: dict) -> int | None:
 
 def _is_bot_disabled(name: str, bots_config: dict) -> bool:
     """Mirror supervisor-style disabled state for dashboard display."""
-    if name in {"hdd", "mm"}:
+    if name in ALWAYS_DISABLED_BOT_IDS:
         return True
     config_key = BOT_CONFIG_KEY.get(name, name)
     bot_cfg = bots_config.get(config_key, {})
@@ -912,6 +1010,9 @@ async def api_health():
     weather_actuals = get_weather_actual_source_summary()
     if weather_actuals:
         health_data["weather_actuals"] = weather_actuals
+    weather_nws_crosscheck = get_weather_nws_crosscheck_summary()
+    if weather_nws_crosscheck:
+        health_data["weather_nws_crosscheck"] = weather_nws_crosscheck
     return health_data
 
 
@@ -1073,12 +1174,7 @@ async def api_exit_state():
     """
     # Load trailing state
     trailing_path = DATA_DIR / "trailing-state.json"
-    trailing = {}
-    if trailing_path.exists():
-        try:
-            trailing = json.loads(trailing_path.read_text())
-        except (json.JSONDecodeError, ValueError):
-            pass
+    trailing = load_json_safe(trailing_path) or {}
 
     # Load bots config for exit thresholds
     bots_config = load_json_safe(BOTS_CONFIG_PATH) or {}
@@ -1145,6 +1241,7 @@ async def api_attribution():
     attr = PnLAttributor(
         trade_file_paths=_ANALYTICS_TRADE_FILES,
         regime_state_path=str(PROJECT_DIR / "data" / "regime-state.json"),
+        ledger_path=DEFAULT_LEDGER_PATH if _use_ledger_reads() else None,
     )
     attr.load_trades()
     report = attr.full_report()
@@ -1194,7 +1291,10 @@ async def api_execution_quality():
     if cached is not None:
         return cached
 
-    ea = ExecutionAnalyzer(trade_file_paths=_ANALYTICS_TRADE_FILES)
+    ea = ExecutionAnalyzer(
+        trade_file_paths=_ANALYTICS_TRADE_FILES,
+        ledger_path=DEFAULT_LEDGER_PATH if _use_ledger_reads() else None,
+    )
     ea.load_trades()
     report = ea.json_report()
     cache.set("exec_quality", report, ttl=120)
@@ -1207,12 +1307,7 @@ async def api_execution_quality():
 async def api_correlation():
     """Return correlation engine state for monitoring."""
     state_path = DATA_DIR / "correlation-state.json"
-    if state_path.exists():
-        try:
-            return json.loads(state_path.read_text())
-        except (json.JSONDecodeError, ValueError):
-            pass
-    return {"cluster_risk": {}, "portfolio_var": 0, "last_updated": ""}
+    return load_json_safe(state_path) or {"cluster_risk": {}, "portfolio_var": 0, "last_updated": ""}
 
 
 def main():

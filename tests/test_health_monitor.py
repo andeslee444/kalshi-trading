@@ -11,6 +11,12 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from artifact_contracts import (
+    HEALTH_STATE_ARTIFACT,
+    HEALTH_SUMMARY_BOT_FIELDS,
+    HEALTH_SUMMARY_REQUIRED_FIELDS,
+    HEALTH_SUMMARY_SOURCE_FIELDS,
+)
 from kalshi_auth import (
     HealthCheckMonitor, KILL_SWITCH_PATH, BOT_SOURCE_MAP,
     notify_imessage, _reset_imessage_rate_limiter,
@@ -38,6 +44,15 @@ class TestBotHeartbeat:
         # Load a new instance from the same state file
         hm2 = HealthCheckMonitor(state_path=str(state_path))
         assert "crypto" in hm2._state["bots"]
+
+    def test_health_state_includes_schema_metadata(self, tmp_path):
+        state_path = tmp_path / "health-state.json"
+        hm = HealthCheckMonitor(state_path=str(state_path))
+        hm.record_bot_heartbeat("weather")
+
+        data = json.loads(state_path.read_text())
+        assert data["artifact_type"] == HEALTH_STATE_ARTIFACT
+        assert data["schema_version"] == 1
 
     def test_fresh_heartbeat_not_stale(self, tmp_path):
         hm = self._make_monitor(tmp_path, staleness_minutes=60)
@@ -153,6 +168,18 @@ class TestSourceTracking:
         issues = hm.check_health()
         failing_issues = [i for i in issues if "failing" in i]
         assert len(failing_issues) == 0
+
+    def test_stale_source_errors_are_not_reported_forever(self, tmp_path):
+        hm = self._make_monitor(tmp_path)
+        old_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)).isoformat()
+        hm._state["sources"]["open-meteo"] = {
+            "last_success": None,
+            "last_error": old_time,
+            "error_count": 1870,
+            "opened_at": None,
+        }
+        issues = hm.check_health()
+        assert not any("source/open-meteo failing" in issue for issue in issues)
 
 
 class TestAutoHalt:
@@ -288,9 +315,11 @@ class TestHealthSummary:
         for _ in range(5):
             mon.record_source_error("boxoffice", "timeout")
         summary = mon.get_summary()
+        assert set(HEALTH_SUMMARY_REQUIRED_FIELDS).issubset(summary)
         assert "hdd" in summary["sources"]
         assert "nws" in summary["sources"]
         assert "boxoffice" in summary["sources"]
+        assert set(HEALTH_SUMMARY_SOURCE_FIELDS).issubset(summary["sources"]["hdd"])
         assert summary["sources"]["hdd"]["status"] == "ok"
         assert summary["sources"]["boxoffice"]["status"] == "error"
 
@@ -299,6 +328,7 @@ class TestHealthSummary:
         mon.record_bot_heartbeat("weather")
         summary = mon.get_summary()
         assert "weather" in summary["bots"]
+        assert set(HEALTH_SUMMARY_BOT_FIELDS).issubset(summary["bots"]["weather"])
 
     def test_summary_overall_healthy(self, tmp_path):
         mon = self._make_monitor(tmp_path)

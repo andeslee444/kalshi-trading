@@ -18,7 +18,6 @@ Usage:
 """
 
 import fcntl
-import json
 import os
 import re
 import time
@@ -26,14 +25,26 @@ import datetime
 import logging
 from pathlib import Path
 
+from artifact_contracts import BUDGET_RESPONSE_FIELDS, normalize_allocator_state
 from correlation_engine import CorrelationEngine, CorrelationConfig
 from regime_detector import RegimeDetector, regime_kelly_multiplier
 from edge_monitor import EdgeMonitor
+from event_ledger import get_event_ledger
+from storage import SnapshotStore, StateStore
 
 _log = logging.getLogger("capital_allocator")
 
+from kalshi_auth import notify_webhook
 
-from kalshi_auth import atomic_write_json as _atomic_write_json
+
+def _load_dict_snapshot(path, logger=None):
+    data = SnapshotStore(path, logger=logger or _log).load(default={})
+    return data if isinstance(data, dict) else {}
+
+
+def _load_list_snapshot(path, logger=None):
+    data = SnapshotStore(path, logger=logger or _log).load(default=[])
+    return data if isinstance(data, list) else []
 
 
 # Default path for shared state file (all bots converge here)
@@ -78,7 +89,7 @@ def _load_absolute_cap():
     try:
         config_path = Path(__file__).resolve().parent.parent.parent / "config" / "bots-config.json"
         if config_path.exists():
-            cfg = json.loads(config_path.read_text())
+            cfg = _load_dict_snapshot(config_path)
             cap_dollars = cfg.get("allocator", {}).get("absoluteDailyLossCap", 100)
             if not isinstance(cap_dollars, (int, float)):
                 _log.warning("absoluteDailyLossCap has invalid type %s, using $100 default", type(cap_dollars).__name__)
@@ -99,7 +110,7 @@ def _load_absolute_cap_pct():
     try:
         config_path = Path(__file__).resolve().parent.parent.parent / "config" / "bots-config.json"
         if config_path.exists():
-            cfg = json.loads(config_path.read_text())
+            cfg = _load_dict_snapshot(config_path)
             pct = cfg.get("allocator", {}).get("absoluteDailyLossCapPct", 0)
             if not isinstance(pct, (int, float)):
                 _log.warning("absoluteDailyLossCapPct has invalid type %s, using 0 default", type(pct).__name__)
@@ -119,7 +130,7 @@ def _load_drawdown_threshold():
     try:
         config_path = Path(__file__).resolve().parent.parent.parent / "config" / "bots-config.json"
         if config_path.exists():
-            cfg = json.loads(config_path.read_text())
+            cfg = _load_dict_snapshot(config_path)
             val = cfg.get("allocator", {}).get("drawdownHaltThreshold", 0.50)
             return max(0.05, min(0.95, float(val)))
     except Exception:
@@ -140,7 +151,7 @@ def _load_per_bot_daily_limits():
     try:
         config_path = Path(__file__).resolve().parent.parent.parent / "config" / "bots-config.json"
         if config_path.exists():
-            cfg = json.loads(config_path.read_text())
+            cfg = _load_dict_snapshot(config_path)
             raw = cfg.get("allocator", {}).get("perBotDailyLimit", {})
             return {k: int(float(v) * 100) for k, v in raw.items()
                     if isinstance(v, (int, float)) and v > 0}
@@ -229,6 +240,10 @@ class BudgetResponse:
             return f"BudgetResponse(approved=True, max_cost=${self.max_cost_cents/100:.2f}, bankroll=${self.bankroll_cents/100:.2f})"
         return f"BudgetResponse(approved=False, reason={self.reason!r})"
 
+    def as_record(self):
+        """Return the canonical allocator decision contract as a plain dict."""
+        return {field: getattr(self, field) for field in BUDGET_RESPONSE_FIELDS}
+
 
 class PortfolioAllocator:
     """Portfolio-level capital allocator across all bots.
@@ -251,6 +266,12 @@ class PortfolioAllocator:
             self.state_path = Path(state_path)
         else:
             self.state_path = DEFAULT_STATE_PATH
+        self._state_store = StateStore(
+            self.state_path,
+            logger=self.log,
+            normalizer=normalize_allocator_state,
+        )
+        self._ledger = get_event_ledger(logger=self.log)
 
         # In-memory state (loaded from / saved to file)
         # ticker -> {"bot": str, "timestamp": str, "signal_quality": float,
@@ -290,6 +311,7 @@ class PortfolioAllocator:
         self._edge_weights_loaded_at = time.time()
         self._last_drawdown_check = 0
         self._drawdown_halted = False
+        self._cluster_denial_streaks = {}
 
         if ABSOLUTE_DAILY_LOSS_CAP_PCT > 0:
             self.log.info("Allocator: daily loss cap = $%.0f floor + %.0f%% of bankroll",
@@ -300,6 +322,22 @@ class PortfolioAllocator:
         if PER_BOT_DAILY_LIMITS:
             self.log.info("Allocator: per-bot daily limits: %s",
                           {k: f"${v/100:.0f}" for k, v in PER_BOT_DAILY_LIMITS.items()})
+
+    def _record_cluster_denial(self, bot_name, ticker, reason):
+        state = self._cluster_denial_streaks.get(bot_name, {"count": 0, "reason": ""})
+        if state.get("reason") != reason:
+            state = {"count": 0, "reason": reason}
+        state["count"] += 1
+        self._cluster_denial_streaks[bot_name] = state
+        if state["count"] == 5:
+            notify_webhook(
+                f"{bot_name}: repeated cluster denials on {ticker} ({reason})",
+                level="warning",
+                logger=self.log,
+            )
+
+    def _clear_cluster_denial(self, bot_name):
+        self._cluster_denial_streaks.pop(bot_name, None)
 
     def _check_drawdown_halt(self):
         """Check if portfolio drawdown exceeds threshold. Creates HALT_TRADING if so.
@@ -324,7 +362,7 @@ class PortfolioAllocator:
             deposits_path = self.state_path.parent / "deposits.json" if self.state_path else _DEPOSITS_PATH
             if not deposits_path.exists():
                 return False
-            deposits = json.loads(deposits_path.read_text())
+            deposits = _load_list_snapshot(deposits_path, logger=self.log)
             total_deposited = sum(
                 e.get("amount_cents", 0) for e in deposits
                 if e.get("type") == "deposit"
@@ -370,7 +408,7 @@ class PortfolioAllocator:
         try:
             config_path = Path(__file__).resolve().parent.parent.parent / "config" / "bots-config.json"
             if config_path.exists():
-                cfg = json.loads(config_path.read_text())
+                cfg = _load_dict_snapshot(config_path, logger=self.log)
                 corr = cfg.get("correlation", {})
                 return CorrelationConfig(
                     cluster_max_fraction=corr.get("clusterMaxFraction", 0.15),
@@ -403,19 +441,13 @@ class PortfolioAllocator:
 
         Uses self._holding_lock to skip locking when caller already holds it.
         """
-        if not self.state_path or not self.state_path.exists():
+        if not self.state_path:
             return
-        lock_path = self.state_path.with_suffix(".lock")
         try:
             if self._holding_lock:
-                data = json.loads(self.state_path.read_text())
+                data = self._state_store.load_unlocked()
             else:
-                with open(lock_path, "w") as lock_fd:
-                    fcntl.flock(lock_fd, fcntl.LOCK_SH)
-                    try:
-                        data = json.loads(self.state_path.read_text())
-                    finally:
-                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                data = self._state_store.load()
             raw_tickers = data.get("traded_tickers", {})
             # Backward compat: convert old tuple/list format to new dict format
             self._traded_tickers = {}
@@ -456,39 +488,24 @@ class PortfolioAllocator:
         """
         if not self.state_path:
             return
-        data = {
+        data = normalize_allocator_state({
             "traded_tickers": self._traded_tickers,
             "bot_spend": self._bot_spend,
             "city_risk": self._city_risk,
             "region_risk": self._region_risk,
             "daily_date": self._daily_date,
-        }
-        lock_path = self.state_path.with_suffix(".lock")
+        })
+
+        def _merge_on_disk(on_disk):
+            merged = normalize_allocator_state(on_disk)
+            merged.update(data)
+            return normalize_allocator_state(merged)
+
         try:
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
             if self._holding_lock:
-                on_disk = {}
-                if self.state_path.exists():
-                    try:
-                        on_disk = json.loads(self.state_path.read_text())
-                    except (json.JSONDecodeError, OSError):
-                        pass
-                on_disk.update(data)
-                _atomic_write_json(self.state_path, on_disk)
+                self._state_store.save_unlocked(_merge_on_disk(self._state_store.load_unlocked()))
             else:
-                with open(lock_path, "w") as lock_fd:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                    try:
-                        on_disk = {}
-                        if self.state_path.exists():
-                            try:
-                                on_disk = json.loads(self.state_path.read_text())
-                            except (json.JSONDecodeError, OSError):
-                                pass
-                        on_disk.update(data)
-                        _atomic_write_json(self.state_path, on_disk)
-                    finally:
-                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                self._state_store.update(_merge_on_disk)
         except Exception as e:
             self.log.warning("Failed to save allocator state: %s", e)
 
@@ -695,15 +712,27 @@ class PortfolioAllocator:
             self.log.warning("Position reconciliation failed: %s", e)
             return
 
-        # Recompute city/region risk from only open positions
+        # Recompute concentration from only open positions.
         new_city_risk = {}
         new_region_risk = {}
-        for ticker, info in self._traded_tickers.items():
-            if not isinstance(info, dict):
+        live_cluster_records = []
+        tracked_open = {
+            ticker: info for ticker, info in self._traded_tickers.items()
+            if isinstance(info, dict) and ticker in open_tickers
+        }
+        for pos in positions:
+            if not isinstance(pos, dict) or pos.get("position", 0) == 0:
                 continue
-            if ticker not in open_tickers:
-                continue  # settled — don't count toward concentration
-            risk = info.get("risk_cents", 0)
+            ticker = pos.get("ticker", "")
+            if not ticker:
+                continue
+            risk = pos.get("market_exposure")
+            if not isinstance(risk, (int, float)) or risk <= 0:
+                risk = tracked_open.get(ticker, {}).get("risk_cents", 0)
+            if risk <= 0:
+                continue
+            risk = int(round(risk))
+            live_cluster_records.append({"ticker": ticker, "risk_cents": risk})
             city_key = _extract_city_key(ticker)
             if city_key:
                 new_city_risk[city_key] = new_city_risk.get(city_key, 0) + risk
@@ -717,6 +746,13 @@ class PortfolioAllocator:
             self.log.info("Reconciled settled positions: freed $%.2f city risk", freed_city / 100)
         self._city_risk = new_city_risk
         self._region_risk = new_region_risk
+        old_cluster_risk = dict(self._correlation_engine._cluster_risk)
+        self._correlation_engine.rebuild_cluster_risk(live_cluster_records)
+        freed_cluster = sum(old_cluster_risk.values()) - sum(self._correlation_engine._cluster_risk.values())
+        if freed_cluster > 0:
+            self.log.info("Reconciled settled positions: freed $%.2f cluster risk", freed_cluster / 100)
+        if old_cluster_risk != self._correlation_engine._cluster_risk:
+            self._correlation_engine.save_state()
 
     def get_pending_exits(self):
         """Return and clear the list of tickers that should be exited.
@@ -750,6 +786,8 @@ class PortfolioAllocator:
         # other bots during slow network calls.
         self._prefetch_api_data()
 
+        request_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
         def _do_request():
             self._load_state()
             self._reset_daily_if_needed_inner()
@@ -762,11 +800,53 @@ class PortfolioAllocator:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 self._holding_lock = True
                 try:
-                    return _do_request()
+                    response = _do_request()
                 finally:
                     self._holding_lock = False
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        return _do_request()
+        else:
+            response = _do_request()
+        self._record_budget_decision(
+            timestamp=request_ts,
+            bot_name=bot_name,
+            ticker=ticker,
+            edge=edge,
+            confidence=confidence,
+            bot_max_cost_cents=bot_max_cost_cents,
+            source_type=source_type,
+            response=response,
+        )
+        return response
+
+    def _record_budget_decision(
+        self,
+        *,
+        timestamp,
+        bot_name,
+        ticker,
+        edge,
+        confidence,
+        bot_max_cost_cents,
+        source_type,
+        response,
+    ):
+        try:
+            self._ledger.record_budget_decision({
+                "timestamp": timestamp,
+                "bot_name": bot_name,
+                "ticker": ticker,
+                "edge": round(float(edge), 6) if edge is not None else None,
+                "confidence": round(float(confidence), 6) if confidence is not None else None,
+                "bot_max_cost_cents": int(bot_max_cost_cents),
+                "source_type": source_type,
+                "approved": bool(response.approved),
+                "max_cost_cents": int(response.max_cost_cents),
+                "bankroll_cents": int(response.bankroll_cents),
+                "reason": response.reason,
+                "binding_constraint": response.binding_constraint,
+            })
+        except Exception as e:
+            self.log.warning("Failed to dual-write budget decision: %s", e)
 
     def _request_budget_inner(self, bot_name, ticker, edge, confidence, bot_max_cost_cents, source_type=None):
         """Inner budget logic (called under lock)."""
@@ -872,7 +952,9 @@ class PortfolioAllocator:
             ticker, bot_max_cost_cents, available_balance
         )
         if not cluster_ok:
+            self._record_cluster_denial(bot_name, ticker, cluster_reason)
             return BudgetResponse(False, reason=cluster_reason)
+        self._clear_cluster_denial(bot_name)
 
         # 5e. Marginal VaR check
         current_positions = self._get_positions_for_var()

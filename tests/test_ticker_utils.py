@@ -424,6 +424,9 @@ class TestParseCryptoTicker:
     def test_truly_unknown_format_returns_none(self):
         assert parse_crypto_ticker("KXBTCFOO-26MAR04-BAR") is None
 
+    def test_solar_markets_do_not_parse_as_sol(self):
+        assert parse_crypto_ticker("KXSOLAR-25-30") is None
+
 
 # ===================================================================
 # Crypto Ticker Return Type Consistency
