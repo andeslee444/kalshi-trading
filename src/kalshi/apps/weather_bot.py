@@ -7,6 +7,7 @@ import json, time, datetime, os, sys, re, threading
 import requests
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from app_bootstrap import AppContext, install_app_context
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested, CITY_TIMEZONES, _local_today, normalize_markets
 from probability import weather_probability, weather_sigma, weather_sigma_hourly, ensemble_weather_probability, ensemble_spread_sigma_multiplier, ensemble_weather_probability_v2, empirical_ensemble_probability, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, _load_calibration
 from ticker_utils import parse_weather_ticker as parse_ticker
@@ -15,35 +16,20 @@ from forecast_verifier import ForecastVerifier, DEFAULT_STATION_MAP, NWSCrossChe
 from weather_data import EnsembleCollector, HRRRFetcher, NAMFetcher, PreviousRunsFetcher, OrderBookDepth, next_model_run, latest_available_model_run, canonical_model_name, open_meteo_model_name, STATION_MAP, NWSForecastFetcher, BiasCorrector
 from singleton_lock import acquire_process_singleton, release_process_singleton
 
-setup_unbuffered()
-log = setup_logging("weather")
-setup_signal_handlers()
-
 # === Config ===
 CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-config.json"
 TRADES_PATH = PROJECT_DIR / "data" / "kalshi-trades.json"
-TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
 WEATHER_SINGLETON_LOCK_PATH = PROJECT_DIR / "data" / "pids" / "weather-bot.lock"
 
-config = json.loads(CONFIG_PATH.read_text())
-CITIES = config["cities"]
-
-client = KalshiClient()
-allocator = PortfolioAllocator(client, logger=log)
-health = HealthCheckMonitor(logger=log)
-order_monitor = OrderMonitor(
-    client,
-    log=log,
-    max_age_seconds=config.get("makerExecution", {}).get("maxRestingSeconds", 300),
-)
-trade_manager = TradeManager(client, TRADES_PATH, {
-    "maxTradeAmount": config["maxTradeAmount"],
-    "maxTradeAmountPct": config.get("maxTradeAmountPct"),
-    "maxDailyTrades": config.get("maxDailyTrades", 10),
-    "maxDailyLoss": config.get("maxDailyLoss", 10),
-    "maxDailyLossPct": config.get("maxDailyLossPct"),
-}, logger=log, order_monitor=order_monitor, cooldown_hours=0.5, bot_name="weather")
-trim_trade_log(TRADES_PATH)
+_APP_CONTEXT = None
+log = None
+config = {}
+CITIES = {}
+client = None
+allocator = None
+health = None
+order_monitor = None
+trade_manager = None
 
 
 def _release_singleton_lock():
@@ -134,13 +120,13 @@ def _effective_weather_edge_threshold():
     return base
 
 
-def _resolve_optional_project_path(path_str):
+def _resolve_optional_project_path(path_str, project_dir=None):
     if not path_str:
         return None
     path = Path(path_str)
     if path.is_absolute():
         return path
-    return PROJECT_DIR / path
+    return Path(project_dir or PROJECT_DIR) / path
 
 
 def get_weather_markets(cache_ttl=600):
@@ -203,7 +189,7 @@ ENSEMBLE_MODELS = {
     "aifs": "ecmwf_aifs025",       # ECMWF AI model
     "graphcast": "gfs_graphcast025",  # DeepMind AI model
 }
-ENSEMBLE_ENABLED = config.get("ensemble", {}).get("enabled", False)
+ENSEMBLE_ENABLED = False
 
 # === Open-Meteo API Configuration ===
 # Premium API: set OPEN_METEO_API_KEY in .env for higher rate limits and priority.
@@ -226,7 +212,6 @@ _GFS_API_MODELS = {
 _endpoint_route_warned = set()
 if _OPEN_METEO_API_KEY:
     OPEN_METEO_BASE = _OPEN_METEO_PREMIUM_FORECAST_BASE
-    log.info("Using Open-Meteo PREMIUM API (customer endpoint)")
 else:
     OPEN_METEO_BASE = _OPEN_METEO_FORECAST_BASE
 
@@ -258,10 +243,7 @@ class RateLimiter:
 
 
 # Premium API allows higher rate limits
-_open_meteo_limiter = RateLimiter(
-    max_per_second=10 if _OPEN_METEO_API_KEY else 4,
-    burst=10 if _OPEN_METEO_API_KEY else 4,
-)
+_open_meteo_limiter = None
 
 
 def _open_meteo_request_target(model_name=None):
@@ -333,60 +315,20 @@ def _record_source_failure(source, message, status_code=None, immediate_on_bad_r
 
 
 # === Forecast Verification ===
-VERIFICATION_ENABLED = config.get("verification", {}).get("enabled", True)
-VERIFICATION_CONFIG = config.get("verification", {})
-bias_cfg = config.get("biasCorrection", {})
-nws_cfg = config.get("nwsCrossValidation", {})
-verifier = ForecastVerifier(PROJECT_DIR / "data" / "weather-verification.json", logger=log) if VERIFICATION_ENABLED else None
-if verifier:
-    verifier.load()
-nws_audit_enabled = bool(nws_cfg.get("auditEnabled", True))
-nws_audit_path = _resolve_optional_project_path(
-    nws_cfg.get("auditPath", "data/weather-nws-cross-check.json")
-)
-nws_crosscheck_verifier = (
-    NWSCrossCheckVerifier(nws_audit_path, logger=log)
-    if nws_audit_enabled and nws_audit_path is not None
-    else None
-)
-if nws_crosscheck_verifier:
-    nws_crosscheck_verifier.load()
-
-# Ensemble member collector for empirical CDF model
-ensemble_collector = EnsembleCollector(logger=log)
-
-# HRRR deterministic forecast fetcher (Phase 3)
-hrrr_fetcher = HRRRFetcher(logger=log, rate_limiter=_open_meteo_limiter.acquire)
-
-# NAM deterministic forecast fetcher (3km, 60h)
-nam_fetcher = NAMFetcher(logger=log, rate_limiter=_open_meteo_limiter.acquire)
-
-# Bias corrector — only uses calibration artifacts explicitly marked as lead-time matched
-_bias_calibration_override = _resolve_optional_project_path(
-    os.environ.get("WEATHER_BIAS_CALIBRATION_PATH") or bias_cfg.get("calibrationPath")
-)
-if _bias_calibration_override:
-    log.info("Using weather bias calibration override: %s", _bias_calibration_override)
-bias_corrector = BiasCorrector(
-    calibration_path=str(_bias_calibration_override) if _bias_calibration_override else None,
-    logger=log,
-    require_lead_time_matched=True,
-)
-
-# NWS forecast fetcher (fallback when Open-Meteo fails)
-nws_fetcher = NWSForecastFetcher(
-    logger=log,
-    grid_map=nws_cfg.get("gridOverrides"),
-    city_coords=CITIES,
-    threshold_map=nws_cfg.get("thresholds"),
-    threshold_scale=nws_cfg.get("citySigmaScale"),
-    max_threshold_f=nws_cfg.get("maxThresholdF"),
-    mode_map=nws_cfg.get("cityModes") or nws_cfg.get("modes"),
-    default_mode=nws_cfg.get("defaultMode", "gridpoint"),
-)
-
-# Order book depth analyzer (Phase 3)
-orderbook = OrderBookDepth(logger=log)
+VERIFICATION_ENABLED = True
+VERIFICATION_CONFIG = {}
+bias_cfg = {}
+nws_cfg = {}
+verifier = None
+nws_audit_enabled = False
+nws_audit_path = None
+nws_crosscheck_verifier = None
+ensemble_collector = None
+hrrr_fetcher = None
+nam_fetcher = None
+bias_corrector = None
+nws_fetcher = None
+orderbook = None
 
 
 def get_forecast(lat, lon):
@@ -2158,11 +2100,134 @@ def scan_and_trade():
     ss.finalize()
     return markets
 
+
+def load_config(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    return json.loads((project_dir / "config" / "kalshi-config.json").read_text())
+
+
+def build_app(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    setup_unbuffered()
+    logger = setup_logging("weather")
+    setup_signal_handlers()
+
+    config_path = project_dir / "config" / "kalshi-config.json"
+    trades_path = project_dir / "data" / "kalshi-trades.json"
+    trades_path.parent.mkdir(parents=True, exist_ok=True)
+    singleton_lock_path = project_dir / "data" / "pids" / "weather-bot.lock"
+
+    loaded_config = load_config(project_dir)
+    cities = loaded_config["cities"]
+    client_obj = KalshiClient()
+    allocator_obj = PortfolioAllocator(client_obj, logger=logger)
+    health_monitor = HealthCheckMonitor(logger=logger)
+    order_monitor_obj = OrderMonitor(
+        client_obj,
+        log=logger,
+        max_age_seconds=loaded_config.get("makerExecution", {}).get("maxRestingSeconds", 300),
+    )
+    trade_manager_obj = TradeManager(client_obj, trades_path, {
+        "maxTradeAmount": loaded_config["maxTradeAmount"],
+        "maxTradeAmountPct": loaded_config.get("maxTradeAmountPct"),
+        "maxDailyTrades": loaded_config.get("maxDailyTrades", 10),
+        "maxDailyLoss": loaded_config.get("maxDailyLoss", 10),
+        "maxDailyLossPct": loaded_config.get("maxDailyLossPct"),
+    }, logger=logger, order_monitor=order_monitor_obj, cooldown_hours=0.5, bot_name="weather")
+    trim_trade_log(trades_path)
+
+    verification_enabled = loaded_config.get("verification", {}).get("enabled", True)
+    verification_config = loaded_config.get("verification", {})
+    local_bias_cfg = loaded_config.get("biasCorrection", {})
+    local_nws_cfg = loaded_config.get("nwsCrossValidation", {})
+    open_meteo_base = (
+        _OPEN_METEO_PREMIUM_FORECAST_BASE if _OPEN_METEO_API_KEY else _OPEN_METEO_FORECAST_BASE
+    )
+    open_meteo_limiter = RateLimiter(
+        max_per_second=10 if _OPEN_METEO_API_KEY else 4,
+        burst=10 if _OPEN_METEO_API_KEY else 4,
+    )
+    verification_path = project_dir / "data" / "weather-verification.json"
+    verifier_obj = ForecastVerifier(verification_path, logger=logger) if verification_enabled else None
+    if verifier_obj:
+        verifier_obj.load()
+    local_nws_audit_enabled = bool(local_nws_cfg.get("auditEnabled", True))
+    local_nws_audit_path = _resolve_optional_project_path(
+        local_nws_cfg.get("auditPath", "data/weather-nws-cross-check.json"),
+        project_dir=project_dir,
+    )
+    crosscheck_verifier = (
+        NWSCrossCheckVerifier(local_nws_audit_path, logger=logger)
+        if local_nws_audit_enabled and local_nws_audit_path is not None
+        else None
+    )
+    if crosscheck_verifier:
+        crosscheck_verifier.load()
+
+    bias_calibration_override = _resolve_optional_project_path(
+        os.environ.get("WEATHER_BIAS_CALIBRATION_PATH") or local_bias_cfg.get("calibrationPath"),
+        project_dir=project_dir,
+    )
+    if bias_calibration_override:
+        logger.info("Using weather bias calibration override: %s", bias_calibration_override)
+
+    context = AppContext({
+        "PROJECT_DIR": project_dir,
+        "CONFIG_PATH": config_path,
+        "TRADES_PATH": trades_path,
+        "WEATHER_SINGLETON_LOCK_PATH": singleton_lock_path,
+        "log": logger,
+        "config": loaded_config,
+        "CITIES": cities,
+        "client": client_obj,
+        "allocator": allocator_obj,
+        "health": health_monitor,
+        "order_monitor": order_monitor_obj,
+        "trade_manager": trade_manager_obj,
+        "ENSEMBLE_ENABLED": loaded_config.get("ensemble", {}).get("enabled", False),
+        "OPEN_METEO_BASE": open_meteo_base,
+        "_endpoint_route_warned": set(),
+        "_open_meteo_limiter": open_meteo_limiter,
+        "_forecast_cache": {},
+        "_local_trade_times": {},
+        "_weather_market_cache": {"fetched_at": 0.0, "markets": []},
+        "VERIFICATION_ENABLED": verification_enabled,
+        "VERIFICATION_CONFIG": verification_config,
+        "bias_cfg": local_bias_cfg,
+        "nws_cfg": local_nws_cfg,
+        "verifier": verifier_obj,
+        "nws_audit_enabled": local_nws_audit_enabled,
+        "nws_audit_path": local_nws_audit_path,
+        "nws_crosscheck_verifier": crosscheck_verifier,
+        "ensemble_collector": EnsembleCollector(logger=logger),
+        "hrrr_fetcher": HRRRFetcher(logger=logger, rate_limiter=open_meteo_limiter.acquire),
+        "nam_fetcher": NAMFetcher(logger=logger, rate_limiter=open_meteo_limiter.acquire),
+        "bias_corrector": BiasCorrector(
+            calibration_path=str(bias_calibration_override) if bias_calibration_override else None,
+            logger=logger,
+            require_lead_time_matched=True,
+        ),
+        "nws_fetcher": NWSForecastFetcher(
+            logger=logger,
+            grid_map=local_nws_cfg.get("gridOverrides"),
+            city_coords=cities,
+            threshold_map=local_nws_cfg.get("thresholds"),
+            threshold_scale=local_nws_cfg.get("citySigmaScale"),
+            max_threshold_f=local_nws_cfg.get("maxThresholdF"),
+            mode_map=local_nws_cfg.get("cityModes") or local_nws_cfg.get("modes"),
+            default_mode=local_nws_cfg.get("defaultMode", "gridpoint"),
+        ),
+        "orderbook": OrderBookDepth(logger=logger),
+    })
+    return install_app_context(globals(), context)
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Weather temperature trading bot")
     parser.add_argument("--once", action="store_true", help="Run single scan then exit")
     args = parser.parse_args()
+    build_app()
 
     if not _acquire_singleton_lock():
         log.warning("Duplicate weather bot launch blocked; exiting.")

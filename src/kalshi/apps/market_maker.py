@@ -17,6 +17,7 @@ Usage:
 
 import json, time, datetime, os, sys, re, math, argparse
 from pathlib import Path
+from app_bootstrap import AppContext, install_app_context
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, TradeManager, trim_trade_log, build_market_snapshot,
@@ -25,54 +26,41 @@ from kalshi_auth import (
 from probability import weather_probability, weather_sigma, is_market_liquid, _probit, _norm_pdf
 from capital_allocator import PortfolioAllocator
 
-setup_unbuffered()
-log = setup_logging("market-maker")
-setup_signal_handlers()
-health = HealthCheckMonitor(logger=log)
-
 # === Paths ===
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
 TRADES_PATH = PROJECT_DIR / "data" / "kalshi-mm-trades.json"
-TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-# Load config
-bots_config = json.loads(BOTS_CONFIG_PATH.read_text())
-mm_config = bots_config.get("market_maker", {})
-
-ENABLED = mm_config.get("enabled", False)
-SCAN_INTERVAL = mm_config.get("scanIntervalMinutes", 5)
-MAX_INVENTORY = mm_config.get("maxInventoryPerMarket", 20)
-GAMMA = mm_config.get("gamma", 0.3)  # risk aversion parameter (prediction markets need higher)
-K_PARAM = mm_config.get("kParam", 1.5)  # order arrival intensity
-MAX_TRADE = mm_config.get("maxTradeAmount", 5)
-MAX_DAILY_TRADES = mm_config.get("maxDailyTrades", 50)
-MAX_DAILY_LOSS = mm_config.get("maxDailyLoss", 25)
-TARGET_MARKETS = mm_config.get("targetMarkets", ["KXHIGH"])
+_APP_CONTEXT = None
+log = None
+health = None
+bots_config = {}
+mm_config = {}
+ENABLED = False
+SCAN_INTERVAL = 5
+MAX_INVENTORY = 20
+GAMMA = 0.3
+K_PARAM = 1.5
+MAX_TRADE = 5
+MAX_DAILY_TRADES = 50
+MAX_DAILY_LOSS = 25
+TARGET_MARKETS = ["KXHIGH"]
 
 # Load calibrated per-market params (from orderbook simulation)
 MM_CALIBRATION_PATH = PROJECT_DIR / "config" / "mm-calibration.json"
 
-def _load_mm_calibration():
+def _load_mm_calibration(path=None):
     """Load per-prefix calibrated MM params."""
+    calibration_path = Path(path or MM_CALIBRATION_PATH)
     try:
-        if MM_CALIBRATION_PATH.exists():
-            return json.loads(MM_CALIBRATION_PATH.read_text())
+        if calibration_path.exists():
+            return json.loads(calibration_path.read_text())
     except (json.JSONDecodeError, ValueError):
         pass
     return {}
 
-_mm_calibration = _load_mm_calibration()
-
-client = KalshiClient()
-allocator = PortfolioAllocator(client, logger=log)
-trade_manager = TradeManager(client, TRADES_PATH, {
-    "maxTradeAmount": MAX_TRADE,
-    "maxTradeAmountPct": mm_config.get("maxTradeAmountPct"),
-    "maxDailyTrades": MAX_DAILY_TRADES,
-    "maxDailyLoss": MAX_DAILY_LOSS,
-    "maxDailyLossPct": mm_config.get("maxDailyLossPct"),
-}, logger=log, cooldown_hours=0, bot_name="mm")  # MM must re-quote every cycle
-trim_trade_log(TRADES_PATH)
+_mm_calibration = {}
+client = None
+allocator = None
+trade_manager = None
 
 # === Inventory Tracking ===
 _inventory = {}  # ticker -> net position (positive = long YES, negative = short YES)
@@ -454,10 +442,67 @@ def analyze_opportunities():
 
 # === Entry Point ===
 
+def load_config(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    return json.loads((project_dir / "config" / "bots-config.json").read_text())
+
+
+def build_app(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    setup_unbuffered()
+    logger = setup_logging("market-maker")
+    setup_signal_handlers()
+    health_monitor = HealthCheckMonitor(logger=logger)
+    bots_config_path = project_dir / "config" / "bots-config.json"
+    trades_path = project_dir / "data" / "kalshi-mm-trades.json"
+    mm_calibration_path = project_dir / "config" / "mm-calibration.json"
+    trades_path.parent.mkdir(parents=True, exist_ok=True)
+    loaded_bots_config = load_config(project_dir)
+    loaded_mm_config = loaded_bots_config.get("market_maker", {})
+    max_trade = loaded_mm_config.get("maxTradeAmount", 5)
+    max_daily_trades = loaded_mm_config.get("maxDailyTrades", 50)
+    max_daily_loss = loaded_mm_config.get("maxDailyLoss", 25)
+    client_obj = KalshiClient()
+    allocator_obj = PortfolioAllocator(client_obj, logger=logger)
+    trade_manager_obj = TradeManager(client_obj, trades_path, {
+        "maxTradeAmount": max_trade,
+        "maxTradeAmountPct": loaded_mm_config.get("maxTradeAmountPct"),
+        "maxDailyTrades": max_daily_trades,
+        "maxDailyLoss": max_daily_loss,
+        "maxDailyLossPct": loaded_mm_config.get("maxDailyLossPct"),
+    }, logger=logger, cooldown_hours=0, bot_name="mm")
+    trim_trade_log(trades_path)
+    mm_calibration = _load_mm_calibration(mm_calibration_path)
+    return install_app_context(globals(), AppContext({
+        "PROJECT_DIR": project_dir,
+        "BOTS_CONFIG_PATH": bots_config_path,
+        "TRADES_PATH": trades_path,
+        "MM_CALIBRATION_PATH": mm_calibration_path,
+        "log": logger,
+        "health": health_monitor,
+        "bots_config": loaded_bots_config,
+        "mm_config": loaded_mm_config,
+        "ENABLED": loaded_mm_config.get("enabled", False),
+        "SCAN_INTERVAL": loaded_mm_config.get("scanIntervalMinutes", 5),
+        "MAX_INVENTORY": loaded_mm_config.get("maxInventoryPerMarket", 20),
+        "GAMMA": loaded_mm_config.get("gamma", 0.3),
+        "K_PARAM": loaded_mm_config.get("kParam", 1.5),
+        "MAX_TRADE": max_trade,
+        "MAX_DAILY_TRADES": max_daily_trades,
+        "MAX_DAILY_LOSS": max_daily_loss,
+        "TARGET_MARKETS": loaded_mm_config.get("targetMarkets", ["KXHIGH"]),
+        "_mm_calibration": mm_calibration,
+        "client": client_obj,
+        "allocator": allocator_obj,
+        "trade_manager": trade_manager_obj,
+    }))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Kalshi Market Maker")
     parser.add_argument("--once", action="store_true", help="Run single scan and exit")
     args = parser.parse_args()
+    build_app()
 
     log.info("=" * 60)
     log.info("Kalshi Market Maker (Avellaneda-Stoikov)")

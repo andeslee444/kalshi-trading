@@ -1,7 +1,7 @@
 # Refactor Program
 
 Generated: 2026-03-14
-Status: Active. Phases 0 and 1 complete on 2026-03-14.
+Status: Active. Phases 0, 1, 2, and 3 complete on 2026-03-14. Phase 4 implementation is complete on 2026-03-14; parity observation is now pending.
 
 This program is optimized for three goals:
 
@@ -124,6 +124,8 @@ Estimated size:
 
 Objective: make bots import-safe and testable.
 
+Status: complete on 2026-03-14.
+
 Deliverables:
 
 - Explicit `main()` and `build_app()` pattern for each bot
@@ -168,6 +170,8 @@ Estimated size:
 
 Objective: stop coupling business logic to direct JSON file access.
 
+Status: complete on 2026-03-14.
+
 Deliverables:
 
 - `TradeStore`
@@ -205,6 +209,8 @@ Estimated size:
 ## Phase 4: Add A Canonical Event Ledger
 
 Objective: create one source of truth for research, audit, and ops.
+
+Status: implementation complete on 2026-03-14. The 2-week parity observation window starts after rollout.
 
 Recommended first implementation:
 

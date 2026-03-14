@@ -6,7 +6,7 @@ and writes settlement_result, settlement_revenue_cents, fill_price_cents, and
 realized_edge back into the trade record.
 
 Idempotent: skips records that already have settlement_result set.
-Atomic writes: uses _atomic_write_json for safe file updates.
+Writes go through TradeStore so file format stays unchanged.
 
 Usage:
     python3 scripts/reconcile-trades.py              # annotate all trade files
@@ -23,10 +23,13 @@ _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src" / "kalshi")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from kalshi_auth import KalshiClient, load_trades, _atomic_write_json, setup_logging
+from event_ledger import get_event_ledger
+from kalshi_auth import KalshiClient, setup_logging
+from storage import TradeStore
 from trade_files import ALL_TRADE_PATHS
 
 log = setup_logging("reconcile")
+ledger = get_event_ledger(logger=log)
 
 # Use canonical trade file list from trade_files module
 TRADE_FILES = ALL_TRADE_PATHS
@@ -175,13 +178,28 @@ def reconcile_all(dry_run=False):
         if not trade_file.exists():
             continue
 
-        trades = load_trades(trade_file)
+        store = TradeStore(trade_file, logger=log)
+        trades = store.load()
         if not trades:
             continue
 
         file_modified = 0
         for trade in trades:
             if _annotate_trade(trade, settlements, fills):
+                try:
+                    if trade.get("order_id") and trade.get("fill_price_cents") is not None:
+                        ledger.record_fill({
+                            "timestamp": trade.get("timestamp"),
+                            "ticker": trade.get("ticker"),
+                            "order_id": trade.get("order_id"),
+                            "fill_price_cents": trade.get("fill_price_cents"),
+                            "fill_count": trade.get("count"),
+                            "source_bot": trade.get("source_bot"),
+                        }, source_path=trade_file)
+                    if trade.get("settlement_result") is not None:
+                        ledger.record_settlement(trade, source_path=trade_file)
+                except Exception as e:
+                    log.warning("Failed to dual-write reconcile event for %s: %s", trade.get("ticker", "?"), e)
                 file_modified += 1
             else:
                 total_skipped += 1
@@ -189,7 +207,7 @@ def reconcile_all(dry_run=False):
         if file_modified > 0:
             log.info("  %s: %d/%d records annotated", trade_file.name, file_modified, len(trades))
             if not dry_run:
-                _atomic_write_json(trade_file, trades)
+                store.save(trades)
             total_annotated += file_modified
 
     log.info("Reconciliation complete: %d annotated, %d skipped (already done or no match)",

@@ -5,7 +5,6 @@ historical API, and provides verification data for adaptive ensemble
 weights and city-level bias estimation.
 """
 
-import json
 import logging
 import datetime
 from pathlib import Path
@@ -18,6 +17,8 @@ from artifact_contracts import (
     WEATHER_VERIFICATION_SCHEMA_VERSION,
     normalize_verification_state,
 )
+from event_ledger import get_event_ledger
+from storage import StateStore
 from weather_data import SettlementTemperatureFetcher
 
 _log = logging.getLogger("forecast_verifier")
@@ -69,6 +70,12 @@ class ForecastVerifier:
         self.state_path = Path(state_path)
         self.log = logger or _log
         self._settlement_fetcher = SettlementTemperatureFetcher(logger=self.log)
+        self._ledger = get_event_ledger(logger=self.log)
+        self._state_store = StateStore(
+            self.state_path,
+            logger=self.log,
+            normalizer=self._normalize_state,
+        )
         self.state = self._normalize_state(None)
 
     def record_forecast(self, city, date_str, model_forecasts, threshold=None,
@@ -125,6 +132,14 @@ class ForecastVerifier:
             if self._record_identity(p) != record_id
         ]
         self.state["pending"].append(record)
+        try:
+            self._ledger.record_forecast_snapshot(
+                record,
+                source_path=self.state_path,
+                category="weather_forecast",
+            )
+        except Exception as e:
+            self.log.warning("Failed to dual-write forecast snapshot: %s", e)
 
     def verify_past_forecasts(self, city_coords=None, station_map=None):
         """Check forecasts from 2+ days ago against actual temperatures.
@@ -234,6 +249,14 @@ class ForecastVerifier:
                 verified_record["hour_of_day"] = record["hour_of_day"]
 
             verified_this_scan.append(verified_record)
+            try:
+                self._ledger.record_verification_result(
+                    verified_record,
+                    source_path=self.state_path,
+                    category="weather_verification",
+                )
+            except Exception as e:
+                self.log.warning("Failed to dual-write verification result: %s", e)
 
         self.state["pending"] = remaining
         self.state["verified"].extend(verified_this_scan)
@@ -573,32 +596,24 @@ class ForecastVerifier:
     def save(self):
         """Persist state to disk using atomic write."""
         try:
-            from kalshi_auth import _atomic_write_json
-            self.state = self._normalize_state(self.state)
-            _atomic_write_json(self.state_path, self.state)
-        except ImportError:
-            # Fallback: direct write
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            self.state = self._normalize_state(self.state)
-            self.state_path.write_text(json.dumps(self.state, indent=2))
+            self.state = self._state_store.save(self.state)
         except Exception as e:
             self.log.warning("Failed to save verification state: %s", e)
 
     def load(self):
         """Load state from disk. Start fresh if file missing or corrupt."""
         try:
-            if self.state_path.exists():
-                data = json.loads(self.state_path.read_text())
-                if isinstance(data, dict):
-                    self.state = self._normalize_state(data)
-                    self.log.info("Loaded verification state: %d pending, %d verified",
-                                 len(self.state["pending"]), len(self.state["verified"]))
-                    return
-        except (json.JSONDecodeError, OSError) as e:
+            had_state = self.state_path.exists()
+            self.state = self._state_store.load()
+            if had_state:
+                self.log.info(
+                    "Loaded verification state: %d pending, %d verified",
+                    len(self.state["pending"]),
+                    len(self.state["verified"]),
+                )
+        except Exception as e:
             self.log.warning("Failed to load verification state: %s (starting fresh)", e)
-
-        # Start fresh
-        self.state = self._normalize_state(None)
+            self.state = self._normalize_state(None)
 
     def cleanup(self, max_age_days=90):
         """Remove verification records older than max_age_days."""
@@ -757,6 +772,14 @@ class NWSCrossCheckVerifier(ForecastVerifier):
             if self._comparison_identity(existing) != record_id
         ]
         self.state["pending"].append(record)
+        try:
+            self._ledger.record_forecast_snapshot(
+                record,
+                source_path=self.state_path,
+                category="weather_nws_crosscheck_snapshot",
+            )
+        except Exception as e:
+            self.log.warning("Failed to dual-write NWS cross-check snapshot: %s", e)
 
     def verify_past_comparisons(self, station_map=None, max_calls=5):
         """Resolve older cross-check records against settlement actual highs."""
@@ -826,6 +849,14 @@ class NWSCrossCheckVerifier(ForecastVerifier):
             )
             verified_record["verified_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             verified_this_scan.append(verified_record)
+            try:
+                self._ledger.record_verification_result(
+                    verified_record,
+                    source_path=self.state_path,
+                    category="weather_nws_crosscheck",
+                )
+            except Exception as e:
+                self.log.warning("Failed to dual-write NWS cross-check verification: %s", e)
 
         self.state["pending"] = remaining
         self.state["verified"].extend(verified_this_scan)

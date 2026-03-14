@@ -29,6 +29,7 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 # ─── Trade file definitions ───
 # Import from canonical trade_files module (shared across all scripts)
 from trade_files import TRADE_FILES as _CANONICAL_TRADE_FILES
+from event_ledger import DEFAULT_LEDGER_PATH, get_event_ledger
 
 DATA_DIR = PROJECT_DIR / "data"
 TRADE_FILES = [
@@ -39,8 +40,10 @@ TRADE_FILES = [
 
 # ─── Helpers ───
 
-def load_trades_safe(filepath: Path) -> list | None:
+def load_trades_safe(filepath: Path, *, use_ledger=False, ledger=None) -> list | None:
     """Load a JSON trade file.  Returns list on success, None on missing/corrupt."""
+    if use_ledger and ledger is not None:
+        return ledger.get_trade_records(filepath)
     if not filepath.exists():
         return None
     try:
@@ -748,7 +751,13 @@ def main():
         action="store_true",
         help="Save performance metrics to data/performance-metrics.json (requires --reconcile).",
     )
+    parser.add_argument(
+        "--use-ledger",
+        action="store_true",
+        help="Read local trade history from the SQLite event ledger instead of JSON trade logs.",
+    )
     args = parser.parse_args()
+    ledger = get_event_ledger(path=DEFAULT_LEDGER_PATH) if args.use_ledger else None
 
     results = []
 
@@ -761,7 +770,7 @@ def main():
         except ValueError:
             rel_path = str(filepath)
 
-        trades = load_trades_safe(filepath)
+        trades = load_trades_safe(filepath, use_ledger=args.use_ledger, ledger=ledger)
         if trades is None or len(trades) == 0:
             results.append({"label": label, "rel_path": rel_path, "stats": None})
         else:
@@ -778,7 +787,7 @@ def main():
 
         local_trades_by_bot = []
         for tf in TRADE_FILES:
-            trades = load_trades_safe(tf["path"])
+            trades = load_trades_safe(tf["path"], use_ledger=args.use_ledger, ledger=ledger)
             local_trades_by_bot.append({
                 "label": tf["label"],
                 "trades": trades or [],

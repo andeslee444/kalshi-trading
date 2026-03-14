@@ -6,24 +6,17 @@ Authenticates, lists markets, places test trades, verifies positions.
 import json, time, datetime, os, sys, uuid
 import requests
 from pathlib import Path
+from app_bootstrap import AppContext, install_app_context
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, TradeManager, trim_trade_log
-
-setup_unbuffered()
-setup_signal_handlers()
-log = setup_logging("demo-trader")
 
 # === Config ===
 DATA_DIR = PROJECT_DIR / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
 TRADES_PATH = DATA_DIR / "demo-trades.json"
 
-client = KalshiClient()
-trade_manager = TradeManager(client, TRADES_PATH, {
-    "maxTradeAmount": 5,
-    "maxDailyTrades": 10,
-    "maxDailyLoss": 10,
-}, logger=log)
-trim_trade_log(TRADES_PATH)
+_APP_CONTEXT = None
+log = None
+client = None
+trade_manager = None
 
 # === Market Discovery ===
 def get_all_markets(limit=200):
@@ -149,7 +142,33 @@ def get_balance():
     return client.get("/portfolio/balance")
 
 # === Main ===
+def build_app(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    setup_unbuffered()
+    setup_signal_handlers()
+    logger = setup_logging("demo-trader")
+    data_dir = project_dir / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    trades_path = data_dir / "demo-trades.json"
+    client_obj = KalshiClient()
+    trade_manager_obj = TradeManager(client_obj, trades_path, {
+        "maxTradeAmount": 5,
+        "maxDailyTrades": 10,
+        "maxDailyLoss": 10,
+    }, logger=logger)
+    trim_trade_log(trades_path)
+    return install_app_context(globals(), AppContext({
+        "PROJECT_DIR": project_dir,
+        "DATA_DIR": data_dir,
+        "TRADES_PATH": trades_path,
+        "log": logger,
+        "client": client_obj,
+        "trade_manager": trade_manager_obj,
+    }))
+
+
 def main():
+    build_app()
     log.info("=" * 70)
     log.info("KALSHI DEMO TRADER — Testing Full Trading Flow")
     log.info("Time: %s", datetime.datetime.now().isoformat())

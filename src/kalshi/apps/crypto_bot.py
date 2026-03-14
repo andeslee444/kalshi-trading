@@ -16,6 +16,7 @@ Usage:
 import json, time, datetime, os, sys, re, argparse, math
 import requests
 from pathlib import Path
+from app_bootstrap import AppContext, install_app_context
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot,
@@ -35,74 +36,35 @@ from crypto_models import EnsembleModel, smooth_edge_threshold, horizon_kelly_fr
 from vol_forecaster import GARCHForecaster, DCCCorrelation, intraday_vol_multiplier, correct_bid_ask_bounce
 from singleton_lock import acquire_process_singleton
 
-setup_unbuffered()
-log = setup_logging("crypto")
-setup_signal_handlers()
-
 # === Paths ===
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
 TRADES_PATH = PROJECT_DIR / "data" / "kalshi-crypto-trades.json"
-TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-# Load config
-bots_config = json.loads(BOTS_CONFIG_PATH.read_text())
-crypto_config = bots_config.get("crypto", {})
-
-MAX_TRADE = crypto_config.get("maxTradeAmount", 10)
-MAX_DAILY_TRADES = crypto_config.get("maxDailyTrades", 30)
-MAX_DAILY_LOSS = crypto_config.get("maxDailyLoss", 25)
-SCAN_INTERVAL = crypto_config.get("scanIntervalMinutes", 5)
-EDGE_THRESHOLD = crypto_config.get("edgeThreshold", 0.06)
-# Buffer must exceed market cache TTL (60s) to prevent race condition
-SETTLEMENT_BUFFER_MINUTES = max(3, crypto_config.get("settlementBufferMinutes", 3))
-USE_OU = crypto_config.get("useOrnsteinUhlenbeck", False)
-OU_HALF_LIFE = crypto_config.get("ouHalfLifeMinutes", 120)
-DRIFT_PCT = crypto_config.get("driftPct", 0.0)
-
-client = KalshiClient()
-allocator = PortfolioAllocator(client, logger=log)
-health = HealthCheckMonitor(logger=log)
-order_monitor = OrderMonitor(client, log=log)
-trade_manager = TradeManager(client, TRADES_PATH, {
-    "maxTradeAmount": MAX_TRADE,
-    "maxTradeAmountPct": crypto_config.get("maxTradeAmountPct"),
-    "maxDailyTrades": MAX_DAILY_TRADES,
-    "maxDailyLoss": MAX_DAILY_LOSS,
-    "maxDailyLossPct": crypto_config.get("maxDailyLossPct"),
-}, logger=log, cooldown_hours=0.5, order_monitor=order_monitor, bot_name="crypto")  # short cooldown for fast markets
-trim_trade_log(TRADES_PATH)
-
-# Particle filter for Bayesian belief tracking
-pf_config = FilterConfig(
-    n_particles=crypto_config.get("pfParticles", 200),
-    process_noise=crypto_config.get("pfProcessNoise", 0.02),
-    observation_noise=crypto_config.get("pfObservationNoise", 0.05),
-)
-filter_mgr = FilterManager(bot_name="crypto", state_dir=PROJECT_DIR / "data",
-                            default_config=pf_config)
-pf_staleness_seconds = int(crypto_config.get("pfStalenessHours", 24) * 3600)
-filter_mgr.load_all(max_age_seconds=pf_staleness_seconds)
-
-# Regime detector
-regime_detector = RegimeDetector()
+_APP_CONTEXT = None
+log = None
+bots_config = {}
+crypto_config = {}
+MAX_TRADE = 10
+MAX_DAILY_TRADES = 30
+MAX_DAILY_LOSS = 25
+SCAN_INTERVAL = 5
+EDGE_THRESHOLD = 0.06
+SETTLEMENT_BUFFER_MINUTES = 3
+USE_OU = False
+OU_HALF_LIFE = 120
+DRIFT_PCT = 0.0
+client = None
+allocator = None
+health = None
+order_monitor = None
+trade_manager = None
+pf_config = None
+filter_mgr = None
+pf_staleness_seconds = 24 * 3600
+regime_detector = None
 regime_state_path = PROJECT_DIR / "data" / "regime-state.json"
-regime_detector.load(str(regime_state_path))
-
-# Ensemble model (loads calibration if available)
 _calibration_path = PROJECT_DIR / "config" / "crypto-calibration.json"
 _calibration = {}
-if _calibration_path.exists():
-    try:
-        _calibration = json.loads(_calibration_path.read_text())
-    except (json.JSONDecodeError, OSError):
-        pass
-
-if _calibration.get("assets"):
-    # Use BTC calibration as the primary (most liquid, best data)
-    ensemble_model = EnsembleModel.from_calibration(_calibration, asset="BTC")
-    log.info("Loaded calibrated ensemble model from crypto-calibration.json")
-else:
-    ensemble_model = EnsembleModel()
+ensemble_model = None
 
 # Default Heston parameters
 DEFAULT_HESTON_PARAMS = {"v0": 0.25, "kappa": 2.0, "theta": 0.25, "xi": 0.3, "rho": -0.7}
@@ -119,7 +81,7 @@ dcc_tracker = None  # populated after DEFAULT_VOLS is defined
 # === Market ticker prefixes ===
 CRYPTO_PREFIXES = ["KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXXRP", "KXCRYPTO"]
 INVALID_MARKETS_PATH = PROJECT_DIR / "data" / "crypto-invalid-markets.json"
-INVALID_MARKET_TTL_SECONDS = int(crypto_config.get("invalidMarketTtlHours", 6) * 3600)
+INVALID_MARKET_TTL_SECONDS = 6 * 3600
 
 
 def _load_invalid_market_cache():
@@ -154,7 +116,7 @@ def _save_invalid_market_cache(cache):
     _atomic_write_json(INVALID_MARKETS_PATH, _prune_invalid_market_cache(cache))
 
 
-_invalid_market_cache = _load_invalid_market_cache()
+_invalid_market_cache = {}
 
 
 def _refresh_invalid_market_cache():
@@ -197,10 +159,10 @@ DEFAULT_VOLS = {
     "XRP": 0.75,   # mid-cap alt, moderate-high vol
 }
 
-# Initialize forecasters now that DEFAULT_VOLS is defined
-garch_forecasters = {asset: GARCHForecaster() for asset in DEFAULT_VOLS}
-ar1_forecasters = {asset: AR1VolForecast() for asset in DEFAULT_VOLS}
-dcc_tracker = DCCCorrelation(assets=list(DEFAULT_VOLS.keys()))
+# Initialize forecasters in build_app()
+garch_forecasters = {}
+ar1_forecasters = {}
+dcc_tracker = None
 
 # Recent price cache for realized vol computation
 _price_history = {}  # asset -> [(timestamp, price), ...]
@@ -228,7 +190,6 @@ def _save_price_history():
         pass  # best-effort
 
 
-_load_price_history()
 
 
 
@@ -1353,10 +1314,130 @@ def _check_short_horizon_markets():
 
 # === Entry Point ===
 
+def load_config(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    return json.loads((project_dir / "config" / "bots-config.json").read_text())
+
+
+def build_app(project_dir=None):
+    project_dir = Path(project_dir or PROJECT_DIR)
+    setup_unbuffered()
+    logger = setup_logging("crypto")
+    setup_signal_handlers()
+
+    bots_config_path = project_dir / "config" / "bots-config.json"
+    trades_path = project_dir / "data" / "kalshi-crypto-trades.json"
+    trades_path.parent.mkdir(parents=True, exist_ok=True)
+    loaded_bots_config = load_config(project_dir)
+    loaded_crypto_config = loaded_bots_config.get("crypto", {})
+
+    max_trade = loaded_crypto_config.get("maxTradeAmount", 10)
+    max_daily_trades = loaded_crypto_config.get("maxDailyTrades", 30)
+    max_daily_loss = loaded_crypto_config.get("maxDailyLoss", 25)
+    scan_interval = loaded_crypto_config.get("scanIntervalMinutes", 5)
+    edge_threshold = loaded_crypto_config.get("edgeThreshold", 0.06)
+    settlement_buffer_minutes = max(3, loaded_crypto_config.get("settlementBufferMinutes", 3))
+    use_ou = loaded_crypto_config.get("useOrnsteinUhlenbeck", False)
+    ou_half_life = loaded_crypto_config.get("ouHalfLifeMinutes", 120)
+    drift_pct = loaded_crypto_config.get("driftPct", 0.0)
+
+    client_obj = KalshiClient()
+    allocator_obj = PortfolioAllocator(client_obj, logger=logger)
+    health_monitor = HealthCheckMonitor(logger=logger)
+    order_monitor_obj = OrderMonitor(client_obj, log=logger)
+    trade_manager_obj = TradeManager(client_obj, trades_path, {
+        "maxTradeAmount": max_trade,
+        "maxTradeAmountPct": loaded_crypto_config.get("maxTradeAmountPct"),
+        "maxDailyTrades": max_daily_trades,
+        "maxDailyLoss": max_daily_loss,
+        "maxDailyLossPct": loaded_crypto_config.get("maxDailyLossPct"),
+    }, logger=logger, cooldown_hours=0.5, order_monitor=order_monitor_obj, bot_name="crypto")
+    trim_trade_log(trades_path)
+
+    particle_filter_config = FilterConfig(
+        n_particles=loaded_crypto_config.get("pfParticles", 200),
+        process_noise=loaded_crypto_config.get("pfProcessNoise", 0.02),
+        observation_noise=loaded_crypto_config.get("pfObservationNoise", 0.05),
+    )
+    filter_manager = FilterManager(
+        bot_name="crypto",
+        state_dir=project_dir / "data",
+        default_config=particle_filter_config,
+    )
+    pf_max_age = int(loaded_crypto_config.get("pfStalenessHours", 24) * 3600)
+    filter_manager.load_all(max_age_seconds=pf_max_age)
+
+    regime_state = project_dir / "data" / "regime-state.json"
+    regime_detector_obj = RegimeDetector()
+    regime_detector_obj.load(str(regime_state))
+
+    calibration_path = project_dir / "config" / "crypto-calibration.json"
+    calibration = {}
+    if calibration_path.exists():
+        try:
+            calibration = json.loads(calibration_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            calibration = {}
+
+    if calibration.get("assets"):
+        ensemble_model_obj = EnsembleModel.from_calibration(calibration, asset="BTC")
+        logger.info("Loaded calibrated ensemble model from crypto-calibration.json")
+    else:
+        ensemble_model_obj = EnsembleModel()
+
+    invalid_markets_path = project_dir / "data" / "crypto-invalid-markets.json"
+    invalid_market_ttl_seconds = int(loaded_crypto_config.get("invalidMarketTtlHours", 6) * 3600)
+    price_history_path = project_dir / "data" / "crypto-price-history.json"
+
+    context = AppContext({
+        "PROJECT_DIR": project_dir,
+        "BOTS_CONFIG_PATH": bots_config_path,
+        "TRADES_PATH": trades_path,
+        "bots_config": loaded_bots_config,
+        "crypto_config": loaded_crypto_config,
+        "MAX_TRADE": max_trade,
+        "MAX_DAILY_TRADES": max_daily_trades,
+        "MAX_DAILY_LOSS": max_daily_loss,
+        "SCAN_INTERVAL": scan_interval,
+        "EDGE_THRESHOLD": edge_threshold,
+        "SETTLEMENT_BUFFER_MINUTES": settlement_buffer_minutes,
+        "USE_OU": use_ou,
+        "OU_HALF_LIFE": ou_half_life,
+        "DRIFT_PCT": drift_pct,
+        "log": logger,
+        "client": client_obj,
+        "allocator": allocator_obj,
+        "health": health_monitor,
+        "order_monitor": order_monitor_obj,
+        "trade_manager": trade_manager_obj,
+        "pf_config": particle_filter_config,
+        "filter_mgr": filter_manager,
+        "pf_staleness_seconds": pf_max_age,
+        "regime_detector": regime_detector_obj,
+        "regime_state_path": regime_state,
+        "_calibration_path": calibration_path,
+        "_calibration": calibration,
+        "ensemble_model": ensemble_model_obj,
+        "INVALID_MARKETS_PATH": invalid_markets_path,
+        "INVALID_MARKET_TTL_SECONDS": invalid_market_ttl_seconds,
+        "_invalid_market_cache": {},
+        "garch_forecasters": {asset: GARCHForecaster() for asset in DEFAULT_VOLS},
+        "ar1_forecasters": {asset: AR1VolForecast() for asset in DEFAULT_VOLS},
+        "dcc_tracker": DCCCorrelation(assets=list(DEFAULT_VOLS.keys())),
+        "_price_history": {},
+        "_PRICE_HISTORY_PATH": price_history_path,
+    })
+    install_app_context(globals(), context)
+    _refresh_invalid_market_cache()
+    _load_price_history()
+    return _APP_CONTEXT
+
+
 def main():
     parser = argparse.ArgumentParser(description="Kalshi Crypto Bot")
     parser.add_argument("--once", action="store_true", help="Run single scan and exit")
     args = parser.parse_args()
+    build_app()
 
     if not acquire_process_singleton("crypto", PROJECT_DIR, log):
         log.warning("Duplicate crypto launch blocked; exiting.")
