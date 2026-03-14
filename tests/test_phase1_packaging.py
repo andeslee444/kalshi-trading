@@ -60,6 +60,29 @@ def test_legacy_flat_import_aliases_package_module():
             sys.path.insert(0, flat_src_dir)
 
 
+def test_subpackage_aliases_resolve_extracted_phase5_modules():
+    flat_src_dir = str(PROJECT_DIR / "src" / "kalshi")
+    removed = False
+    if flat_src_dir in sys.path:
+        sys.path.remove(flat_src_dir)
+        removed = True
+    for name in ("ops", "ops.logging", "risk", "risk.kill_switch", "kalshi.ops", "kalshi.ops.logging", "kalshi.risk", "kalshi.risk.kill_switch"):
+        sys.modules.pop(name, None)
+    try:
+        pkg_ops = importlib.import_module("kalshi.ops.logging")
+        flat_ops = importlib.import_module("ops.logging")
+        assert Path(flat_ops.__file__).resolve() == Path(pkg_ops.__file__).resolve()
+
+        pkg_risk = importlib.import_module("kalshi.risk.kill_switch")
+        flat_risk = importlib.import_module("risk.kill_switch")
+        assert Path(flat_risk.__file__).resolve() == Path(pkg_risk.__file__).resolve()
+    finally:
+        for name in ("ops", "ops.logging", "risk", "risk.kill_switch", "kalshi.ops", "kalshi.ops.logging", "kalshi.risk", "kalshi.risk.kill_switch"):
+            sys.modules.pop(name, None)
+        if removed:
+            sys.path.insert(0, flat_src_dir)
+
+
 def test_weather_app_imports_via_package_name_without_hyphen_loader():
     fake_auth = make_fake_auth(PROJECT_DIR=PROJECT_DIR, normalize_markets=lambda markets: markets)
     fake_probability = _stub_module(
