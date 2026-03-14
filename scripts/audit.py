@@ -35,6 +35,7 @@ from probability import (
     kalshi_fee_cents, KALSHI_FEE_RATE,
     is_market_liquid, compute_limit_price,
 )
+from source_paths import resolve_bot_source_path
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -794,7 +795,7 @@ class AuditEngine:
         ]
         callers = []
         for bf in bot_files:
-            path = PROJECT_DIR / "src" / "kalshi" / bf
+            path = resolve_bot_source_path(bf)
             if path.exists():
                 content = path.read_text()
                 if "edge_after_fees(" in content and "import" not in content.split("edge_after_fees(")[0].split("\n")[-1]:
@@ -803,7 +804,7 @@ class AuditEngine:
         # Also check if bots pass fee_cents to Kelly functions
         fee_passers = []
         for bf in bot_files:
-            path = PROJECT_DIR / "src" / "kalshi" / bf
+            path = resolve_bot_source_path(bf)
             if path.exists():
                 content = path.read_text()
                 if "fee_cents=" in content:
@@ -1511,7 +1512,7 @@ class AuditEngine:
         ))
 
         # 5G.2: Fuzzy matching threshold — check actual code
-        arb_path = PROJECT_DIR / "src" / "kalshi" / "cross-platform-arb.py"
+        arb_path = resolve_bot_source_path("cross-platform-arb.py")
         arb_score = "?"
         has_num_validation = False
         if arb_path.exists():
@@ -1574,7 +1575,7 @@ class AuditEngine:
         # 5H.2: Avellaneda-Stoikov parameter review — check sigma estimation
         gamma = mm_cfg.get("gamma", "?")
         k_param = mm_cfg.get("kParam", "?")
-        mm_path = PROJECT_DIR / "src" / "kalshi" / "market-maker.py"
+        mm_path = resolve_bot_source_path("market-maker.py")
         sigma_independent = False
         if mm_path.exists():
             mm_src = mm_path.read_text()
@@ -1639,7 +1640,7 @@ class AuditEngine:
         ))
 
         # 5I.2: Fee accounting in exit decisions — check actual code
-        pm_path = PROJECT_DIR / "src" / "kalshi" / "position-monitor.py"
+        pm_path = resolve_bot_source_path("position-monitor.py")
         uses_fee_in_exits = False
         if pm_path.exists():
             pm_src = pm_path.read_text()
@@ -1771,7 +1772,7 @@ class AuditEngine:
         bots_with_allocator = []
         bots_without_allocator = []
         for bf in trading_bots:
-            path = PROJECT_DIR / "src" / "kalshi" / bf
+            path = resolve_bot_source_path(bf)
             if path.exists():
                 content = path.read_text()
                 if "request_budget(" in content or "is_ticker_traded(" in content:

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kalshi-trading"
+version = "0.1.0"
+description = "Kalshi prediction market trading bots"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.scripts]
+kalshi-weather = "kalshi.apps.weather_bot:main"
+kalshi-entertainment = "kalshi.apps.entertainment_bot:main"
+kalshi-demo = "kalshi.apps.demo_trader:main"
+kalshi-strategy = "kalshi.apps.strategy_trader:main"
+kalshi-hdd = "kalshi.apps.hdd_scraper:main"
+kalshi-monitor = "kalshi.apps.source_monitor:main"
+kalshi-positions = "kalshi.apps.position_monitor:main"
+kalshi-economics = "kalshi.apps.economics_bot:main"
+kalshi-crypto = "kalshi.apps.crypto_bot:main"
+kalshi-arb = "kalshi.apps.cross_platform_arb:main"
+kalshi-mm = "kalshi.apps.market_maker:main"
+kalshi-beatrelease = "kalshi.apps.beatrelease_scanner:main"
+kalshi-dashboard = "kalshi.cli:dashboard"
+kalshi-supervisor = "kalshi.cli:supervisor"
+kalshi-daily-report = "kalshi.cli:daily_report"
+kalshi-snapshot = "kalshi.cli:snapshot"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

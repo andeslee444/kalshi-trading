@@ -18,6 +18,7 @@ import pytest
 
 from probability import longshot_edge, compute_limit_price, _reset_calibration
 from conftest import make_fake_auth, load_bot_module
+from source_paths import resolve_bot_source_path
 
 
 @pytest.fixture(autouse=True)
@@ -69,7 +70,7 @@ class TestBug2ReasoningString:
 
     def test_source_code_uses_sell_price(self):
         """Verify the source code computes implied_prob from sell_price, not yes_ask."""
-        source_path = Path(__file__).resolve().parent.parent / "src" / "kalshi" / "strategy-trader.py"
+        source_path = resolve_bot_source_path("strategy-trader.py")
         source = source_path.read_text()
         # The reasoning string section should use sell_price / 100.0
         assert "sell_price / 100.0" in source, (

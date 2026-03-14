@@ -14,6 +14,7 @@ import pytest
 from unittest.mock import patch, MagicMock, PropertyMock
 
 from conftest import make_fake_auth
+from source_paths import resolve_bot_source_path
 
 
 # ===================================================================
@@ -79,8 +80,8 @@ class TestAdaptiveInterval:
     @staticmethod
     def _load_compute_adaptive_interval():
         """Extract compute_adaptive_interval from weather-bot.py source."""
-        bot_path = os.path.join(os.path.dirname(__file__), "..", "src", "kalshi", "weather-bot.py")
-        with open(os.path.abspath(bot_path)) as f:
+        bot_path = resolve_bot_source_path("weather-bot.py")
+        with open(bot_path, encoding="utf-8") as f:
             source = f.read()
 
         # Extract the function definition

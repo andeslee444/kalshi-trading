@@ -1,7 +1,7 @@
 # Refactor Program
 
 Generated: 2026-03-14
-Status: Proposed
+Status: Active. Phases 0 and 1 complete on 2026-03-14.
 
 This program is optimized for three goals:
 
@@ -89,6 +89,8 @@ Estimated size:
 ## Phase 1: Package The Repo Without Changing Behavior
 
 Objective: eliminate path hacks and import-name hazards.
+
+Status: complete on 2026-03-14.
 
 Deliverables:
 
