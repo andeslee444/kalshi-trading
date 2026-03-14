@@ -23,6 +23,15 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR / "src" / "kalshi"))
 
 from pnl_attribution import PnLAttributor, _classify_market_type
+from bot_registry import (
+    ALWAYS_DISABLED_BOT_IDS,
+    BOT_CONFIG_KEY_MAP,
+    BOT_DEFAULT_SCAN_INTERVAL_MAP,
+    BOT_DISPLAY_NAMES,
+    BOT_HEALTH_KEY_MAP,
+    DASHBOARD_BOT_IDS,
+    DECISION_FILE_SPECS,
+)
 from edge_monitor import EdgeMonitor
 from execution_quality import ExecutionAnalyzer
 from ticker_utils import format_ticker_human
@@ -44,21 +53,7 @@ BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
 WEATHER_CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-config.json"
 STARTING_BALANCE_CENTS = int(os.environ.get("STARTING_BALANCE_CENTS", "50000"))  # $500 default
 
-# ─── Strategy display names ───
-STRATEGY_DISPLAY = {
-    "weather": "Weather",
-    "entertainment": "Entertainment",
-    "crypto": "Crypto",
-    "economics": "Economics",
-    "positions": "Position Mgmt",
-    "monitor": "Data Monitor",
-    "strategy": "Opportunistic",
-    "hdd": "Data Scraper",
-    "hdd-monitor": "HDD Monitor",
-    "arb": "Cross-Platform",
-    "mm": "Market Making",
-    "beatrelease": "Beat Release",
-}
+STRATEGY_DISPLAY = BOT_DISPLAY_NAMES
 
 # ─── Human-readable decision skip reasons ───
 SKIP_REASON_MAP = [
@@ -82,20 +77,8 @@ def _human_reason(raw_reason: str) -> str:
     return raw_reason
 
 
-# ─── Config key mapping: bot name → bots-config.json key ───
-BOT_CONFIG_KEY = {
-    "positions": "position_monitor",
-    "mm": "market_maker",
-    "arb": "cross_platform_arb",
-    "hdd-monitor": "hdd_monitor",
-}
-
-BOT_HEALTH_KEY = {
-    "positions": "position-monitor",
-    "monitor": "source-monitor",
-    "arb": "cross-platform-arb",
-    "mm": "market-maker",
-}
+BOT_CONFIG_KEY = BOT_CONFIG_KEY_MAP
+BOT_HEALTH_KEY = BOT_HEALTH_KEY_MAP
 
 # ─── Trade file definitions (derived from canonical trade_files.py) ───
 TRADE_FILES = [
@@ -103,29 +86,13 @@ TRADE_FILES = [
     for f in _CANONICAL_FILES
 ]
 
-# ─── Bot definitions (from supervisor.py) ───
-BOT_NAMES = [
-    "weather", "entertainment", "crypto", "economics",
-    "positions", "monitor", "strategy", "hdd", "hdd-monitor", "arb", "mm", "beatrelease",
-]
+BOT_NAMES = list(DASHBOARD_BOT_IDS)
+BOT_SCAN_INTERVAL_DEFAULTS = BOT_DEFAULT_SCAN_INTERVAL_MAP
 
-BOT_SCAN_INTERVAL_DEFAULTS = {
-    "weather": 30,
-    "entertainment": 15,
-    "crypto": 5,
-    "economics": 360,
-    "positions": 15,
-    "monitor": 10,
-    "strategy": 15,
-    "hdd-monitor": 15,
-    "arb": 10,
-    "beatrelease": 60,
-}
-
-# Decision log files — bots that write decision logs
 DECISION_FILES = [
-    {"bot": bot, "path": DATA_DIR / f"{bot}-decisions.json"}
-    for bot in BOT_NAMES
+    {"bot": spec["bot"], "path": DATA_DIR / spec["filename"]}
+    for spec in DECISION_FILE_SPECS
+    if spec["bot"] in BOT_NAMES
 ]
 
 
@@ -451,7 +418,7 @@ def _bot_scan_interval_minutes(name: str, bot_cfg: dict) -> int | None:
 
 def _is_bot_disabled(name: str, bots_config: dict) -> bool:
     """Mirror supervisor-style disabled state for dashboard display."""
-    if name in {"hdd", "mm"}:
+    if name in ALWAYS_DISABLED_BOT_IDS:
         return True
     config_key = BOT_CONFIG_KEY.get(name, name)
     bot_cfg = bots_config.get(config_key, {})

@@ -27,6 +27,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"))
 
+from bot_registry import (
+    ALWAYS_DISABLED_BOT_IDS,
+    BOT_COMMANDS as REGISTRY_BOT_COMMANDS,
+    BOT_CONFIG_KEY_MAP,
+    BOT_DEFAULT_SCAN_INTERVAL_MAP,
+    BOT_HEALTH_KEY_MAP,
+    BOT_LOG_NAME_MAP,
+    DAEMON_BOT_IDS,
+    ONESHOT_BOT_IDS,
+)
 from kalshi_auth import setup_logging, check_kill_switch, notify_webhook, per_bot_halt_path
 
 log = setup_logging("supervisor")
@@ -38,28 +48,14 @@ HEALTH_STATE_PATH = PROJECT_DIR / "data" / "health-state.json"
 SUPERVISOR_STATE_PATH = PID_DIR / "supervisor-state.json"
 WEATHER_VERIFICATION_PATH = PROJECT_DIR / "data" / "weather-verification.json"
 
-# Bot definitions — maps name -> command (derived from package.json)
-BOT_COMMANDS = {
-    "weather":       ["python3", "src/kalshi/weather-bot.py"],
-    "entertainment": ["python3", "src/kalshi/entertainment-bot.py"],
-    "crypto":        ["python3", "src/kalshi/crypto-bot.py"],
-    "economics":     ["python3", "src/kalshi/economics-bot.py"],
-    "positions":     ["python3", "src/kalshi/position-monitor.py"],
-    "monitor":       ["python3", "src/kalshi/source-monitor.py"],
-    "strategy":      ["python3", "src/kalshi/strategy-trader.py"],
-    "hdd":           ["python3", "src/kalshi/hdd-scraper.py"],
-    "hdd-monitor":   ["python3", "src/kalshi/hdd-scraper.py", "monitor"],
-    "arb":           ["python3", "src/kalshi/cross-platform-arb.py"],
-    "mm":            ["python3", "src/kalshi/market-maker.py"],
-    "beatrelease":   ["python3", "src/kalshi/beatrelease-scanner.py"],
-}
+BOT_COMMANDS = {name: list(cmd) for name, cmd in REGISTRY_BOT_COMMANDS.items()}
 
-# Daemon bots auto-restart on crash; one-shot bots do not
-DAEMON_BOTS = {"weather", "crypto", "economics", "positions", "monitor", "beatrelease", "arb", "entertainment", "strategy", "hdd-monitor"}
-ONESHOT_BOTS = {"hdd"}
+DAEMON_BOTS = set(DAEMON_BOT_IDS)
+ONESHOT_BOTS = set(ONESHOT_BOT_IDS)
 
-# Bots that are always disabled (no config entry, experimental, unsafe, or utility one-shots)
-_ALWAYS_DISABLED = {"mm", "demo", "hdd"}
+# Bots that are always disabled (experimental, unsafe, or utility one-shots)
+_ALWAYS_DISABLED = set(ALWAYS_DISABLED_BOT_IDS)
+CONFIG_KEY = {name: key for name, key in BOT_CONFIG_KEY_MAP.items() if key != name}
 
 def _load_disabled_bots():
     """Read bots-config.json to determine which bots are disabled.
@@ -68,10 +64,8 @@ def _load_disabled_bots():
     are assumed enabled (core bots like weather/crypto don't have one).
     Falls back to a safe default set if config is unreadable.
     """
-    # Config key mapping (some config keys differ from bot names)
-    CONFIG_KEY = {"arb": "cross_platform_arb", "mm": "market_maker", "hdd-monitor": "hdd_monitor"}
     config_path = PROJECT_DIR / "config" / "bots-config.json"
-    fallback = {"mm", "demo", "entertainment", "beatrelease", "arb", "strategy", "hdd-monitor"}
+    fallback = set(_ALWAYS_DISABLED) | {"entertainment", "beatrelease", "arb", "strategy", "hdd-monitor"}
     try:
         with open(config_path) as f:
             config = json.load(f)
@@ -97,40 +91,21 @@ CHECK_INTERVAL = 30  # seconds
 
 # Heartbeat staleness detection
 HEARTBEAT_NAMES = {
-    "weather": "weather",
-    "entertainment": "entertainment",
-    "crypto": "crypto",
-    "economics": "economics",
-    "positions": "position-monitor",
-    "monitor": "source-monitor",
-    "strategy": "strategy",
-    "hdd-monitor": "hdd-monitor",
-    "arb": "cross-platform-arb",
-    "mm": "market-maker",
-    "beatrelease": "beatrelease",
+    name: key for name, key in BOT_HEALTH_KEY_MAP.items() if name in BOT_COMMANDS
 }
 
-# Expected scan intervals in minutes (from bots-config / kalshi-config)
 BOT_SCAN_INTERVALS = {
-    "weather": 30,
-    "entertainment": 15,
-    "crypto": 5,
-    "economics": 360,
-    "positions": 15,
-    "monitor": 10,
-    "strategy": 15,
-    "hdd-monitor": 15,
-    "arb": 10,
-    "beatrelease": 60,
+    name: minutes
+    for name, minutes in BOT_DEFAULT_SCAN_INTERVAL_MAP.items()
+    if name in BOT_COMMANDS
 }
 
 HEARTBEAT_GRACE_PERIOD = 300  # 5 min startup grace before checking heartbeats
 
 BOT_LOG_NAMES = {
-    "arb": "cross-platform-arb",
-    "monitor": "source-monitor",
-    "positions": "position-monitor",
-    "hdd-monitor": "hdd-scraper",
+    name: log_name
+    for name, log_name in BOT_LOG_NAME_MAP.items()
+    if name in BOT_COMMANDS
 }
 
 

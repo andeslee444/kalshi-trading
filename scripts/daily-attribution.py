@@ -17,22 +17,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"
 
 from pnl_attribution import PnLAttributor
 from edge_monitor import EdgeMonitor
+from trade_files import TRADE_FILES as _CANONICAL_TRADE_FILES
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_DIR / "data"
 
-# Trade file definitions (mirrors dashboard.py / trade_files.py)
 TRADE_FILES = [
-    {"path": str(DATA_DIR / "kalshi-trades.json"), "bot": "weather"},
-    {"path": str(DATA_DIR / "kalshi-strategy-trades.json"), "bot": "strategy"},
-    {"path": str(DATA_DIR / "kalshi-entertainment-trades.json"), "bot": "entertainment"},
-    {"path": str(DATA_DIR / "beatrelease-trades.json"), "bot": "beatrelease"},
-    {"path": str(DATA_DIR / "kalshi-monitor-trades.json"), "bot": "monitor"},
-    {"path": str(DATA_DIR / "kalshi-position-trades.json"), "bot": "positions"},
-    {"path": str(DATA_DIR / "kalshi-economics-trades.json"), "bot": "economics"},
-    {"path": str(DATA_DIR / "kalshi-crypto-trades.json"), "bot": "crypto"},
-    {"path": str(DATA_DIR / "kalshi-arb-trades.json"), "bot": "arb"},
-    {"path": str(DATA_DIR / "kalshi-mm-trades.json"), "bot": "mm"},
+    {"path": str(DATA_DIR / tf["filename"]), "bot": tf["bot"]}
+    for tf in _CANONICAL_TRADE_FILES
 ]
 
 
