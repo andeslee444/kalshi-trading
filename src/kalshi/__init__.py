@@ -22,6 +22,11 @@ def _compat_alias_targets() -> dict[str, str]:
         if stem == "__init__" or not stem.isidentifier():
             continue
         aliases[stem] = f"{__name__}.{stem}"
+    for path in pkg_dir.iterdir():
+        if path.is_dir() and (path / "__init__.py").exists():
+            stem = path.name
+            if stem.isidentifier() and stem != "apps":
+                aliases[stem] = f"{__name__}.{stem}"
     return aliases
 
 
