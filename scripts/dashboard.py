@@ -34,6 +34,7 @@ from bot_registry import (
 )
 from edge_monitor import EdgeMonitor
 from execution_quality import ExecutionAnalyzer
+from storage import SnapshotStore, TradeStore
 from ticker_utils import format_ticker_human
 from trade_files import TRADE_FILES as _CANONICAL_FILES
 
@@ -99,18 +100,7 @@ DECISION_FILES = [
 # ─── Helpers (from analyze-performance.py) ───
 
 def load_trades_safe(filepath: Path) -> list | None:
-    if not filepath.exists():
-        return None
-    try:
-        text = filepath.read_text().strip()
-        if not text:
-            return None
-        data = json.loads(text)
-        if not isinstance(data, list):
-            return None
-        return data
-    except (json.JSONDecodeError, ValueError, OSError):
-        return None
+    return TradeStore(filepath, logger=logger).load(default=None)
 
 
 def extract_side(trade: dict) -> str:
@@ -175,15 +165,7 @@ def extract_timestamp(trade: dict) -> str | None:
 
 
 def load_json_safe(filepath: Path) -> dict | list | None:
-    if not filepath.exists():
-        return None
-    try:
-        text = filepath.read_text().strip()
-        if not text:
-            return None
-        return json.loads(text)
-    except (json.JSONDecodeError, ValueError, OSError):
-        return None
+    return SnapshotStore(filepath, logger=logger).load(default=None)
 
 
 def get_weather_actual_source_summary() -> dict:
@@ -1149,12 +1131,7 @@ async def api_exit_state():
     """
     # Load trailing state
     trailing_path = DATA_DIR / "trailing-state.json"
-    trailing = {}
-    if trailing_path.exists():
-        try:
-            trailing = json.loads(trailing_path.read_text())
-        except (json.JSONDecodeError, ValueError):
-            pass
+    trailing = load_json_safe(trailing_path) or {}
 
     # Load bots config for exit thresholds
     bots_config = load_json_safe(BOTS_CONFIG_PATH) or {}
@@ -1283,12 +1260,7 @@ async def api_execution_quality():
 async def api_correlation():
     """Return correlation engine state for monitoring."""
     state_path = DATA_DIR / "correlation-state.json"
-    if state_path.exists():
-        try:
-            return json.loads(state_path.read_text())
-        except (json.JSONDecodeError, ValueError):
-            pass
-    return {"cluster_risk": {}, "portfolio_var": 0, "last_updated": ""}
+    return load_json_safe(state_path) or {"cluster_risk": {}, "portfolio_var": 0, "last_updated": ""}
 
 
 def main():

@@ -6,7 +6,7 @@ and writes settlement_result, settlement_revenue_cents, fill_price_cents, and
 realized_edge back into the trade record.
 
 Idempotent: skips records that already have settlement_result set.
-Atomic writes: uses _atomic_write_json for safe file updates.
+Writes go through TradeStore so file format stays unchanged.
 
 Usage:
     python3 scripts/reconcile-trades.py              # annotate all trade files
@@ -23,7 +23,8 @@ _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src" / "kalshi")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from kalshi_auth import KalshiClient, load_trades, _atomic_write_json, setup_logging
+from kalshi_auth import KalshiClient, setup_logging
+from storage import TradeStore
 from trade_files import ALL_TRADE_PATHS
 
 log = setup_logging("reconcile")
@@ -175,7 +176,8 @@ def reconcile_all(dry_run=False):
         if not trade_file.exists():
             continue
 
-        trades = load_trades(trade_file)
+        store = TradeStore(trade_file, logger=log)
+        trades = store.load()
         if not trades:
             continue
 
@@ -189,7 +191,7 @@ def reconcile_all(dry_run=False):
         if file_modified > 0:
             log.info("  %s: %d/%d records annotated", trade_file.name, file_modified, len(trades))
             if not dry_run:
-                _atomic_write_json(trade_file, trades)
+                store.save(trades)
             total_annotated += file_modified
 
     log.info("Reconciliation complete: %d annotated, %d skipped (already done or no match)",
