@@ -23,6 +23,7 @@ from cryptography.hazmat.backends import default_backend
 from dotenv import load_dotenv
 
 from artifact_contracts import normalize_health_state, normalize_health_summary
+from execution.order_monitor import OrderMonitor as ExecutionOrderMonitor
 from ops.logging import (
     is_shutdown_requested as ops_is_shutdown_requested,
     setup_logging as ops_setup_logging,
@@ -870,105 +871,17 @@ def _maybe_alert_on_scan_summary(summaries, latest):
 
 # === Order Monitor ===
 
-class OrderMonitor:
-    """Tracks pending orders and manages their lifecycle.
 
-    Detects unfilled limit orders, cancels stale ones, and reclaims
-    capital from resting orders that have exceeded their max age.
-
-    Args:
-        client: KalshiClient instance.
-        log: Logger instance.
-        max_age_seconds: Cancel resting orders after this many seconds (default 300 = 5 min).
-        check_interval: Minimum seconds between check_orders() API calls (default 30).
-    """
+class OrderMonitor(ExecutionOrderMonitor):
+    """Compatibility wrapper over the extracted execution.order_monitor module."""
 
     def __init__(self, client, log=None, max_age_seconds=300, check_interval=30):
-        self.client = client
-        self.log = log or _log
-        self.max_age_seconds = max_age_seconds
-        self.check_interval = check_interval
-        self._pending = {}  # {order_id: {"placed_at": float, "ticker": str, "side": str, "price": int, "count": int}}
-        self._last_check = 0
-
-    def track(self, order_id, ticker, side, price_cents, count):
-        """Register a newly placed order for monitoring."""
-        self._pending[order_id] = {
-            "placed_at": time.time(),
-            "ticker": ticker,
-            "side": side,
-            "price": price_cents,
-            "count": count,
-        }
-
-    def check_orders(self):
-        """Poll order statuses and handle stale orders.
-
-        Called from daemon bot main loops (not a background thread).
-        Returns dict of {order_id: {"status": str, "action": str}} for any state changes.
-
-        Respects check_interval to avoid excessive API calls.
-        """
-        now = time.time()
-        if now - self._last_check < self.check_interval:
-            return {}
-        self._last_check = now
-
-        if not self._pending:
-            return {}
-
-        changes = {}
-
-        try:
-            data = self.client.get("/portfolio/orders?status=resting")
-            resting_ids = {o.get("order_id") for o in data.get("orders", [])}
-        except Exception as e:
-            self.log.warning("OrderMonitor: failed to fetch resting orders: %s", e)
-            return {}
-
-        stale_ids = []
-        for order_id, info in list(self._pending.items()):
-            age = now - info["placed_at"]
-
-            if order_id not in resting_ids:
-                # Order is no longer resting — filled, canceled, or expired
-                self.log.info("OrderMonitor: %s on %s no longer resting (filled/canceled after %.0fs)",
-                              order_id[:12], info["ticker"], age)
-                changes[order_id] = {"status": "filled_or_canceled", "action": "removed"}
-                del self._pending[order_id]
-            elif age > self.max_age_seconds:
-                # Still resting but too old — cancel it
-                stale_ids.append(order_id)
-
-        # Cancel stale orders
-        for order_id in stale_ids:
-            info = self._pending[order_id]
-            success = self.cancel_order(order_id)
-            if success:
-                self.log.info("OrderMonitor: canceled stale order %s on %s (age %.0fs > %ds)",
-                              order_id[:12], info["ticker"],
-                              now - info["placed_at"], self.max_age_seconds)
-                changes[order_id] = {"status": "canceled_stale", "action": "canceled"}
-                del self._pending[order_id]
-
-        return changes
-
-    def cancel_order(self, order_id):
-        """Cancel a specific order. Returns True on success."""
-        try:
-            self.client.delete(f"/portfolio/orders/{order_id}")
-            return True
-        except Exception as e:
-            self.log.warning("OrderMonitor: failed to cancel %s: %s", order_id[:12], e)
-            return False
-
-    def get_pending_count(self):
-        """Return number of orders still being tracked."""
-        return len(self._pending)
-
-    def get_pending_capital(self):
-        """Return total cents locked in pending orders."""
-        return sum(info["price"] * info["count"] for info in self._pending.values())
+        super().__init__(
+            client,
+            log=log or _log,
+            max_age_seconds=max_age_seconds,
+            check_interval=check_interval,
+        )
 
 
 # === TradeManager ===

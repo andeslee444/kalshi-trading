@@ -66,9 +66,26 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
     if flat_src_dir in sys.path:
         sys.path.remove(flat_src_dir)
         removed = True
-    for name in ("ops", "ops.logging", "risk", "risk.kill_switch", "kalshi.ops", "kalshi.ops.logging", "kalshi.risk", "kalshi.risk.kill_switch"):
+    for name in (
+        "execution",
+        "execution.order_monitor",
+        "ops",
+        "ops.logging",
+        "risk",
+        "risk.kill_switch",
+        "kalshi.execution",
+        "kalshi.execution.order_monitor",
+        "kalshi.ops",
+        "kalshi.ops.logging",
+        "kalshi.risk",
+        "kalshi.risk.kill_switch",
+    ):
         sys.modules.pop(name, None)
     try:
+        pkg_execution = importlib.import_module("kalshi.execution.order_monitor")
+        flat_execution = importlib.import_module("execution.order_monitor")
+        assert Path(flat_execution.__file__).resolve() == Path(pkg_execution.__file__).resolve()
+
         pkg_ops = importlib.import_module("kalshi.ops.logging")
         flat_ops = importlib.import_module("ops.logging")
         assert Path(flat_ops.__file__).resolve() == Path(pkg_ops.__file__).resolve()
@@ -77,7 +94,20 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         flat_risk = importlib.import_module("risk.kill_switch")
         assert Path(flat_risk.__file__).resolve() == Path(pkg_risk.__file__).resolve()
     finally:
-        for name in ("ops", "ops.logging", "risk", "risk.kill_switch", "kalshi.ops", "kalshi.ops.logging", "kalshi.risk", "kalshi.risk.kill_switch"):
+        for name in (
+            "execution",
+            "execution.order_monitor",
+            "ops",
+            "ops.logging",
+            "risk",
+            "risk.kill_switch",
+            "kalshi.execution",
+            "kalshi.execution.order_monitor",
+            "kalshi.ops",
+            "kalshi.ops.logging",
+            "kalshi.risk",
+            "kalshi.risk.kill_switch",
+        ):
             sys.modules.pop(name, None)
         if removed:
             sys.path.insert(0, flat_src_dir)
