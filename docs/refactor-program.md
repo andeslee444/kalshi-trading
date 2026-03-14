@@ -271,6 +271,7 @@ Current bridge state:
 
 - Slice 1 is implemented in `storage.py` first, because the repo already ships a top-level `storage.py` module
 - The later package split to `storage/json_atomic.py` should happen only after the existing `storage.py` module is broken into a package without changing public behavior
+- Slice 2 extracts runtime logging and signal installation into `ops/logging.py`, with `kalshi_auth.py` preserving the existing public imports
 
 Rules:
 

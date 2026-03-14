@@ -11,10 +11,9 @@ Usage:
     client.post("/portfolio/orders", body={...})
 """
 
-import json, time, base64, os, sys, signal, logging, datetime, tempfile, fcntl, threading
+import json, time, base64, os, sys, logging, datetime, tempfile, fcntl, threading
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
-from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from pathlib import Path
@@ -24,6 +23,12 @@ from cryptography.hazmat.backends import default_backend
 from dotenv import load_dotenv
 
 from artifact_contracts import normalize_health_state, normalize_health_summary
+from ops.logging import (
+    is_shutdown_requested as ops_is_shutdown_requested,
+    setup_logging as ops_setup_logging,
+    setup_signal_handlers as ops_setup_signal_handlers,
+    setup_unbuffered as ops_setup_unbuffered,
+)
 from storage import (
     MetricsStore,
     TradeStore,
@@ -164,9 +169,7 @@ _log = logging.getLogger("kalshi_auth")
 
 def setup_unbuffered():
     """Enable unbuffered stdout for real-time logging."""
-    if hasattr(sys.stdout, 'reconfigure'):
-        sys.stdout.reconfigure(line_buffering=True)
-    os.environ['PYTHONUNBUFFERED'] = '1'
+    ops_setup_unbuffered()
 
 
 def setup_logging(name, log_file=None):
@@ -178,28 +181,7 @@ def setup_logging(name, log_file=None):
 
     Call once at bot startup: ``log = setup_logging("weather")``
     """
-    logger = logging.getLogger(name)
-    if logger.handlers:
-        return logger  # Already configured
-    logger.setLevel(logging.INFO)
-    fmt = logging.Formatter(
-        "%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    # Only add StreamHandler if stdout is a real TTY (not redirected by supervisor)
-    if hasattr(sys.stdout, "isatty") and sys.stdout.isatty():
-        sh = logging.StreamHandler(sys.stdout)
-        sh.setFormatter(fmt)
-        logger.addHandler(sh)
-    # Auto file logging — derive path from bot name if not explicitly provided
-    if log_file is None:
-        log_file = str(PROJECT_DIR / "data" / "logs" / f"{name}.log")
-    if log_file:
-        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        fh = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=3)
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
-    return logger
+    return ops_setup_logging(name, log_file=log_file, project_dir=PROJECT_DIR)
 
 
 _shutdown_requested = False
@@ -211,22 +193,19 @@ def is_shutdown_requested():
     Bots should check this after each scan cycle and break their main loop
     to allow clean exit before SIGTERM arrives.
     """
-    return _shutdown_requested
+    return ops_is_shutdown_requested(_shutdown_requested)
 
 
 def setup_signal_handlers():
     """Install graceful shutdown handlers for SIGTERM, SIGINT, and SIGUSR1."""
-    def _handler(signum, frame):
-        _log.info("Received signal %s, shutting down gracefully...", signum)
-        sys.exit(0)
-    signal.signal(signal.SIGTERM, _handler)
-    signal.signal(signal.SIGINT, _handler)
-
-    def _sigusr1_handler(signum, frame):
+    def _mark_shutdown_requested(requested=True):
         global _shutdown_requested
-        _log.info("Received SIGUSR1, requesting graceful shutdown...")
-        _shutdown_requested = True
-    signal.signal(signal.SIGUSR1, _sigusr1_handler)
+        _shutdown_requested = ops_is_shutdown_requested(requested)
+
+    ops_setup_signal_handlers(
+        _mark_shutdown_requested,
+        logger=_log,
+    )
 
 
 class KalshiClient:
