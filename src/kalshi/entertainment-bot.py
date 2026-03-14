@@ -449,7 +449,7 @@ def evaluate_album_opportunity(market, album, market_price, ss=None):
                 units=units, threshold=threshold, source=album.get("source", ""),
                 sizing_method=sizing_method,
             )
-            allocator.record_trade("entertainment", ticker, risk, edge=edge)
+            allocator.record_trade("entertainment", ticker, result.get("cost_cents", risk), edge=edge)
 
     elif side == "no" and no_ask and no_ask < 99:
         edge = confidence - no_ask / 100
@@ -510,7 +510,7 @@ def evaluate_album_opportunity(market, album, market_price, ss=None):
                 units=units, threshold=threshold, source=album.get("source", ""),
                 sizing_method=sizing_method,
             )
-            allocator.record_trade("entertainment", ticker, risk, edge=edge)
+            allocator.record_trade("entertainment", ticker, result.get("cost_cents", risk), edge=edge)
 
 def evaluate_boxoffice_opportunity(market, movie, market_price, ss=None):
     """Evaluate box office trade opportunity."""
@@ -619,7 +619,7 @@ def evaluate_boxoffice_opportunity(market, movie, market_price, ss=None):
                 gross=gross, threshold=threshold, source=movie.get("source", ""),
                 sizing_method=sizing_method,
             )
-            allocator.record_trade("entertainment", ticker, risk, edge=edge)
+            allocator.record_trade("entertainment", ticker, result.get("cost_cents", risk), edge=edge)
 
     elif side == "no" and no_ask and no_ask < 99:
         edge = confidence - no_ask / 100
@@ -679,7 +679,7 @@ def evaluate_boxoffice_opportunity(market, movie, market_price, ss=None):
                 gross=gross, threshold=threshold, source=movie.get("source", ""),
                 sizing_method=sizing_method,
             )
-            allocator.record_trade("entertainment", ticker, risk, edge=edge)
+            allocator.record_trade("entertainment", ticker, result.get("cost_cents", risk), edge=edge)
 
 # === Main Loop ===
 def scan():

@@ -36,6 +36,29 @@ parse_ticker = _mod.parse_ticker
 compute_probability = _mod.compute_probability
 
 
+class TestLiveModelBias:
+
+    def test_apply_live_model_bias_shrinks_correction_by_confidence(self):
+        adjusted, applied = _mod._apply_live_model_bias(
+            "DEN",
+            {"gfs": 70.0, "graphcast": 68.0, "nws": 69.0},
+            {
+                "DEN": {
+                    "gfs": {"bias_f": 4.0, "confidence": 0.25, "n": 2},
+                    "graphcast": {"bias_f": 2.0, "confidence": 0.5, "n": 5},
+                }
+            },
+        )
+
+        assert adjusted["gfs"] == pytest.approx(69.0)
+        assert adjusted["graphcast"] == pytest.approx(67.0)
+        assert adjusted["nws"] == pytest.approx(69.0)
+        assert applied == [
+            {"model": "gfs", "bias_f": 4.0, "confidence": 0.25, "correction_f": 1.0},
+            {"model": "graphcast", "bias_f": 2.0, "confidence": 0.5, "correction_f": 1.0},
+        ]
+
+
 # ===================================================================
 # parse_ticker tests
 # ===================================================================
@@ -80,6 +103,186 @@ class TestParseTicker:
     def test_invalid_month(self):
         """A three-letter month code that isn't in the MONTHS map."""
         assert parse_ticker("KXHIGHMIA-26XYZ16-T86") is None
+
+
+class TestWeatherMarketDiscovery:
+    """Verify weather markets are fetched via city series, not global prefix scans."""
+
+    def test_get_weather_markets_queries_city_series_and_normalizes(self, monkeypatch):
+        monkeypatch.setattr(_mod, "CITIES", {
+            "MIA": {"lat": 25.8, "lon": -80.3},
+            "NY": {"lat": 40.8, "lon": -74.0},
+        })
+        monkeypatch.setattr(_mod, "_weather_market_cache", {"fetched_at": 0.0, "markets": []})
+        monkeypatch.setattr(
+            _mod,
+            "normalize_markets",
+            lambda markets: [
+                dict(
+                    market,
+                    yes_bid=int(round(float(market.get("yes_bid_dollars", 0)) * 100)),
+                    yes_ask=int(round(float(market.get("yes_ask_dollars", 0)) * 100)),
+                )
+                for market in markets
+            ],
+        )
+
+        seen_paths = []
+
+        class FakeClient:
+            def get(self, path):
+                seen_paths.append(path)
+                if "series_ticker=KXHIGHMIA" in path:
+                    return {
+                        "markets": [{
+                            "ticker": "KXHIGHMIA-26MAR14-T86",
+                            "yes_bid_dollars": "0.50",
+                            "yes_ask_dollars": "0.51",
+                        }]
+                    }
+                if "series_ticker=KXHIGHNY" in path:
+                    return {
+                        "markets": [{
+                            "ticker": "KXHIGHNY-26MAR14-T56",
+                            "yes_bid_dollars": "0.42",
+                            "yes_ask_dollars": "0.43",
+                        }]
+                    }
+                raise AssertionError(f"unexpected path {path}")
+
+        monkeypatch.setattr(_mod, "client", FakeClient())
+
+        markets = _mod.get_weather_markets(cache_ttl=0)
+
+        assert [m["ticker"] for m in markets] == [
+            "KXHIGHMIA-26MAR14-T86",
+            "KXHIGHNY-26MAR14-T56",
+        ]
+        assert markets[0]["yes_bid"] == 50
+        assert markets[1]["yes_ask"] == 43
+        assert any("series_ticker=KXHIGHMIA" in path for path in seen_paths)
+        assert any("series_ticker=KXHIGHNY" in path for path in seen_paths)
+        assert all("status=open" in path for path in seen_paths)
+
+
+class TestWeatherCalibrationPathResolution:
+    def test_resolve_optional_project_path_returns_none_for_empty(self):
+        assert _mod._resolve_optional_project_path(None) is None
+        assert _mod._resolve_optional_project_path("") is None
+
+    def test_resolve_optional_project_path_joins_relative_paths(self):
+        resolved = _mod._resolve_optional_project_path("data/test-bias.json")
+        assert resolved == _mod.PROJECT_DIR / "data" / "test-bias.json"
+
+
+class TestWeatherExecutionPlanning:
+    """Thin-book weather markets should still produce passive entry plans."""
+
+    def test_build_maker_entry_plan_prices_inside_wide_spread(self):
+        market = {"yes_bid": 40, "yes_ask": 78, "volume": 12}
+        plan = _mod._build_maker_entry_plan(market, "yes", 0.74, days_out=1)
+        assert plan is not None
+        assert plan["execution_mode"] == "maker"
+        assert 41 <= plan["price"] <= 77
+        assert plan["edge"] >= _mod._maker_min_edge(1)
+
+    def test_build_maker_entry_plan_disabled_for_far_markets(self):
+        market = {"yes_bid": 40, "yes_ask": 78, "volume": 12}
+        plan = _mod._build_maker_entry_plan(
+            market,
+            "yes",
+            0.74,
+            days_out=3,
+            maker_cfg={"enabled": True, "maxDaysOut": 1, "minEdgeNearTerm": 0.10, "minEdgeFar": 0.14,
+                       "minImprovementCents": 1, "maxJoinUpliftCents": 18,
+                       "pricePriorityEdgeBuffer": 0.02, "maxPriceCents": 95},
+        )
+        assert plan is None
+
+    def test_select_execution_plan_prefers_maker_when_book_is_illiquid(self):
+        displayed = {"execution_mode": "taker", "price": 78, "edge": 0.06}
+        maker = {"execution_mode": "maker", "price": 67, "edge": 0.17}
+        chosen = _mod._select_weather_execution_plan(displayed, maker, market_liquid=False)
+        assert chosen == maker
+
+
+class TestWeatherOpportunitySelection:
+    def _opp(self, city, date_str, direction, edge, price, execution_mode="maker", verification=1.0):
+        return {
+            "city": city,
+            "days_out": 0,
+            "edge": edge,
+            "entry_price": price,
+            "execution_mode": execution_mode,
+            "verification_confidence": verification,
+            "parsed": {"city": city, "date": date_str, "direction": direction},
+        }
+
+    def test_selection_prefers_thresholds_and_diversifies_city_dates(self):
+        opps = [
+            self._opp("MIA", "2026-03-14", "T", 0.50, 49),
+            self._opp("MIA", "2026-03-14", "B", 0.60, 37),
+            self._opp("MIA", "2026-03-14", "B", 0.58, 38),
+            self._opp("CHI", "2026-03-14", "T", 0.55, 45),
+            self._opp("CHI", "2026-03-14", "B", 0.53, 46),
+            self._opp("NY", "2026-03-14", "T", 0.49, 49),
+        ]
+        selected, pruned = _mod._select_weather_opportunities(
+            opps,
+            remaining_slots=2,
+            selection_cfg={
+                "enabled": True,
+                "oversampleFactor": 1,
+                "minCandidates": 2,
+                "maxPerCity": 2,
+                "maxPerCityDate": 1,
+                "maxBracketPerCityDate": 0,
+            },
+        )
+        assert len(selected) == 2
+        assert all(opp["parsed"]["direction"] == "T" for opp in selected)
+        assert {opp["city"] for opp in selected} == {"CHI", "MIA"}
+        assert len(pruned) == 4
+
+    def test_selection_caps_brackets_per_city_date(self):
+        opps = [
+            self._opp("LAX", "2026-03-14", "T", 0.42, 49),
+            self._opp("LAX", "2026-03-14", "B", 0.60, 37),
+            self._opp("LAX", "2026-03-14", "B", 0.59, 38),
+        ]
+        selected, _ = _mod._select_weather_opportunities(
+            opps,
+            remaining_slots=3,
+            selection_cfg={
+                "enabled": True,
+                "oversampleFactor": 3,
+                "minCandidates": 3,
+                "maxPerCity": 3,
+                "maxPerCityDate": 3,
+                "maxBracketPerCityDate": 1,
+            },
+        )
+        bracket_count = sum(1 for opp in selected if opp["parsed"]["direction"] == "B")
+        assert bracket_count == 1
+
+
+class TestWeatherDailyTradeSlots:
+    def test_remaining_slots_uses_trade_manager_sync(self, monkeypatch):
+        class FakeTradeManager:
+            def __init__(self):
+                self.called = 0
+
+            def remaining_daily_trade_slots(self):
+                self.called += 1
+                return 0
+
+        fake_manager = FakeTradeManager()
+        monkeypatch.setattr(_mod, "trade_manager", fake_manager)
+
+        remaining = _mod._remaining_weather_trade_slots()
+
+        assert remaining == 0
+        assert fake_manager.called == 1
 
 
 # ===================================================================
@@ -219,6 +422,54 @@ class TestEnsembleModels:
     def test_graphcast_model_string(self):
         assert _mod.ENSEMBLE_MODELS["graphcast"] == "gfs_graphcast025"
 
+    def test_nbm_uses_premium_gfs_endpoint_when_premium_key_set(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_OPEN_METEO_API_KEY", "premium-key")
+        request_model = _mod.open_meteo_model_name("nbm_conus", api_key=_mod._OPEN_METEO_API_KEY)
+        url = _mod._open_meteo_url(f"models={request_model}", model_name=request_model)
+        assert url.startswith("https://customer-api.open-meteo.com/v1/gfs?")
+        assert "&apikey=premium-key" in url
+        assert "models=ncep_nbm_conus" in url
+
+    def test_batch_nbm_falls_back_to_per_city_on_http_400(self, monkeypatch):
+        class _Resp:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        class _HTTP400(Exception):
+            def __init__(self):
+                super().__init__("bad request")
+                self.response = MagicMock(status_code=400)
+
+        cities = {
+            "MIA": {"lat": 25.8, "lon": -80.3},
+            "NY": {"lat": 40.8, "lon": -74.0},
+        }
+
+        def fake_cached_request(url, timeout=30, max_retries=2):
+            if "latitude=25.8,40.8" in url and "models=ncep_nbm_conus" in url:
+                raise _HTTP400()
+            if "latitude=25.8&longitude=-80.3" in url and "models=ncep_nbm_conus" in url:
+                return _Resp({"daily": {"time": ["2026-03-14"], "temperature_2m_max": [85.0]}})
+            if "latitude=40.8&longitude=-74.0" in url and "models=ncep_nbm_conus" in url:
+                return _Resp({"daily": {"time": ["2026-03-14"], "temperature_2m_max": [52.0]}})
+            raise AssertionError(f"unexpected url {url}")
+
+        monkeypatch.setattr(_mod, "ENSEMBLE_MODELS", {"nbm": "nbm_conus"})
+        monkeypatch.setattr(_mod, "_OPEN_METEO_API_KEY", "premium-key")
+        monkeypatch.setattr(_mod.health, "is_source_open", lambda source: False)
+        record_source_success = MagicMock()
+        monkeypatch.setattr(_mod.health, "record_source_success", record_source_success)
+        monkeypatch.setattr(_mod, "_cached_request", fake_cached_request)
+
+        forecasts = _mod.get_batch_ensemble_forecasts(cities)
+
+        assert forecasts["MIA"]["2026-03-14"]["nbm"] == 85.0
+        assert forecasts["NY"]["2026-03-14"]["nbm"] == 52.0
+        record_source_success.assert_called_once_with("open-meteo-nbm")
+
 
 def test_bias_corrector_imported():
     """BiasCorrector must be importable from weather_data and used in weather-bot."""
@@ -254,6 +505,42 @@ class TestBiasBlending:
         """Simulates city_bias=None scenario (no ForecastVerifier data)."""
         result = self._compute_blend(hist_bias=8.5, live_bias=0.0, live_n=0)
         assert result == 8.5
+
+
+class TestWeatherBiasTradeFields:
+    def test_trade_fields_capture_conflict_and_cap_metadata(self):
+        fields = _mod._weather_bias_trade_fields(
+            bias_applied=6.0,
+            hist_bias=14.64,
+            live_bias=-4.65,
+            live_n=2,
+            live_confidence=0.2,
+            alpha=0.35,
+            bias_meta={"capped": True, "conflict": True},
+        )
+
+        assert fields == {
+            "bias_applied_f": 6.0,
+            "bias_hist_f": 14.64,
+            "bias_live_f": -4.65,
+            "bias_live_n": 2,
+            "bias_live_confidence": 0.2,
+            "bias_alpha": 0.35,
+            "bias_capped": True,
+            "bias_conflict": True,
+        }
+
+    def test_trade_fields_default_cleanly_when_bias_not_used(self):
+        fields = _mod._weather_bias_trade_fields()
+
+        assert fields["bias_applied_f"] is None
+        assert fields["bias_hist_f"] is None
+        assert fields["bias_live_f"] is None
+        assert fields["bias_live_n"] == 0
+        assert fields["bias_live_confidence"] == 0.0
+        assert fields["bias_alpha"] is None
+        assert fields["bias_capped"] is False
+        assert fields["bias_conflict"] is False
 
 
 class TestSourceBreakerRegression:

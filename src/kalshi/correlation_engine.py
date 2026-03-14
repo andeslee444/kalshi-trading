@@ -194,6 +194,19 @@ class CorrelationEngine:
         key = self._cluster_key(factor)
         self._cluster_risk[key] = self._cluster_risk.get(key, 0) + risk_cents
 
+    def rebuild_cluster_risk(self, exposure_records: List[Dict]) -> None:
+        """Recompute cluster exposure from live open-position records."""
+        rebuilt = {}
+        for record in exposure_records:
+            ticker = record.get("ticker")
+            risk_cents = record.get("risk_cents", 0)
+            if not ticker or risk_cents <= 0:
+                continue
+            factor = self.ticker_to_factor(ticker)
+            key = self._cluster_key(factor)
+            rebuilt[key] = rebuilt.get(key, 0) + int(round(risk_cents))
+        self._cluster_risk = rebuilt
+
     def get_cluster_risk(self, factor: str) -> int:
         """Get total risk in the cluster containing this factor."""
         key = self._cluster_key(factor)

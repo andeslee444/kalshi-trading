@@ -16,8 +16,11 @@ Usage:
     python3 scripts/calibrate-historical.py                          # All cities, 180 days
     python3 scripts/calibrate-historical.py --days 90                # 90 days
     python3 scripts/calibrate-historical.py --city MIA               # Single city
+    python3 scripts/calibrate-historical.py --cities AUS,DEN,HOU     # Targeted city set
     python3 scripts/calibrate-historical.py --models gfs,ecmwf,nbm   # Specific models
+    python3 scripts/calibrate-historical.py --actuals-source iem     # Faster proxy actuals
     python3 scripts/calibrate-historical.py --save                   # Write audit artifact
+    python3 scripts/calibrate-historical.py --output data/foo.json   # Write to explicit path
     python3 scripts/calibrate-historical.py --merge-bias             # Store bias priors in calibration.json
     python3 scripts/calibrate-historical.py --dry-run                # Preview only
 """
@@ -30,12 +33,22 @@ import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 # Add src/kalshi to path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"))
 
 from kalshi_auth import PROJECT_DIR, retry_request, atomic_write_json
-from weather_data import STATION_MAP, SettlementTemperatureFetcher
+from weather_data import (
+    IEMFetcher,
+    STATION_MAP,
+    SettlementTemperatureFetcher,
+    _city_timezone_name,
+    open_meteo_model_name,
+)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
 
 
 # Models to calibrate (Open-Meteo API identifiers)
@@ -55,7 +68,7 @@ def get_city_coords():
     return json.loads(config_path.read_text()).get("cities", {})
 
 
-def fetch_historical_forecasts(lat, lon, start_date, end_date, model_name):
+def fetch_historical_forecasts(lat, lon, start_date, end_date, model_name, city_code=None):
     """Fetch historical model predictions from Open-Meteo Historical Forecast API.
 
     This returns what the model PREDICTED for each date (not the same as actuals).
@@ -69,6 +82,8 @@ def fetch_historical_forecasts(lat, lon, start_date, end_date, model_name):
         dict of {date_str: temp_f} or empty dict on failure.
     """
     api_key = os.environ.get("OPEN_METEO_API_KEY", "")
+    request_model = open_meteo_model_name(model_name, api_key=api_key)
+    timezone_name = quote(_city_timezone_name(city_code=city_code), safe="")
     base = ("https://customer-historical-forecast-api.open-meteo.com/v1/forecast"
             if api_key else "https://historical-forecast-api.open-meteo.com/v1/forecast")
 
@@ -76,8 +91,8 @@ def fetch_historical_forecasts(lat, lon, start_date, end_date, model_name):
         f"{base}?latitude={lat}&longitude={lon}"
         f"&start_date={start_date}&end_date={end_date}"
         f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
-        f"&timezone=America%2FNew_York"
-        f"&models={model_name}"
+        f"&timezone={timezone_name}"
+        f"&models={request_model}"
         + (f"&apikey={api_key}" if api_key else "")
     )
 
@@ -176,7 +191,10 @@ def write_bias_to_calibration(output):
     weather = cal.setdefault("weather", {})
     weather["bias_correction"] = {
         "generated_at": output["generated_at"],
+        "source": output.get("source"),
+        "lead_time_matched": output.get("lead_time_matched", False),
         "period": output["period"],
+        "actuals_source": output.get("actuals_source"),
         "n_forecasts": output["n_forecasts"],
         "n_cities": output["n_cities"],
         "per_city": output["per_city"],
@@ -192,10 +210,24 @@ def main():
                         help="Days of history to analyze (default: 180)")
     parser.add_argument("--city", type=str, default=None,
                         help="Single city code (default: all)")
+    parser.add_argument("--cities", type=str, default=None,
+                        help="Comma-separated city codes (e.g. AUS,DEN,HOU)")
     parser.add_argument("--models", type=str, default=None,
                         help="Comma-separated model short names (e.g., gfs,ecmwf,nbm)")
+    parser.add_argument(
+        "--actuals-source",
+        choices=("iem", "settlement"),
+        default="settlement",
+        help="Actual temperature source for calibration (default: settlement)",
+    )
     parser.add_argument("--save", action="store_true",
                         help="Write results to config/historical-calibration.json")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Explicit output path for audit artifact (relative paths resolve under project root)",
+    )
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview only, don't fetch data")
     parser.add_argument("--merge-bias", action="store_true",
@@ -210,11 +242,22 @@ def main():
         sys.exit(2)
 
     cities = get_city_coords()
+    if args.city and args.cities:
+        print("Error: use either --city or --cities, not both")
+        sys.exit(1)
+
     if args.city:
         if args.city not in cities:
             print(f"Error: unknown city '{args.city}'. Available: {', '.join(cities.keys())}")
             sys.exit(1)
         target_cities = {args.city: cities[args.city]}
+    elif args.cities:
+        requested = [c.strip() for c in args.cities.split(",") if c.strip()]
+        unknown = [c for c in requested if c not in cities]
+        if unknown:
+            print(f"Error: unknown cities {', '.join(unknown)}. Available: {', '.join(cities.keys())}")
+            sys.exit(1)
+        target_cities = {c: cities[c] for c in requested}
     else:
         target_cities = cities
 
@@ -250,7 +293,10 @@ def main():
         print(f"  Total API calls: {len(target_cities)} IEM + {len(target_cities) * len(target_models)} historical forecast")
         return
 
-    actuals_fetcher = SettlementTemperatureFetcher()
+    if args.actuals_source == "settlement":
+        actuals_fetcher = SettlementTemperatureFetcher()
+    else:
+        actuals_fetcher = IEMFetcher()
     all_city_stats = {}
     global_errors = {m: [] for m in target_models}
     total_forecasts = 0
@@ -265,7 +311,7 @@ def main():
         print(f"\n--- {code} ({info['name']}) -> {station} ---")
 
         # Fetch IEM actuals
-        print(f"  Fetching IEM actuals: {start_date} to {end_date}")
+        print(f"  Fetching {args.actuals_source.upper()} actuals: {start_date} to {end_date}")
         actuals = actuals_fetcher.fetch_daily_highs(station, start_date, end_date, city_code=code)
         print(f"  Got {len(actuals)} actual observations")
 
@@ -277,7 +323,14 @@ def main():
         city_stats = {}
         for model_short, model_api in target_models.items():
             print(f"  Fetching {model_short} historical forecasts...")
-            forecasts = fetch_historical_forecasts(lat, lon, start_date, end_date, model_api)
+            forecasts = fetch_historical_forecasts(
+                lat,
+                lon,
+                start_date,
+                end_date,
+                model_api,
+                city_code=code,
+            )
             print(f"  Got {len(forecasts)} forecast dates for {model_short}")
             total_forecasts += len(forecasts)
 
@@ -328,7 +381,10 @@ def main():
     # Build output
     output = {
         "generated_at": datetime.datetime.now().isoformat(),
+        "source": "historical_forecast_api",
+        "lead_time_matched": False,
         "period": {"start": start_date, "end": end_date, "days": args.days},
+        "actuals_source": args.actuals_source,
         "n_forecasts": total_forecasts,
         "n_cities": len(all_city_stats),
         "per_city": all_city_stats,
@@ -339,12 +395,20 @@ def main():
     if args.merge_bias:
         write_bias_to_calibration(output)
 
-    if args.save:
+    out_path = None
+    if args.output:
+        out_path = Path(args.output)
+        if not out_path.is_absolute():
+            out_path = PROJECT_DIR / out_path
+    elif args.save:
         out_path = PROJECT_DIR / "config" / "historical-calibration.json"
-        out_path.write_text(json.dumps(output, indent=2))
+
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(out_path, output)
         print(f"\nSaved to {out_path}")
     else:
-        print(f"\n(Use --save to write to config/historical-calibration.json)")
+        print(f"\n(Use --save or --output PATH to write an audit artifact)")
 
 
 if __name__ == "__main__":

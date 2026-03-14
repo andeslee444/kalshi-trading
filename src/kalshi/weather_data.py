@@ -26,6 +26,7 @@ import re
 import sqlite3
 from collections import defaultdict
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 _log = logging.getLogger("weather_data")
 
@@ -69,21 +70,45 @@ MODEL_NAME_ALIASES = {
     "ecmwf_ifs04": "ecmwf",
     "icon": "icon",
     "icon_seamless": "icon",
+    "gem": "gem",
+    "gem_global": "gem",
     "graphcast": "graphcast",
     "gfs_graphcast025": "graphcast",
     "aifs": "aifs",
     "ecmwf_aifs025": "aifs",
     "nbm": "nbm",
     "nbm_conus": "nbm",
+    "ncep_nbm_conus": "nbm",
     "hrrr": "hrrr",
     "hrrr_conus": "hrrr",
     "ncep_hrrr_conus": "hrrr",
     "nam": "nam",
     "nam_conus": "nam",
+    "ncep_nam_conus": "nam",
     "nws": "nws",
 }
 
+PREMIUM_GFS_MODEL_ALIASES = {
+    "hrrr_conus": "ncep_hrrr_conus",
+    "nbm_conus": "ncep_nbm_conus",
+    "nam_conus": "ncep_nam_conus",
+}
+
 STATION_TO_CITY = {station: city for city, station in STATION_MAP.items()}
+OPEN_METEO_FORECAST_BASE = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_PREMIUM_FORECAST_BASE = "https://customer-api.open-meteo.com/v1/forecast"
+OPEN_METEO_GFS_BASE = "https://api.open-meteo.com/v1/gfs"
+OPEN_METEO_PREMIUM_GFS_BASE = "https://customer-api.open-meteo.com/v1/gfs"
+GFS_API_MODELS = {
+    "gfs_seamless",
+    "gfs_graphcast025",
+    "hrrr_conus",
+    "ncep_hrrr_conus",
+    "nbm_conus",
+    "ncep_nbm_conus",
+    "nam_conus",
+    "ncep_nam_conus",
+}
 
 
 def _city_timezone_name(city_code=None, station_id=None):
@@ -105,6 +130,27 @@ def canonical_model_name(model_name):
     if not model_name:
         return model_name
     return MODEL_NAME_ALIASES.get(model_name, model_name)
+
+
+def open_meteo_model_name(model_name, api_key=None):
+    """Translate model ids for the premium NOAA endpoint when required."""
+    api_key = api_key if api_key is not None else os.environ.get("OPEN_METEO_API_KEY", "")
+    if api_key:
+        return PREMIUM_GFS_MODEL_ALIASES.get(model_name, model_name)
+    return model_name
+
+
+def open_meteo_forecast_target(model_name=None, api_key=None):
+    """Choose the correct Open-Meteo endpoint family for a model."""
+    api_key = api_key if api_key is not None else os.environ.get("OPEN_METEO_API_KEY", "")
+    resolved_model = open_meteo_model_name(model_name, api_key=api_key)
+    if model_name in GFS_API_MODELS or resolved_model in GFS_API_MODELS:
+        if api_key:
+            return OPEN_METEO_PREMIUM_GFS_BASE, api_key
+        return OPEN_METEO_GFS_BASE, ""
+    if api_key:
+        return OPEN_METEO_PREMIUM_FORECAST_BASE, api_key
+    return OPEN_METEO_FORECAST_BASE, ""
 
 
 def _is_iem_header_row(parts):
@@ -150,10 +196,45 @@ class NWSForecastFetcher:
     Returns daily high temperature forecasts in Fahrenheit.
     """
 
-    NWS_CROSS_VALIDATE_THRESHOLD_F = 3.0  # Flag if sources disagree by >3F
+    NWS_CROSS_VALIDATE_THRESHOLD_F = 3.0  # Base threshold when no city calibration exists
+    NWS_CROSS_VALIDATE_SIGMA_SCALE = 0.75
+    NWS_CROSS_VALIDATE_MAX_THRESHOLD_F = 6.0
+    VALID_CROSS_VALIDATE_MODES = {"gridpoint", "advisory_only", "disabled"}
 
-    def __init__(self, logger=None):
+    def __init__(self, logger=None, grid_map=None, city_coords=None, threshold_map=None,
+                 threshold_scale=None, max_threshold_f=None, mode_map=None,
+                 default_mode="gridpoint"):
         self.log = logger or _log
+        self.grid_map = dict(NWS_GRID_MAP)
+        self.grid_overrides = dict(grid_map or {})
+        if self.grid_overrides:
+            self.grid_map.update(self.grid_overrides)
+        self.city_coords = {
+            city: {
+                "lat": float(info["lat"]),
+                "lon": float(info["lon"]),
+            }
+            for city, info in (city_coords or {}).items()
+            if isinstance(info, dict) and "lat" in info and "lon" in info
+        }
+        self._resolved_grid_cache = {}
+        self.threshold_map = dict(threshold_map or {})
+        self.threshold_scale = (
+            float(threshold_scale)
+            if threshold_scale is not None
+            else self.NWS_CROSS_VALIDATE_SIGMA_SCALE
+        )
+        self.max_threshold_f = (
+            float(max_threshold_f)
+            if max_threshold_f is not None
+            else self.NWS_CROSS_VALIDATE_MAX_THRESHOLD_F
+        )
+        self.default_mode = self._normalize_cross_validate_mode(default_mode)
+        self.mode_map = {
+            city: self._normalize_cross_validate_mode(mode)
+            for city, mode in (mode_map or {}).items()
+        }
+        self._logged_cross_validation_mismatches = set()
 
     def fetch_forecast(self, city_code):
         """Fetch NWS 7-day forecast for a city.
@@ -169,7 +250,7 @@ class NWSForecastFetcher:
             self.log.warning("retry_request not available")
             return None
 
-        grid = NWS_GRID_MAP.get(city_code)
+        grid = self._grid_for_city(city_code)
         if not grid:
             self.log.debug("No NWS grid mapping for city %s", city_code)
             return None
@@ -200,6 +281,61 @@ class NWSForecastFetcher:
             self.log.warning("NWS API error for %s: %s", city_code, e)
             return None
 
+    def _grid_for_city(self, city_code):
+        if city_code in self.grid_overrides:
+            return self.grid_overrides[city_code]
+        if city_code in self._resolved_grid_cache:
+            return self._resolved_grid_cache[city_code]
+
+        coords = self.city_coords.get(city_code)
+        if coords:
+            resolved = self._resolve_gridpoint(city_code, coords["lat"], coords["lon"])
+            if resolved:
+                self._resolved_grid_cache[city_code] = resolved
+                return resolved
+
+        return self.grid_map.get(city_code)
+
+    def _resolve_gridpoint(self, city_code, lat, lon):
+        if _retry_request is None:
+            return None
+
+        url = f"https://api.weather.gov/points/{lat},{lon}"
+        try:
+            resp = _retry_request("GET", url, timeout=10, max_retries=2)
+            if resp is None or resp.status_code != 200:
+                return None
+
+            props = resp.json().get("properties", {})
+            office = props.get("gridId") or props.get("cwa")
+            grid_x = props.get("gridX")
+            grid_y = props.get("gridY")
+            if not office or grid_x is None or grid_y is None:
+                return None
+
+            resolved = {
+                "office": str(office),
+                "gridX": int(grid_x),
+                "gridY": int(grid_y),
+            }
+            fallback = NWS_GRID_MAP.get(city_code)
+            if fallback and fallback != resolved:
+                self.log.info(
+                    "Resolved NWS grid for %s from station coordinates: %s/%s,%s "
+                    "(fallback was %s/%s,%s)",
+                    city_code,
+                    resolved["office"],
+                    resolved["gridX"],
+                    resolved["gridY"],
+                    fallback["office"],
+                    fallback["gridX"],
+                    fallback["gridY"],
+                )
+            return resolved
+        except Exception as e:
+            self.log.debug("NWS points lookup failed for %s: %s", city_code, e)
+            return None
+
     def _parse_periods(self, periods):
         """Parse NWS forecast periods into {date_str: high_temp_f}.
 
@@ -227,34 +363,119 @@ class NWSForecastFetcher:
 
         return result if result else None
 
-    def cross_validate(self, city_code, open_meteo_temp, nws_temp):
+    def cross_validate_mode(self, city_code):
+        """Return the configured cross-check mode for a city."""
+        return self.mode_map.get(city_code, self.default_mode)
+
+    def should_cross_validate(self, city_code):
+        """Return True when the gridpoint cross-check should run for a city."""
+        return self.cross_validate_mode(city_code) != "disabled"
+
+    def cross_validate_threshold(self, city_code, days_out=0):
+        """Return the city-aware tolerance band for Open-Meteo vs NWS."""
+        override = self.threshold_map.get(city_code)
+        if isinstance(override, (int, float)) and override > 0:
+            return float(override)
+
+        try:
+            from probability import weather_sigma
+
+            sigma = weather_sigma(days_out=max(0, int(days_out or 0)), city=city_code)
+            if isinstance(sigma, (int, float)) and sigma > 0:
+                threshold = max(
+                    self.NWS_CROSS_VALIDATE_THRESHOLD_F,
+                    min(self.max_threshold_f, sigma * self.threshold_scale),
+                )
+                return round(threshold, 1)
+        except Exception:
+            pass
+
+        return float(self.NWS_CROSS_VALIDATE_THRESHOLD_F)
+
+    def cross_validate(self, city_code, open_meteo_temp, nws_temp, date_str=None):
         """Check if Open-Meteo and NWS forecasts agree within threshold.
 
         Args:
             city_code: city code for logging
             open_meteo_temp: temperature from Open-Meteo (F)
             nws_temp: temperature from NWS (F)
+            date_str: optional forecast date in YYYY-MM-DD for days-out-aware thresholds
 
         Returns:
             True if sources agree (difference <= threshold), False if they diverge.
         """
+        mode = self.cross_validate_mode(city_code)
+        if mode == "disabled":
+            return True
+
+        days_out = self._days_out(city_code, date_str)
         diff = abs(open_meteo_temp - nws_temp)
-        if diff > self.NWS_CROSS_VALIDATE_THRESHOLD_F:
-            self.log.warning(
-                "%s: Open-Meteo (%.1fF) and NWS (%.1fF) disagree by %.1fF (>%.1fF threshold) "
-                "-- one source may be stale",
-                city_code, open_meteo_temp, nws_temp, diff,
-                self.NWS_CROSS_VALIDATE_THRESHOLD_F,
+        threshold = self.cross_validate_threshold(city_code, days_out=days_out)
+        if diff > threshold:
+            cache_key = (
+                city_code,
+                date_str,
+                mode,
+                round(open_meteo_temp, 1),
+                round(nws_temp, 1),
+                round(threshold, 1),
             )
+            if cache_key not in self._logged_cross_validation_mismatches:
+                if len(self._logged_cross_validation_mismatches) > 4096:
+                    self._logged_cross_validation_mismatches.clear()
+                label = city_code if not date_str else f"{city_code} {date_str}"
+                suffix = (
+                    "advisory only; settlement/station mismatch is possible"
+                    if mode == "advisory_only"
+                    else "gridpoint/station mismatch is possible"
+                )
+                log_fn = self.log.info if mode == "advisory_only" else self.log.warning
+                if days_out is None:
+                    log_fn(
+                        "%s: Open-Meteo (%.1fF) and NWS gridpoint forecast (%.1fF) diverge by %.1fF "
+                        "(>%.1fF threshold) -- %s",
+                        label, open_meteo_temp, nws_temp, diff, threshold, suffix,
+                    )
+                else:
+                    log_fn(
+                        "%s: Open-Meteo (%.1fF) and NWS gridpoint forecast (%.1fF) diverge by %.1fF "
+                        "(>%.1fF threshold, day+%d) -- %s",
+                        label, open_meteo_temp, nws_temp, diff, threshold, days_out, suffix,
+                    )
+                self._logged_cross_validation_mismatches.add(cache_key)
             return False
         return True
+
+    def _normalize_cross_validate_mode(self, mode):
+        normalized = str(mode or "").strip().lower()
+        if normalized in self.VALID_CROSS_VALIDATE_MODES:
+            return normalized
+        return "gridpoint"
+
+    def _days_out(self, city_code, date_str):
+        if not date_str:
+            return None
+        try:
+            target_date = datetime.date.fromisoformat(date_str)
+        except (TypeError, ValueError):
+            return None
+        return max(0, (target_date - self._city_local_today(city_code)).days)
+
+    def _city_local_today(self, city_code):
+        try:
+            tz = ZoneInfo(_city_timezone_name(city_code=city_code))
+            return datetime.datetime.now(tz).date()
+        except Exception:
+            return datetime.date.today()
 
 
 class EnsembleCollector:
     """Fetches raw ensemble member temperatures from Open-Meteo Ensemble API.
 
-    Returns per-date lists of all ensemble member forecasts (typically 82 members:
-    31 GEFS + 51 ECMWF ENS when both models requested).
+    Returns per-date lists of all ensemble member forecasts.
+
+    Current Open-Meteo model mix is typically 143 members:
+    31 GFS + 51 ECMWF + 40 ICON + 21 GEM.
     """
 
     def __init__(self, logger=None):
@@ -497,48 +718,77 @@ class NWSClimateReportFetcher:
 
     def __init__(self, logger=None):
         self.log = logger or _log
+        self._recent_products_cache = {}
+        self._product_text_cache = {}
+        self._parsed_product_cache = {}
 
     def fetch_daily_high(self, station_id, date_str, city_code=None):
         """Fetch actual high temperature from the final NWS climate report."""
-        if _retry_request is None:
-            self.log.warning("retry_request not available")
-            return None
-
         try:
             target_date = datetime.date.fromisoformat(date_str)
         except ValueError:
             self.log.warning("Invalid date format: %s", date_str)
             return None
 
+        return self.fetch_daily_highs(
+            station_id,
+            date_str,
+            date_str,
+            city_code=city_code,
+        ).get(date_str)
+
+    def fetch_daily_highs(self, station_id, start_date, end_date, city_code=None):
+        """Fetch actual highs for a date range from cached NWS CLI products."""
+        if _retry_request is None:
+            self.log.warning("retry_request not available")
+            return {}
+
+        try:
+            start = datetime.date.fromisoformat(start_date)
+            end = datetime.date.fromisoformat(end_date)
+        except ValueError:
+            self.log.warning("Invalid date range: %s to %s", start_date, end_date)
+            return {}
+
+        if end < start:
+            return {}
+
         location_id = self._location_id(station_id, city_code)
         products = self._fetch_recent_products(location_id)
         if not products:
-            return None
+            return {}
 
+        target_dates = set()
+        current = start
+        while current <= end:
+            target_dates.add(current)
+            current += datetime.timedelta(days=1)
+
+        results = {}
         for product in products[:self.MAX_RECENT_PRODUCTS]:
             issue_time = self._parse_issue_time(product.get("issuanceTime"))
-            if issue_time and issue_time.date() < target_date:
+            if issue_time and issue_time.date() < start:
                 break
 
-            product_id = product.get("id")
-            if not product_id:
+            report_date, maximum = self._fetch_parsed_product(product.get("id"))
+            if report_date is None or report_date not in target_dates:
                 continue
+            if report_date not in results:
+                results[report_date] = maximum
+                if len(results) == len(target_dates):
+                    break
 
-            product_text = self._fetch_product_text(product_id)
-            if not product_text:
-                continue
+        if not results:
+            self.log.debug(
+                "No NWS climate report matches for %s %s..%s (%s)",
+                station_id,
+                start_date,
+                end_date,
+                location_id,
+            )
+            return {}
 
-            report_date, maximum = self._parse_product(product_text)
-            if report_date == target_date:
-                return maximum
-
-        self.log.debug(
-            "No NWS climate report match for %s/%s (%s)",
-            station_id,
-            date_str,
-            location_id,
-        )
-        return None
+        return {date.isoformat(): value for date, value in sorted(results.items())}
 
     def _location_id(self, station_id, city_code=None):
         if station_id and station_id.startswith("K") and len(station_id) == 4:
@@ -548,6 +798,8 @@ class NWSClimateReportFetcher:
         return city_code or ""
 
     def _fetch_recent_products(self, location_id):
+        if location_id in self._recent_products_cache:
+            return list(self._recent_products_cache[location_id])
         url = f"https://api.weather.gov/products/types/CLI/locations/{location_id}"
         try:
             resp = _retry_request("GET", url, timeout=10, max_retries=2)
@@ -555,25 +807,41 @@ class NWSClimateReportFetcher:
                 return []
             data = resp.json()
             products = data.get("@graph", [])
-            return sorted(
+            products = sorted(
                 products,
                 key=lambda p: p.get("issuanceTime", ""),
                 reverse=True,
             )
+            self._recent_products_cache[location_id] = list(products)
+            return products
         except Exception as e:
             self.log.warning("NWS CLI product list error for %s: %s", location_id, e)
             return []
 
     def _fetch_product_text(self, product_id):
+        if product_id in self._product_text_cache:
+            return self._product_text_cache[product_id]
         url = f"https://api.weather.gov/products/{product_id}"
         try:
             resp = _retry_request("GET", url, timeout=10, max_retries=2)
             if resp is None:
                 return None
-            return resp.json().get("productText")
+            product_text = resp.json().get("productText")
+            self._product_text_cache[product_id] = product_text
+            return product_text
         except Exception as e:
             self.log.warning("NWS CLI product fetch error for %s: %s", product_id, e)
             return None
+
+    def _fetch_parsed_product(self, product_id):
+        if not product_id:
+            return None, None
+        if product_id in self._parsed_product_cache:
+            return self._parsed_product_cache[product_id]
+        product_text = self._fetch_product_text(product_id)
+        parsed = self._parse_product(product_text)
+        self._parsed_product_cache[product_id] = parsed
+        return parsed
 
     def _parse_issue_time(self, value):
         if not value:
@@ -663,12 +931,16 @@ class SettlementTemperatureFetcher:
 
         recent_cutoff = datetime.date.today() - datetime.timedelta(days=self.NWS_LOOKBACK_DAYS)
         current = max(start, recent_cutoff)
-        while current <= end:
-            date_key = current.isoformat()
-            nws_value = self.nws.fetch_daily_high(station_id, date_key, city_code=city_code)
-            if nws_value is not None:
-                actuals[date_key] = nws_value
-            current += datetime.timedelta(days=1)
+        if current <= end:
+            nws_actuals = self.nws.fetch_daily_highs(
+                station_id,
+                current.isoformat(),
+                end.isoformat(),
+                city_code=city_code,
+            )
+            for date_key, nws_value in nws_actuals.items():
+                if nws_value is not None:
+                    actuals[date_key] = nws_value
 
         return actuals
 
@@ -709,15 +981,15 @@ class HRRRFetcher:
 
         # Use premium endpoint if API key is configured
         api_key = os.environ.get("OPEN_METEO_API_KEY", "")
-        base = "https://customer-api.open-meteo.com/v1/forecast" if api_key else "https://api.open-meteo.com/v1/forecast"
-        model = "ncep_hrrr_conus" if api_key else "hrrr_conus"
+        model = open_meteo_model_name("hrrr_conus", api_key=api_key)
+        base, request_key = open_meteo_forecast_target(model_name=model, api_key=api_key)
         params = (
             f"latitude={lat}&longitude={lon}"
             f"&hourly=temperature_2m&temperature_unit=fahrenheit"
             f"&timezone=auto&forecast_days=2"
             f"&models={model}"
         )
-        url = f"{base}?{params}" + (f"&apikey={api_key}" if api_key else "")
+        url = f"{base}?{params}" + (f"&apikey={request_key}" if request_key else "")
 
         try:
             if self._rate_limiter is not None:
@@ -801,14 +1073,15 @@ class NAMFetcher:
         self.last_error = None
 
         api_key = os.environ.get("OPEN_METEO_API_KEY", "")
-        base = "https://customer-api.open-meteo.com/v1/forecast" if api_key else "https://api.open-meteo.com/v1/forecast"
+        model = open_meteo_model_name("nam_conus", api_key=api_key)
+        base, request_key = open_meteo_forecast_target(model_name=model, api_key=api_key)
         params = (
             f"latitude={lat}&longitude={lon}"
             f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
             f"&timezone=auto&forecast_days=3"
-            f"&models=nam_conus"
+            f"&models={model}"
         )
-        url = f"{base}?{params}" + (f"&apikey={api_key}" if api_key else "")
+        url = f"{base}?{params}" + (f"&apikey={request_key}" if request_key else "")
 
         try:
             if self._rate_limiter is not None:
@@ -884,7 +1157,7 @@ class PreviousRunsFetcher:
 
         params = (
             f"latitude={lats}&longitude={lons}"
-            f"&daily=temperature_2m_max,temperature_2m_max_previous_day1"
+            f"&hourly=temperature_2m,temperature_2m_previous_day1"
             f"&temperature_unit=fahrenheit"
             f"&timezone=auto"
             f"&forecast_days=7"
@@ -935,19 +1208,49 @@ class PreviousRunsFetcher:
         current = daily.get("temperature_2m_max", [])
         previous = daily.get("temperature_2m_max_previous_day1", [])
 
-        if not dates or not current:
+        if dates and current:
+            result = {}
+            for i, date_str in enumerate(dates):
+                cur = current[i] if i < len(current) else None
+                prev = previous[i] if i < len(previous) else None
+                if cur is not None:
+                    entry = {"current": cur, "previous": prev, "delta": None}
+                    if prev is not None:
+                        entry["delta"] = round(cur - prev, 2)
+                    result[date_str] = entry
+            return result if result else None
+
+        return self._parse_convergence_hourly(city_data)
+
+    def _parse_convergence_hourly(self, city_data):
+        """Aggregate hourly current/previous temperatures into local daily highs."""
+        hourly = city_data.get("hourly", {})
+        times = hourly.get("time", [])
+        current = hourly.get("temperature_2m", [])
+        previous = hourly.get("temperature_2m_previous_day1", [])
+
+        if not times or not current:
             return None
 
         result = {}
-        for i, date_str in enumerate(dates):
+        for i, ts in enumerate(times):
+            date_str = str(ts).split("T", 1)[0]
             cur = current[i] if i < len(current) else None
             prev = previous[i] if i < len(previous) else None
-            if cur is not None:
-                entry = {"current": cur, "previous": prev, "delta": None}
-                if prev is not None:
-                    entry["delta"] = round(cur - prev, 2)
-                result[date_str] = entry
+            entry = result.setdefault(date_str, {"current": None, "previous": None, "delta": None})
 
+            if cur is not None:
+                if entry["current"] is None or cur > entry["current"]:
+                    entry["current"] = cur
+            if prev is not None:
+                if entry["previous"] is None or prev > entry["previous"]:
+                    entry["previous"] = prev
+
+        for entry in result.values():
+            if entry["current"] is not None and entry["previous"] is not None:
+                entry["delta"] = round(entry["current"] - entry["previous"], 2)
+
+        result = {date_str: entry for date_str, entry in result.items() if entry["current"] is not None}
         return result if result else None
 
     @staticmethod
@@ -973,10 +1276,9 @@ class PreviousRunsFetcher:
 
 
 class BiasCorrector:
-    """Corrects systematic forecast bias using historical calibration data.
+    """Corrects systematic forecast bias using calibration data.
 
-    Loads per-city, per-model bias from config/historical-calibration.json
-    and applies correction: corrected_temp = raw_temp - bias.
+    Applies per-city, per-model bias correction: corrected_temp = raw_temp - bias.
 
     Fallback chain for direct model correction: per-city per-model > global model > raw temp.
     City-average bias is reserved for mixed-member ensembles where model attribution
@@ -984,10 +1286,19 @@ class BiasCorrector:
     """
 
     EXEMPT_MODELS = {"hrrr", "nam", "nws"}
+    # Raw ensemble member counts from the Open-Meteo ensemble docs.
+    # The weighting function normalizes over whatever subset is calibrated.
+    EMPIRICAL_MEMBER_MODEL_WEIGHTS = {
+        "gfs": 31.0,
+        "ecmwf": 51.0,
+        "icon": 40.0,
+        "gem": 21.0,
+    }
 
-    def __init__(self, calibration_path=None, logger=None):
+    def __init__(self, calibration_path=None, logger=None, require_lead_time_matched=False):
         self.log = logger or _log
         self._data = {}
+        self.require_lead_time_matched = bool(require_lead_time_matched)
         self._load(calibration_path)
 
     def _load(self, path=None):
@@ -996,6 +1307,7 @@ class BiasCorrector:
             candidates = [Path(path)]
         else:
             candidates = [
+                config_dir / "weather-live-bias.json",
                 config_dir / "historical-calibration.json",
                 config_dir / "calibration.json",
             ]
@@ -1005,8 +1317,14 @@ class BiasCorrector:
                 if not candidate.exists():
                     continue
                 raw = json.loads(candidate.read_text())
-                data = self._extract_bias_data(raw)
+                data, meta = self._extract_bias_data(raw)
                 if not data:
+                    continue
+                if self.require_lead_time_matched and not bool(meta.get("lead_time_matched", False)):
+                    self.log.warning(
+                        "BiasCorrector: skipping %s because it is not marked lead-time matched",
+                        candidate,
+                    )
                     continue
                 self._data = data
                 n = self._data.get("n_forecasts", 0)
@@ -1039,25 +1357,58 @@ class BiasCorrector:
             for model, temp in forecasts.items()
         }
 
-    def city_average_bias(self, city):
+    def city_average_bias(self, city, model_weights=None):
         """Average bias across all calibrated models for a city.
 
         Used for ensemble members where individual model attribution
         is not possible (GEFS + ECMWF EPS mixed members).
         """
         per_city = self._data.get("per_city", {}).get(city, {})
-        if not per_city:
-            return self._global_average_bias()
-        biases = [m["bias"] for m in per_city.values() if "bias" in m]
-        return sum(biases) / len(biases) if biases else 0.0
+        avg = self._average_bias(per_city, model_weights=model_weights)
+        if avg is not None:
+            return avg
+        return self._global_average_bias(model_weights=model_weights)
 
-    def blend_live_bias(self, city, live_bias=None, live_n=0, ramp_n=20):
-        """Blend historical city bias with live verification bias."""
-        hist_bias = self.city_average_bias(city)
-        if live_bias is None or live_n <= 0:
-            return hist_bias, hist_bias, 0.0
-        alpha = min(1.0, float(live_n) / max(1.0, float(ramp_n)))
-        return alpha * live_bias + (1.0 - alpha) * hist_bias, hist_bias, alpha
+    def blend_live_bias(
+        self,
+        city,
+        live_bias=None,
+        live_n=0,
+        ramp_n=20,
+        min_live_samples=2,
+        max_abs_bias_f=None,
+        conflict_gap_f=4.0,
+        conflict_alpha_floor=0.35,
+        hist_model_weights=None,
+    ):
+        """Blend historical city bias with live verification bias conservatively."""
+        hist_bias = self.city_average_bias(city, model_weights=hist_model_weights)
+        alpha = 0.0
+        conflict = False
+        if live_bias is None or live_n < min_live_samples:
+            blended = hist_bias
+        else:
+            alpha = min(1.0, float(live_n) / max(1.0, float(ramp_n)))
+            if (
+                abs(hist_bias - live_bias) >= conflict_gap_f
+                or (hist_bias > 0 > live_bias)
+                or (hist_bias < 0 < live_bias)
+            ):
+                alpha = max(alpha, conflict_alpha_floor)
+                conflict = True
+            blended = alpha * live_bias + (1.0 - alpha) * hist_bias
+
+        capped = False
+        if isinstance(max_abs_bias_f, (int, float)) and max_abs_bias_f > 0:
+            clipped = max(-float(max_abs_bias_f), min(float(max_abs_bias_f), blended))
+            capped = not math.isclose(clipped, blended, abs_tol=1e-9)
+            blended = clipped
+
+        return blended, hist_bias, alpha, {
+            "capped": capped,
+            "cap_f": max_abs_bias_f,
+            "conflict": conflict,
+        }
 
     def residual_std(self, city, model=None):
         """Compute residual std: sqrt(RMSE^2 - bias^2).
@@ -1081,14 +1432,14 @@ class BiasCorrector:
 
     def _extract_bias_data(self, raw):
         if not isinstance(raw, dict):
-            return {}
+            return {}, {}
         if "per_city" in raw and "global" in raw:
-            return raw
+            return raw, raw
         weather = raw.get("weather", {})
         bias_data = weather.get("bias_correction", {})
         if isinstance(bias_data, dict) and "per_city" in bias_data and "global" in bias_data:
-            return bias_data
-        return {}
+            return bias_data, bias_data
+        return {}, {}
 
     def _get_model_bias(self, city, model):
         model = canonical_model_name(model)
@@ -1102,10 +1453,32 @@ class BiasCorrector:
             return global_stats.get("bias", 0.0)
         return None
 
-    def _global_average_bias(self):
+    def _average_bias(self, stats_map, model_weights=None):
+        if not stats_map:
+            return None
+
+        if model_weights:
+            weighted = []
+            total = 0.0
+            for model_name, weight in model_weights.items():
+                model_key = canonical_model_name(model_name)
+                if not isinstance(weight, (int, float)) or weight <= 0:
+                    continue
+                stats = stats_map.get(model_key)
+                if not stats or "bias" not in stats:
+                    continue
+                weighted.append((float(stats["bias"]), float(weight)))
+                total += float(weight)
+            if total > 0:
+                return sum(bias * weight for bias, weight in weighted) / total
+
+        biases = [stats["bias"] for stats in stats_map.values() if "bias" in stats]
+        return sum(biases) / len(biases) if biases else None
+
+    def _global_average_bias(self, model_weights=None):
         global_stats = self._data.get("global", {})
-        biases = [m["bias"] for m in global_stats.values() if "bias" in m]
-        return sum(biases) / len(biases) if biases else 0.0
+        avg = self._average_bias(global_stats, model_weights=model_weights)
+        return avg if avg is not None else 0.0
 
     def _compute_residual(self, stats):
         if not stats or "rmse" not in stats or "bias" not in stats:

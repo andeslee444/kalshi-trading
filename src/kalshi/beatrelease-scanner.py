@@ -703,13 +703,13 @@ def scan_cycle():
                     edge=round(edge, 4), price_cents=limit_price,
                     confidence=round(blog_confidence, 4), source_url=url,
                 )
-                allocator.record_trade("beatrelease", ticker,
-                                       limit_price * t["quantity"], edge=edge)
+                actual_risk = result.get("cost_cents", limit_price * bounded_qty)
+                allocator.record_trade("beatrelease", ticker, actual_risk, edge=edge)
                 placed.append({
                     "ticker": ticker,
                     "side": side,
                     "price": limit_price,
-                    "quantity": t["quantity"],
+                    "quantity": result.get("count", bounded_qty),
                 })
             time.sleep(0.5)  # Rate limit
 

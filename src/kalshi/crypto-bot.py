@@ -118,6 +118,75 @@ dcc_tracker = None  # populated after DEFAULT_VOLS is defined
 
 # === Market ticker prefixes ===
 CRYPTO_PREFIXES = ["KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXXRP", "KXCRYPTO"]
+INVALID_MARKETS_PATH = PROJECT_DIR / "data" / "crypto-invalid-markets.json"
+INVALID_MARKET_TTL_SECONDS = int(crypto_config.get("invalidMarketTtlHours", 6) * 3600)
+
+
+def _load_invalid_market_cache():
+    if not INVALID_MARKETS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(INVALID_MARKETS_PATH.read_text())
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _prune_invalid_market_cache(cache):
+    if not cache:
+        return {}
+    now = datetime.datetime.now(datetime.timezone.utc)
+    fresh = {}
+    for ticker, info in cache.items():
+        marked_at = info.get("marked_at") if isinstance(info, dict) else None
+        if not marked_at:
+            continue
+        try:
+            marked_dt = datetime.datetime.fromisoformat(marked_at.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if (now - marked_dt).total_seconds() < INVALID_MARKET_TTL_SECONDS:
+            fresh[ticker] = info
+    return fresh
+
+
+def _save_invalid_market_cache(cache):
+    _atomic_write_json(INVALID_MARKETS_PATH, _prune_invalid_market_cache(cache))
+
+
+_invalid_market_cache = _load_invalid_market_cache()
+
+
+def _refresh_invalid_market_cache():
+    _invalid_market_cache.clear()
+    _invalid_market_cache.update(_prune_invalid_market_cache(_load_invalid_market_cache()))
+    _save_invalid_market_cache(_invalid_market_cache)
+
+
+def _mark_invalid_market(ticker, reason):
+    _invalid_market_cache[ticker] = {
+        "marked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "reason": reason,
+    }
+    _save_invalid_market_cache(_invalid_market_cache)
+
+
+def _is_invalid_market(ticker):
+    fresh_cache = _prune_invalid_market_cache(_invalid_market_cache)
+    if len(fresh_cache) != len(_invalid_market_cache):
+        _invalid_market_cache.clear()
+        _invalid_market_cache.update(fresh_cache)
+        _save_invalid_market_cache(_invalid_market_cache)
+    return ticker in _invalid_market_cache
+
+
+def _validate_tradeable_market(ticker):
+    market = client.get_market(ticker)
+    status = str((market or {}).get("status") or "open").lower()
+    if not market or status != "open":
+        _mark_invalid_market(ticker, f"lookup status={status}")
+        return None
+    return market
 
 # Default annualized volatilities (post-ETF era, updated 2026)
 DEFAULT_VOLS = {
@@ -783,12 +852,32 @@ def compute_correlation_multiplier(max_positive_corr):
     return max(0.1, min(1.0, raw))
 
 
+def finalize_position_size(count, price_cents, bankroll_cents, multipliers=None, max_cost_cents=None):
+    """Apply final caps/multipliers and return synchronized count+risk."""
+    if count <= 0 or price_cents <= 0:
+        return 0, 0
+
+    max_exposure = max(500, int((bankroll_cents or 50000) * 0.02))
+    hard_cap = min(max_exposure, max_cost_cents) if max_cost_cents else max_exposure
+
+    if count * price_cents > hard_cap:
+        count = max(1, hard_cap // price_cents)
+
+    if multipliers:
+        count = apply_kelly_multipliers(count, multipliers, floor_pct=0.25)
+        if count * price_cents > hard_cap:
+            count = max(1, hard_cap // price_cents)
+
+    return count, count * price_cents
+
+
 # === Scanning ===
 
 def scan_and_trade():
     """Scan crypto markets and trade on model edge."""
     now = datetime.datetime.now()
     ss = ScanSummary("crypto", log)
+    _refresh_invalid_market_cache()
     log.info(f"\n{'='*60}")
     log.info(f"[{now.isoformat()}] Crypto scan starting...")
 
@@ -902,6 +991,9 @@ def scan_and_trade():
     opportunities = []
     for m in all_markets:
         ticker = m.get("ticker", "")
+        if _is_invalid_market(ticker):
+            ss.skip("invalid_market_cache")
+            continue
         parsed = parse_crypto_ticker(ticker)
         if not parsed:
             ss.skip("unparseable")
@@ -1143,11 +1235,6 @@ def scan_and_trade():
         # Scale from half-Kelly to horizon-appropriate fraction
         count = max(0, int(count * kelly_frac / 0.5))
 
-        # Bankroll-scaled cap (2% of bankroll, min $5)
-        max_exposure = max(500, int((budget.bankroll_cents or 50000) * 0.02))
-        if count * price > max_exposure:
-            count = max(1, max_exposure // price)
-
         # CI-aware sizing: reduce position when filter is uncertain
         filtered_est = opp["filtered_est"]
         kelly_mult = ci_kelly_multiplier(filtered_est)
@@ -1167,7 +1254,13 @@ def scan_and_trade():
                         max_pos_corr = max(max_pos_corr, rho)
             corr_mult = compute_correlation_multiplier(max_pos_corr)
 
-        count = apply_kelly_multipliers(count, [kelly_mult, regime_mult, corr_mult], floor_pct=0.25)
+        count, risk = finalize_position_size(
+            count,
+            price,
+            budget.bankroll_cents,
+            multipliers=[kelly_mult, regime_mult, corr_mult],
+            max_cost_cents=trade_manager._effective_max_trade_cents(),
+        )
 
         if count <= 0:
             ss.skip("kelly_zero")
@@ -1195,6 +1288,15 @@ def scan_and_trade():
             f"vol={opp['vol_used']*100:.0f}%, T={opp['minutes_to_settle']}min, "
             f"P(YES)={opp['prob']*100:.0f}%, {side} edge={edge*100:.1f}%"
         )
+
+        validated_market = _validate_tradeable_market(ticker)
+        if not validated_market:
+            ss.skip("invalid_market")
+            trade_manager.log_decision(
+                ticker, side, "skipped", "market unavailable before order",
+                edge=edge, price_cents=price, asset=opp["asset"],
+            )
+            continue
 
         log.info(f"\n-> TRADE: {reasoning}")
         log.info(f"  Placing: {count}x {side} @ {price}c on {ticker} ({kelly_frac:.0%}-Kelly)")
@@ -1224,7 +1326,10 @@ def scan_and_trade():
                                             ou_shadow_prob=round(opp["ou_shadow_prob"], 4) if opp.get("ou_shadow_prob") is not None else None)
         if result:
             ss.trades_placed += 1
-            allocator.record_trade("crypto", ticker, risk, edge=edge)
+            allocator.record_trade("crypto", ticker, result.get("cost_cents", risk), edge=edge)
+        elif trade_manager.last_error_code == "market_not_found":
+            _mark_invalid_market(ticker, trade_manager.last_error_message or "market_not_found")
+            ss.skip("market_not_found")
 
     # Save particle filter state
     filter_mgr.save_all()

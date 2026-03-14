@@ -33,7 +33,7 @@ from edge_monitor import EdgeMonitor
 _log = logging.getLogger("capital_allocator")
 
 
-from kalshi_auth import atomic_write_json as _atomic_write_json
+from kalshi_auth import atomic_write_json as _atomic_write_json, notify_webhook
 
 
 # Default path for shared state file (all bots converge here)
@@ -290,6 +290,7 @@ class PortfolioAllocator:
         self._edge_weights_loaded_at = time.time()
         self._last_drawdown_check = 0
         self._drawdown_halted = False
+        self._cluster_denial_streaks = {}
 
         if ABSOLUTE_DAILY_LOSS_CAP_PCT > 0:
             self.log.info("Allocator: daily loss cap = $%.0f floor + %.0f%% of bankroll",
@@ -300,6 +301,22 @@ class PortfolioAllocator:
         if PER_BOT_DAILY_LIMITS:
             self.log.info("Allocator: per-bot daily limits: %s",
                           {k: f"${v/100:.0f}" for k, v in PER_BOT_DAILY_LIMITS.items()})
+
+    def _record_cluster_denial(self, bot_name, ticker, reason):
+        state = self._cluster_denial_streaks.get(bot_name, {"count": 0, "reason": ""})
+        if state.get("reason") != reason:
+            state = {"count": 0, "reason": reason}
+        state["count"] += 1
+        self._cluster_denial_streaks[bot_name] = state
+        if state["count"] == 5:
+            notify_webhook(
+                f"{bot_name}: repeated cluster denials on {ticker} ({reason})",
+                level="warning",
+                logger=self.log,
+            )
+
+    def _clear_cluster_denial(self, bot_name):
+        self._cluster_denial_streaks.pop(bot_name, None)
 
     def _check_drawdown_halt(self):
         """Check if portfolio drawdown exceeds threshold. Creates HALT_TRADING if so.
@@ -695,15 +712,27 @@ class PortfolioAllocator:
             self.log.warning("Position reconciliation failed: %s", e)
             return
 
-        # Recompute city/region risk from only open positions
+        # Recompute concentration from only open positions.
         new_city_risk = {}
         new_region_risk = {}
-        for ticker, info in self._traded_tickers.items():
-            if not isinstance(info, dict):
+        live_cluster_records = []
+        tracked_open = {
+            ticker: info for ticker, info in self._traded_tickers.items()
+            if isinstance(info, dict) and ticker in open_tickers
+        }
+        for pos in positions:
+            if not isinstance(pos, dict) or pos.get("position", 0) == 0:
                 continue
-            if ticker not in open_tickers:
-                continue  # settled — don't count toward concentration
-            risk = info.get("risk_cents", 0)
+            ticker = pos.get("ticker", "")
+            if not ticker:
+                continue
+            risk = pos.get("market_exposure")
+            if not isinstance(risk, (int, float)) or risk <= 0:
+                risk = tracked_open.get(ticker, {}).get("risk_cents", 0)
+            if risk <= 0:
+                continue
+            risk = int(round(risk))
+            live_cluster_records.append({"ticker": ticker, "risk_cents": risk})
             city_key = _extract_city_key(ticker)
             if city_key:
                 new_city_risk[city_key] = new_city_risk.get(city_key, 0) + risk
@@ -717,6 +746,13 @@ class PortfolioAllocator:
             self.log.info("Reconciled settled positions: freed $%.2f city risk", freed_city / 100)
         self._city_risk = new_city_risk
         self._region_risk = new_region_risk
+        old_cluster_risk = dict(self._correlation_engine._cluster_risk)
+        self._correlation_engine.rebuild_cluster_risk(live_cluster_records)
+        freed_cluster = sum(old_cluster_risk.values()) - sum(self._correlation_engine._cluster_risk.values())
+        if freed_cluster > 0:
+            self.log.info("Reconciled settled positions: freed $%.2f cluster risk", freed_cluster / 100)
+        if old_cluster_risk != self._correlation_engine._cluster_risk:
+            self._correlation_engine.save_state()
 
     def get_pending_exits(self):
         """Return and clear the list of tickers that should be exited.
@@ -872,7 +908,9 @@ class PortfolioAllocator:
             ticker, bot_max_cost_cents, available_balance
         )
         if not cluster_ok:
+            self._record_cluster_denial(bot_name, ticker, cluster_reason)
             return BudgetResponse(False, reason=cluster_reason)
+        self._clear_cluster_denial(bot_name)
 
         # 5e. Marginal VaR check
         current_positions = self._get_positions_for_var()

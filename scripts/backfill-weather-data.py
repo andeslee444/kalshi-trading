@@ -9,21 +9,33 @@ Usage:
     python3 scripts/backfill-weather-data.py                 # All cities, 90 days
     python3 scripts/backfill-weather-data.py --days 30       # 30 days
     python3 scripts/backfill-weather-data.py --city MIA      # Miami only
+    python3 scripts/backfill-weather-data.py --models gfs,ecmwf,icon,gem
     python3 scripts/backfill-weather-data.py --dry-run       # Preview only
 """
 
 import argparse
 import datetime
 import json
+import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 # Add src/kalshi to path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"))
 
 from kalshi_auth import PROJECT_DIR, retry_request
-from weather_data import STATION_MAP, SettlementTemperatureFetcher, TrainingStore
+from weather_data import (
+    STATION_MAP,
+    SettlementTemperatureFetcher,
+    TrainingStore,
+    _city_timezone_name,
+    open_meteo_model_name,
+)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
 
 
 def get_city_coords():
@@ -33,18 +45,63 @@ def get_city_coords():
     return config.get("cities", {})
 
 
-def fetch_historical_forecasts(lat, lon, past_days, model_name):
+def _parse_previous_runs_daily(payload):
+    """Parse current and previous-day forecasts into lead-day buckets."""
+    daily = payload.get("daily", {}) if "daily" in payload else payload
+    dates = daily.get("time", [])
+    current = daily.get("temperature_2m_max", [])
+    previous_day1 = daily.get("temperature_2m_max_previous_day1", [])
+    if dates and current:
+        by_lead = {0: {}, 1: {}}
+        for idx, date_str in enumerate(dates):
+            cur = current[idx] if idx < len(current) else None
+            prev = previous_day1[idx] if idx < len(previous_day1) else None
+            if cur is not None:
+                by_lead[0][date_str] = cur
+            if prev is not None:
+                by_lead[1][date_str] = prev
+        return {lead_days: values for lead_days, values in by_lead.items() if values}
+
+    hourly = payload.get("hourly", {}) if "hourly" in payload else {}
+    times = hourly.get("time", [])
+    current = hourly.get("temperature_2m", [])
+    previous_day1 = hourly.get("temperature_2m_previous_day1", [])
+    if not times:
+        return {}
+
+    by_lead = {0: {}, 1: {}}
+    for idx, ts in enumerate(times):
+        date_str = str(ts).split("T", 1)[0]
+        cur = current[idx] if idx < len(current) else None
+        prev = previous_day1[idx] if idx < len(previous_day1) else None
+        if cur is not None:
+            existing = by_lead[0].get(date_str)
+            by_lead[0][date_str] = cur if existing is None else max(existing, cur)
+        if prev is not None:
+            existing = by_lead[1].get(date_str)
+            by_lead[1][date_str] = prev if existing is None else max(existing, prev)
+    return {lead_days: values for lead_days, values in by_lead.items() if values}
+
+
+def fetch_previous_runs_forecasts(lat, lon, past_days, model_name, city_code=None):
     """Fetch historical deterministic forecasts from Open-Meteo Previous Runs API.
 
     Returns:
-        dict of {date_str: temp_f} or empty dict on failure.
+        dict of {lead_days: {date_str: temp_f}} or empty dict on failure.
     """
+    api_key = os.environ.get("OPEN_METEO_API_KEY", "")
+    request_model = open_meteo_model_name(model_name, api_key=api_key)
+    timezone_name = quote(_city_timezone_name(city_code=city_code), safe="")
+    base = ("https://customer-previous-runs-api.open-meteo.com/v1/forecast"
+            if api_key else "https://previous-runs-api.open-meteo.com/v1/forecast")
     url = (
-        f"https://previous-runs-api.open-meteo.com/v1/forecast?"
+        f"{base}?"
         f"latitude={lat}&longitude={lon}"
-        f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
-        f"&timezone=America%2FNew_York&past_days={past_days}"
-        f"&models={model_name}"
+        f"&hourly=temperature_2m,temperature_2m_previous_day1"
+        f"&temperature_unit=fahrenheit"
+        f"&timezone={timezone_name}&past_days={past_days}"
+        f"&models={request_model}"
+        + (f"&apikey={api_key}" if api_key else "")
     )
 
     try:
@@ -52,10 +109,7 @@ def fetch_historical_forecasts(lat, lon, past_days, model_name):
         if resp is None or resp.status_code != 200:
             return {}
         data = resp.json()
-        daily = data.get("daily", {})
-        dates = daily.get("time", [])
-        temps = daily.get("temperature_2m_max", [])
-        return {d: t for d, t in zip(dates, temps) if t is not None}
+        return _parse_previous_runs_daily(data)
     except Exception as e:
         print(f"  Warning: Previous runs API error for {model_name}: {e}")
         return {}
@@ -82,25 +136,55 @@ def fetch_settled_markets(city_code):
         return []
 
 
+MODEL_MAP = {
+    "gfs": "gfs_seamless",
+    "ecmwf": "ecmwf_ifs025",
+    "icon": "icon_seamless",
+    "gem": "gem_global",
+    "graphcast": "gfs_graphcast025",
+}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backfill weather training data")
     parser.add_argument("--days", type=int, default=90, help="Days of history to fetch (default: 90)")
     parser.add_argument("--city", type=str, default=None, help="Single city code (default: all)")
+    parser.add_argument(
+        "--models",
+        type=str,
+        default="gfs,ecmwf",
+        help="Comma-separated model list from: gfs, ecmwf, icon, gem, graphcast (default: gfs,ecmwf)",
+    )
+    parser.add_argument(
+        "--db-path",
+        type=str,
+        default=str(PROJECT_DIR / "data" / "weather-training.db"),
+        help="Output SQLite DB path (default: data/weather-training.db)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Preview only, don't write to DB")
     args = parser.parse_args()
 
     cities = get_city_coords()
     target_cities = {args.city: cities[args.city]} if args.city and args.city in cities else cities
     actuals_fetcher = SettlementTemperatureFetcher()
+    requested_models = [m.strip() for m in args.models.split(",") if m.strip()]
+    unknown_models = [m for m in requested_models if m not in MODEL_MAP]
+    if unknown_models:
+        raise SystemExit(
+            f"Unknown models: {', '.join(unknown_models)}. "
+            f"Choose from: {', '.join(sorted(MODEL_MAP))}"
+        )
+    selected_models = {MODEL_MAP[m]: m for m in requested_models}
 
     if args.dry_run:
         print("[DRY RUN] Would process these cities:")
         for code in target_cities:
             print(f"  {code} -> {STATION_MAP.get(code, '?')}")
         print(f"  Days: {args.days}")
+        print(f"  Models: {', '.join(requested_models)}")
         return
 
-    db_path = str(PROJECT_DIR / "data" / "weather-training.db")
+    db_path = str((PROJECT_DIR / args.db_path).resolve()) if not Path(args.db_path).is_absolute() else args.db_path
     store = TrainingStore(db_path=db_path)
     total_pairs = 0
     today = datetime.date.today()
@@ -119,27 +203,39 @@ def main():
         # 1. Fetch historical actuals from the settlement source path
         start_date = (today - datetime.timedelta(days=args.days)).isoformat()
         end_date = (today - datetime.timedelta(days=1)).isoformat()
-        print(f"  Fetching IEM actuals: {start_date} to {end_date}")
+        print(f"  Fetching settlement actuals: {start_date} to {end_date}")
         actuals = actuals_fetcher.fetch_daily_highs(station, start_date, end_date, city_code=code)
         print(f"  Got {len(actuals)} actual observations")
 
         # 2. Fetch historical forecasts from Open-Meteo Previous Runs
-        models = {"gfs_seamless": "gfs", "ecmwf_ifs025": "ecmwf"}
-        all_forecasts = {}  # {model_name: {date: temp}}
-        for api_model, short_name in models.items():
+        all_forecasts = {}  # {(model_name, lead_days): {date: temp}}
+        for api_model, short_name in selected_models.items():
             print(f"  Fetching {short_name} historical forecasts...")
-            fc = fetch_historical_forecasts(lat, lon, args.days, api_model)
-            all_forecasts[short_name] = fc
-            print(f"  Got {len(fc)} forecast dates for {short_name}")
+            forecasts_by_lead = fetch_previous_runs_forecasts(
+                lat,
+                lon,
+                args.days,
+                api_model,
+                city_code=code,
+            )
+            total_model_dates = sum(len(fc) for fc in forecasts_by_lead.values())
+            for lead_days, fc in forecasts_by_lead.items():
+                all_forecasts[(short_name, lead_days)] = fc
+            print(
+                f"  Got {total_model_dates} forecast dates for {short_name} "
+                f"across leads {sorted(forecasts_by_lead.keys())}"
+            )
             time.sleep(0.3)  # Rate limit
 
         # 3. Match forecasts to actuals
         rows = []
-        for model_name, fc in all_forecasts.items():
+        for (model_name, lead_days), fc in all_forecasts.items():
             for date_str, forecast_temp in fc.items():
                 actual = actuals.get(date_str)
+                if actual is None:
+                    continue
                 rows.append((
-                    code, date_str, model_name, 0, 0,
+                    code, date_str, model_name, lead_days, 0,
                     forecast_temp, actual, None,
                 ))
 

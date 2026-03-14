@@ -7,12 +7,12 @@ import json, time, datetime, os, sys, re, threading
 import requests
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested, CITY_TIMEZONES, _local_today
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, retry_request, TradeManager, trim_trade_log, build_market_snapshot, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested, CITY_TIMEZONES, _local_today, normalize_markets
 from probability import weather_probability, weather_sigma, weather_sigma_hourly, ensemble_weather_probability, ensemble_spread_sigma_multiplier, ensemble_weather_probability_v2, empirical_ensemble_probability, half_kelly, quarter_kelly, high_conviction_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, _load_calibration
 from ticker_utils import parse_weather_ticker as parse_ticker
 from capital_allocator import PortfolioAllocator
-from forecast_verifier import ForecastVerifier, DEFAULT_STATION_MAP
-from weather_data import EnsembleCollector, HRRRFetcher, NAMFetcher, PreviousRunsFetcher, OrderBookDepth, next_model_run, latest_available_model_run, canonical_model_name, STATION_MAP, NWSForecastFetcher, BiasCorrector
+from forecast_verifier import ForecastVerifier, DEFAULT_STATION_MAP, NWSCrossCheckVerifier
+from weather_data import EnsembleCollector, HRRRFetcher, NAMFetcher, PreviousRunsFetcher, OrderBookDepth, next_model_run, latest_available_model_run, canonical_model_name, open_meteo_model_name, STATION_MAP, NWSForecastFetcher, BiasCorrector
 from singleton_lock import acquire_process_singleton, release_process_singleton
 
 setup_unbuffered()
@@ -31,7 +31,11 @@ CITIES = config["cities"]
 client = KalshiClient()
 allocator = PortfolioAllocator(client, logger=log)
 health = HealthCheckMonitor(logger=log)
-order_monitor = OrderMonitor(client, log=log)
+order_monitor = OrderMonitor(
+    client,
+    log=log,
+    max_age_seconds=config.get("makerExecution", {}).get("maxRestingSeconds", 300),
+)
 trade_manager = TradeManager(client, TRADES_PATH, {
     "maxTradeAmount": config["maxTradeAmount"],
     "maxTradeAmountPct": config.get("maxTradeAmountPct"),
@@ -64,6 +68,7 @@ def _acquire_singleton_lock(lock_path=None):
 # while day-3+ markets don't need to be re-traded for 12 hours.
 
 _local_trade_times = {}  # ticker -> datetime of last trade
+_weather_market_cache = {"fetched_at": 0.0, "markets": []}
 
 
 def get_dedup_cooldown(days_out):
@@ -128,6 +133,65 @@ def _effective_weather_edge_threshold():
         return max(base, recommended)
     return base
 
+
+def _resolve_optional_project_path(path_str):
+    if not path_str:
+        return None
+    path = Path(path_str)
+    if path.is_absolute():
+        return path
+    return PROJECT_DIR / path
+
+
+def get_weather_markets(cache_ttl=600):
+    """Fetch weather markets directly by city series.
+
+    Prefix-scanning all open markets can miss KXHIGH contracts when they sit
+    beyond the first pagination window. Weather series are stable and bounded,
+    so querying each configured city series is both faster and more reliable.
+    """
+    now = time.time()
+    cached_markets = _weather_market_cache.get("markets", [])
+    if cached_markets and (now - _weather_market_cache.get("fetched_at", 0.0)) < cache_ttl:
+        return list(cached_markets)
+
+    markets = []
+    seen = set()
+    series_failures = 0
+
+    for city_code in CITIES:
+        series_ticker = f"KXHIGH{city_code}"
+        cursor = None
+        while True:
+            path = f"/markets?series_ticker={series_ticker}&status=open&limit=1000"
+            if cursor:
+                path += f"&cursor={cursor}"
+            try:
+                data = client.get(path)
+            except Exception as e:
+                series_failures += 1
+                log.warning("Weather market fetch failed for %s: %s", series_ticker, e)
+                break
+
+            batch = normalize_markets(data.get("markets", []))
+            for market in batch:
+                ticker = market.get("ticker")
+                if ticker and ticker not in seen:
+                    seen.add(ticker)
+                    markets.append(market)
+
+            cursor = data.get("cursor")
+            if not cursor or not batch:
+                break
+
+    if not markets and series_failures:
+        log.warning("Series-based weather market discovery returned no markets; falling back to prefix scan")
+        return client.get_all_markets(prefix="KXHIGH", cache_ttl=cache_ttl)
+
+    _weather_market_cache["fetched_at"] = now
+    _weather_market_cache["markets"] = list(markets)
+    return markets
+
 # === Weather Forecast ===
 
 # Ensemble model endpoints for Open-Meteo
@@ -142,13 +206,29 @@ ENSEMBLE_MODELS = {
 ENSEMBLE_ENABLED = config.get("ensemble", {}).get("enabled", False)
 
 # === Open-Meteo API Configuration ===
-# Premium API: set OPEN_METEO_API_KEY in .env for higher rate limits and priority
+# Premium API: set OPEN_METEO_API_KEY in .env for higher rate limits and priority.
+# NOAA-family models (GFS/HRRR/NBM/NAM/GraphCast) are served from the GFS API.
 _OPEN_METEO_API_KEY = os.environ.get("OPEN_METEO_API_KEY", "")
+_OPEN_METEO_FORECAST_BASE = "https://api.open-meteo.com/v1/forecast"
+_OPEN_METEO_PREMIUM_FORECAST_BASE = "https://customer-api.open-meteo.com/v1/forecast"
+_OPEN_METEO_GFS_BASE = "https://api.open-meteo.com/v1/gfs"
+_OPEN_METEO_PREMIUM_GFS_BASE = "https://customer-api.open-meteo.com/v1/gfs"
+_GFS_API_MODELS = {
+    "gfs_seamless",
+    "gfs_graphcast025",
+    "hrrr_conus",
+    "ncep_hrrr_conus",
+    "nbm_conus",
+    "ncep_nbm_conus",
+    "nam_conus",
+    "ncep_nam_conus",
+}
+_endpoint_route_warned = set()
 if _OPEN_METEO_API_KEY:
-    OPEN_METEO_BASE = "https://customer-api.open-meteo.com/v1/forecast"
+    OPEN_METEO_BASE = _OPEN_METEO_PREMIUM_FORECAST_BASE
     log.info("Using Open-Meteo PREMIUM API (customer endpoint)")
 else:
-    OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
+    OPEN_METEO_BASE = _OPEN_METEO_FORECAST_BASE
 
 
 # === Rate Limiter ===
@@ -184,11 +264,31 @@ _open_meteo_limiter = RateLimiter(
 )
 
 
-def _open_meteo_url(params):
-    """Build Open-Meteo URL with API key if configured."""
-    url = f"{OPEN_METEO_BASE}?{params}"
+def _open_meteo_request_target(model_name=None):
+    resolved_model = open_meteo_model_name(model_name, api_key=_OPEN_METEO_API_KEY)
+    if resolved_model in _GFS_API_MODELS:
+        route_key = (model_name, resolved_model)
+        if route_key not in _endpoint_route_warned:
+            target = "premium gfs" if _OPEN_METEO_API_KEY else "public gfs"
+            if model_name and model_name != resolved_model:
+                log.info("Open-Meteo routing: %s -> %s uses %s endpoint", model_name, resolved_model, target)
+            else:
+                log.info("Open-Meteo routing: %s uses %s endpoint", resolved_model, target)
+            _endpoint_route_warned.add(route_key)
+        if _OPEN_METEO_API_KEY:
+            return _OPEN_METEO_PREMIUM_GFS_BASE, _OPEN_METEO_API_KEY
+        return _OPEN_METEO_GFS_BASE, ""
     if _OPEN_METEO_API_KEY:
-        url += f"&apikey={_OPEN_METEO_API_KEY}"
+        return OPEN_METEO_BASE, _OPEN_METEO_API_KEY
+    return _OPEN_METEO_FORECAST_BASE, ""
+
+
+def _open_meteo_url(params, model_name=None):
+    """Build Open-Meteo URL with API key if configured."""
+    base, api_key = _open_meteo_request_target(model_name=model_name)
+    url = f"{base}?{params}"
+    if api_key:
+        url += f"&apikey={api_key}"
     return url
 
 
@@ -235,9 +335,22 @@ def _record_source_failure(source, message, status_code=None, immediate_on_bad_r
 # === Forecast Verification ===
 VERIFICATION_ENABLED = config.get("verification", {}).get("enabled", True)
 VERIFICATION_CONFIG = config.get("verification", {})
+bias_cfg = config.get("biasCorrection", {})
+nws_cfg = config.get("nwsCrossValidation", {})
 verifier = ForecastVerifier(PROJECT_DIR / "data" / "weather-verification.json", logger=log) if VERIFICATION_ENABLED else None
 if verifier:
     verifier.load()
+nws_audit_enabled = bool(nws_cfg.get("auditEnabled", True))
+nws_audit_path = _resolve_optional_project_path(
+    nws_cfg.get("auditPath", "data/weather-nws-cross-check.json")
+)
+nws_crosscheck_verifier = (
+    NWSCrossCheckVerifier(nws_audit_path, logger=log)
+    if nws_audit_enabled and nws_audit_path is not None
+    else None
+)
+if nws_crosscheck_verifier:
+    nws_crosscheck_verifier.load()
 
 # Ensemble member collector for empirical CDF model
 ensemble_collector = EnsembleCollector(logger=log)
@@ -248,11 +361,29 @@ hrrr_fetcher = HRRRFetcher(logger=log, rate_limiter=_open_meteo_limiter.acquire)
 # NAM deterministic forecast fetcher (3km, 60h)
 nam_fetcher = NAMFetcher(logger=log, rate_limiter=_open_meteo_limiter.acquire)
 
-# Bias corrector — loads historical calibration for per-city per-model correction
-bias_corrector = BiasCorrector(logger=log)
+# Bias corrector — only uses calibration artifacts explicitly marked as lead-time matched
+_bias_calibration_override = _resolve_optional_project_path(
+    os.environ.get("WEATHER_BIAS_CALIBRATION_PATH") or bias_cfg.get("calibrationPath")
+)
+if _bias_calibration_override:
+    log.info("Using weather bias calibration override: %s", _bias_calibration_override)
+bias_corrector = BiasCorrector(
+    calibration_path=str(_bias_calibration_override) if _bias_calibration_override else None,
+    logger=log,
+    require_lead_time_matched=True,
+)
 
 # NWS forecast fetcher (fallback when Open-Meteo fails)
-nws_fetcher = NWSForecastFetcher(logger=log)
+nws_fetcher = NWSForecastFetcher(
+    logger=log,
+    grid_map=nws_cfg.get("gridOverrides"),
+    city_coords=CITIES,
+    threshold_map=nws_cfg.get("thresholds"),
+    threshold_scale=nws_cfg.get("citySigmaScale"),
+    max_threshold_f=nws_cfg.get("maxThresholdF"),
+    mode_map=nws_cfg.get("cityModes") or nws_cfg.get("modes"),
+    default_mode=nws_cfg.get("defaultMode", "gridpoint"),
+)
 
 # Order book depth analyzer (Phase 3)
 orderbook = OrderBookDepth(logger=log)
@@ -317,18 +448,40 @@ def get_batch_ensemble_forecasts(cities_dict):
     lats = ",".join(str(cities_dict[c]["lat"]) for c in codes)
     lons = ",".join(str(cities_dict[c]["lon"]) for c in codes)
 
+    def _fetch_single_model_forecasts(model_name):
+        """Fallback for model endpoints that reject multi-location requests."""
+        city_forecasts = {}
+        request_model_name = open_meteo_model_name(model_name, api_key=_OPEN_METEO_API_KEY)
+        for code in codes:
+            info = cities_dict[code]
+            url = _open_meteo_url(
+                f"latitude={info['lat']}&longitude={info['lon']}"
+                f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
+                f"&timezone=auto&forecast_days=14"
+                f"&models={request_model_name}",
+                model_name=request_model_name,
+            )
+            r = _cached_request(url, timeout=30)
+            data = r.json()
+            d = data.get("daily", {})
+            if d and "time" in d and "temperature_2m_max" in d:
+                city_forecasts[code] = dict(zip(d["time"], d["temperature_2m_max"]))
+        return city_forecasts
+
     # Fetch each model in a single batch request
     model_results = {}  # model_key -> {city_code: {date: temp}}
     for model_key, model_name in ENSEMBLE_MODELS.items():
         if health.is_source_open(f"open-meteo-{model_key}"):
             log.warning(f"Circuit breaker open for {model_key}, skipping")
             continue
+        request_model_name = open_meteo_model_name(model_name, api_key=_OPEN_METEO_API_KEY)
 
         url = _open_meteo_url(
             f"latitude={lats}&longitude={lons}"
             f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
             f"&timezone=auto&forecast_days=14"
-            f"&models={model_name}"
+            f"&models={request_model_name}",
+            model_name=request_model_name,
         )
 
         try:
@@ -351,11 +504,40 @@ def get_batch_ensemble_forecasts(cities_dict):
             model_results[model_key] = city_forecasts
             health.record_source_success(f"open-meteo-{model_key}")
         except Exception as e:
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            if status_code == 400 and len(codes) > 1:
+                log.warning(
+                    "Batch ensemble %s failed with HTTP 400; retrying per-city",
+                    model_key,
+                )
+                try:
+                    city_forecasts = _fetch_single_model_forecasts(model_name)
+                except Exception as fallback_error:
+                    log.warning(f"Per-city ensemble fallback {model_key} failed: {fallback_error}")
+                    _record_source_failure(
+                        f"open-meteo-{model_key}",
+                        str(fallback_error),
+                        status_code=getattr(getattr(fallback_error, "response", None), "status_code", None),
+                        immediate_on_bad_request=True,
+                    )
+                    continue
+                if city_forecasts:
+                    model_results[model_key] = city_forecasts
+                    health.record_source_success(f"open-meteo-{model_key}")
+                    continue
+                log.warning("Per-city ensemble fallback %s returned no data", model_key)
+                _record_source_failure(
+                    f"open-meteo-{model_key}",
+                    "per-city fallback returned no data",
+                    status_code=status_code,
+                    immediate_on_bad_request=False,
+                )
+                continue
             log.warning(f"Batch ensemble {model_key} failed: {e}")
             _record_source_failure(
                 f"open-meteo-{model_key}",
                 str(e),
-                status_code=getattr(getattr(e, "response", None), "status_code", None),
+                status_code=status_code,
                 immediate_on_bad_request=True,
             )
 
@@ -406,7 +588,8 @@ def get_ensemble_forecast(lat, lon):
             f"latitude={lat}&longitude={lon}"
             f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
             f"&timezone=auto&forecast_days=14"
-            f"&models={model_name}"
+            f"&models={model_name}",
+            model_name=model_name,
         )
         urls[url] = model_key
 
@@ -523,6 +706,263 @@ def choose_order_type(yes_bid, yes_ask, side, edge, our_prob, depth_data=None):
     return "market", price
 
 
+def _maker_execution_config():
+    raw = config.get("makerExecution", {})
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "maxDaysOut": int(raw.get("maxDaysOut", 1)),
+        "minEdgeNearTerm": float(raw.get("minEdgeNearTerm", 0.10)),
+        "minEdgeFar": float(raw.get("minEdgeFar", 0.14)),
+        "minImprovementCents": int(raw.get("minImprovementCents", 1)),
+        "maxJoinUpliftCents": int(raw.get("maxJoinUpliftCents", 18)),
+        "pricePriorityEdgeBuffer": float(raw.get("pricePriorityEdgeBuffer", 0.02)),
+        "maxPriceCents": int(raw.get("maxPriceCents", 95)),
+    }
+
+
+def _side_quotes(market, side):
+    yes_bid = int(market.get("yes_bid", 0) or 0)
+    yes_ask = int(market.get("yes_ask", 0) or 0)
+    no_bid = int(market.get("no_bid", 0) or (100 - yes_ask if yes_ask else 0))
+    no_ask = int(market.get("no_ask", 0) or (100 - yes_bid if yes_bid else 0))
+    if side == "yes":
+        return {"bid": yes_bid, "ask": yes_ask}
+    return {"bid": no_bid, "ask": no_ask}
+
+
+def _maker_min_edge(days_out, maker_cfg=None):
+    cfg = maker_cfg or _maker_execution_config()
+    if days_out is not None and days_out <= cfg["maxDaysOut"]:
+        return cfg["minEdgeNearTerm"]
+    return cfg["minEdgeFar"]
+
+
+def _build_displayed_entry_plan(market, side, side_prob, liquid):
+    quotes = _side_quotes(market, side)
+    ask = quotes["ask"]
+    if not liquid or not ask or ask >= 99:
+        return None
+    edge = side_prob - (ask / 100.0)
+    return {
+        "execution_mode": "taker",
+        "price": ask,
+        "edge": edge,
+        "bid": quotes["bid"],
+        "ask": ask,
+    }
+
+
+def _build_maker_entry_plan(market, side, side_prob, days_out, maker_cfg=None):
+    cfg = maker_cfg or _maker_execution_config()
+    if not cfg.get("enabled", True):
+        return None
+    if days_out is not None and days_out > cfg["maxDaysOut"]:
+        return None
+
+    quotes = _side_quotes(market, side)
+    bid = quotes["bid"]
+    ask = quotes["ask"]
+    volume = int(market.get("volume", 0) or 0)
+    if not bid and not ask and volume <= 0:
+        return None
+
+    side_prob = max(0.0, min(1.0, float(side_prob)))
+    fair_value_cents = side_prob * 100.0
+    min_edge = _maker_min_edge(days_out, cfg)
+    target_price = int(fair_value_cents - min_edge * 100.0)
+    target_price = max(1, min(cfg["maxPriceCents"], target_price))
+
+    if bid and ask:
+        if ask - bid > 1:
+            floor = bid + cfg["minImprovementCents"]
+            ceiling = ask - 1
+        else:
+            floor = max(1, bid)
+            ceiling = min(cfg["maxPriceCents"], bid + cfg["maxJoinUpliftCents"] // 2)
+    elif bid:
+        confidence_bonus = max(0, int(round(max(0.0, side_prob - 0.70) * 30)))
+        floor = bid + cfg["minImprovementCents"]
+        ceiling = min(cfg["maxPriceCents"], bid + cfg["maxJoinUpliftCents"] + confidence_bonus)
+    elif ask:
+        floor = 1
+        ceiling = max(1, min(cfg["maxPriceCents"], ask - 1 if ask > 1 else 1))
+    else:
+        return None
+
+    if ceiling < floor:
+        return None
+
+    price = max(floor, min(target_price, ceiling))
+    edge = side_prob - (price / 100.0)
+    if edge + 1e-9 < min_edge:
+        return None
+
+    return {
+        "execution_mode": "maker",
+        "price": price,
+        "edge": round(edge, 4),
+        "bid": bid,
+        "ask": ask,
+        "fair_value_cents": round(fair_value_cents, 1),
+        "min_edge": min_edge,
+    }
+
+
+def _select_weather_execution_plan(displayed_plan, maker_plan, market_liquid, maker_cfg=None):
+    cfg = maker_cfg or _maker_execution_config()
+    if maker_plan and (not market_liquid or not displayed_plan):
+        return maker_plan
+    if maker_plan and displayed_plan:
+        if maker_plan["edge"] >= displayed_plan["edge"] + cfg["pricePriorityEdgeBuffer"]:
+            return maker_plan
+    return displayed_plan
+
+
+def _weather_bias_trade_fields(bias_applied=None, hist_bias=None, live_bias=None,
+                               live_n=0, live_confidence=0.0, alpha=None, bias_meta=None):
+    meta = bias_meta or {}
+
+    def _rounded(value, digits=3):
+        if isinstance(value, (int, float)):
+            return round(float(value), digits)
+        return None
+
+    return {
+        "bias_applied_f": _rounded(bias_applied),
+        "bias_hist_f": _rounded(hist_bias),
+        "bias_live_f": _rounded(live_bias),
+        "bias_live_n": int(live_n or 0),
+        "bias_live_confidence": _rounded(live_confidence, 4),
+        "bias_alpha": _rounded(alpha, 4),
+        "bias_capped": bool(meta.get("capped", False)),
+        "bias_conflict": bool(meta.get("conflict", False)),
+    }
+
+
+def _apply_live_model_bias(city, forecasts, city_model_bias=None):
+    """Apply sample-shrunk live per-model bias corrections when available."""
+    if not isinstance(forecasts, dict):
+        return forecasts, []
+    live_map = (city_model_bias or {}).get(city, {})
+    if not live_map:
+        return dict(forecasts), []
+
+    adjusted = dict(forecasts)
+    applied = []
+    for model_name, temp in adjusted.items():
+        if temp is None:
+            continue
+        stats = live_map.get(canonical_model_name(model_name))
+        if not stats:
+            continue
+        confidence = float(stats.get("confidence") or 0.0)
+        bias_f = float(stats.get("bias_f") or 0.0)
+        correction = bias_f * confidence
+        if abs(correction) < 0.05:
+            continue
+        adjusted[model_name] = temp - correction
+        applied.append({
+            "model": canonical_model_name(model_name),
+            "bias_f": round(bias_f, 3),
+            "confidence": round(confidence, 3),
+            "correction_f": round(correction, 3),
+        })
+
+    return adjusted, applied
+
+
+def _weather_selection_config():
+    raw = config.get("opportunitySelection", {})
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "oversampleFactor": max(1, int(raw.get("oversampleFactor", 3))),
+        "minCandidates": max(1, int(raw.get("minCandidates", 12))),
+        "maxPerCity": max(1, int(raw.get("maxPerCity", 3))),
+        "maxPerCityDate": max(1, int(raw.get("maxPerCityDate", 2))),
+        "maxBracketPerCityDate": max(0, int(raw.get("maxBracketPerCityDate", 1))),
+    }
+
+
+def _weather_opportunity_priority(opp):
+    parsed = opp.get("parsed", {})
+    price = max(1, int(opp.get("entry_price") or 1))
+    price_dollars = price / 100.0
+    edge = float(opp.get("edge") or 0.0)
+    roi = edge / max(price_dollars, 0.01)
+    is_threshold = 1 if parsed.get("direction") != "B" else 0
+    is_taker = 1 if opp.get("execution_mode") != "maker" else 0
+    verification_confidence = float(opp.get("verification_confidence") or 0.0)
+    days_out = opp.get("days_out")
+    if not isinstance(days_out, int):
+        days_out = 99
+    return (
+        is_threshold,
+        roi,
+        edge,
+        is_taker,
+        verification_confidence,
+        -days_out,
+    )
+
+
+def _select_weather_opportunities(opportunities, remaining_slots, selection_cfg=None):
+    cfg = selection_cfg or _weather_selection_config()
+    if not opportunities:
+        return [], []
+    if not cfg.get("enabled", True):
+        ranked = sorted(opportunities, key=_weather_opportunity_priority, reverse=True)
+        return ranked, []
+    if remaining_slots <= 0:
+        return [], list(opportunities)
+
+    ranked = sorted(opportunities, key=_weather_opportunity_priority, reverse=True)
+    max_candidates = max(cfg["minCandidates"], remaining_slots * cfg["oversampleFactor"])
+    selected = []
+    pruned = []
+    city_counts = {}
+    city_date_counts = {}
+    bracket_counts = {}
+
+    for opp in ranked:
+        city = opp.get("city")
+        date_str = opp.get("parsed", {}).get("date")
+        key = (city, date_str)
+        is_bracket = opp.get("parsed", {}).get("direction") == "B"
+
+        if city_counts.get(city, 0) >= cfg["maxPerCity"]:
+            pruned.append(opp)
+            continue
+        if city_date_counts.get(key, 0) >= cfg["maxPerCityDate"]:
+            pruned.append(opp)
+            continue
+        if is_bracket and bracket_counts.get(key, 0) >= cfg["maxBracketPerCityDate"]:
+            pruned.append(opp)
+            continue
+
+        selected.append(opp)
+        city_counts[city] = city_counts.get(city, 0) + 1
+        city_date_counts[key] = city_date_counts.get(key, 0) + 1
+        if is_bracket:
+            bracket_counts[key] = bracket_counts.get(key, 0) + 1
+
+        if len(selected) >= max_candidates:
+            break
+
+    selected_ids = {id(opp) for opp in selected}
+    pruned_ids = {id(opp) for opp in pruned}
+    remaining = [opp for opp in ranked if id(opp) not in selected_ids and id(opp) not in pruned_ids]
+    pruned.extend(remaining)
+    return selected, pruned
+
+
+def _remaining_weather_trade_slots():
+    if hasattr(trade_manager, "remaining_daily_trade_slots"):
+        return max(0, int(trade_manager.remaining_daily_trade_slots()))
+    if hasattr(trade_manager, "_reset_daily_if_needed"):
+        trade_manager._reset_daily_if_needed()
+    return max(0, config.get("maxDailyTrades", 10) - getattr(trade_manager, "_daily_trades", 0))
+
+
 def compute_probability(forecast_temp, threshold, direction, days_out=0, city=None):
     """Estimate probability that YES resolves true.
 
@@ -599,10 +1039,10 @@ def scan_and_trade():
         return
 
     # Get weather markets (10-min cache — market structure doesn't change fast,
-    # and full pagination through 20K+ Kalshi markets takes 30-60s on demo API)
+    # and direct city-series queries avoid missing contracts beyond global pagination)
     try:
         t0 = time.time()
-        markets = client.get_all_markets(prefix="KXHIGH", cache_ttl=600)
+        markets = get_weather_markets(cache_ttl=600)
         ss.markets_fetched = len(markets)
         log.info(f"Found {len(markets)} KXHIGH markets ({time.time()-t0:.1f}s)")
     except Exception as e:
@@ -614,6 +1054,36 @@ def scan_and_trade():
         log.info("No weather markets found.")
         ss.finalize()
         return
+
+    active_city_codes = set()
+    near_term_city_codes = set()
+    for market in markets:
+        ticker = market.get("ticker", "")
+        if not ticker.startswith("KXHIGH") or ticker.startswith("KXHIGHINFLATION"):
+            continue
+        parsed = parse_ticker(ticker)
+        if not parsed:
+            continue
+        city_code = parsed.get("city")
+        if city_code not in CITIES:
+            continue
+        active_city_codes.add(city_code)
+        try:
+            market_date = datetime.date.fromisoformat(parsed["date"])
+            days_out = max(0, (market_date - _city_today(city_code)).days)
+        except (ValueError, TypeError):
+            days_out = 0
+        if days_out <= 1:
+            near_term_city_codes.add(city_code)
+
+    active_cities = {code: CITIES[code] for code in sorted(active_city_codes)}
+    near_term_cities = {code: CITIES[code] for code in sorted(near_term_city_codes)}
+    if active_cities:
+        log.info("Active weather cities this scan: %d/%d (%s)",
+                 len(active_cities), len(CITIES), ", ".join(active_cities.keys()))
+    if near_term_cities:
+        log.info("Near-term weather cities for HRRR/NAM: %d (%s)",
+                 len(near_term_cities), ", ".join(near_term_cities.keys()))
 
     # Get forecasts (batch API: 1-3 requests instead of 20-60+)
     # Uses separate circuit breaker keys so batch failures don't block per-model fallback
@@ -702,7 +1172,12 @@ def scan_and_trade():
 
     # Cross-validate Open-Meteo vs NWS where both are available
     if not nws_missing:  # Only cross-validate if we didn't need NWS as primary
-        for code in list(CITIES.keys())[:5]:  # Sample up to 5 cities to limit API calls
+        eligible_codes = [
+            code for code in (list(active_cities.keys()) or list(CITIES.keys()))
+            if nws_fetcher.should_cross_validate(code)
+        ]
+        sample_codes = eligible_codes[:5]
+        for code in sample_codes:  # Sample up to 5 relevant cities to limit API calls
             if code in forecasts and not health.is_source_open("nws-forecast"):
                 try:
                     nws_data = nws_fetcher.fetch_forecast(code)
@@ -725,9 +1200,34 @@ def scan_and_trade():
                 om_temps = [t for t in om_data.values() if t is not None]
                 if om_temps:
                     om_mean = sum(om_temps) / len(om_temps)
-                    nws_fetcher.cross_validate(code, om_mean, nws_temp)
+                    days_out = nws_fetcher._days_out(code, date_str)
+                    threshold_f = nws_fetcher.cross_validate_threshold(code, days_out=days_out)
+                    if nws_crosscheck_verifier:
+                        nws_crosscheck_verifier.record_comparison(
+                            code,
+                            date_str,
+                            om_mean,
+                            nws_temp,
+                            days_out=days_out,
+                            threshold_f=threshold_f,
+                            mode=nws_fetcher.cross_validate_mode(code),
+                            open_meteo_models=om_data,
+                        )
+                    nws_fetcher.cross_validate(code, om_mean, nws_temp, date_str=date_str)
             elif om_data is not None:
-                nws_fetcher.cross_validate(code, om_data, nws_temp)
+                days_out = nws_fetcher._days_out(code, date_str)
+                threshold_f = nws_fetcher.cross_validate_threshold(code, days_out=days_out)
+                if nws_crosscheck_verifier:
+                    nws_crosscheck_verifier.record_comparison(
+                        code,
+                        date_str,
+                        om_data,
+                        nws_temp,
+                        days_out=days_out,
+                        threshold_f=threshold_f,
+                        mode=nws_fetcher.cross_validate_mode(code),
+                    )
+                nws_fetcher.cross_validate(code, om_data, nws_temp, date_str=date_str)
 
     model_run_tags = {}
     convergence_data = {}  # {city_code: {date_str: {current, previous, delta}}}
@@ -782,26 +1282,45 @@ def scan_and_trade():
                             model_run_tags=model_run_tags,
                         )
 
+    if nws_crosscheck_verifier:
+        try:
+            nws_crosscheck_verifier.verify_past_comparisons(station_map=DEFAULT_STATION_MAP)
+        except Exception as e:
+            log.warning("NWS cross-check verification failed (non-blocking): %s", e)
+
     # Get adaptive ensemble data from verification (if available)
     verification_summary = None
     city_bias = {}
+    city_model_bias = {}
     if verifier:
         try:
             lookback = VERIFICATION_CONFIG.get("lookback_days", 30)
             verification_summary = verifier.get_verification_summary(lookback)
-            city_bias = verifier.get_city_bias(lookback)
+            city_bias = verifier.get_city_bias(
+                lookback,
+                min_samples=int(bias_cfg.get("liveMinSamples", 2)),
+                full_weight_n=int(bias_cfg.get("skewFullWeightSamples", 10)),
+            )
+            city_model_bias = verifier.get_city_model_bias(
+                lookback,
+                min_samples=int(bias_cfg.get("liveMinSamples", 2)),
+                full_weight_n=int(bias_cfg.get("skewFullWeightSamples", 10)),
+            )
             if verification_summary:
                 log.info("Adaptive weights available from %d models",
                         len(verification_summary))
             if city_bias:
                 log.info("City bias available for %d cities", len(city_bias))
+            if city_model_bias:
+                log.info("City-model bias available for %d cities", len(city_model_bias))
         except Exception as e:
             log.warning("Verification summary failed (non-blocking): %s", e)
 
     # Fetch raw ensemble member data for empirical CDF model
     ensemble_members = {}  # {city_code: {date_str: [member_temps]}}
     if ENSEMBLE_ENABLED and not health.is_source_open("open-meteo-ensemble"):
-        for code, info in CITIES.items():
+        target_cities = active_cities or CITIES
+        for code, info in target_cities.items():
             if health.is_source_open("open-meteo-ensemble"):
                 break
             try:
@@ -821,7 +1340,8 @@ def scan_and_trade():
     hrrr_cfg = config.get("hrrr", {})
     hrrr_source = "open-meteo-hrrr"
     if hrrr_cfg.get("enabled", False) and not health.is_source_open(hrrr_source):
-        for code, info in CITIES.items():
+        target_cities = near_term_cities or active_cities
+        for code, info in target_cities.items():
             if health.is_source_open(hrrr_source):
                 log.info("HRRR circuit breaker open, skipping remaining cities")
                 break
@@ -853,7 +1373,8 @@ def scan_and_trade():
     nam_cfg = config.get("nam", {})
     nam_source = "open-meteo-nam"
     if nam_cfg.get("enabled", False) and not health.is_source_open(nam_source):
-        for code, info in CITIES.items():
+        target_cities = near_term_cities or active_cities
+        for code, info in target_cities.items():
             if health.is_source_open(nam_source):
                 log.info("NAM circuit breaker open, skipping remaining cities")
                 break
@@ -886,6 +1407,7 @@ def scan_and_trade():
     t_analysis = time.time()
     opportunities = []
     base_edge_threshold = _effective_weather_edge_threshold()
+    maker_cfg = _maker_execution_config()
     for m in markets:
         ticker = m.get("ticker", "")
         # Filter non-weather KXHIGH tickers (e.g., KXHIGHINFLATION)
@@ -926,6 +1448,14 @@ def scan_and_trade():
         per_model_probs = {}
         probability_method = "single_model"
         weights_used = {}
+        verification_confidence = 0.0
+        bias = None
+        hist_bias = None
+        live_bias = None
+        live_n = 0
+        live_confidence = 0.0
+        alpha = None
+        bias_meta = {}
         market_record_models = dict(forecast_data) if isinstance(forecast_data, dict) else None
 
         if ENSEMBLE_ENABLED and isinstance(forecast_data, dict):
@@ -934,6 +1464,17 @@ def scan_and_trade():
                 continue
             # Bias-correct each model's forecast before computing mean
             corrected_data = bias_corrector.correct_forecast_dict(city, forecast_data)
+            corrected_data, live_model_bias_applied = _apply_live_model_bias(
+                city,
+                corrected_data,
+                city_model_bias,
+            )
+            if live_model_bias_applied:
+                detail = ", ".join(
+                    f"{item['model']}={item['correction_f']:+.1f}F@{item['confidence']:.2f}"
+                    for item in live_model_bias_applied
+                )
+                log.info("  %s: live model bias applied (%s)", ticker, detail)
             valid_temps = [t for t in corrected_data.values() if t is not None]
             if not valid_temps:
                 ss.skip("null_forecast")
@@ -978,14 +1519,34 @@ def scan_and_trade():
                     # Blend historical calibration bias with live ForecastVerifier bias
                     live_bias = city_bias.get(city, {}).get("bias_f", 0.0) if city_bias else 0.0
                     live_n = city_bias.get(city, {}).get("n", 0) if city_bias else 0
-                    bias, hist_bias, alpha = bias_corrector.blend_live_bias(
+                    live_confidence = city_bias.get(city, {}).get("confidence", 0.0) if city_bias else 0.0
+                    bias, hist_bias, alpha, bias_meta = bias_corrector.blend_live_bias(
                         city,
                         live_bias=live_bias,
                         live_n=live_n,
+                        ramp_n=int(bias_cfg.get("liveRampSamples", 8)),
+                        min_live_samples=int(bias_cfg.get("liveMinSamples", 2)),
+                        max_abs_bias_f=float(bias_cfg.get("historicalMaxAbsF", 6.0)),
+                        conflict_gap_f=float(bias_cfg.get("conflictGapF", 4.0)),
+                        conflict_alpha_floor=float(bias_cfg.get("conflictAlphaFloor", 0.35)),
+                        hist_model_weights=BiasCorrector.EMPIRICAL_MEMBER_MODEL_WEIGHTS,
                     )
                     if abs(bias) > 0.1:
-                        log.info("  %s: bias correction %.1fF (hist=%.1fF, live=%.1fF, alpha=%.2f)",
-                                 ticker, bias, hist_bias, live_bias, alpha)
+                        extras = []
+                        if bias_meta.get("conflict"):
+                            extras.append("conflict_guard")
+                        if bias_meta.get("capped"):
+                            extras.append(f"cap={bias_meta.get('cap_f'):.1f}F")
+                        suffix = f" [{' '.join(extras)}]" if extras else ""
+                        log.info(
+                            "  %s: bias correction %.1fF (hist=%.1fF, live=%.1fF, alpha=%.2f)%s",
+                            ticker,
+                            bias,
+                            hist_bias,
+                            live_bias,
+                            alpha,
+                            suffix,
+                        )
 
                     empirical_result = empirical_ensemble_probability(
                         members, parsed["threshold"], parsed["direction"],
@@ -1028,7 +1589,7 @@ def scan_and_trade():
             # Fallback: parametric ensemble (v2 with adaptive weights)
             if not used_empirical:
                 # Phase 3: Blend HRRR into parametric forecast data
-                parametric_data = bias_corrector.correct_forecast_dict(city, dict(forecast_data))
+                parametric_data = dict(corrected_data)
                 if city in hrrr_data and date_str in hrrr_data.get(city, {}) and days_out <= 1:
                     parametric_data["hrrr"] = hrrr_data[city][date_str]
                     log.info("  %s: HRRR temp %.1fF added to parametric ensemble",
@@ -1065,8 +1626,15 @@ def scan_and_trade():
                     disagreement_score = ensemble_details.get("disagreement_score", 0.0)
                     per_model_probs = ensemble_details.get("per_model_probs", {})
                     weights_used = ensemble_details.get("weights_used", {})
+                    verification_confidence = ensemble_details.get("verification_confidence", 0.0)
                     if disagreement_score > 0.3:
                         log.info(f"  {ticker}: high ensemble disagreement ({disagreement_score:.2f}), doubling edge threshold")
+                    elif verification_confidence and verification_confidence < 0.6:
+                        log.info(
+                            "  %s: adaptive sample confidence %.2f still thin, shrinking toward static weights",
+                            ticker,
+                            verification_confidence,
+                        )
                 else:
                     # Ensemble failed (zero weight) — fall back to single-model
                     log.warning("Ensemble returned None for %s, falling back to single-model", ticker)
@@ -1088,7 +1656,27 @@ def scan_and_trade():
                     continue
                 # Get first model key and correct its temp
                 first_model = list(forecast_data.keys())[0]
-                forecast_temp = bias_corrector.correct(city, first_model, forecast_data[first_model])
+                single_corrected, live_model_bias_applied = _apply_live_model_bias(
+                    city,
+                    {
+                        first_model: bias_corrector.correct(
+                            city,
+                            first_model,
+                            forecast_data[first_model],
+                        )
+                    },
+                    city_model_bias,
+                )
+                forecast_temp = single_corrected.get(first_model)
+                if live_model_bias_applied:
+                    item = live_model_bias_applied[0]
+                    log.info(
+                        "  %s: live model bias applied (%s=%+.1fF@%.2f)",
+                        ticker,
+                        item["model"],
+                        item["correction_f"],
+                        item["confidence"],
+                    )
             else:
                 forecast_temp = forecast_data
             if forecast_temp is None:
@@ -1142,10 +1730,10 @@ def scan_and_trade():
                                        sigma=round(sigma, 2))
             continue
 
-        yes_ask = m.get("yes_ask", 0)
         yes_bid = m.get("yes_bid", 0)
-        no_ask = m.get("no_ask", 0)
-        last = m.get("last_price", 0)
+        yes_ask = m.get("yes_ask", 0)
+        no_bid = m.get("no_bid", 0) or (100 - yes_ask if yes_ask else 0)
+        no_ask = m.get("no_ask", 0) or (100 - yes_bid if yes_bid else 0)
 
         # Relaxed liquidity for near-settlement markets (0-1 days out)
         # where forecast accuracy is best and trading interest highest
@@ -1153,31 +1741,44 @@ def scan_and_trade():
             liquid = is_market_liquid(m, min_volume=5)
         else:
             liquid = is_market_liquid(m)
-        if not liquid:
-            ss.skip("illiquid")
+
+        # Compute edge against the price we'd actually pay (ask for taker flow,
+        # passive limit price for maker flow).
+        city_name = CITIES[city]["name"]
+        side = "yes" if our_prob > 0.5 else "no"
+        side_prob = our_prob if side == "yes" else (1 - our_prob)
+        displayed_plan = _build_displayed_entry_plan(m, side, side_prob, liquid)
+        maker_plan = _build_maker_entry_plan(m, side, side_prob, days_out, maker_cfg=maker_cfg)
+        entry_plan = _select_weather_execution_plan(displayed_plan, maker_plan, liquid, maker_cfg=maker_cfg)
+
+        if entry_plan is None:
+            displayed_edge = displayed_plan["edge"] if displayed_plan else None
+            if isinstance(displayed_edge, (int, float)) and displayed_edge < 0:
+                ss.skip("negative_edge")
+                trade_manager.log_decision(
+                    ticker,
+                    side,
+                    "skipped",
+                    "negative_edge",
+                    edge=displayed_edge,
+                    price_cents=displayed_plan["price"] if displayed_plan else None,
+                )
+            elif displayed_plan is None and maker_plan is None:
+                ss.skip("illiquid" if not liquid else "no_price")
+            else:
+                ss.skip("illiquid")
             continue
 
         ss.markets_evaluated += 1
-
-        # Compute edge against the price we'd actually pay (ask for YES, 100-bid for NO)
-        # not the midpoint, to avoid false positives from wide spreads
-        city_name = CITIES[city]["name"]
-
-        if our_prob > 0.5 and yes_ask and yes_ask < 99:
-            edge_yes = our_prob - (yes_ask / 100.0)
-        elif our_prob <= 0.5 and no_ask and no_ask < 99:
-            edge_yes = (1 - our_prob) - (no_ask / 100.0)  # positive = NO signal
-        else:
-            ss.skip("no_price")
-            continue
+        edge_yes = entry_plan["edge"]
 
         # Guard: never trade on negative edge (model says we'd lose money)
         if edge_yes < 0:
             ss.skip("negative_edge")
-            trade_manager.log_decision(ticker, "yes" if our_prob > 0.5 else "no",
+            trade_manager.log_decision(ticker, side,
                                        "skipped", "negative_edge",
                                        edge=edge_yes,
-                                       price_cents=yes_ask if our_prob > 0.5 else no_ask)
+                                       price_cents=entry_plan["price"])
             continue
 
         # Adjust edge threshold for high ensemble spread or disagreement (defense in depth)
@@ -1187,33 +1788,77 @@ def scan_and_trade():
             effective_edge_threshold = base_edge_threshold * disagree_mult
         elif spread_mult > 1.5:
             effective_edge_threshold = base_edge_threshold * 2
+        elif verification_confidence and verification_confidence < 0.6:
+            effective_edge_threshold *= 1.0 + ((0.6 - verification_confidence) * 0.5)
 
         if edge_yes >= effective_edge_threshold:
-            side = "yes" if our_prob > 0.5 else "no"
+            if parsed["direction"] == "B" and edge_yes < base_edge_threshold * 2:
+                ss.skip("bracket_low_edge")
+                trade_manager.log_decision(
+                    ticker,
+                    side,
+                    "skipped",
+                    f"bracket edge {edge_yes*100:.1f}% < 2x threshold",
+                    edge=edge_yes,
+                    price_cents=entry_plan["price"],
+                )
+                continue
             opportunities.append({
                 "ticker": ticker, "market": m, "parsed": parsed,
                 "forecast": forecast_temp, "our_prob": our_prob,
-                "market_price": (yes_ask / 100.0) if side == "yes" else (no_ask / 100.0),
+                "market_price": (entry_plan["price"] / 100.0),
                 "edge": edge_yes,
                 "side": side,
                 "city_name": city_name,
-                "yes_ask": yes_ask, "no_ask": no_ask,
+                "yes_bid": yes_bid,
+                "yes_ask": yes_ask,
+                "no_bid": no_bid,
+                "no_ask": no_ask,
                 "days_out": days_out, "city": city,
                 "per_model_probs": per_model_probs,
                 "probability_method": probability_method,
                 "sigma_used": sigma,
                 "weights_used": weights_used,
+                "verification_confidence": verification_confidence,
+                "effective_edge_threshold": effective_edge_threshold,
+                "execution_mode": entry_plan["execution_mode"],
+                "entry_price": entry_plan["price"],
+                "maker_plan": maker_plan,
+                **_weather_bias_trade_fields(
+                    bias_applied=bias,
+                    hist_bias=hist_bias,
+                    live_bias=live_bias,
+                    live_n=live_n,
+                    live_confidence=live_confidence,
+                    alpha=alpha,
+                    bias_meta=bias_meta,
+                ),
             })
         else:
             ss.skip("low_edge")
             trade_manager.log_decision(
-                ticker, "yes" if our_prob > 0.5 else "no", "skipped",
+                ticker, side, "skipped",
                 "edge below threshold", edge=edge_yes,
-                price_cents=yes_ask if our_prob > 0.5 else no_ask,
+                price_cents=entry_plan["price"],
             )
 
     # Sort by edge magnitude
-    opportunities.sort(key=lambda x: x["edge"], reverse=True)
+    remaining_trade_slots = _remaining_weather_trade_slots()
+    selection_cfg = _weather_selection_config()
+    opportunities, pruned_opportunities = _select_weather_opportunities(
+        opportunities,
+        remaining_trade_slots,
+        selection_cfg=selection_cfg,
+    )
+    if pruned_opportunities:
+        log.info(
+            "Opportunity selection kept %d/%d candidates (remaining daily slots=%d)",
+            len(opportunities),
+            len(opportunities) + len(pruned_opportunities),
+            remaining_trade_slots,
+        )
+        for _ in pruned_opportunities:
+            ss.skip("selection_pruned")
     log.info(f"Found {len(opportunities)} opportunities with edge >= {base_edge_threshold*100:.0f}%")
 
     for opp in opportunities:
@@ -1225,7 +1870,8 @@ def scan_and_trade():
         city_name = opp["city_name"]
         yes_ask = opp["yes_ask"]
         no_ask = opp["no_ask"]
-        yes_bid = opp["market"].get("yes_bid", 0)
+        yes_bid = opp["yes_bid"]
+        no_bid = opp["no_bid"]
         is_bracket = (direction == "B")
 
         # Days-out-aware dedup: shorter cooldown for near-settlement markets
@@ -1248,8 +1894,10 @@ def scan_and_trade():
                                        edge=edge, price_cents=yes_ask if opp["side"] == "yes" else no_ask)
             continue
 
-        # Edge is always positive (computed against the ask for the side we'd trade)
+        # Edge is always positive (computed against the price we'd actually quote/pay)
         side = opp["side"]
+        execution_mode = opp.get("execution_mode", "taker")
+        price = opp.get("entry_price")
 
         # Phase 3: Order book depth gating — skip thin books, improve limit pricing
         ob_cfg = config.get("orderbookDepth", {})
@@ -1260,33 +1908,99 @@ def scan_and_trade():
                 min_depth = ob_cfg.get("minDepthContracts", 5)
                 side_depth = depth_data["total_ask_depth"] if side == "yes" else depth_data["total_bid_depth"]
                 if side_depth < min_depth:
-                    log.info(f"  Skipping {ticker}: insufficient depth ({side_depth} < {min_depth})")
-                    ss.skip("low_depth")
-                    trade_manager.log_decision(ticker, side, "skipped", f"insufficient depth ({side_depth} < {min_depth})",
-                                               edge=edge, price_cents=yes_ask if side == "yes" else no_ask)
-                    continue
+                    maker_plan = opp.get("maker_plan") or _build_maker_entry_plan(
+                        opp["market"],
+                        side,
+                        opp["our_prob"] if side == "yes" else (1 - opp["our_prob"]),
+                        opp["days_out"],
+                        maker_cfg=maker_cfg,
+                    )
+                    if maker_plan is None:
+                        log.info(f"  Skipping {ticker}: insufficient depth ({side_depth} < {min_depth})")
+                        ss.skip("low_depth")
+                        trade_manager.log_decision(
+                            ticker,
+                            side,
+                            "skipped",
+                            f"insufficient depth ({side_depth} < {min_depth})",
+                            edge=edge,
+                            price_cents=yes_ask if side == "yes" else no_ask,
+                        )
+                        continue
+                    execution_mode = "maker"
+                    price = maker_plan["price"]
+                    edge = maker_plan["edge"]
+                    log.info(
+                        "  %s: thin book (%d < %d), switching to passive %s quote @ %dc",
+                        ticker,
+                        side_depth,
+                        min_depth,
+                        side.upper(),
+                        price,
+                    )
+                    if edge < opp.get("effective_edge_threshold", base_edge_threshold):
+                        ss.skip("low_depth")
+                        trade_manager.log_decision(
+                            ticker,
+                            side,
+                            "skipped",
+                            "maker edge below threshold after thin-book repricing",
+                            edge=edge,
+                            price_cents=price,
+                        )
+                        continue
 
-        if side == "yes" and yes_ask and yes_ask < 99:
+        if side == "yes" and ((yes_ask and yes_ask < 99) or execution_mode == "maker"):
             # Config-level YES disable — if set, skip all weather YES trades
             if config.get("disableWeatherYes", False):
                 trade_manager.log_decision(ticker, "yes", "skipped", "weather YES disabled by config",
-                                            edge=edge, price_cents=yes_ask)
+                                            edge=edge, price_cents=price or yes_ask)
                 continue
             # Rec 2: NO-only weather constraint — skip YES unless edge >= 15%
             # YES side has 0% historical win rate; only trade with very high conviction
             if edge < 0.15:
                 trade_manager.log_decision(ticker, "yes", "skipped", f"YES edge {edge*100:.1f}% < 15% minimum",
-                                            edge=edge, price_cents=yes_ask)
+                                            edge=edge, price_cents=price or yes_ask)
                 continue
-            order_type, price = choose_order_type(yes_bid, yes_ask, "yes", edge, opp["our_prob"], depth_data)
-            if not price or price <= 0:
-                price = yes_ask
-            reasoning = f"{city_name} forecast: {forecast}F, {ticker} YES at {price}c ({order_type}) -> our prob {opp['our_prob']*100:.0f}%, edge +{edge*100:.1f}%, buying YES"
-        elif side == "no" and no_ask and no_ask < 99:
-            order_type, price = choose_order_type(yes_bid, yes_ask, "no", edge, opp["our_prob"], depth_data)
-            if not price or price <= 0:
-                price = no_ask
-            reasoning = f"{city_name} forecast: {forecast}F, {ticker} NO at {price}c ({order_type}) -> our prob {(1-opp['our_prob'])*100:.0f}%, edge +{edge*100:.1f}%, buying NO"
+            if execution_mode == "maker":
+                order_type = "maker-limit"
+                if not price or price <= 0:
+                    price = _build_maker_entry_plan(
+                        opp["market"],
+                        "yes",
+                        opp["our_prob"],
+                        opp["days_out"],
+                        maker_cfg=maker_cfg,
+                    )["price"]
+                reasoning = (
+                    f"{city_name} forecast: {forecast}F, {ticker} YES passive quote at {price}c "
+                    f"(maker) -> our prob {opp['our_prob']*100:.0f}%, edge +{edge*100:.1f}%"
+                )
+            else:
+                order_type, price = choose_order_type(yes_bid, yes_ask, "yes", edge, opp["our_prob"], depth_data)
+                if not price or price <= 0:
+                    price = yes_ask
+                reasoning = f"{city_name} forecast: {forecast}F, {ticker} YES at {price}c ({order_type}) -> our prob {opp['our_prob']*100:.0f}%, edge +{edge*100:.1f}%, buying YES"
+        elif side == "no" and (no_ask and no_ask < 99 or execution_mode == "maker"):
+            if execution_mode == "maker":
+                order_type = "maker-limit"
+                if not price or price <= 0:
+                    price = _build_maker_entry_plan(
+                        opp["market"],
+                        "no",
+                        1 - opp["our_prob"],
+                        opp["days_out"],
+                        maker_cfg=maker_cfg,
+                    )["price"]
+                reasoning = (
+                    f"{city_name} forecast: {forecast}F, {ticker} NO passive quote at {price}c "
+                    f"(maker) -> our prob {(1-opp['our_prob'])*100:.0f}%, edge +{edge*100:.1f}%"
+                )
+            else:
+                order_type, price = choose_order_type(yes_bid, yes_ask, "no", edge, opp["our_prob"], depth_data)
+                if not price or price <= 0:
+                    price = no_ask
+                reasoning = f"{city_name} forecast: {forecast}F, {ticker} NO at {price}c ({order_type}) -> our prob {(1-opp['our_prob'])*100:.0f}%, edge +{edge*100:.1f}%, buying NO"
         else:
             continue
 
@@ -1350,7 +2064,7 @@ def scan_and_trade():
                              ticker, conv_mult, city_conv[date_str_opp]["delta"], old_count, count)
 
         # Phase 3: Improve limit price using orderbook depth (after Kelly sizing for accurate qty)
-        if depth_data and count > 0:
+        if depth_data and count > 0 and execution_mode != "maker":
             old_price = price
             if side == "yes":
                 fill_price = orderbook.estimate_fill_price(depth_data, "yes", count)
@@ -1386,7 +2100,12 @@ def scan_and_trade():
         result = trade_manager.place_order(
             ticker, side, price, count, reasoning,
             forecast_temp=forecast, threshold=threshold, edge=round(edge, 4),
-            market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
+            market_snapshot=build_market_snapshot(
+                yes_bid=yes_bid,
+                yes_ask=yes_ask,
+                volume=opp["market"].get("volume"),
+                open_interest=opp["market"].get("open_interest"),
+            ),
             model_prob=round(opp["our_prob"], 4),
             raw_edge=round(edge, 4),
             fee_cents=round(kalshi_fee_cents(price), 2),
@@ -1404,10 +2123,20 @@ def scan_and_trade():
             probability_method=opp.get("probability_method"),
             per_model_probs=opp.get("per_model_probs"),
             weights_used=opp.get("weights_used"),
+            verification_confidence=round(opp.get("verification_confidence", 0.0), 4),
+            execution_style=execution_mode,
+            bias_applied_f=opp.get("bias_applied_f"),
+            bias_hist_f=opp.get("bias_hist_f"),
+            bias_live_f=opp.get("bias_live_f"),
+            bias_live_n=opp.get("bias_live_n"),
+            bias_live_confidence=opp.get("bias_live_confidence"),
+            bias_alpha=opp.get("bias_alpha"),
+            bias_capped=opp.get("bias_capped"),
+            bias_conflict=opp.get("bias_conflict"),
         )
         if result:
             ss.trades_placed += 1
-            allocator.record_trade("weather", ticker, risk, edge=edge)
+            allocator.record_trade("weather", ticker, result.get("cost_cents", risk), edge=edge)
             record_local_trade(ticker)
 
     log.info(f"Market analysis + trading ({time.time()-t_analysis:.1f}s)")
@@ -1419,6 +2148,12 @@ def scan_and_trade():
             verifier.save()
         except Exception as e:
             log.warning("Verification save failed (non-blocking): %s", e)
+    if nws_crosscheck_verifier:
+        try:
+            nws_crosscheck_verifier.cleanup()
+            nws_crosscheck_verifier.save()
+        except Exception as e:
+            log.warning("NWS cross-check save failed (non-blocking): %s", e)
 
     ss.finalize()
     return markets

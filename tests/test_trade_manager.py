@@ -356,9 +356,22 @@ class TestTradeManager:
     def test_cost_cap_adjustment(self, tmp_path):
         mgr, client, _ = _make_manager(tmp_path, {"maxTradeAmount": 1, "maxDailyTrades": 100, "maxDailyLoss": 100})
         # maxTradeAmount=1 dollar = 100 cents. 50c * 5 = 250c > 100c, so count should be adjusted to 2
-        mgr.place_order("T1", "yes", 50, 5, "r1")
+        result = mgr.place_order("T1", "yes", 50, 5, "r1")
         call_body = client.post.call_args[1]["body"]
         assert call_body["count"] == 2
+        assert result["count"] == 2
+        assert result["cost_cents"] == 100
+
+    def test_daily_loss_limit_uses_post_cap_size(self, tmp_path):
+        mgr, client, _ = _make_manager(tmp_path, {
+            "maxTradeAmount": 0.25,
+            "maxDailyTrades": 100,
+            "maxDailyLoss": 0.50,
+        })
+        result = mgr.place_order("T1", "yes", 20, 10, "r1")
+        assert result is not None
+        assert client.post.call_args[1]["body"]["count"] == 1
+        assert result["cost_cents"] == 20
 
     def test_dedup_blocks_repeat(self, tmp_path):
         mgr, _, _ = _make_manager(tmp_path)

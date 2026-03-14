@@ -389,7 +389,7 @@ def evaluate_album_trade(market, sale, ss=None):
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
                 units=units, threshold=threshold, source=sale.get("source", ""),
             )
-            allocator.record_trade("source-monitor", ticker, risk, edge=edge)
+            allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)
 
     elif outcome == "no" and no_ask and no_ask < 99:
         edge = confidence - no_ask / 100
@@ -448,7 +448,7 @@ def evaluate_album_trade(market, sale, ss=None):
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
                 units=units, threshold=threshold, source=sale.get("source", ""),
             )
-            allocator.record_trade("source-monitor", ticker, risk, edge=edge)
+            allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)
 
 
 # ============================================================
@@ -772,7 +772,7 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
                 gross=gross, threshold=threshold, source=movie.get("source", ""),
             )
-            allocator.record_trade("source-monitor", ticker, risk, edge=edge)
+            allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)
 
     elif outcome == "no" and no_ask and no_ask < 99:
         edge = confidence - no_ask / 100
@@ -830,7 +830,7 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
                 gross=gross, threshold=threshold, source=movie.get("source", ""),
             )
-            allocator.record_trade("source-monitor", ticker, risk, edge=edge)
+            allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)
 
 
 # ============================================================
@@ -1113,7 +1113,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             confidence=round(prob, 4), running_high=round(running_high, 1),
                             city=city, threshold=threshold, hour=city_hour,
                         )
-                        allocator.record_trade("source-monitor", ticker, risk, edge=edge)
+                        allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)
 
                 elif prob <= 0.5 and no_ask and no_ask < 99:
                     # Buy NO (raw edge, fees handled in Kelly)
@@ -1176,7 +1176,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             confidence=round(no_prob, 4), running_high=round(running_high, 1),
                             city=city, threshold=threshold, hour=city_hour,
                         )
-                        allocator.record_trade("source-monitor", ticker, risk, edge=edge)
+                        allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)
 
     except Exception as e:
         log.error("  NWS market matching failed: %s", e, exc_info=True)

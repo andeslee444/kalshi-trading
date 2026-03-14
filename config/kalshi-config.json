@@ -49,6 +49,29 @@
     "disagreement_edge_multiplier": 2.0,
     "max_api_calls_per_scan": 5
   },
+  "biasCorrection": {
+    "liveMinSamples": 2,
+    "liveRampSamples": 8,
+    "skewFullWeightSamples": 10,
+    "historicalMaxAbsF": 6.0,
+    "conflictGapF": 4.0,
+    "conflictAlphaFloor": 0.35
+  },
+  "nwsCrossValidation": {
+    "defaultMode": "gridpoint",
+    "auditEnabled": true,
+    "auditPath": "data/weather-nws-cross-check.json",
+    "citySigmaScale": 0.75,
+    "maxThresholdF": 6.0,
+    "cityModes": {
+      "AUS": "advisory_only",
+      "CHI": "advisory_only",
+      "DEN": "advisory_only",
+      "HOU": "advisory_only"
+    },
+    "thresholds": {},
+    "gridOverrides": {}
+  },
   "hrrr": {
     "enabled": true,
     "weight_day0": 0.60,
@@ -64,6 +87,25 @@
   "orderbookDepth": {
     "enabled": true,
     "minDepthContracts": 5
+  },
+  "makerExecution": {
+    "enabled": true,
+    "maxDaysOut": 1,
+    "minEdgeNearTerm": 0.10,
+    "minEdgeFar": 0.14,
+    "minImprovementCents": 1,
+    "maxJoinUpliftCents": 18,
+    "pricePriorityEdgeBuffer": 0.02,
+    "maxPriceCents": 95,
+    "maxRestingSeconds": 300
+  },
+  "opportunitySelection": {
+    "enabled": true,
+    "oversampleFactor": 3,
+    "minCandidates": 12,
+    "maxPerCity": 3,
+    "maxPerCityDate": 2,
+    "maxBracketPerCityDate": 1
   },
   "nam": {
     "enabled": true,

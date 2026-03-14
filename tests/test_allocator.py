@@ -524,6 +524,12 @@ class TestCorrelationIntegration:
         Patches absolute cap to isolate the cluster check.
         """
         alloc = self._make_allocator(balance=500000)
+        alloc.client.get.return_value = {
+            "market_positions": [
+                {"ticker": f"KXCPI-26MAY-T3{i}", "position": 1, "market_exposure": 10000}
+                for i in range(8)
+            ]
+        }
         # Record $800 in CPI trades (80000 cents > 75000 cluster limit)
         for i in range(8):
             alloc.record_trade("source-monitor", f"KXCPI-26MAY-T3{i}", 10000, edge=0.10)
@@ -551,6 +557,18 @@ class TestCorrelationIntegration:
         if result.approved:
             # Bankroll should be reduced by tail risk multiplier (75% of 500000 = 375000)
             assert result.bankroll_cents < 500000
+
+    def test_reconcile_rebuilds_cluster_risk_from_live_positions(self):
+        alloc = self._make_allocator(balance=500000)
+        alloc._correlation_engine.record_trade("KXBTC-26MAR31-T80000", 80000)
+        alloc.client.get.return_value = {
+            "market_positions": [
+                {"ticker": "KXETHY-27JAN0100-T1000.00", "position": 5, "market_exposure": 2500},
+            ]
+        }
+        alloc._last_reconcile = 0
+        alloc._reconcile_settled_positions()
+        assert alloc._correlation_engine.get_cluster_risk("BTC") == 2500
 
 
 # ===================================================================

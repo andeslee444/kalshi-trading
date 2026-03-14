@@ -201,3 +201,56 @@ class TestProductionConcentrationConstants:
     def test_max_contracts_per_order(self):
         """MAX_CONTRACTS_PER_ORDER should be 200 (penny contract cap)."""
         assert _econ.MAX_CONTRACTS_PER_ORDER == 200
+
+
+class TestLiveExposureRecords:
+    """Economics concentration should prefer live positions over stale trade logs."""
+
+    def test_compute_exposure_accepts_market_exposure_records(self):
+        records = [
+            {"ticker": "KXECONSTATCPIYOY-26MAY-T2.0", "market_exposure": 12000},
+            {"ticker": "KXECONSTATCPIYOY-26MAY-T2.5", "market_exposure": 5400},
+        ]
+        exposure = _econ._compute_exposure(records, "KXECONSTATCPIYOY-26MAY", "family")
+        assert exposure == 17400
+
+    def test_load_active_econ_exposure_prefers_live_positions(self):
+        _econ.client.get.return_value = {
+            "market_positions": [
+                {"ticker": "KXECONSTATCPIYOY-26MAY-T2.0", "position": 10, "market_exposure": 12000},
+                {"ticker": "KXBTCY-27JAN0100-T149999.99", "position": 2, "market_exposure": 9999},
+                {"ticker": "KXGDP-26APR30-T4.5", "position": 0, "market_exposure": 5000},
+            ]
+        }
+
+        records = _econ._load_active_econ_exposure_records()
+        assert records == [{"ticker": "KXECONSTATCPIYOY-26MAY-T2.0", "cost_cents": 12000}]
+
+    def test_load_active_econ_exposure_falls_back_to_open_trade_log(self):
+        _econ.client.get.side_effect = RuntimeError("api unavailable")
+        _econ.load_trades.return_value = [
+            {
+                "ticker": "KXECONSTATCPIYOY-26MAY-T2.0",
+                "action": "buy",
+                "status": "executed",
+                "settlement_result": None,
+                "cost_cents": 12000,
+            },
+            {
+                "ticker": "KXECONSTATCPIYOY-26MAY-T2.5",
+                "action": "sell",
+                "status": "executed",
+                "settlement_result": None,
+                "cost_cents": 2000,
+            },
+            {
+                "ticker": "KXECONSTATCPIYOY-26APR-T2.0",
+                "action": "buy",
+                "status": "canceled",
+                "settlement_result": None,
+                "cost_cents": 8000,
+            },
+        ]
+
+        records = _econ._load_active_econ_exposure_records()
+        assert records == [{"ticker": "KXECONSTATCPIYOY-26MAY-T2.0", "cost_cents": 12000}]

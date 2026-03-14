@@ -227,6 +227,73 @@ class TestHealthEndpoint:
         assert data["weather_actuals"]["summary_7d"]["counts"]["nws_cli"] == 3
         assert data["weather_actuals"]["summary_30d"]["shares"]["iem_fallback"] == 0.1
 
+    def test_health_includes_weather_nws_crosscheck_summary(self, client, dashboard):
+        """Weather NWS cross-check audit is exposed for operator decisions."""
+        health_state = {"sources": {}, "bots": {}}
+        crosscheck = {
+            "summary_7d": {
+                "overall": {
+                    "n": 4,
+                    "open_meteo_mae": 3.2,
+                    "nws_mae": 5.4,
+                    "open_meteo_better_share": 0.75,
+                    "nws_better_share": 0.25,
+                    "tie_share": 0.0,
+                },
+            },
+            "summary_30d": {
+                "overall": {
+                    "n": 12,
+                    "open_meteo_mae": 3.7,
+                    "nws_mae": 5.9,
+                    "open_meteo_better_share": 0.67,
+                    "nws_better_share": 0.25,
+                    "tie_share": 0.08,
+                },
+                "per_city": {
+                    "DEN": {
+                        "n": 6,
+                        "open_meteo_mae": 4.0,
+                        "nws_mae": 6.8,
+                        "open_meteo_better_share": 0.83,
+                        "nws_better_share": 0.17,
+                        "tie_share": 0.0,
+                    },
+                },
+            },
+            "recommendations": {
+                "DEN": {
+                    "city": "DEN",
+                    "current_mode": "advisory_only",
+                    "recommended_mode": "disabled",
+                    "action": "tighten",
+                    "reason": "Open-Meteo is materially better against settlement",
+                    "n": 6,
+                },
+            },
+            "actionable": {
+                "DEN": {
+                    "city": "DEN",
+                    "current_mode": "advisory_only",
+                    "recommended_mode": "disabled",
+                },
+            },
+            "pending_count": 8,
+            "verified_count": 12,
+            "last_verification": "2026-03-14T14:00:00+00:00",
+        }
+
+        with patch.object(dashboard, "load_json_safe", return_value=health_state):
+            with patch.object(dashboard, "get_weather_nws_crosscheck_summary", return_value=crosscheck):
+                with patch("builtins.open", side_effect=FileNotFoundError):
+                    resp = client.get("/api/health")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["weather_nws_crosscheck"]["summary_7d"]["overall"]["n"] == 4
+        assert data["weather_nws_crosscheck"]["recommendations"]["DEN"]["recommended_mode"] == "disabled"
+        assert data["weather_nws_crosscheck"]["pending_count"] == 8
+
 
 class TestBotsEndpoint:
     """Test /api/bots endpoint reflects supervisor-style bot state."""

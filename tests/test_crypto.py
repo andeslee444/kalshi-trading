@@ -88,6 +88,7 @@ apply_drift = _crypto_bot.apply_drift
 compute_correlation_multiplier = _crypto_bot.compute_correlation_multiplier
 compute_ou_target = _crypto_bot.compute_ou_target
 apply_kelly_multipliers = _crypto_bot.apply_kelly_multipliers
+finalize_position_size = _crypto_bot.finalize_position_size
 get_spot_price = _crypto_bot.get_spot_price
 PRICE_SOURCES = _crypto_bot.PRICE_SOURCES
 MAX_PRICE_DIVERGENCE = _crypto_bot.MAX_PRICE_DIVERGENCE
@@ -568,6 +569,20 @@ class TestJumpDiffusionCrypto:
         assert prob < 0.10  # Very unlikely in 5 minutes
 
 
+class TestHestonCrypto:
+    """Regression coverage for Heston edge cases."""
+
+    def test_zero_threshold_returns_ceiling_for_positive_spot(self):
+        from probability import crypto_price_probability_heston
+        prob = crypto_price_probability_heston(
+            current_price=90000,
+            threshold=0,
+            direction="above",
+            time_horizon_minutes=60,
+        )
+        assert prob == pytest.approx(0.999)
+
+
 class TestPriceFallback:
     """Test price fallback logic (production get_market_price)."""
 
@@ -945,6 +960,32 @@ class TestKellyStackFloor:
         """Multipliers > 1.0 (e.g. low_vol regime bonus) should be allowed."""
         result = apply_kelly_multipliers(10, [1.1])
         assert result == 11
+
+
+class TestFinalizePositionSize:
+    """Final crypto risk should reflect the actual post-cap order size."""
+
+    def test_recomputes_risk_after_count_caps(self):
+        count, risk = finalize_position_size(
+            count=2293,
+            price_cents=10,
+            bankroll_cents=382294,
+            multipliers=[1.0, 1.0, 1.0],
+            max_cost_cents=2500,
+        )
+        assert count == 250
+        assert risk == 2500
+
+    def test_final_cap_applies_after_multiplier_bonus(self):
+        count, risk = finalize_position_size(
+            count=250,
+            price_cents=10,
+            bankroll_cents=382294,
+            multipliers=[1.1],
+            max_cost_cents=2500,
+        )
+        assert count == 250
+        assert risk == 2500
 
 
 class TestPriceSourceFallback:

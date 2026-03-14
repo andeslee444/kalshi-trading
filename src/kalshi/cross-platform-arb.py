@@ -371,7 +371,7 @@ def scan_spreads():
                                                         kelly_details=kelly_details)
                     if result:
                         ss.trades_placed += 1
-                        allocator.record_trade("cross-platform-arb", k_ticker, risk, edge=edge)
+                        allocator.record_trade("cross-platform-arb", k_ticker, result.get("cost_cents", risk), edge=edge)
                 else:
                     trade_manager.log_decision(k_ticker, "yes", "skipped", "kelly_zero",
                                                edge=edge, price_cents=spread["kalshi_yes_ask"])

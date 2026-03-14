@@ -65,6 +65,8 @@ def make_fake_auth(**overrides):
     mod.retry_request = MagicMock(return_value=None)
     mod.notify_whatsapp = MagicMock()
     mod.notify_webhook = MagicMock()
+    mod.normalize_market = MagicMock(side_effect=lambda market: market)
+    mod.normalize_markets = MagicMock(side_effect=lambda markets: markets)
 
     # Constants
     mod.PROJECT_DIR = PROJECT_DIR

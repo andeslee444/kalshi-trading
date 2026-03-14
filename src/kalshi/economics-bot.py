@@ -125,11 +125,24 @@ def _classify_econ_market(ticker):
 FAMILY_EXPOSURE_PCT = 0.15   # 15% of bankroll per ticker family
 TOTAL_ECON_PCT = 0.40        # 40% total economics exposure
 MAX_CONTRACTS_PER_ORDER = 200  # Hard cap: prevent enormous penny-contract positions
+ECON_EXPOSURE_PREFIXES = ("KXECON", "KXCPI", "KXGDP", "KXJOBS", "KXGAS", "KXINFLATION")
 
 def _ticker_family(ticker):
     """Extract ticker family (everything before -T/-B threshold suffix)."""
     m = re.match(r'^(.*?)-[TB][\d.]+$', ticker)
     return m.group(1) if m else ticker
+
+def _record_exposure_cents(record):
+    """Extract exposure from either trade logs or live position payloads."""
+    raw = record.get("cost_cents")
+    if raw is None:
+        raw = record.get("market_exposure")
+    if raw is None:
+        raw = record.get("risk_cents")
+    try:
+        return max(0, int(float(raw)))
+    except (TypeError, ValueError):
+        return 0
 
 def _compute_exposure(trades, match_value, match_mode="family"):
     """Sum cost_cents across trades matching a ticker family or prefix."""
@@ -138,11 +151,58 @@ def _compute_exposure(trades, match_value, match_mode="family"):
         t_ticker = t.get("ticker", "")
         if match_mode == "family":
             if _ticker_family(t_ticker) == match_value:
-                total += t.get("cost_cents", 0)
+                total += _record_exposure_cents(t)
         elif match_mode == "prefix":
             if t_ticker.startswith(match_value):
-                total += t.get("cost_cents", 0)
+                total += _record_exposure_cents(t)
     return total
+
+
+def _fallback_trade_exposure_records(trades):
+    """Best-effort exposure fallback when live positions are unavailable."""
+    net_by_ticker = {}
+    for trade in trades:
+        ticker = trade.get("ticker", "")
+        if not ticker:
+            continue
+        status = str(trade.get("status", "")).lower()
+        if status and status not in {"executed", "filled", "complete", "resting"}:
+            continue
+        if trade.get("settlement_result") is not None:
+            continue
+        exposure = _record_exposure_cents(trade)
+        if exposure <= 0:
+            continue
+        sign = -1 if str(trade.get("action", "buy")).lower() == "sell" else 1
+        net_by_ticker[ticker] = net_by_ticker.get(ticker, 0) + sign * exposure
+
+    return [
+        {"ticker": ticker, "cost_cents": exposure}
+        for ticker, exposure in net_by_ticker.items()
+        if exposure > 0
+    ]
+
+
+def _load_active_econ_exposure_records():
+    """Load current economics exposure, preferring live positions over trade logs."""
+    try:
+        data = client.get("/portfolio/positions")
+        positions = data.get("market_positions", [])
+        active = []
+        for pos in positions:
+            ticker = pos.get("ticker", "")
+            if not ticker.startswith(ECON_EXPOSURE_PREFIXES):
+                continue
+            if pos.get("position", 0) == 0:
+                continue
+            exposure = _record_exposure_cents(pos)
+            if exposure <= 0:
+                continue
+            active.append({"ticker": ticker, "cost_cents": exposure})
+        return active
+    except Exception as e:
+        log.warning("Failed to fetch live econ exposure, falling back to trade log: %s", e)
+        return _fallback_trade_exposure_records(load_trades(TRADES_PATH))
 
 def _check_concentration(ticker, bankroll_cents, trades):
     """Check concentration limits. Returns (allowed, reason) tuple."""
@@ -156,12 +216,7 @@ def _check_concentration(ticker, bankroll_cents, trades):
 
     # Level 3: Total econ exposure (40%)
     total_cap = int(bankroll_cents * TOTAL_ECON_PCT)
-    total_exposure = _compute_exposure(trades, "KXECON", "prefix")
-    total_exposure += _compute_exposure(trades, "KXCPI", "prefix")
-    total_exposure += _compute_exposure(trades, "KXGDP", "prefix")
-    total_exposure += _compute_exposure(trades, "KXJOBS", "prefix")
-    total_exposure += _compute_exposure(trades, "KXGAS", "prefix")
-    total_exposure += _compute_exposure(trades, "KXINFLATION", "prefix")
+    total_exposure = sum(_compute_exposure(trades, prefix, "prefix") for prefix in ECON_EXPOSURE_PREFIXES)
     if total_exposure >= total_cap:
         return False, f"total_econ_cap: ${total_exposure/100:.0f} >= ${total_cap/100:.0f} (40%)"
 
@@ -1229,6 +1284,7 @@ def scan_and_trade():
     max_econ_exposure = int(balance * max_exposure_pct)
     log.info(f"  Edge scaler: {len([s for s in settled if s.get('profitable')])} wins -> "
              f"max {max_exposure_pct*100:.0f}% exposure (${max_econ_exposure/100:.0f})")
+    active_econ_exposure = _load_active_econ_exposure_records()
 
     for opp in opportunities:
         ticker = opp["ticker"]
@@ -1248,8 +1304,7 @@ def scan_and_trade():
             continue
 
         # Concentration check
-        existing_trades = load_trades(TRADES_PATH)
-        allowed, conc_reason = _check_concentration(ticker, budget.bankroll_cents, existing_trades)
+        allowed, conc_reason = _check_concentration(ticker, budget.bankroll_cents, active_econ_exposure)
         if not allowed:
             log.info(f"  Concentration limit hit for {ticker}: {conc_reason}")
             ss.skip("concentration_limit")
@@ -1333,7 +1388,9 @@ def scan_and_trade():
                                             data_source_timestamp=opp.get("data_source_timestamp"))
         if result:
             ss.trades_placed += 1
-            allocator.record_trade("economics", ticker, risk, edge=edge)
+            actual_risk = result.get("cost_cents", risk)
+            allocator.record_trade("economics", ticker, actual_risk, edge=edge)
+            active_econ_exposure.append({"ticker": ticker, "cost_cents": actual_risk})
 
     ss.finalize()
 

@@ -154,6 +154,18 @@ class TestSourceTracking:
         failing_issues = [i for i in issues if "failing" in i]
         assert len(failing_issues) == 0
 
+    def test_stale_source_errors_are_not_reported_forever(self, tmp_path):
+        hm = self._make_monitor(tmp_path)
+        old_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)).isoformat()
+        hm._state["sources"]["open-meteo"] = {
+            "last_success": None,
+            "last_error": old_time,
+            "error_count": 1870,
+            "opened_at": None,
+        }
+        issues = hm.check_health()
+        assert not any("source/open-meteo failing" in issue for issue in issues)
+
 
 class TestAutoHalt:
     """Test auto-halt on critical failure."""

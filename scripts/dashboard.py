@@ -37,6 +37,7 @@ LOG_DIR = DATA_DIR / "logs"
 HEALTH_STATE_PATH = DATA_DIR / "health-state.json"
 SUPERVISOR_STATE_PATH = PID_DIR / "supervisor-state.json"
 WEATHER_VERIFICATION_PATH = DATA_DIR / "weather-verification.json"
+WEATHER_NWS_CROSSCHECK_PATH = DATA_DIR / "weather-nws-cross-check.json"
 ALLOCATOR_STATE_PATH = DATA_DIR / "allocator-state.json"
 KILL_SWITCH_PATH = DATA_DIR / "HALT_TRADING"
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
@@ -235,6 +236,111 @@ def get_weather_actual_source_summary() -> dict:
         }
     except Exception as e:
         logger.warning("Failed to load weather verification summary: %s", e)
+        return {}
+
+
+def _weather_crosscheck_mode_recommendation(city: str, stats: dict, current_mode: str) -> dict:
+    """Heuristic recommendation for whether NWS gridpoint cross-check should remain enabled."""
+    n = int(stats.get("n", 0) or 0)
+    om_mae = stats.get("open_meteo_mae")
+    nws_mae = stats.get("nws_mae")
+    om_win = float(stats.get("open_meteo_better_share") or 0.0)
+    nws_win = float(stats.get("nws_better_share") or 0.0)
+
+    recommendation = {
+        "city": city,
+        "current_mode": current_mode,
+        "recommended_mode": current_mode,
+        "action": "hold",
+        "confidence": "low" if n < 8 else "medium",
+        "reason": "Waiting for more verified cross-check records",
+        "n": n,
+        "open_meteo_mae": om_mae,
+        "nws_mae": nws_mae,
+        "open_meteo_better_share": stats.get("open_meteo_better_share"),
+        "nws_better_share": stats.get("nws_better_share"),
+    }
+    if n < 5 or om_mae is None or nws_mae is None:
+        return recommendation
+
+    if om_win >= 0.70 and (nws_mae - om_mae) >= 1.0:
+        recommendation["recommended_mode"] = "disabled" if current_mode != "disabled" else "disabled"
+        recommendation["action"] = "tighten" if recommendation["recommended_mode"] != current_mode else "hold"
+        recommendation["confidence"] = "high" if n >= 10 else "medium"
+        recommendation["reason"] = (
+            f"Open-Meteo is materially better against settlement "
+            f"(MAE {om_mae:.2f}F vs {nws_mae:.2f}F, win {om_win:.0%}, n={n})"
+        )
+        return recommendation
+
+    if om_win >= 0.60 and (nws_mae - om_mae) >= 0.5:
+        recommendation["recommended_mode"] = "advisory_only" if current_mode != "disabled" else "disabled"
+        recommendation["action"] = "tighten" if recommendation["recommended_mode"] != current_mode else "hold"
+        recommendation["confidence"] = "medium"
+        recommendation["reason"] = (
+            f"Open-Meteo is outperforming NWS vs settlement "
+            f"(MAE {om_mae:.2f}F vs {nws_mae:.2f}F, win {om_win:.0%}, n={n})"
+        )
+        return recommendation
+
+    if nws_win >= 0.60 and (om_mae - nws_mae) >= 0.5:
+        recommendation["recommended_mode"] = "gridpoint"
+        recommendation["action"] = "promote" if current_mode != "gridpoint" else "hold"
+        recommendation["confidence"] = "high" if n >= 10 else "medium"
+        recommendation["reason"] = (
+            f"NWS is adding signal against settlement "
+            f"(MAE {nws_mae:.2f}F vs {om_mae:.2f}F, win {nws_win:.0%}, n={n})"
+        )
+        return recommendation
+
+    recommendation["confidence"] = "medium" if n >= 8 else "low"
+    recommendation["reason"] = (
+        f"No clear winner yet (OM MAE {om_mae:.2f}F, NWS MAE {nws_mae:.2f}F, n={n})"
+    )
+    return recommendation
+
+
+def get_weather_nws_crosscheck_summary() -> dict:
+    """Return recent Open-Meteo vs NWS cross-check performance for dashboard display."""
+    try:
+        from forecast_verifier import NWSCrossCheckVerifier
+    except Exception as e:
+        logger.warning("Failed to import NWSCrossCheckVerifier for dashboard health: %s", e)
+        return {}
+
+    try:
+        verifier = NWSCrossCheckVerifier(WEATHER_NWS_CROSSCHECK_PATH, logger=logger)
+        verifier.load()
+        weather_cfg = load_json_safe(WEATHER_CONFIG_PATH) or {}
+        cross_cfg = weather_cfg.get("nwsCrossValidation", {}) if isinstance(weather_cfg, dict) else {}
+        default_mode = str(cross_cfg.get("defaultMode", "gridpoint"))
+        city_modes = cross_cfg.get("cityModes") or cross_cfg.get("modes") or {}
+
+        summary_7d = verifier.get_summary(lookback_days=7)
+        summary_30d = verifier.get_summary(lookback_days=30)
+
+        recommendations = {}
+        for city, stats in (summary_30d.get("per_city") or {}).items():
+            current_mode = str(city_modes.get(city, default_mode))
+            recommendations[city] = _weather_crosscheck_mode_recommendation(city, stats, current_mode)
+
+        actionable = {
+            city: rec for city, rec in recommendations.items()
+            if rec.get("recommended_mode") != rec.get("current_mode")
+        }
+
+        return {
+            "summary_7d": summary_7d,
+            "summary_30d": summary_30d,
+            "recommendations": recommendations,
+            "actionable": actionable,
+            "pending_count": len(verifier.state.get("pending", [])),
+            "verified_count": len(verifier.state.get("verified", [])),
+            "last_verification": verifier.state.get("stats", {}).get("last_verification"),
+            "default_mode": default_mode,
+        }
+    except Exception as e:
+        logger.warning("Failed to load weather NWS cross-check summary: %s", e)
         return {}
 
 
@@ -912,6 +1018,9 @@ async def api_health():
     weather_actuals = get_weather_actual_source_summary()
     if weather_actuals:
         health_data["weather_actuals"] = weather_actuals
+    weather_nws_crosscheck = get_weather_nws_crosscheck_summary()
+    if weather_nws_crosscheck:
+        health_data["weather_nws_crosscheck"] = weather_nws_crosscheck
     return health_data
 
 

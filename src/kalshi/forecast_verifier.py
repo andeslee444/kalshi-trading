@@ -251,14 +251,20 @@ class ForecastVerifier:
         Returns:
             dict of {model_name: {"mae": float|None, "bias": float|None, "n": int,
                      "brier_predictions": [(pred_prob, actual_outcome), ...]}}
-            Includes models with >= 10 verified snapshot errors or >= 10 market-level
-            Brier predictions in the lookback window.
+            Includes models with recent pending coverage even when resolved samples
+            are still thin, so the live ensemble can blend adaptive weights toward
+            current-model coverage instead of overfitting the narrow verified set.
         """
         cutoff = datetime.date.today() - datetime.timedelta(days=lookback_days)
         recent = [v for v in self.state["verified"]
                   if self._parse_date(v.get("date")) and self._parse_date(v["date"]) >= cutoff]
+        pending_cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=lookback_days)
+        recent_pending = [
+            p for p in self.state["pending"]
+            if self._parse_datetime(p.get("recorded_at")) and self._parse_datetime(p["recorded_at"]) >= pending_cutoff
+        ]
 
-        if not recent:
+        if not recent and not recent_pending:
             return {}
 
         # Aggregate per-model stats
@@ -295,11 +301,30 @@ class ForecastVerifier:
                         (prob_for_model, actual_outcome)
                     )
 
+        pending_counts = {}
+        for record in recent_pending:
+            key = "pending_market_n" if record.get("record_kind", "snapshot") == "market" else "pending_snapshot_n"
+            for model_name in record.get("models", {}).keys():
+                stats = pending_counts.setdefault(
+                    model_name,
+                    {"pending_snapshot_n": 0, "pending_market_n": 0},
+                )
+                stats[key] += 1
+
         # Build summary with minimum sample requirement
         min_samples = 10
         summary = {}
-        for model_name, data in model_data.items():
-            if len(data["errors"]) < min_samples and len(data["brier_predictions"]) < min_samples:
+        for model_name in sorted(set(model_data) | set(pending_counts)):
+            data = model_data.get(model_name, {"errors": [], "brier_predictions": []})
+            pending = pending_counts.get(
+                model_name,
+                {"pending_snapshot_n": 0, "pending_market_n": 0},
+            )
+            resolved_n = len(data["errors"])
+            market_n = len(data["brier_predictions"])
+            if resolved_n < min_samples and market_n < min_samples and (
+                pending["pending_snapshot_n"] + pending["pending_market_n"]
+            ) < min_samples:
                 continue
 
             errors = data["errors"]
@@ -310,7 +335,10 @@ class ForecastVerifier:
                 "mae": round(mae, 2) if mae is not None else None,
                 "bias": round(bias, 2) if bias is not None else None,
                 "n": len(errors),
+                "market_n": market_n,
                 "brier_predictions": data["brier_predictions"],
+                "pending_snapshot_n": pending["pending_snapshot_n"],
+                "pending_market_n": pending["pending_market_n"],
             }
 
         return summary
@@ -350,15 +378,15 @@ class ForecastVerifier:
 
         return deltas
 
-    def get_city_bias(self, lookback_days=30):
+    def get_city_bias(self, lookback_days=30, min_samples=2, full_weight_n=10):
         """Return per-city forecast bias for skew parameter estimation.
 
         Returns:
-            dict of {city: {"bias_f": float, "skew_alpha": float, "n": int}}
+            dict of {city: {"bias_f": float, "skew_alpha": float, "n": int, "confidence": float}}
             skew_alpha is derived from bias: positive bias (warm) -> negative alpha
             (model overestimates), negative bias (cold) -> positive alpha.
-            Scaling: alpha = -bias_f * 0.3 (heuristic).
-            Only includes cities with >= 15 verified forecasts.
+            Scaling: alpha = -bias_f * 0.3 (heuristic), further shrunk by sample
+            confidence so thin live samples influence the distribution gently.
         """
         cutoff = datetime.date.today() - datetime.timedelta(days=lookback_days)
         recent = [v for v in self.state["verified"]
@@ -384,24 +412,71 @@ class ForecastVerifier:
                     city_errors[city].append(avg_error)
 
         # Build bias summary with minimum sample requirement
-        min_samples = 15
         bias_summary = {}
         for city, errors in city_errors.items():
             if len(errors) < min_samples:
                 continue
 
             bias_f = sum(errors) / len(errors)  # positive = warm bias
+            confidence = min(1.0, len(errors) / max(1.0, float(full_weight_n)))
             # Skew alpha: negative bias maps to positive alpha (model underestimates)
             # positive bias maps to negative alpha (model overestimates)
-            skew_alpha = -bias_f * 0.3
+            skew_alpha = -bias_f * 0.3 * confidence
 
             bias_summary[city] = {
                 "bias_f": round(bias_f, 2),
                 "skew_alpha": round(skew_alpha, 3),
                 "n": len(errors),
+                "confidence": round(confidence, 3),
             }
 
         return bias_summary
+
+    def get_city_model_bias(self, lookback_days=30, min_samples=2, full_weight_n=10):
+        """Return per-city, per-model bias from verified settlement-aligned forecasts.
+
+        Returns:
+            dict of {city: {model: {"bias_f": float, "n": int, "confidence": float}}}
+            Confidence is a simple sample-size shrinkage factor so thin live samples
+            can influence corrections without fully overriding raw model output.
+        """
+        cutoff = datetime.date.today() - datetime.timedelta(days=lookback_days)
+        recent = [
+            v for v in self.state["verified"]
+            if self._parse_date(v.get("date")) and self._parse_date(v["date"]) >= cutoff
+        ]
+
+        if not recent:
+            return {}
+
+        city_model_errors = {}
+        for record in recent:
+            if record.get("record_kind", "snapshot") != "snapshot":
+                continue
+            city = record.get("city")
+            errors = record.get("errors", {})
+            if not city or not isinstance(errors, dict):
+                continue
+            for model_name, error in errors.items():
+                city_model_errors.setdefault(city, {}).setdefault(model_name, []).append(error)
+
+        summary = {}
+        for city, per_model in city_model_errors.items():
+            city_summary = {}
+            for model_name, errors in per_model.items():
+                if len(errors) < min_samples:
+                    continue
+                confidence = min(1.0, len(errors) / max(1.0, float(full_weight_n)))
+                bias_f = sum(errors) / len(errors)
+                city_summary[model_name] = {
+                    "bias_f": round(bias_f, 2),
+                    "n": len(errors),
+                    "confidence": round(confidence, 3),
+                }
+            if city_summary:
+                summary[city] = city_summary
+
+        return summary
 
     def get_actual_source_summary(self, lookback_days=30):
         """Summarize verification actual sources over a recent window."""
@@ -563,6 +638,19 @@ class ForecastVerifier:
             return None
 
     @staticmethod
+    def _parse_datetime(dt_str):
+        """Parse an ISO datetime string, returning None on failure."""
+        if not dt_str:
+            return None
+        try:
+            dt = datetime.datetime.fromisoformat(dt_str)
+        except (ValueError, TypeError):
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+
+    @staticmethod
     def _record_identity(record):
         kind = record.get("record_kind", "snapshot")
         base = (record.get("city"), record.get("date"), kind)
@@ -602,3 +690,263 @@ class ForecastVerifier:
     def _city_local_today(self, city_code):
         tz = ZoneInfo(self._city_tz_name(city_code))
         return datetime.datetime.now(tz).date()
+
+
+class NWSCrossCheckVerifier(ForecastVerifier):
+    """Persist Open-Meteo vs NWS gridpoint comparisons and verify against settlement."""
+
+    def record_comparison(
+        self,
+        city,
+        date_str,
+        open_meteo_temp,
+        nws_temp,
+        days_out=None,
+        threshold_f=None,
+        mode="gridpoint",
+        open_meteo_models=None,
+        model_run_tags=None,
+        recorded_at=None,
+    ):
+        """Record one cross-check comparison for later settlement audit."""
+        try:
+            open_meteo_temp = float(open_meteo_temp)
+            nws_temp = float(nws_temp)
+        except (TypeError, ValueError):
+            return
+
+        record = {
+            "city": city,
+            "date": date_str,
+            "open_meteo_temp": round(open_meteo_temp, 2),
+            "nws_temp": round(nws_temp, 2),
+            "open_meteo_minus_nws": round(open_meteo_temp - nws_temp, 2),
+            "mode": str(mode or "gridpoint"),
+            "recorded_at": recorded_at or datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        if days_out is not None:
+            try:
+                record["days_out"] = max(0, int(days_out))
+            except (TypeError, ValueError):
+                pass
+        if isinstance(threshold_f, (int, float)):
+            record["threshold_f"] = round(float(threshold_f), 2)
+        if isinstance(open_meteo_models, dict):
+            record["open_meteo_models"] = {
+                model: temp
+                for model, temp in open_meteo_models.items()
+                if temp is not None
+            }
+        if isinstance(model_run_tags, dict):
+            record["model_run_tags"] = {
+                model: tag
+                for model, tag in model_run_tags.items()
+                if tag is not None
+            }
+
+        record_id = self._comparison_identity(record)
+        self.state["pending"] = [
+            existing for existing in self.state["pending"]
+            if self._comparison_identity(existing) != record_id
+        ]
+        self.state["pending"].append(record)
+
+    def verify_past_comparisons(self, station_map=None, max_calls=5):
+        """Resolve older cross-check records against settlement actual highs."""
+        if not station_map:
+            return
+
+        to_verify = []
+        remaining = []
+        for record in self.state["pending"]:
+            forecast_date = self._parse_date(record.get("date"))
+            if forecast_date is None:
+                remaining.append(record)
+                continue
+            cutoff = self._city_local_today(record.get("city")) - datetime.timedelta(days=2)
+            if forecast_date <= cutoff:
+                to_verify.append(record)
+            else:
+                remaining.append(record)
+
+        if not to_verify:
+            return
+
+        api_calls = 0
+        verified_this_scan = []
+        actual_cache = {}
+
+        for record in to_verify:
+            city = record.get("city")
+            station_id = station_map.get(city)
+            date_str = record.get("date")
+            if not city or not station_id or not date_str:
+                remaining.append(record)
+                continue
+
+            cache_key = (city, date_str)
+            if cache_key in actual_cache:
+                actual_high, actual_source = actual_cache[cache_key]
+            else:
+                if api_calls >= max_calls:
+                    remaining.append(record)
+                    continue
+                actual_high, actual_source = self._fetch_actual_high(
+                    station_id,
+                    date_str,
+                    city_code=city,
+                )
+                actual_cache[cache_key] = (actual_high, actual_source)
+                api_calls += 1
+
+            if actual_high is None:
+                remaining.append(record)
+                continue
+
+            om_error = round(float(record["open_meteo_temp"]) - actual_high, 2)
+            nws_error = round(float(record["nws_temp"]) - actual_high, 2)
+            verified_record = dict(record)
+            verified_record["actual_high"] = actual_high
+            if actual_source is not None:
+                verified_record["actual_source"] = actual_source
+            verified_record["open_meteo_error"] = om_error
+            verified_record["nws_error"] = nws_error
+            verified_record["open_meteo_abs_error"] = round(abs(om_error), 2)
+            verified_record["nws_abs_error"] = round(abs(nws_error), 2)
+            verified_record["winner"] = self._winner(
+                verified_record["open_meteo_abs_error"],
+                verified_record["nws_abs_error"],
+            )
+            verified_record["verified_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            verified_this_scan.append(verified_record)
+
+        self.state["pending"] = remaining
+        self.state["verified"].extend(verified_this_scan)
+        self.state["stats"]["total_verified"] = len(self.state["verified"])
+        if verified_this_scan:
+            self.state["stats"]["last_verification"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            self.log.info(
+                "Verified %d NWS cross-check records (total: %d)",
+                len(verified_this_scan),
+                len(self.state["verified"]),
+            )
+
+    def get_summary(self, lookback_days=30, tolerance_f=0.11):
+        """Summarize verified Open-Meteo vs NWS cross-check performance."""
+        cutoff = datetime.date.today() - datetime.timedelta(days=lookback_days)
+        recent = [
+            record for record in self.state["verified"]
+            if self._parse_date(record.get("date")) and self._parse_date(record["date"]) >= cutoff
+        ]
+
+        return {
+            "lookback_days": lookback_days,
+            "overall": self._summarize_records(recent, tolerance_f=tolerance_f),
+            "per_city": {
+                city: self._summarize_records(rows, tolerance_f=tolerance_f)
+                for city, rows in sorted(self._group_by(recent, "city").items())
+            },
+            "per_mode": {
+                mode: self._summarize_records(rows, tolerance_f=tolerance_f)
+                for mode, rows in sorted(self._group_by(recent, "mode").items())
+            },
+            "per_days_out": {
+                str(days_out): self._summarize_records(rows, tolerance_f=tolerance_f)
+                for days_out, rows in sorted(self._group_by(recent, "days_out").items())
+            },
+        }
+
+    @staticmethod
+    def _comparison_identity(record):
+        return (
+            record.get("city"),
+            record.get("date"),
+            record.get("mode", "gridpoint"),
+            record.get("days_out"),
+            round(float(record.get("open_meteo_temp", 0.0)), 1),
+            round(float(record.get("nws_temp", 0.0)), 1),
+        )
+
+    @staticmethod
+    def _group_by(records, key):
+        grouped = {}
+        for record in records:
+            value = record.get(key)
+            grouped.setdefault(value, []).append(record)
+        return grouped
+
+    @staticmethod
+    def _winner(open_meteo_abs_error, nws_abs_error, tolerance_f=0.11):
+        if ForecastVerifier._temps_match(open_meteo_abs_error, nws_abs_error, tolerance_f):
+            return "tie"
+        if open_meteo_abs_error < nws_abs_error:
+            return "open_meteo"
+        return "nws"
+
+    @classmethod
+    def _summarize_records(cls, records, tolerance_f=0.11):
+        if not records:
+            return {
+                "n": 0,
+                "open_meteo_mae": None,
+                "nws_mae": None,
+                "open_meteo_bias": None,
+                "nws_bias": None,
+                "mean_open_meteo_minus_nws": None,
+                "open_meteo_better": 0,
+                "nws_better": 0,
+                "ties": 0,
+                "open_meteo_better_share": None,
+                "nws_better_share": None,
+                "tie_share": None,
+            }
+
+        om_errors = [float(record["open_meteo_error"]) for record in records if record.get("open_meteo_error") is not None]
+        nws_errors = [float(record["nws_error"]) for record in records if record.get("nws_error") is not None]
+        diffs = [float(record["open_meteo_minus_nws"]) for record in records if record.get("open_meteo_minus_nws") is not None]
+        open_meteo_better = 0
+        nws_better = 0
+        ties = 0
+        for record in records:
+            winner = record.get("winner")
+            if winner == "open_meteo":
+                open_meteo_better += 1
+            elif winner == "nws":
+                nws_better += 1
+            else:
+                winner = cls._winner(
+                    abs(float(record.get("open_meteo_error", 0.0))),
+                    abs(float(record.get("nws_error", 0.0))),
+                    tolerance_f=tolerance_f,
+                )
+                if winner == "open_meteo":
+                    open_meteo_better += 1
+                elif winner == "nws":
+                    nws_better += 1
+                else:
+                    ties += 1
+                    continue
+            if winner == "tie":
+                ties += 1
+
+        total = len(records)
+        om_mae = sum(abs(err) for err in om_errors) / len(om_errors) if om_errors else None
+        nws_mae = sum(abs(err) for err in nws_errors) / len(nws_errors) if nws_errors else None
+        om_bias = sum(om_errors) / len(om_errors) if om_errors else None
+        nws_bias = sum(nws_errors) / len(nws_errors) if nws_errors else None
+        mean_diff = sum(diffs) / len(diffs) if diffs else None
+
+        return {
+            "n": total,
+            "open_meteo_mae": round(om_mae, 2) if om_mae is not None else None,
+            "nws_mae": round(nws_mae, 2) if nws_mae is not None else None,
+            "open_meteo_bias": round(om_bias, 2) if om_bias is not None else None,
+            "nws_bias": round(nws_bias, 2) if nws_bias is not None else None,
+            "mean_open_meteo_minus_nws": round(mean_diff, 2) if mean_diff is not None else None,
+            "open_meteo_better": open_meteo_better,
+            "nws_better": nws_better,
+            "ties": ties,
+            "open_meteo_better_share": round(open_meteo_better / total, 3) if total else None,
+            "nws_better_share": round(nws_better / total, 3) if total else None,
+            "tie_share": round(ties / total, 3) if total else None,
+        }
