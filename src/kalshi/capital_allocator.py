@@ -29,6 +29,7 @@ from artifact_contracts import BUDGET_RESPONSE_FIELDS, normalize_allocator_state
 from correlation_engine import CorrelationEngine, CorrelationConfig
 from regime_detector import RegimeDetector, regime_kelly_multiplier
 from edge_monitor import EdgeMonitor
+from event_ledger import get_event_ledger
 from storage import SnapshotStore, StateStore
 
 _log = logging.getLogger("capital_allocator")
@@ -270,6 +271,7 @@ class PortfolioAllocator:
             logger=self.log,
             normalizer=normalize_allocator_state,
         )
+        self._ledger = get_event_ledger(logger=self.log)
 
         # In-memory state (loaded from / saved to file)
         # ticker -> {"bot": str, "timestamp": str, "signal_quality": float,
@@ -784,6 +786,8 @@ class PortfolioAllocator:
         # other bots during slow network calls.
         self._prefetch_api_data()
 
+        request_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
         def _do_request():
             self._load_state()
             self._reset_daily_if_needed_inner()
@@ -796,11 +800,53 @@ class PortfolioAllocator:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 self._holding_lock = True
                 try:
-                    return _do_request()
+                    response = _do_request()
                 finally:
                     self._holding_lock = False
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        return _do_request()
+        else:
+            response = _do_request()
+        self._record_budget_decision(
+            timestamp=request_ts,
+            bot_name=bot_name,
+            ticker=ticker,
+            edge=edge,
+            confidence=confidence,
+            bot_max_cost_cents=bot_max_cost_cents,
+            source_type=source_type,
+            response=response,
+        )
+        return response
+
+    def _record_budget_decision(
+        self,
+        *,
+        timestamp,
+        bot_name,
+        ticker,
+        edge,
+        confidence,
+        bot_max_cost_cents,
+        source_type,
+        response,
+    ):
+        try:
+            self._ledger.record_budget_decision({
+                "timestamp": timestamp,
+                "bot_name": bot_name,
+                "ticker": ticker,
+                "edge": round(float(edge), 6) if edge is not None else None,
+                "confidence": round(float(confidence), 6) if confidence is not None else None,
+                "bot_max_cost_cents": int(bot_max_cost_cents),
+                "source_type": source_type,
+                "approved": bool(response.approved),
+                "max_cost_cents": int(response.max_cost_cents),
+                "bankroll_cents": int(response.bankroll_cents),
+                "reason": response.reason,
+                "binding_constraint": response.binding_constraint,
+            })
+        except Exception as e:
+            self.log.warning("Failed to dual-write budget decision: %s", e)
 
     def _request_budget_inner(self, bot_name, ticker, edge, confidence, bot_max_cost_cents, source_type=None):
         """Inner budget logic (called under lock)."""

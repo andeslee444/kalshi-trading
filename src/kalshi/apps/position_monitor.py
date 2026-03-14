@@ -16,6 +16,7 @@ import json, time, datetime, os, sys, re, argparse, logging
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from app_bootstrap import AppContext, install_app_context
+from event_ledger import get_event_ledger
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, TradeManager, trim_trade_log, CITY_TIMEZONES, _local_today,
@@ -246,6 +247,14 @@ def get_open_positions():
             p["yes"] = pos_val if pos_val > 0 else 0
             p["no"] = abs(pos_val) if pos_val < 0 else 0
             result.append(p)
+        try:
+            get_event_ledger(logger=log).record_position_snapshot(
+                result,
+                observed_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                source="position_monitor",
+            )
+        except Exception:
+            pass
         return result
     except Exception as e:
         log.error(f"Failed to fetch positions: {e}")

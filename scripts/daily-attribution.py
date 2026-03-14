@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import json
 import os
 import sys
@@ -17,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"
 
 from pnl_attribution import PnLAttributor
 from edge_monitor import EdgeMonitor
+from event_ledger import DEFAULT_LEDGER_PATH, get_event_ledger
 from trade_files import TRADE_FILES as _CANONICAL_TRADE_FILES
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -86,14 +88,17 @@ def main():
     parser = argparse.ArgumentParser(description="Daily P&L Attribution")
     parser.add_argument("--save", action="store_true", help="Save report to JSON")
     parser.add_argument("--notify", action="store_true", help="Send WhatsApp alerts")
+    parser.add_argument("--use-ledger", action="store_true", help="Read trades from the SQLite event ledger")
     args = parser.parse_args()
 
     attr = PnLAttributor(
         trade_file_paths=TRADE_FILES,
         regime_state_path=str(DATA_DIR / "regime-state.json"),
+        ledger_path=DEFAULT_LEDGER_PATH if args.use_ledger else None,
     )
     attr.load_trades()
     report = attr.full_report()
+    report["generated_at"] = report.get("generated_at") or datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     print_report(report)
 
@@ -102,6 +107,10 @@ def main():
         with open(str(out_path) + ".tmp", "w") as f:
             json.dump(report, f, indent=2)
         os.replace(str(out_path) + ".tmp", str(out_path))
+        try:
+            get_event_ledger(path=DEFAULT_LEDGER_PATH).record_post_trade_attribution(report)
+        except Exception:
+            pass
         print(f"\nSaved to {out_path}")
 
     check_edge_decay(notify=args.notify)

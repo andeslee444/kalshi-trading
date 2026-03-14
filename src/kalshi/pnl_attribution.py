@@ -19,6 +19,8 @@ import logging
 from collections import defaultdict
 from pathlib import Path
 
+from event_ledger import get_event_ledger
+
 log = logging.getLogger("pnl-attribution")
 
 # Default edge bucket boundaries (inclusive low, exclusive high)
@@ -101,7 +103,7 @@ def _finalize_stats(group):
 class PnLAttributor:
     """P&L attribution engine — decomposes realized returns by multiple dimensions."""
 
-    def __init__(self, trade_file_paths=None, regime_state_path=None):
+    def __init__(self, trade_file_paths=None, regime_state_path=None, ledger_path=None):
         """
         Args:
             trade_file_paths: List of dicts with "path" (str/Path) and "bot" (str) keys.
@@ -109,6 +111,7 @@ class PnLAttributor:
         """
         self._trade_file_paths = trade_file_paths
         self._regime_state_path = regime_state_path
+        self._ledger_path = ledger_path
         self._trades = []       # Settled trades only (with _pnl_cents)
         self._all_trades = []   # All trades including unsettled
 
@@ -120,6 +123,15 @@ class PnLAttributor:
         """
         if trades is not None:
             self._all_trades = list(trades)
+        elif self._ledger_path and self._trade_file_paths:
+            ledger = get_event_ledger(path=self._ledger_path, logger=log)
+            self._all_trades = []
+            for tf in self._trade_file_paths:
+                trades_for_path = ledger.get_trade_records(tf["path"])
+                for t in trades_for_path:
+                    if not t.get("source_bot"):
+                        t["source_bot"] = tf.get("bot", "unknown")
+                    self._all_trades.append(t)
         elif self._trade_file_paths:
             self._all_trades = []
             for tf in self._trade_file_paths:

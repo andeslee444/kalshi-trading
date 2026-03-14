@@ -13,6 +13,7 @@ import json, time, datetime, os, sys, re, hashlib
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from app_bootstrap import AppContext, install_app_context
+from event_ledger import get_event_ledger
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, quarter_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, nws_sigma_for_hour
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
@@ -37,7 +38,18 @@ trade_manager = None
 def save_snapshot(source_name, content, ext="html"):
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     fname = f"{source_name}_{ts}.{ext}"
-    (SNAPSHOTS_DIR / fname).write_text(content[:500000] if isinstance(content, str) else json.dumps(content, indent=2)[:500000])
+    payload = content[:500000] if isinstance(content, str) else json.dumps(content, indent=2)[:500000]
+    (SNAPSHOTS_DIR / fname).write_text(payload)
+    try:
+        get_event_ledger(logger=log).record_source_observation(
+            source_name=source_name,
+            snapshot_name=fname,
+            content_hash=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            observed_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            extra={"ext": ext},
+        )
+    except Exception:
+        pass
     # Cleanup: delete snapshots older than 7 days
     try:
         cutoff = time.time() - 7 * 86400
