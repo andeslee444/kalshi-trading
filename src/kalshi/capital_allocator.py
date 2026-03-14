@@ -18,7 +18,6 @@ Usage:
 """
 
 import fcntl
-import json
 import os
 import re
 import time
@@ -30,11 +29,22 @@ from artifact_contracts import BUDGET_RESPONSE_FIELDS, normalize_allocator_state
 from correlation_engine import CorrelationEngine, CorrelationConfig
 from regime_detector import RegimeDetector, regime_kelly_multiplier
 from edge_monitor import EdgeMonitor
+from event_ledger import get_event_ledger
+from storage import SnapshotStore, StateStore
 
 _log = logging.getLogger("capital_allocator")
 
+from kalshi_auth import notify_webhook
 
-from kalshi_auth import atomic_write_json as _atomic_write_json, notify_webhook
+
+def _load_dict_snapshot(path, logger=None):
+    data = SnapshotStore(path, logger=logger or _log).load(default={})
+    return data if isinstance(data, dict) else {}
+
+
+def _load_list_snapshot(path, logger=None):
+    data = SnapshotStore(path, logger=logger or _log).load(default=[])
+    return data if isinstance(data, list) else []
 
 
 # Default path for shared state file (all bots converge here)
@@ -79,7 +89,7 @@ def _load_absolute_cap():
     try:
         config_path = Path(__file__).resolve().parent.parent.parent / "config" / "bots-config.json"
         if config_path.exists():
-            cfg = json.loads(config_path.read_text())
+            cfg = _load_dict_snapshot(config_path)
             cap_dollars = cfg.get("allocator", {}).get("absoluteDailyLossCap", 100)
             if not isinstance(cap_dollars, (int, float)):
                 _log.warning("absoluteDailyLossCap has invalid type %s, using $100 default", type(cap_dollars).__name__)
@@ -100,7 +110,7 @@ def _load_absolute_cap_pct():
     try:
         config_path = Path(__file__).resolve().parent.parent.parent / "config" / "bots-config.json"
         if config_path.exists():
-            cfg = json.loads(config_path.read_text())
+            cfg = _load_dict_snapshot(config_path)
             pct = cfg.get("allocator", {}).get("absoluteDailyLossCapPct", 0)
             if not isinstance(pct, (int, float)):
                 _log.warning("absoluteDailyLossCapPct has invalid type %s, using 0 default", type(pct).__name__)
@@ -120,7 +130,7 @@ def _load_drawdown_threshold():
     try:
         config_path = Path(__file__).resolve().parent.parent.parent / "config" / "bots-config.json"
         if config_path.exists():
-            cfg = json.loads(config_path.read_text())
+            cfg = _load_dict_snapshot(config_path)
             val = cfg.get("allocator", {}).get("drawdownHaltThreshold", 0.50)
             return max(0.05, min(0.95, float(val)))
     except Exception:
@@ -141,7 +151,7 @@ def _load_per_bot_daily_limits():
     try:
         config_path = Path(__file__).resolve().parent.parent.parent / "config" / "bots-config.json"
         if config_path.exists():
-            cfg = json.loads(config_path.read_text())
+            cfg = _load_dict_snapshot(config_path)
             raw = cfg.get("allocator", {}).get("perBotDailyLimit", {})
             return {k: int(float(v) * 100) for k, v in raw.items()
                     if isinstance(v, (int, float)) and v > 0}
@@ -256,6 +266,12 @@ class PortfolioAllocator:
             self.state_path = Path(state_path)
         else:
             self.state_path = DEFAULT_STATE_PATH
+        self._state_store = StateStore(
+            self.state_path,
+            logger=self.log,
+            normalizer=normalize_allocator_state,
+        )
+        self._ledger = get_event_ledger(logger=self.log)
 
         # In-memory state (loaded from / saved to file)
         # ticker -> {"bot": str, "timestamp": str, "signal_quality": float,
@@ -346,7 +362,7 @@ class PortfolioAllocator:
             deposits_path = self.state_path.parent / "deposits.json" if self.state_path else _DEPOSITS_PATH
             if not deposits_path.exists():
                 return False
-            deposits = json.loads(deposits_path.read_text())
+            deposits = _load_list_snapshot(deposits_path, logger=self.log)
             total_deposited = sum(
                 e.get("amount_cents", 0) for e in deposits
                 if e.get("type") == "deposit"
@@ -392,7 +408,7 @@ class PortfolioAllocator:
         try:
             config_path = Path(__file__).resolve().parent.parent.parent / "config" / "bots-config.json"
             if config_path.exists():
-                cfg = json.loads(config_path.read_text())
+                cfg = _load_dict_snapshot(config_path, logger=self.log)
                 corr = cfg.get("correlation", {})
                 return CorrelationConfig(
                     cluster_max_fraction=corr.get("clusterMaxFraction", 0.15),
@@ -425,20 +441,13 @@ class PortfolioAllocator:
 
         Uses self._holding_lock to skip locking when caller already holds it.
         """
-        if not self.state_path or not self.state_path.exists():
+        if not self.state_path:
             return
-        lock_path = self.state_path.with_suffix(".lock")
         try:
             if self._holding_lock:
-                data = json.loads(self.state_path.read_text())
+                data = self._state_store.load_unlocked()
             else:
-                with open(lock_path, "w") as lock_fd:
-                    fcntl.flock(lock_fd, fcntl.LOCK_SH)
-                    try:
-                        data = json.loads(self.state_path.read_text())
-                    finally:
-                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            data = normalize_allocator_state(data)
+                data = self._state_store.load()
             raw_tickers = data.get("traded_tickers", {})
             # Backward compat: convert old tuple/list format to new dict format
             self._traded_tickers = {}
@@ -486,34 +495,17 @@ class PortfolioAllocator:
             "region_risk": self._region_risk,
             "daily_date": self._daily_date,
         })
-        lock_path = self.state_path.with_suffix(".lock")
+
+        def _merge_on_disk(on_disk):
+            merged = normalize_allocator_state(on_disk)
+            merged.update(data)
+            return normalize_allocator_state(merged)
+
         try:
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
             if self._holding_lock:
-                on_disk = normalize_allocator_state(None)
-                if self.state_path.exists():
-                    try:
-                        on_disk = normalize_allocator_state(json.loads(self.state_path.read_text()))
-                    except (json.JSONDecodeError, OSError):
-                        pass
-                on_disk.update(data)
-                on_disk = normalize_allocator_state(on_disk)
-                _atomic_write_json(self.state_path, on_disk)
+                self._state_store.save_unlocked(_merge_on_disk(self._state_store.load_unlocked()))
             else:
-                with open(lock_path, "w") as lock_fd:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                    try:
-                        on_disk = normalize_allocator_state(None)
-                        if self.state_path.exists():
-                            try:
-                                on_disk = normalize_allocator_state(json.loads(self.state_path.read_text()))
-                            except (json.JSONDecodeError, OSError):
-                                pass
-                        on_disk.update(data)
-                        on_disk = normalize_allocator_state(on_disk)
-                        _atomic_write_json(self.state_path, on_disk)
-                    finally:
-                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                self._state_store.update(_merge_on_disk)
         except Exception as e:
             self.log.warning("Failed to save allocator state: %s", e)
 
@@ -794,6 +786,8 @@ class PortfolioAllocator:
         # other bots during slow network calls.
         self._prefetch_api_data()
 
+        request_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
         def _do_request():
             self._load_state()
             self._reset_daily_if_needed_inner()
@@ -806,11 +800,53 @@ class PortfolioAllocator:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 self._holding_lock = True
                 try:
-                    return _do_request()
+                    response = _do_request()
                 finally:
                     self._holding_lock = False
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        return _do_request()
+        else:
+            response = _do_request()
+        self._record_budget_decision(
+            timestamp=request_ts,
+            bot_name=bot_name,
+            ticker=ticker,
+            edge=edge,
+            confidence=confidence,
+            bot_max_cost_cents=bot_max_cost_cents,
+            source_type=source_type,
+            response=response,
+        )
+        return response
+
+    def _record_budget_decision(
+        self,
+        *,
+        timestamp,
+        bot_name,
+        ticker,
+        edge,
+        confidence,
+        bot_max_cost_cents,
+        source_type,
+        response,
+    ):
+        try:
+            self._ledger.record_budget_decision({
+                "timestamp": timestamp,
+                "bot_name": bot_name,
+                "ticker": ticker,
+                "edge": round(float(edge), 6) if edge is not None else None,
+                "confidence": round(float(confidence), 6) if confidence is not None else None,
+                "bot_max_cost_cents": int(bot_max_cost_cents),
+                "source_type": source_type,
+                "approved": bool(response.approved),
+                "max_cost_cents": int(response.max_cost_cents),
+                "bankroll_cents": int(response.bankroll_cents),
+                "reason": response.reason,
+                "binding_constraint": response.binding_constraint,
+            })
+        except Exception as e:
+            self.log.warning("Failed to dual-write budget decision: %s", e)
 
     def _request_budget_inner(self, bot_name, ticker, edge, confidence, bot_max_cost_cents, source_type=None):
         """Inner budget logic (called under lock)."""

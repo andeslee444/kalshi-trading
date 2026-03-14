@@ -24,6 +24,13 @@ from cryptography.hazmat.backends import default_backend
 from dotenv import load_dotenv
 
 from artifact_contracts import normalize_health_state, normalize_health_summary
+from event_ledger import get_event_ledger
+from storage import (
+    DecisionStore,
+    MetricsStore,
+    TradeStore,
+    atomic_write_json as storage_atomic_write_json,
+)
 
 # === Constants ===
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
@@ -490,29 +497,12 @@ class KalshiClient:
 
 def load_trades(trades_path: Path) -> list:
     """Load trades from a JSON file. Returns [] on missing/corrupt file."""
-    if trades_path.exists():
-        try:
-            return json.loads(trades_path.read_text())
-        except (json.JSONDecodeError, ValueError) as e:
-            _log.warning("Corrupt trades file %s: %s", trades_path, e)
-            return []
-    return []
+    return TradeStore(trades_path, logger=_log).load()
 
 
 def atomic_write_json(path: Path, data):
     """Write JSON data to a file atomically using a temp file + os.replace()."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp_path, str(path))
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    storage_atomic_write_json(path, data)
 
 # Backward-compatible alias
 _atomic_write_json = atomic_write_json
@@ -520,16 +510,11 @@ _atomic_write_json = atomic_write_json
 
 def save_trade(trades_path: Path, trade: dict):
     """Append a trade to a JSON trades file (atomic write with file lock)."""
-    trades_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = trades_path.with_suffix(".lock")
-    with open(lock_path, "w") as lock_fd:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        try:
-            trades = load_trades(trades_path)
-            trades.append(trade)
-            _atomic_write_json(trades_path, trades)
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    TradeStore(trades_path, logger=_log).append(trade)
+    try:
+        get_event_ledger(logger=_log).record_order_submitted(trade, source_path=trades_path)
+    except Exception as e:
+        _log.warning("Failed to dual-write trade to event ledger: %s", e)
 
 
 # === Shared market data cache ===
@@ -972,21 +957,19 @@ def _append_scan_summary(summary):
     clobbering each other's data.
     """
     try:
-        SCAN_SUMMARIES_PATH.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = SCAN_SUMMARIES_PATH.with_suffix(".lock")
-        with open(lock_path, "w") as lock_fd:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            try:
-                existing = []
-                if SCAN_SUMMARIES_PATH.exists():
-                    existing = json.loads(SCAN_SUMMARIES_PATH.read_text())
-                existing.append(summary)
-                _maybe_alert_on_scan_summary(existing, summary)
-                if len(existing) > 2000:
-                    existing = existing[-1500:]
-                _atomic_write_json(SCAN_SUMMARIES_PATH, existing)
-            finally:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        store = MetricsStore(SCAN_SUMMARIES_PATH, logger=_log)
+
+        def _append(existing):
+            summaries = list(existing)
+            summaries.append(summary)
+            _maybe_alert_on_scan_summary(summaries, summary)
+            return store._trim_records(
+                summaries,
+                max_records=store.max_records,
+                trim_to=store.trim_to,
+            )
+
+        store.update(_append)
     except Exception as e:
         _log.warning("Failed to append scan summary: %s", e)
 
@@ -1178,6 +1161,7 @@ class TradeManager:
 
         # Write-ahead log for crash recovery
         self._wal_path = self.trades_path.with_suffix(".wal.json")
+        self._wal_store = TradeStore(self._wal_path, logger=self.log)
         self._recover_wal()
 
         # Log if percentage-based scaling is active
@@ -1278,28 +1262,23 @@ class TradeManager:
 
     def _write_wal(self, entry):
         """Write a pending trade entry to the WAL file."""
-        entries = self._read_wal()
-        entries.append(entry)
-        _atomic_write_json(self._wal_path, entries)
+        self._wal_store.append(entry)
 
     def _read_wal(self):
         """Read all WAL entries. Returns [] if missing/corrupt."""
-        if not self._wal_path.exists():
-            return []
-        try:
-            data = json.loads(self._wal_path.read_text())
-            return data if isinstance(data, list) else []
-        except (json.JSONDecodeError, OSError):
-            return []
+        return self._wal_store.load()
 
     def _clear_wal(self, order_id):
         """Remove a confirmed entry from the WAL by order_id."""
-        entries = self._read_wal()
-        entries = [e for e in entries if e.get("order_id") != order_id]
-        if entries:
-            _atomic_write_json(self._wal_path, entries)
-        elif self._wal_path.exists():
-            self._wal_path.unlink()
+        with self._wal_store.lock():
+            entries = [
+                entry for entry in self._wal_store.load_unlocked()
+                if entry.get("order_id") != order_id
+            ]
+            if entries:
+                self._wal_store.save_unlocked(entries)
+            elif self._wal_path.exists():
+                self._wal_path.unlink()
 
     def _recover_wal(self):
         """On startup, check WAL for trades that were sent but not logged."""
@@ -1335,7 +1314,7 @@ class TradeManager:
         if failed_entries:
             self.log.warning("WAL recovery: %d entries unverified, retaining for next startup",
                              len(failed_entries))
-            _atomic_write_json(self._wal_path, failed_entries)
+            self._wal_store.save(failed_entries)
         elif self._wal_path.exists():
             self._wal_path.unlink()
 
@@ -1815,20 +1794,12 @@ def save_decision(decisions_path: Path, decision: dict):
 
     Uses fcntl.LOCK_EX to prevent concurrent writes from multiple bots.
     """
-    decisions_path = Path(decisions_path)
-    decisions_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = decisions_path.with_suffix(".lock")
     try:
-        with open(lock_path, "w") as lock_fd:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            try:
-                decisions = load_trades(decisions_path)
-                if len(decisions) >= 5000:
-                    decisions = decisions[-4000:]
-                decisions.append(decision)
-                _atomic_write_json(decisions_path, decisions)
-            finally:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        DecisionStore(decisions_path, logger=_log).append(decision)
+        try:
+            get_event_ledger(logger=_log).record_trade_decision(decision, source_path=decisions_path)
+        except Exception as e:
+            _log.warning("Failed to dual-write decision to event ledger: %s", e)
     except Exception as e:
         _log.warning("Failed to save decision: %s", e)
 

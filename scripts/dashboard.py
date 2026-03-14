@@ -33,7 +33,9 @@ from bot_registry import (
     DECISION_FILE_SPECS,
 )
 from edge_monitor import EdgeMonitor
+from event_ledger import DEFAULT_LEDGER_PATH, get_event_ledger
 from execution_quality import ExecutionAnalyzer
+from storage import SnapshotStore, TradeStore
 from ticker_utils import format_ticker_human
 from trade_files import TRADE_FILES as _CANONICAL_FILES
 
@@ -96,21 +98,32 @@ DECISION_FILES = [
 ]
 
 
+def _dashboard_data_source() -> str:
+    value = (os.environ.get("KALSHI_DASHBOARD_DATA_SOURCE", "legacy") or "legacy").strip().lower()
+    return value if value in ("legacy", "ledger") else "legacy"
+
+
+def _use_ledger_reads() -> bool:
+    return _dashboard_data_source() == "ledger"
+
+
+def _ledger():
+    return get_event_ledger(path=DEFAULT_LEDGER_PATH, logger=logger)
+
+
 # ─── Helpers (from analyze-performance.py) ───
 
 def load_trades_safe(filepath: Path) -> list | None:
-    if not filepath.exists():
-        return None
-    try:
-        text = filepath.read_text().strip()
-        if not text:
-            return None
-        data = json.loads(text)
-        if not isinstance(data, list):
-            return None
-        return data
-    except (json.JSONDecodeError, ValueError, OSError):
-        return None
+    if _use_ledger_reads():
+        path_str = str(Path(filepath))
+        trade_paths = {str(Path(tf["path"])) for tf in TRADE_FILES}
+        decision_paths = {str(Path(df["path"])) for df in DECISION_FILES}
+        ledger = _ledger()
+        if path_str in trade_paths:
+            return ledger.get_trade_records(filepath)
+        if path_str in decision_paths:
+            return ledger.get_decision_records(filepath)
+    return TradeStore(filepath, logger=logger).load(default=None)
 
 
 def extract_side(trade: dict) -> str:
@@ -175,19 +188,21 @@ def extract_timestamp(trade: dict) -> str | None:
 
 
 def load_json_safe(filepath: Path) -> dict | list | None:
-    if not filepath.exists():
-        return None
-    try:
-        text = filepath.read_text().strip()
-        if not text:
-            return None
-        return json.loads(text)
-    except (json.JSONDecodeError, ValueError, OSError):
-        return None
+    return SnapshotStore(filepath, logger=logger).load(default=None)
 
 
 def get_weather_actual_source_summary() -> dict:
     """Return recent NWS-vs-IEM actual-source mix for dashboard health display."""
+    if _use_ledger_reads():
+        try:
+            ledger = _ledger()
+            return {
+                "summary_7d": ledger.get_actual_source_summary(lookback_days=7),
+                "summary_30d": ledger.get_actual_source_summary(lookback_days=30),
+            }
+        except Exception as e:
+            logger.warning("Failed to load ledger actual-source summary: %s", e)
+            return {}
     try:
         from forecast_verifier import ForecastVerifier
     except Exception as e:
@@ -269,6 +284,16 @@ def _weather_crosscheck_mode_recommendation(city: str, stats: dict, current_mode
 
 def get_weather_nws_crosscheck_summary() -> dict:
     """Return recent Open-Meteo vs NWS cross-check performance for dashboard display."""
+    if _use_ledger_reads():
+        try:
+            ledger = _ledger()
+            return {
+                "summary_7d": ledger.get_nws_crosscheck_summary(lookback_days=7),
+                "summary_30d": ledger.get_nws_crosscheck_summary(lookback_days=30),
+            }
+        except Exception as e:
+            logger.warning("Failed to load ledger NWS cross-check summary: %s", e)
+            return {}
     try:
         from forecast_verifier import NWSCrossCheckVerifier
     except Exception as e:
@@ -1149,12 +1174,7 @@ async def api_exit_state():
     """
     # Load trailing state
     trailing_path = DATA_DIR / "trailing-state.json"
-    trailing = {}
-    if trailing_path.exists():
-        try:
-            trailing = json.loads(trailing_path.read_text())
-        except (json.JSONDecodeError, ValueError):
-            pass
+    trailing = load_json_safe(trailing_path) or {}
 
     # Load bots config for exit thresholds
     bots_config = load_json_safe(BOTS_CONFIG_PATH) or {}
@@ -1221,6 +1241,7 @@ async def api_attribution():
     attr = PnLAttributor(
         trade_file_paths=_ANALYTICS_TRADE_FILES,
         regime_state_path=str(PROJECT_DIR / "data" / "regime-state.json"),
+        ledger_path=DEFAULT_LEDGER_PATH if _use_ledger_reads() else None,
     )
     attr.load_trades()
     report = attr.full_report()
@@ -1270,7 +1291,10 @@ async def api_execution_quality():
     if cached is not None:
         return cached
 
-    ea = ExecutionAnalyzer(trade_file_paths=_ANALYTICS_TRADE_FILES)
+    ea = ExecutionAnalyzer(
+        trade_file_paths=_ANALYTICS_TRADE_FILES,
+        ledger_path=DEFAULT_LEDGER_PATH if _use_ledger_reads() else None,
+    )
     ea.load_trades()
     report = ea.json_report()
     cache.set("exec_quality", report, ttl=120)
@@ -1283,12 +1307,7 @@ async def api_execution_quality():
 async def api_correlation():
     """Return correlation engine state for monitoring."""
     state_path = DATA_DIR / "correlation-state.json"
-    if state_path.exists():
-        try:
-            return json.loads(state_path.read_text())
-        except (json.JSONDecodeError, ValueError):
-            pass
-    return {"cluster_risk": {}, "portfolio_var": 0, "last_updated": ""}
+    return load_json_safe(state_path) or {"cluster_risk": {}, "portfolio_var": 0, "last_updated": ""}
 
 
 def main():
