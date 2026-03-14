@@ -22,6 +22,7 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR / "src" / "kalshi"))
 
+from artifact_contracts import normalize_financial_snapshot
 from trade_files import TRADE_FILES as _CANONICAL_FILES
 
 DATA_DIR = PROJECT_DIR / "data"
@@ -325,7 +326,7 @@ def build_snapshot(balance_cents, portfolio_value_cents, settlements, fills,
         true_total_pnl = nav_cents - net_funded
         deposits["roi_pct"] = round(true_total_pnl / net_funded * 100, 2)
 
-    return {
+    return normalize_financial_snapshot({
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "sources_used": ["kalshi_api", "local_trade_logs"],
         "account": {
@@ -338,7 +339,7 @@ def build_snapshot(balance_cents, portfolio_value_cents, settlements, fills,
         "balance_check": balance_check,
         "verification": verification,
         "deposits": deposits,
-    }
+    })
 
 
 def _build_balance_check(nav_cents, realized, deposits):

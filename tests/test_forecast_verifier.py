@@ -9,6 +9,10 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, "src/kalshi")
 
 from artifact_contracts import (
+    NWS_CROSSCHECK_PENDING_FIELDS,
+    NWS_CROSSCHECK_VERIFIED_FIELDS,
+    VERIFICATION_PENDING_FIELDS,
+    VERIFICATION_VERIFIED_FIELDS,
     WEATHER_NWS_CROSSCHECK_ARTIFACT,
     WEATHER_VERIFICATION_ARTIFACT,
 )
@@ -198,8 +202,10 @@ class TestForecastVerifier:
             verifier.verify_past_forecasts(station_map={"MIA": "KMIA"})
 
         assert len(verifier.state["verified"]) == 1
-        assert verifier.state["verified"][0]["actual_high"] == 80.0
-        assert verifier.state["verified"][0]["actual_source"] == "nws_cli"
+        record = verifier.state["verified"][0]
+        assert set(VERIFICATION_VERIFIED_FIELDS).issubset(record)
+        assert record["actual_high"] == 80.0
+        assert record["actual_source"] == "nws_cli"
 
     def test_get_actual_source_summary_counts_missing_and_present_sources(self, tmp_path):
         verifier = ForecastVerifier(tmp_path / "weather-verification.json")
@@ -396,6 +402,7 @@ class TestForecastVerifier:
     def test_save_persists_schema_metadata(self, tmp_path):
         verifier = ForecastVerifier(tmp_path / "weather-verification.json")
         verifier.record_forecast("MIA", "2026-03-10", {"gfs": 82.0})
+        assert set(VERIFICATION_PENDING_FIELDS).issubset(verifier.state["pending"][0])
         verifier.save()
 
         data = json.loads((tmp_path / "weather-verification.json").read_text())
@@ -420,8 +427,32 @@ class TestForecastVerifier:
     def test_nws_crosscheck_persists_distinct_artifact_type(self, tmp_path):
         verifier = NWSCrossCheckVerifier(tmp_path / "weather-nws-cross-check.json")
         verifier.record_comparison("DEN", "2026-03-14", 68.0, 60.0)
+        assert set(NWS_CROSSCHECK_PENDING_FIELDS).issubset(verifier.state["pending"][0])
         verifier.save()
 
         data = json.loads((tmp_path / "weather-nws-cross-check.json").read_text())
         assert data["artifact_type"] == WEATHER_NWS_CROSSCHECK_ARTIFACT
         assert data["schema_version"] == 1
+
+    def test_nws_crosscheck_verified_record_has_required_fields(self, tmp_path):
+        with patch("forecast_verifier.SettlementTemperatureFetcher") as mock_fetcher_cls:
+            mock_fetcher = MagicMock()
+            mock_fetcher.fetch_daily_high_with_source.return_value = (65.0, "nws_cli")
+            mock_fetcher_cls.return_value = mock_fetcher
+            verifier = NWSCrossCheckVerifier(tmp_path / "weather-nws-cross-check.json")
+
+        verifier.state["pending"] = [{
+            "city": "DEN",
+            "date": "2026-03-10",
+            "open_meteo_temp": 68.0,
+            "nws_temp": 60.0,
+            "open_meteo_minus_nws": 8.0,
+            "mode": "advisory_only",
+            "recorded_at": "2026-03-10T12:00:00+00:00",
+        }]
+
+        with patch.object(verifier, "_city_local_today", return_value=datetime.date(2026, 3, 12)):
+            verifier.verify_past_comparisons(station_map={"DEN": "KDEN"})
+
+        record = verifier.state["verified"][0]
+        assert set(NWS_CROSSCHECK_VERIFIED_FIELDS).issubset(record)

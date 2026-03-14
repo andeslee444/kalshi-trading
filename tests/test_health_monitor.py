@@ -11,7 +11,12 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from artifact_contracts import HEALTH_STATE_ARTIFACT
+from artifact_contracts import (
+    HEALTH_STATE_ARTIFACT,
+    HEALTH_SUMMARY_BOT_FIELDS,
+    HEALTH_SUMMARY_REQUIRED_FIELDS,
+    HEALTH_SUMMARY_SOURCE_FIELDS,
+)
 from kalshi_auth import (
     HealthCheckMonitor, KILL_SWITCH_PATH, BOT_SOURCE_MAP,
     notify_imessage, _reset_imessage_rate_limiter,
@@ -310,9 +315,11 @@ class TestHealthSummary:
         for _ in range(5):
             mon.record_source_error("boxoffice", "timeout")
         summary = mon.get_summary()
+        assert set(HEALTH_SUMMARY_REQUIRED_FIELDS).issubset(summary)
         assert "hdd" in summary["sources"]
         assert "nws" in summary["sources"]
         assert "boxoffice" in summary["sources"]
+        assert set(HEALTH_SUMMARY_SOURCE_FIELDS).issubset(summary["sources"]["hdd"])
         assert summary["sources"]["hdd"]["status"] == "ok"
         assert summary["sources"]["boxoffice"]["status"] == "error"
 
@@ -321,6 +328,7 @@ class TestHealthSummary:
         mon.record_bot_heartbeat("weather")
         summary = mon.get_summary()
         assert "weather" in summary["bots"]
+        assert set(HEALTH_SUMMARY_BOT_FIELDS).issubset(summary["bots"]["weather"])
 
     def test_summary_overall_healthy(self, tmp_path):
         mon = self._make_monitor(tmp_path)

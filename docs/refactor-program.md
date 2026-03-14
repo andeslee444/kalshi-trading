@@ -49,6 +49,8 @@ Target operating model:
 
 Objective: define what must not break.
 
+Status: complete on 2026-03-14.
+
 Deliverables:
 
 - Canonical bot registry:

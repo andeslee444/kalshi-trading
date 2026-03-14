@@ -12,6 +12,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from artifact_contracts import BUDGET_RESPONSE_FIELDS
 from capital_allocator import (
     PortfolioAllocator, compute_signal_quality, MODEL_QUALITY_FACTOR, BudgetResponse,
     CITY_REGIONS, _CITY_TO_REGION, MAX_REGION_FRACTION, _load_absolute_cap,
@@ -45,6 +46,30 @@ class TestSignalQuality:
         for bot in ["source-monitor", "economics", "entertainment",
                      "weather", "crypto", "strategy", "beatrelease"]:
             assert bot in MODEL_QUALITY_FACTOR
+
+
+class TestBudgetResponseContract:
+    """Test canonical allocator decision contract."""
+
+    def test_as_record_contains_required_fields_for_approval(self):
+        response = BudgetResponse(
+            True,
+            max_cost_cents=500,
+            bankroll_cents=10000,
+            reason="",
+            binding_constraint="bot_config_cap",
+        )
+        record = response.as_record()
+        assert set(BUDGET_RESPONSE_FIELDS) == set(record)
+        assert record["approved"] is True
+        assert record["binding_constraint"] == "bot_config_cap"
+
+    def test_as_record_contains_required_fields_for_denial(self):
+        response = BudgetResponse(False, reason="already traded")
+        record = response.as_record()
+        assert set(BUDGET_RESPONSE_FIELDS) == set(record)
+        assert record["approved"] is False
+        assert record["reason"] == "already traded"
 
 
 class TestSupersedeLogic:

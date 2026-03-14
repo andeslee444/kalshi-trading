@@ -27,6 +27,86 @@ DECISION_REQUIRED_FIELDS = (
     "source_bot",
 )
 
+BUDGET_RESPONSE_FIELDS = (
+    "approved",
+    "max_cost_cents",
+    "bankroll_cents",
+    "reason",
+    "binding_constraint",
+)
+
+HEALTH_SUMMARY_REQUIRED_FIELDS = (
+    "sources",
+    "bots",
+    "overall",
+)
+
+HEALTH_SUMMARY_SOURCE_FIELDS = (
+    "status",
+    "error_count",
+    "last_success",
+    "last_error",
+)
+
+HEALTH_SUMMARY_BOT_FIELDS = (
+    "status",
+    "last_heartbeat",
+)
+
+VERIFICATION_PENDING_FIELDS = (
+    "city",
+    "date",
+    "models",
+    "record_kind",
+    "recorded_at",
+)
+
+VERIFICATION_VERIFIED_FIELDS = (
+    "city",
+    "date",
+    "models",
+    "actual_high",
+    "errors",
+    "record_kind",
+    "recorded_at",
+    "verified_at",
+)
+
+NWS_CROSSCHECK_PENDING_FIELDS = (
+    "city",
+    "date",
+    "open_meteo_temp",
+    "nws_temp",
+    "open_meteo_minus_nws",
+    "mode",
+    "recorded_at",
+)
+
+NWS_CROSSCHECK_VERIFIED_FIELDS = (
+    "city",
+    "date",
+    "open_meteo_temp",
+    "nws_temp",
+    "open_meteo_minus_nws",
+    "mode",
+    "actual_high",
+    "open_meteo_error",
+    "nws_error",
+    "winner",
+    "verified_at",
+)
+
+FINANCIAL_SNAPSHOT_REQUIRED_FIELDS = (
+    "generated_at",
+    "sources_used",
+    "account",
+    "realized_pnl",
+    "unrealized_pnl",
+    "balance_check",
+    "verification",
+    "deposits",
+)
+
 SCHEMA_METADATA_FIELDS = ("artifact_type", "schema_version")
 
 HEALTH_STATE_ARTIFACT = "health_state"
@@ -127,4 +207,31 @@ def normalize_supervisor_state(data):
             "started_at": started_at,
             "restart_count": restart_count,
         }
+    return normalized
+
+
+def normalize_health_summary(data):
+    """Normalize HealthCheckMonitor.get_summary() output."""
+    normalized = dict(data) if isinstance(data, dict) else {}
+    normalized["sources"] = dict(normalized.get("sources")) if isinstance(normalized.get("sources"), dict) else {}
+    normalized["bots"] = dict(normalized.get("bots")) if isinstance(normalized.get("bots"), dict) else {}
+    overall = normalized.get("overall")
+    normalized["overall"] = overall if isinstance(overall, str) and overall else "healthy"
+    return normalized
+
+
+def normalize_financial_snapshot(data):
+    """Normalize financial-snapshot.json while preserving extra sections."""
+    normalized = with_schema_metadata(
+        data,
+        FINANCIAL_SNAPSHOT_ARTIFACT,
+        FINANCIAL_SNAPSHOT_SCHEMA_VERSION,
+    )
+    sources_used = normalized.get("sources_used")
+    normalized["sources_used"] = list(sources_used) if isinstance(sources_used, list) else []
+    for key in ("account", "realized_pnl", "unrealized_pnl", "balance_check", "verification", "deposits"):
+        value = normalized.get(key)
+        normalized[key] = dict(value) if isinstance(value, dict) else {}
+    generated_at = normalized.get("generated_at")
+    normalized["generated_at"] = generated_at if isinstance(generated_at, str) else None
     return normalized

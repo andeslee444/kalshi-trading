@@ -23,7 +23,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
 from dotenv import load_dotenv
 
-from artifact_contracts import normalize_health_state
+from artifact_contracts import normalize_health_state, normalize_health_summary
 
 # === Constants ===
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
@@ -2075,7 +2075,7 @@ class HealthCheckMonitor:
         elif issues >= 1:
             summary["overall"] = "degraded"
 
-        return summary
+        return normalize_health_summary(summary)
 
     def check_health(self, staleness_minutes=None):
         """Check for health issues. Returns list of issue strings.

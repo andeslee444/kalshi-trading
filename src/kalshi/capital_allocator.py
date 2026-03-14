@@ -26,7 +26,7 @@ import datetime
 import logging
 from pathlib import Path
 
-from artifact_contracts import normalize_allocator_state
+from artifact_contracts import BUDGET_RESPONSE_FIELDS, normalize_allocator_state
 from correlation_engine import CorrelationEngine, CorrelationConfig
 from regime_detector import RegimeDetector, regime_kelly_multiplier
 from edge_monitor import EdgeMonitor
@@ -229,6 +229,10 @@ class BudgetResponse:
         if self.approved:
             return f"BudgetResponse(approved=True, max_cost=${self.max_cost_cents/100:.2f}, bankroll=${self.bankroll_cents/100:.2f})"
         return f"BudgetResponse(approved=False, reason={self.reason!r})"
+
+    def as_record(self):
+        """Return the canonical allocator decision contract as a plain dict."""
+        return {field: getattr(self, field) for field in BUDGET_RESPONSE_FIELDS}
 
 
 class PortfolioAllocator:
