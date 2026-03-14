@@ -11,6 +11,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from artifact_contracts import HEALTH_STATE_ARTIFACT
 from kalshi_auth import (
     HealthCheckMonitor, KILL_SWITCH_PATH, BOT_SOURCE_MAP,
     notify_imessage, _reset_imessage_rate_limiter,
@@ -38,6 +39,15 @@ class TestBotHeartbeat:
         # Load a new instance from the same state file
         hm2 = HealthCheckMonitor(state_path=str(state_path))
         assert "crypto" in hm2._state["bots"]
+
+    def test_health_state_includes_schema_metadata(self, tmp_path):
+        state_path = tmp_path / "health-state.json"
+        hm = HealthCheckMonitor(state_path=str(state_path))
+        hm.record_bot_heartbeat("weather")
+
+        data = json.loads(state_path.read_text())
+        assert data["artifact_type"] == HEALTH_STATE_ARTIFACT
+        assert data["schema_version"] == 1
 
     def test_fresh_heartbeat_not_stale(self, tmp_path):
         hm = self._make_monitor(tmp_path, staleness_minutes=60)

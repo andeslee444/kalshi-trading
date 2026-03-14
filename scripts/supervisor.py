@@ -37,6 +37,7 @@ from bot_registry import (
     DAEMON_BOT_IDS,
     ONESHOT_BOT_IDS,
 )
+from artifact_contracts import normalize_supervisor_state
 from kalshi_auth import setup_logging, check_kill_switch, notify_webhook, per_bot_halt_path
 
 log = setup_logging("supervisor")
@@ -616,7 +617,7 @@ class Supervisor:
         if not SUPERVISOR_STATE_PATH.exists():
             return
         try:
-            state = json.loads(SUPERVISOR_STATE_PATH.read_text())
+            state = normalize_supervisor_state(json.loads(SUPERVISOR_STATE_PATH.read_text()))
         except (json.JSONDecodeError, OSError):
             return
         for name, bot in self.bots.items():
@@ -636,7 +637,7 @@ class Supervisor:
                 }
         try:
             tmp = SUPERVISOR_STATE_PATH.with_suffix(".tmp")
-            tmp.write_text(json.dumps(state, indent=2))
+            tmp.write_text(json.dumps(normalize_supervisor_state(state), indent=2))
             tmp.replace(SUPERVISOR_STATE_PATH)
         except OSError as e:
             log.warning(f"Failed to save supervisor state: {e}")

@@ -11,6 +11,8 @@ analytics jobs, and operator tools depend on.
 - Bot/process registry: [bot_registry.py](/Users/andeslee/Documents/cursor-projects/kalshi-trading/src/kalshi/bot_registry.py#L1)
 - Canonical trade log registry: [trade_files.py](/Users/andeslee/Documents/cursor-projects/kalshi-trading/src/kalshi/trade_files.py#L1)
 - Trade record schema: [trade-record-schema.md](/Users/andeslee/Documents/cursor-projects/kalshi-trading/docs/trade-record-schema.md#L1)
+- Decision record schema: [decision-record-schema.md](/Users/andeslee/Documents/cursor-projects/kalshi-trading/docs/decision-record-schema.md#L1)
+- Shared state schema helpers: [artifact_contracts.py](/Users/andeslee/Documents/cursor-projects/kalshi-trading/src/kalshi/artifact_contracts.py#L1)
 
 ## Trade And Decision Artifacts
 
@@ -42,6 +44,11 @@ Notes:
 | `data/weather-nws-cross-check.json` | weather bot / `NWSCrossCheckVerifier` | dashboard, weather audit scripts | Open-Meteo vs NWS comparison history |
 | `data/financial-snapshot.json` | `scripts/pnl-snapshot.py` | sync validation, reports | portfolio snapshot for audit/sync |
 | `data/pids/supervisor-state.json` | supervisor | dashboard | restart counts and process metadata |
+
+State metadata convention:
+
+- Shared mutable state files should include `artifact_type` and `schema_version` at the top level.
+- Phase 0 schema version for the current shared-state files is `1`.
 
 ## Bot Control Contracts
 

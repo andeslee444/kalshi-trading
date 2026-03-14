@@ -23,6 +23,8 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
 from dotenv import load_dotenv
 
+from artifact_contracts import normalize_health_state
+
 # === Constants ===
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 load_dotenv(PROJECT_DIR / ".env")
@@ -1864,10 +1866,7 @@ class HealthCheckMonitor:
         self._halt_transitions = {}  # bot_name -> timestamp of last halt/unhalt
         self.source_breaker_threshold = source_breaker_threshold
         self.source_breaker_cooldown_seconds = source_breaker_cooldown_seconds
-        self._state = {
-            "sources": {},      # source -> {"last_success": ts, "last_error": ts, "error_count": int}
-            "bots": {},         # bot -> {"last_heartbeat": ts}
-        }
+        self._state = normalize_health_state(None)
         self._dirty_bots = set()      # bot names modified by this process
         self._dirty_sources = set()   # source names modified by this process
         self._load()
@@ -1875,7 +1874,7 @@ class HealthCheckMonitor:
     def _load(self):
         if self.state_path.exists():
             try:
-                self._state = json.loads(self.state_path.read_text())
+                self._state = normalize_health_state(json.loads(self.state_path.read_text()))
             except (json.JSONDecodeError, OSError):
                 pass
 
@@ -1891,10 +1890,10 @@ class HealthCheckMonitor:
             with open(lock_path, "w") as lock_fd:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 try:
-                    on_disk = {"bots": {}, "sources": {}}
+                    on_disk = normalize_health_state(None)
                     if self.state_path.exists():
                         try:
-                            on_disk = json.loads(self.state_path.read_text())
+                            on_disk = normalize_health_state(json.loads(self.state_path.read_text()))
                         except (json.JSONDecodeError, OSError):
                             pass
                     # Only write back entries this process has modified, to avoid
@@ -1907,6 +1906,7 @@ class HealthCheckMonitor:
                     for source in self._dirty_sources:
                         if source in self._state.get("sources", {}):
                             on_disk_sources[source] = self._state["sources"][source]
+                    on_disk = normalize_health_state(on_disk)
                     _atomic_write_json(self.state_path, on_disk)
                 finally:
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)

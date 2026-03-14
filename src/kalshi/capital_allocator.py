@@ -26,6 +26,7 @@ import datetime
 import logging
 from pathlib import Path
 
+from artifact_contracts import normalize_allocator_state
 from correlation_engine import CorrelationEngine, CorrelationConfig
 from regime_detector import RegimeDetector, regime_kelly_multiplier
 from edge_monitor import EdgeMonitor
@@ -433,6 +434,7 @@ class PortfolioAllocator:
                         data = json.loads(self.state_path.read_text())
                     finally:
                         fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            data = normalize_allocator_state(data)
             raw_tickers = data.get("traded_tickers", {})
             # Backward compat: convert old tuple/list format to new dict format
             self._traded_tickers = {}
@@ -473,36 +475,38 @@ class PortfolioAllocator:
         """
         if not self.state_path:
             return
-        data = {
+        data = normalize_allocator_state({
             "traded_tickers": self._traded_tickers,
             "bot_spend": self._bot_spend,
             "city_risk": self._city_risk,
             "region_risk": self._region_risk,
             "daily_date": self._daily_date,
-        }
+        })
         lock_path = self.state_path.with_suffix(".lock")
         try:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             if self._holding_lock:
-                on_disk = {}
+                on_disk = normalize_allocator_state(None)
                 if self.state_path.exists():
                     try:
-                        on_disk = json.loads(self.state_path.read_text())
+                        on_disk = normalize_allocator_state(json.loads(self.state_path.read_text()))
                     except (json.JSONDecodeError, OSError):
                         pass
                 on_disk.update(data)
+                on_disk = normalize_allocator_state(on_disk)
                 _atomic_write_json(self.state_path, on_disk)
             else:
                 with open(lock_path, "w") as lock_fd:
                     fcntl.flock(lock_fd, fcntl.LOCK_EX)
                     try:
-                        on_disk = {}
+                        on_disk = normalize_allocator_state(None)
                         if self.state_path.exists():
                             try:
-                                on_disk = json.loads(self.state_path.read_text())
+                                on_disk = normalize_allocator_state(json.loads(self.state_path.read_text()))
                             except (json.JSONDecodeError, OSError):
                                 pass
                         on_disk.update(data)
+                        on_disk = normalize_allocator_state(on_disk)
                         _atomic_write_json(self.state_path, on_disk)
                     finally:
                         fcntl.flock(lock_fd, fcntl.LOCK_UN)

@@ -11,6 +11,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from artifact_contracts import DECISION_REQUIRED_FIELDS, TRADE_REQUIRED_FIELDS
 from probability import half_kelly, half_kelly_sell, quarter_kelly, high_conviction_kelly
 
 
@@ -166,6 +167,14 @@ class TestGoldenRecordBuild:
         )
         assert record["limit_price_rule"] == "balanced"
 
+    def test_record_contains_required_fields(self):
+        tm = self._make_tm()
+        record = tm._build_golden_record(
+            "KXHIGHNY-26FEB16-T40", "yes", 50, 2, 100,
+            "test", {"order_id": "req", "status": "ok"},
+        )
+        assert set(TRADE_REQUIRED_FIELDS).issubset(record)
+
 
 class TestEdgeDecayTracking:
     """Test edge_at_entry, model_fair_value_cents, model_name in golden record."""
@@ -305,3 +314,49 @@ class TestReconcileAnnotation:
 
         modified = mod._annotate_trade(trade, settlements, fills)
         assert modified is False
+
+
+class TestDecisionRecordContract:
+    """Test TradeManager.log_decision() persisted contract."""
+
+    def _make_tm(self):
+        from kalshi_auth import TradeManager
+        mock_client = MagicMock()
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            f.write(b"[]")
+            trades_path = Path(f.name)
+        tm = TradeManager.__new__(TradeManager)
+        tm.client = mock_client
+        tm.trades_path = trades_path
+        tm.config = {"maxTradeAmount": 10, "maxDailyTrades": 10, "maxDailyLoss": 50}
+        tm.log = MagicMock()
+        tm.log.name = "decision-bot"
+        tm.kill_switch_path = Path("/tmp/nonexistent_halt")
+        tm.tracker = MagicMock()
+        tm.breaker = MagicMock()
+        tm._daily_trades = 0
+        tm._daily_spend_cents = 0
+        tm._daily_date = None
+        return tm
+
+    def test_log_decision_writes_required_fields(self):
+        tm = self._make_tm()
+        tm.log_decision(
+            "KXHIGHMIA-26FEB16-T86",
+            "no",
+            "skipped",
+            "edge below threshold",
+            edge=0.123456,
+            price_cents=67,
+            model_prob=0.31,
+        )
+
+        decisions_path = tm.trades_path.parent / f"{tm.trades_path.stem}-decisions.json"
+        records = json.loads(decisions_path.read_text())
+        record = records[-1]
+
+        assert set(DECISION_REQUIRED_FIELDS).issubset(record)
+        assert record["source_bot"] == "decision-bot"
+        assert record["edge"] == 0.1235
+        assert record["price_cents"] == 67
+        assert record["model_prob"] == 0.31

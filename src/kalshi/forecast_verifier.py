@@ -11,6 +11,13 @@ import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from artifact_contracts import (
+    WEATHER_NWS_CROSSCHECK_ARTIFACT,
+    WEATHER_NWS_CROSSCHECK_SCHEMA_VERSION,
+    WEATHER_VERIFICATION_ARTIFACT,
+    WEATHER_VERIFICATION_SCHEMA_VERSION,
+    normalize_verification_state,
+)
 from weather_data import SettlementTemperatureFetcher
 
 _log = logging.getLogger("forecast_verifier")
@@ -50,6 +57,9 @@ class ForecastVerifier:
     4. get_city_bias() -- returns systematic bias per city for skew parameter
     """
 
+    STATE_ARTIFACT_TYPE = WEATHER_VERIFICATION_ARTIFACT
+    STATE_SCHEMA_VERSION = WEATHER_VERIFICATION_SCHEMA_VERSION
+
     def __init__(self, state_path, logger=None):
         """
         Args:
@@ -59,11 +69,7 @@ class ForecastVerifier:
         self.state_path = Path(state_path)
         self.log = logger or _log
         self._settlement_fetcher = SettlementTemperatureFetcher(logger=self.log)
-        self.state = {
-            "pending": [],
-            "verified": [],
-            "stats": {"last_verification": None, "total_verified": 0},
-        }
+        self.state = self._normalize_state(None)
 
     def record_forecast(self, city, date_str, model_forecasts, threshold=None,
                         model_prob=None, hour_of_day=None, per_model_probs=None,
@@ -568,10 +574,12 @@ class ForecastVerifier:
         """Persist state to disk using atomic write."""
         try:
             from kalshi_auth import _atomic_write_json
+            self.state = self._normalize_state(self.state)
             _atomic_write_json(self.state_path, self.state)
         except ImportError:
             # Fallback: direct write
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            self.state = self._normalize_state(self.state)
             self.state_path.write_text(json.dumps(self.state, indent=2))
         except Exception as e:
             self.log.warning("Failed to save verification state: %s", e)
@@ -582,14 +590,7 @@ class ForecastVerifier:
             if self.state_path.exists():
                 data = json.loads(self.state_path.read_text())
                 if isinstance(data, dict):
-                    self.state = {
-                        "pending": data.get("pending", []),
-                        "verified": data.get("verified", []),
-                        "stats": data.get("stats", {
-                            "last_verification": None,
-                            "total_verified": 0,
-                        }),
-                    }
+                    self.state = self._normalize_state(data)
                     self.log.info("Loaded verification state: %d pending, %d verified",
                                  len(self.state["pending"]), len(self.state["verified"]))
                     return
@@ -597,11 +598,7 @@ class ForecastVerifier:
             self.log.warning("Failed to load verification state: %s (starting fresh)", e)
 
         # Start fresh
-        self.state = {
-            "pending": [],
-            "verified": [],
-            "stats": {"last_verification": None, "total_verified": 0},
-        }
+        self.state = self._normalize_state(None)
 
     def cleanup(self, max_age_days=90):
         """Remove verification records older than max_age_days."""
@@ -691,9 +688,19 @@ class ForecastVerifier:
         tz = ZoneInfo(self._city_tz_name(city_code))
         return datetime.datetime.now(tz).date()
 
+    def _normalize_state(self, data):
+        return normalize_verification_state(
+            data,
+            artifact_type=self.STATE_ARTIFACT_TYPE,
+            schema_version=self.STATE_SCHEMA_VERSION,
+        )
+
 
 class NWSCrossCheckVerifier(ForecastVerifier):
     """Persist Open-Meteo vs NWS gridpoint comparisons and verify against settlement."""
+
+    STATE_ARTIFACT_TYPE = WEATHER_NWS_CROSSCHECK_ARTIFACT
+    STATE_SCHEMA_VERSION = WEATHER_NWS_CROSSCHECK_SCHEMA_VERSION
 
     def record_comparison(
         self,

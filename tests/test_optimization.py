@@ -25,6 +25,7 @@ import pytest
 from unittest.mock import MagicMock
 from pathlib import Path
 
+from artifact_contracts import ALLOCATOR_STATE_ARTIFACT
 from probability import (
     longshot_edge,
     classify_ticker_category,
@@ -1580,6 +1581,8 @@ class TestAllocatorSharedState:
 
         state_path = tmp_path / "allocator-state.json"
         data = json.loads(state_path.read_text())
+        assert data["artifact_type"] == ALLOCATOR_STATE_ARTIFACT
+        assert data["schema_version"] == 1
         assert "TICK-1" in data["traded_tickers"]
         assert data["bot_spend"]["weather"] == 500
 

@@ -1,12 +1,17 @@
 """Tests for forecast_verifier.py."""
 
 import datetime
+import json
 import sys
 import types
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, "src/kalshi")
 
+from artifact_contracts import (
+    WEATHER_NWS_CROSSCHECK_ARTIFACT,
+    WEATHER_VERIFICATION_ARTIFACT,
+)
 from forecast_verifier import ForecastVerifier, NWSCrossCheckVerifier
 
 
@@ -387,3 +392,36 @@ class TestForecastVerifier:
         assert summary["per_city"]["DEN"]["n"] == 2
         assert summary["per_days_out"]["1"]["open_meteo_better"] == 1
         assert summary["per_days_out"]["2"]["nws_better"] == 1
+
+    def test_save_persists_schema_metadata(self, tmp_path):
+        verifier = ForecastVerifier(tmp_path / "weather-verification.json")
+        verifier.record_forecast("MIA", "2026-03-10", {"gfs": 82.0})
+        verifier.save()
+
+        data = json.loads((tmp_path / "weather-verification.json").read_text())
+        assert data["artifact_type"] == WEATHER_VERIFICATION_ARTIFACT
+        assert data["schema_version"] == 1
+
+    def test_load_backfills_schema_metadata_for_legacy_file(self, tmp_path):
+        path = tmp_path / "weather-verification.json"
+        path.write_text(json.dumps({
+            "pending": [{"city": "MIA", "date": "2026-03-10", "models": {"gfs": 82.0}}],
+            "verified": [],
+            "stats": {},
+        }))
+
+        verifier = ForecastVerifier(path)
+        verifier.load()
+
+        assert verifier.state["artifact_type"] == WEATHER_VERIFICATION_ARTIFACT
+        assert verifier.state["schema_version"] == 1
+        assert verifier.state["pending"][0]["city"] == "MIA"
+
+    def test_nws_crosscheck_persists_distinct_artifact_type(self, tmp_path):
+        verifier = NWSCrossCheckVerifier(tmp_path / "weather-nws-cross-check.json")
+        verifier.record_comparison("DEN", "2026-03-14", 68.0, 60.0)
+        verifier.save()
+
+        data = json.loads((tmp_path / "weather-nws-cross-check.json").read_text())
+        assert data["artifact_type"] == WEATHER_NWS_CROSSCHECK_ARTIFACT
+        assert data["schema_version"] == 1
