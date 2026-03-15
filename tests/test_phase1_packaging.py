@@ -70,6 +70,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "execution",
         "execution.order_monitor",
         "execution.trade_manager",
+        "infra",
+        "infra.kalshi_client",
         "ops",
         "ops.health_monitor",
         "ops.logging",
@@ -79,6 +81,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "kalshi.execution",
         "kalshi.execution.order_monitor",
         "kalshi.execution.trade_manager",
+        "kalshi.infra",
+        "kalshi.infra.kalshi_client",
         "kalshi.ops",
         "kalshi.ops.health_monitor",
         "kalshi.ops.logging",
@@ -95,6 +99,10 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         pkg_trade_manager = importlib.import_module("kalshi.execution.trade_manager")
         flat_trade_manager = importlib.import_module("execution.trade_manager")
         assert Path(flat_trade_manager.__file__).resolve() == Path(pkg_trade_manager.__file__).resolve()
+
+        pkg_infra = importlib.import_module("kalshi.infra.kalshi_client")
+        flat_infra = importlib.import_module("infra.kalshi_client")
+        assert Path(flat_infra.__file__).resolve() == Path(pkg_infra.__file__).resolve()
 
         pkg_ops = importlib.import_module("kalshi.ops.logging")
         flat_ops = importlib.import_module("ops.logging")
@@ -116,6 +124,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "execution",
             "execution.order_monitor",
             "execution.trade_manager",
+            "infra",
+            "infra.kalshi_client",
             "ops",
             "ops.health_monitor",
             "ops.logging",
@@ -125,6 +135,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "kalshi.execution",
             "kalshi.execution.order_monitor",
             "kalshi.execution.trade_manager",
+            "kalshi.infra",
+            "kalshi.infra.kalshi_client",
             "kalshi.ops",
             "kalshi.ops.health_monitor",
             "kalshi.ops.logging",
