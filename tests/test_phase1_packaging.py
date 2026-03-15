@@ -71,6 +71,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "execution.order_monitor",
         "execution.trade_manager",
         "ops",
+        "ops.health_monitor",
         "ops.logging",
         "risk",
         "risk.kill_switch",
@@ -78,6 +79,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "kalshi.execution.order_monitor",
         "kalshi.execution.trade_manager",
         "kalshi.ops",
+        "kalshi.ops.health_monitor",
         "kalshi.ops.logging",
         "kalshi.risk",
         "kalshi.risk.kill_switch",
@@ -96,6 +98,10 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         flat_ops = importlib.import_module("ops.logging")
         assert Path(flat_ops.__file__).resolve() == Path(pkg_ops.__file__).resolve()
 
+        pkg_health = importlib.import_module("kalshi.ops.health_monitor")
+        flat_health = importlib.import_module("ops.health_monitor")
+        assert Path(flat_health.__file__).resolve() == Path(pkg_health.__file__).resolve()
+
         pkg_risk = importlib.import_module("kalshi.risk.kill_switch")
         flat_risk = importlib.import_module("risk.kill_switch")
         assert Path(flat_risk.__file__).resolve() == Path(pkg_risk.__file__).resolve()
@@ -105,6 +111,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "execution.order_monitor",
             "execution.trade_manager",
             "ops",
+            "ops.health_monitor",
             "ops.logging",
             "risk",
             "risk.kill_switch",
@@ -112,6 +119,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "kalshi.execution.order_monitor",
             "kalshi.execution.trade_manager",
             "kalshi.ops",
+            "kalshi.ops.health_monitor",
             "kalshi.ops.logging",
             "kalshi.risk",
             "kalshi.risk.kill_switch",
