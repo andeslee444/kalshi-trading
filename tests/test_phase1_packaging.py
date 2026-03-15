@@ -76,6 +76,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "domain.longshot",
         "domain.longshot.models",
         "domain",
+        "research",
+        "research.registry",
         "domain.shared",
         "domain.shared.stats",
         "domain.shared.sizing",
@@ -101,6 +103,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "kalshi.domain.longshot",
         "kalshi.domain.longshot.models",
         "kalshi.domain",
+        "kalshi.research",
+        "kalshi.research.registry",
         "kalshi.domain.shared",
         "kalshi.domain.shared.stats",
         "kalshi.domain.shared.sizing",
@@ -135,6 +139,10 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         pkg_longshot = importlib.import_module("kalshi.domain.longshot.models")
         flat_longshot = importlib.import_module("domain.longshot.models")
         assert Path(flat_longshot.__file__).resolve() == Path(pkg_longshot.__file__).resolve()
+
+        pkg_research = importlib.import_module("kalshi.research.registry")
+        flat_research = importlib.import_module("research.registry")
+        assert Path(flat_research.__file__).resolve() == Path(pkg_research.__file__).resolve()
 
         pkg_stats = importlib.import_module("kalshi.domain.shared.stats")
         flat_stats = importlib.import_module("domain.shared.stats")
@@ -186,6 +194,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "domain.longshot",
             "domain.longshot.models",
             "domain",
+            "research",
+            "research.registry",
             "domain.shared",
             "domain.shared.stats",
             "domain.shared.sizing",
@@ -211,6 +221,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "kalshi.domain.longshot",
             "kalshi.domain.longshot.models",
             "kalshi.domain",
+            "kalshi.research",
+            "kalshi.research.registry",
             "kalshi.domain.shared",
             "kalshi.domain.shared.stats",
             "kalshi.domain.shared.sizing",

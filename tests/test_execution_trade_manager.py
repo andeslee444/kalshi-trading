@@ -11,8 +11,6 @@ from execution.trade_manager import (
     trim_trade_log,
     validate_trade_config,
 )
-
-
 def _make_manager(tmp_path, config=None, **kwargs):
     client = MagicMock()
     client.post.return_value = {
@@ -71,15 +69,43 @@ def test_trade_manager_places_order_and_persists_trade(tmp_path):
     records = json.loads((tmp_path / "trades.json").read_text())
     assert records[-1]["ticker"] == "TICK-1"
     assert records[-1]["source_bot"] == "execution-trade-manager-test"
+    assert records[-1]["strategy_id"] == "execution-trade-manager-test"
+    assert records[-1]["config_version"]
 
 
 def test_trade_manager_log_decision_persists_record(tmp_path):
     manager, _ = _make_manager(tmp_path)
 
-    manager.log_decision("TICK-2", "no", "skipped", "edge below threshold", edge=0.123456, model_prob=0.31)
+    manager.log_decision(
+        "TICK-2",
+        "no",
+        "skipped",
+        "edge below threshold",
+        edge=0.123456,
+        model_prob=0.31,
+        model_name="threshold_model",
+    )
 
     decisions_path = tmp_path / "trades-decisions.json"
     records = json.loads(decisions_path.read_text())
     assert records[-1]["ticker"] == "TICK-2"
     assert records[-1]["edge"] == 0.1235
     assert records[-1]["model_prob"] == 0.31
+    assert records[-1]["strategy_id"] == "execution-trade-manager-test"
+    assert records[-1]["config_version"]
+    assert records[-1]["model_version"]
+
+
+def test_strategy_config_registry_is_written_on_manager_init(tmp_path):
+    manager, _ = _make_manager(
+        tmp_path,
+        {"maxTradeAmount": 5, "maxDailyTrades": 10, "maxDailyLoss": 25},
+    )
+
+    registry_path = tmp_path / "strategy-config-registry.json"
+    state = json.loads(registry_path.read_text())
+    assert manager._config_version
+    assert any(
+        entry["config_version"] == manager._config_version
+        for entry in state["entries"].values()
+    )

@@ -115,6 +115,8 @@ WEATHER_VERIFICATION_ARTIFACT = "weather_verification_state"
 WEATHER_NWS_CROSSCHECK_ARTIFACT = "weather_nws_cross_check_state"
 SUPERVISOR_STATE_ARTIFACT = "supervisor_state"
 FINANCIAL_SNAPSHOT_ARTIFACT = "financial_snapshot"
+MODEL_REGISTRY_ARTIFACT = "model_registry"
+STRATEGY_CONFIG_REGISTRY_ARTIFACT = "strategy_config_registry"
 
 HEALTH_STATE_SCHEMA_VERSION = 1
 ALLOCATOR_STATE_SCHEMA_VERSION = 1
@@ -122,6 +124,8 @@ WEATHER_VERIFICATION_SCHEMA_VERSION = 1
 WEATHER_NWS_CROSSCHECK_SCHEMA_VERSION = 1
 SUPERVISOR_STATE_SCHEMA_VERSION = 1
 FINANCIAL_SNAPSHOT_SCHEMA_VERSION = 1
+MODEL_REGISTRY_SCHEMA_VERSION = 1
+STRATEGY_CONFIG_REGISTRY_SCHEMA_VERSION = 1
 
 
 def with_schema_metadata(data, artifact_type, schema_version):
@@ -218,6 +222,32 @@ def normalize_health_summary(data):
     overall = normalized.get("overall")
     normalized["overall"] = overall if isinstance(overall, str) and overall else "healthy"
     return normalized
+
+
+def normalize_registry_state(data, artifact_type, schema_version):
+    """Normalize registry artifacts keyed by stable ids."""
+    normalized = with_schema_metadata(data, artifact_type, schema_version)
+    entries = normalized.get("entries")
+    normalized["entries"] = dict(entries) if isinstance(entries, dict) else {}
+    return normalized
+
+
+def normalize_model_registry(data):
+    """Normalize model-registry.json while preserving unknown entry payloads."""
+    return normalize_registry_state(
+        data,
+        MODEL_REGISTRY_ARTIFACT,
+        MODEL_REGISTRY_SCHEMA_VERSION,
+    )
+
+
+def normalize_strategy_config_registry(data):
+    """Normalize strategy-config-registry.json while preserving unknown entry payloads."""
+    return normalize_registry_state(
+        data,
+        STRATEGY_CONFIG_REGISTRY_ARTIFACT,
+        STRATEGY_CONFIG_REGISTRY_SCHEMA_VERSION,
+    )
 
 
 def normalize_financial_snapshot(data):

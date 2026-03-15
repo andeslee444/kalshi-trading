@@ -244,6 +244,18 @@ class TestEdgeDecayTracking:
         )
         assert record["model_name"] == "half_kelly"
 
+    def test_strategy_and_config_versions_are_stamped(self):
+        tm = self._make_tm()
+        tm.strategy_id = "decision-bot"
+        tm._config_version = "cfg123"
+        tm._model_registry = None
+        record = tm._build_golden_record(
+            "KXHIGHMIA-26FEB16-T86", "no", 70, 3, 210,
+            "test", {"order_id": "abc", "status": "ok"},
+        )
+        assert record["strategy_id"] == "decision-bot"
+        assert record["config_version"] == "cfg123"
+
     def test_none_when_no_edge_data(self):
         tm = self._make_tm()
         record = tm._build_golden_record(
@@ -360,3 +372,4 @@ class TestDecisionRecordContract:
         assert record["edge"] == 0.1235
         assert record["price_cents"] == 67
         assert record["model_prob"] == 0.31
+        assert record["strategy_id"] == "decision-bot"
