@@ -69,6 +69,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
     for name in (
         "domain.crypto",
         "domain.crypto.models",
+        "domain.economics",
+        "domain.economics.models",
         "domain",
         "domain.shared",
         "domain.shared.stats",
@@ -88,6 +90,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "risk.kill_switch",
         "kalshi.domain.crypto",
         "kalshi.domain.crypto.models",
+        "kalshi.domain.economics",
+        "kalshi.domain.economics.models",
         "kalshi.domain",
         "kalshi.domain.shared",
         "kalshi.domain.shared.stats",
@@ -111,6 +115,10 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         pkg_crypto = importlib.import_module("kalshi.domain.crypto.models")
         flat_crypto = importlib.import_module("domain.crypto.models")
         assert Path(flat_crypto.__file__).resolve() == Path(pkg_crypto.__file__).resolve()
+
+        pkg_economics = importlib.import_module("kalshi.domain.economics.models")
+        flat_economics = importlib.import_module("domain.economics.models")
+        assert Path(flat_economics.__file__).resolve() == Path(pkg_economics.__file__).resolve()
 
         pkg_stats = importlib.import_module("kalshi.domain.shared.stats")
         flat_stats = importlib.import_module("domain.shared.stats")
@@ -155,6 +163,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         for name in (
             "domain.crypto",
             "domain.crypto.models",
+            "domain.economics",
+            "domain.economics.models",
             "domain",
             "domain.shared",
             "domain.shared.stats",
@@ -174,6 +184,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "risk.kill_switch",
             "kalshi.domain.crypto",
             "kalshi.domain.crypto.models",
+            "kalshi.domain.economics",
+            "kalshi.domain.economics.models",
             "kalshi.domain",
             "kalshi.domain.shared",
             "kalshi.domain.shared.stats",
