@@ -12,6 +12,7 @@ from pathlib import Path
 
 import requests
 
+from research.registry import ModelRegistry, StrategyConfigRegistry
 from risk.circuit_breaker import CircuitBreaker, SHARED_BREAKER_PATH
 from risk.kill_switch import KILL_SWITCH_PATH, check_kill_switch, per_bot_halt_path
 from storage import TradeStore, atomic_write_json, load_trades, save_decision, save_trade
@@ -207,6 +208,10 @@ class TradeManager:
         factory = breaker_factory or (lambda state_path: CircuitBreaker(state_path=state_path))
         self.breaker = factory(breaker_state_path)
         self.order_monitor = order_monitor
+        self.strategy_id = bot_name or getattr(self.log, "name", None)
+        self._config_version = None
+        self._strategy_config_registry = None
+        self._model_registry = None
 
         self._sell_cooldown = {}
         self._sell_cooldown_seconds = 600
@@ -226,6 +231,7 @@ class TradeManager:
         self._wal_path = self.trades_path.with_suffix(".wal.json")
         self._wal_store = trade_store_cls(self._wal_path, logger=self.log)
         self._recover_wal()
+        self._init_research_registries()
 
         if config.get("maxTradeAmountPct") or config.get("maxDailyLossPct"):
             self.log.info(
@@ -233,6 +239,91 @@ class TradeManager:
                 config.get("maxTradeAmountPct", 0) * 100,
                 config.get("maxDailyLossPct", 0) * 100,
             )
+
+    def _init_research_registries(self):
+        registry_dir = self.trades_path.parent
+        try:
+            self._strategy_config_registry = StrategyConfigRegistry(
+                registry_dir / "strategy-config-registry.json",
+                logger=self.log,
+            )
+            entry = self._strategy_config_registry.register(
+                self.strategy_id,
+                self.config,
+                source_bot=getattr(self.log, "name", None),
+            )
+            self._config_version = entry.get("config_version")
+        except Exception as e:
+            self.log.warning("Failed to initialize strategy config registry: %s", e)
+            self._config_version = None
+
+        try:
+            self._model_registry = ModelRegistry(
+                registry_dir / "model-registry.json",
+                logger=self.log,
+            )
+        except Exception as e:
+            self.log.warning("Failed to initialize model registry: %s", e)
+            self._model_registry = None
+
+    def _resolve_research_context(self):
+        strategy_id = getattr(self, "strategy_id", None) or getattr(self, "bot_name", None)
+        if not strategy_id:
+            log = getattr(self, "log", None)
+            strategy_id = getattr(log, "name", None)
+        return strategy_id, getattr(self, "_config_version", None)
+
+    def _resolve_model_version(self, record):
+        model_version = record.get("model_version")
+        if model_version:
+            return model_version
+
+        model_name = record.get("model_name") or record.get("sizing_method")
+        registry = getattr(self, "_model_registry", None)
+        if not model_name or registry is None:
+            return None
+
+        strategy_id, _ = self._resolve_research_context()
+        descriptor = {
+            "strategy_id": strategy_id,
+            "model_name": model_name,
+        }
+        for key in ("model_family", "model_type", "sizing_method"):
+            value = record.get(key)
+            if value is not None:
+                descriptor[key] = value
+        custom_descriptor = record.get("model_descriptor")
+        if isinstance(custom_descriptor, dict):
+            descriptor.update(custom_descriptor)
+
+        try:
+            entry = registry.register(
+                model_name,
+                descriptor,
+                strategy_id=strategy_id,
+                source_bot=record.get("source_bot"),
+                source_path=self.trades_path,
+            )
+            return entry.get("model_version")
+        except Exception as e:
+            self.log.warning("Failed to register model metadata for %s: %s", model_name, e)
+            return None
+
+    def _apply_research_metadata(self, record):
+        strategy_id, config_version = self._resolve_research_context()
+        if record.get("strategy_id") is None and strategy_id is not None:
+            record["strategy_id"] = strategy_id
+        if record.get("config_version") is None and config_version is not None:
+            record["config_version"] = config_version
+        if record.get("model_name") is None and record.get("sizing_method") is not None:
+            record["model_name"] = record.get("sizing_method")
+        if record.get("feature_snapshot_id") is None and record.get("model_inputs") is None:
+            inline_model_inputs = record.get("inline_model_inputs")
+            if inline_model_inputs is not None:
+                record["model_inputs"] = inline_model_inputs
+        model_version = self._resolve_model_version(record)
+        if model_version is not None:
+            record["model_version"] = model_version
 
     def _reset_daily_if_needed(self):
         today = datetime.date.today().isoformat()
@@ -430,6 +521,7 @@ class TradeManager:
         model_prob = extra_fields.get("model_prob")
         record["model_fair_value_cents"] = round(model_prob * 100, 1) if model_prob is not None else None
         record["model_name"] = extra_fields.get("model_name") or extra_fields.get("sizing_method")
+        self._apply_research_metadata(record)
         record.setdefault("settlement_result", None)
         record.setdefault("settlement_revenue_cents", None)
         record.setdefault("fill_price_cents", None)
@@ -710,6 +802,7 @@ class TradeManager:
         if price_cents is not None:
             record["price_cents"] = price_cents
         record.update(extra)
+        self._apply_research_metadata(record)
         save_decision_func(decisions_path, record)
 
 

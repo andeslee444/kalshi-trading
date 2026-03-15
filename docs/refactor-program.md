@@ -396,6 +396,10 @@ Estimated size:
 - 4 to 8 PRs
 - 2 weeks
 
+Current bridge state:
+
+- Slice 1 adds registry groundwork in `research/registry.py` and stamps `strategy_id`, `config_version`, and `model_version` metadata into shared trade and decision records
+
 ## Phase 8: Desk Operations And Governance
 
 Objective: run the system like a professional small quant desk.
