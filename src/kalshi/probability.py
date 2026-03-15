@@ -31,6 +31,11 @@ from domain.crypto.models import (
     crypto_price_probability_heston as _crypto_price_probability_heston_impl,
     crypto_price_probability_jd as _crypto_price_probability_jd_impl,
 )
+from domain.economics.models import (
+    cpi_nowcast_sigma as _cpi_nowcast_sigma_impl,
+    econ_nowcast_probability as _econ_nowcast_probability_impl,
+    gdp_nowcast_sigma as _gdp_nowcast_sigma_impl,
+)
 from domain.shared.stats import _norm_cdf, _skew_normal_cdf, _student_t_cdf
 from domain.weather.models import (
     compute_adaptive_ensemble_weights as _compute_adaptive_ensemble_weights_impl,
@@ -365,118 +370,30 @@ def album_data_sigma(day_of_week, hours_since_publication=0, source=None):
 
 
 def econ_nowcast_probability(nowcast_value, nowcast_sigma, threshold, direction="above", df=None):
-    """CDF-based probability for economics markets (CPI, GDP, Jobs).
-
-    Uses nowcast point estimate and its uncertainty (sigma) to compute
-    P(actual > threshold) or P(actual < threshold).
-
-    Uses Student-t distribution (default df=5) for fatter tails — CPI/GDP
-    surprise prints at 3+ sigma happen far more often than Gaussian predicts.
-
-    Args:
-        nowcast_value: nowcast point estimate (e.g. 3.2% for CPI).
-        nowcast_sigma: uncertainty in the nowcast (std dev, same units).
-        threshold: market threshold value.
-        direction: "above" for P(actual > threshold),
-                   "below" for P(actual < threshold).
-        df: degrees of freedom for Student-t (None = load from calibration, default 5).
-            Set df >= 500 for approximately Gaussian behavior.
-
-    Returns:
-        Probability (0-1).
-    """
-    if nowcast_sigma <= 0:
-        return 1.0 if nowcast_value > threshold else 0.0
-
-    z = (threshold - nowcast_value) / nowcast_sigma
-
-    # Load df from calibration if not explicitly provided
-    if df is None:
-        cal = _load_calibration()
-        df = cal.get("economics", {}).get("df", 5)
-
-    # Validate df range
-    if not isinstance(df, (int, float)) or df < 2 or df > 500:
-        df = 5
-
-    prob_above = 1.0 - _student_t_cdf(z, df)
-
-    if direction == "below":
-        return 1.0 - prob_above
-    return prob_above
+    return _econ_nowcast_probability_impl(
+        nowcast_value,
+        nowcast_sigma,
+        threshold,
+        direction=direction,
+        df=df,
+        load_calibration_func=_load_calibration,
+    )
 
 
 def cpi_nowcast_sigma(days_to_release, fed_ci_width=None):
-    """Piecewise exponential for CPI nowcast uncertainty based on time to release.
-
-    Returns sigma in percentage points (e.g. 0.10 = 0.10%).
-
-    Args:
-        days_to_release: Days until the CPI release date.
-        fed_ci_width: Optional dynamic CI width derived from cross-measure
-            dispersion (e.g. std of CPI/CoreCPI/PCE/CorePCE * 1.645).
-            When provided and > 0, converts to sigma via 90% CI formula
-            (sigma = fed_ci_width / 3.29) and uses it instead of the
-            hardcoded exponential decay, with a floor of 0.03 to prevent
-            unreasonably tight estimates.
-
-    If config/calibration.json has cpi.sigma_by_days (from calibrate-cpi-sigma.py),
-    uses empirically calibrated values. Otherwise falls back to heuristic:
-    ~0.04 at release, ~0.11 at 7d, ~0.23 at 30d, ~0.37 at 107d+.
-    """
-    cal = _load_calibration()
-    cpi_cal = cal.get("cpi", {}).get("sigma_by_days", {})
-    if cpi_cal:
-        key = str(min(14, max(0, days_to_release)))
-        if key in cpi_cal:
-            if fed_ci_width is not None and fed_ci_width > 0:
-                _log.debug("Calibration sigma_by_days overrides fed_ci_width=%.4f at d=%s", fed_ci_width, key)
-            return cpi_cal[key]
-
-    # Dynamic sigma from cross-measure dispersion (when available)
-    if fed_ci_width is not None and fed_ci_width > 0:
-        # 90% CI = 3.29 sigma for normal distribution (z=1.645 * 2)
-        dynamic_sigma = fed_ci_width / 3.29
-        return max(dynamic_sigma, 0.03)
-
-    # Fallback: piecewise exponential for empirical CPI surprise distribution
-    # Calibrated against: Knotek & Zaman (2024) Cleveland Fed WP 24-06,
-    # Bloomberg consensus CPI surprise sigma (~15 bps at 30d),
-    # SPF error statistics (Philadelphia Fed), BLS sampling error floor.
-    #
-    # Two-regime model: fast decay near release (gasoline/shelter data arrives),
-    # slow decay at long horizons (structural uncertainty dominates).
-    d = max(0, days_to_release)
-    if d <= 14:
-        # Near-release: sigma decays rapidly as BLS component data arrives
-        # d=0: 0.04, d=3: 0.08, d=7: 0.11, d=14: 0.14
-        return 0.04 + 0.11 * (1 - math.exp(-0.15 * d))
-    else:
-        # Long-horizon: structural uncertainty, slower decay
-        # d=14: 0.14, d=30: 0.23, d=60: 0.32, d=107: 0.37
-        near_val = 0.04 + 0.11 * (1 - math.exp(-0.15 * 14))  # ~0.14 at d=14
-        return near_val + 0.25 * (1 - math.exp(-0.03 * (d - 14)))
+    return _cpi_nowcast_sigma_impl(
+        days_to_release,
+        fed_ci_width=fed_ci_width,
+        load_calibration_func=_load_calibration,
+        logger=_log,
+    )
 
 
 def gdp_nowcast_sigma(days_to_release):
-    """Exponential decay for GDP nowcast uncertainty based on time to release.
-
-    Returns sigma in percentage points. GDP is much noisier than CPI —
-    actual GDP forecast RMSE is 0.5-1.0 pp even close to release.
-    floor=0.15 at release, range=0.45, k=0.12.
-
-    sigma = 0.15 + 0.45 * (1 - exp(-0.12 * d))
-    d=0: 0.15, d=7: ~0.41, d=14: ~0.52, d=30: ~0.59
-    """
-    cal = _load_calibration()
-    gdp_cal = cal.get("gdp", {}).get("sigma_by_days", {})
-    if gdp_cal:
-        key = str(min(30, max(0, days_to_release)))
-        if key in gdp_cal:
-            return gdp_cal[key]
-
-    d = max(0, days_to_release)
-    return 0.15 + 0.45 * (1 - math.exp(-0.12 * d))
+    return _gdp_nowcast_sigma_impl(
+        days_to_release,
+        load_calibration_func=_load_calibration,
+    )
 
 
 def boxoffice_data_sigma(day_of_week, hours_since_publication=0):
