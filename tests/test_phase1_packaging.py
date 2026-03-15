@@ -67,6 +67,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         sys.path.remove(flat_src_dir)
         removed = True
     for name in (
+        "domain.crypto",
+        "domain.crypto.models",
         "domain",
         "domain.shared",
         "domain.shared.stats",
@@ -84,6 +86,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "ops.notifications",
         "risk",
         "risk.kill_switch",
+        "kalshi.domain.crypto",
+        "kalshi.domain.crypto.models",
         "kalshi.domain",
         "kalshi.domain.shared",
         "kalshi.domain.shared.stats",
@@ -104,6 +108,10 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
     ):
         sys.modules.pop(name, None)
     try:
+        pkg_crypto = importlib.import_module("kalshi.domain.crypto.models")
+        flat_crypto = importlib.import_module("domain.crypto.models")
+        assert Path(flat_crypto.__file__).resolve() == Path(pkg_crypto.__file__).resolve()
+
         pkg_stats = importlib.import_module("kalshi.domain.shared.stats")
         flat_stats = importlib.import_module("domain.shared.stats")
         assert Path(flat_stats.__file__).resolve() == Path(pkg_stats.__file__).resolve()
@@ -145,6 +153,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         assert Path(flat_risk.__file__).resolve() == Path(pkg_risk.__file__).resolve()
     finally:
         for name in (
+            "domain.crypto",
+            "domain.crypto.models",
             "domain",
             "domain.shared",
             "domain.shared.stats",
@@ -162,6 +172,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "ops.notifications",
             "risk",
             "risk.kill_switch",
+            "kalshi.domain.crypto",
+            "kalshi.domain.crypto.models",
             "kalshi.domain",
             "kalshi.domain.shared",
             "kalshi.domain.shared.stats",
