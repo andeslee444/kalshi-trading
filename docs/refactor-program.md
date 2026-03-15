@@ -274,6 +274,7 @@ Current bridge state:
 - Slice 2 extracts runtime logging and signal installation into `ops/logging.py`, with `kalshi_auth.py` preserving the existing public imports
 - Slice 3 extracts kill-switch and circuit-breaker helpers into `risk/`, with `kalshi_auth.py` preserving the existing public imports
 - Slice 4 extracts `OrderMonitor` into `execution/order_monitor.py`, with `kalshi_auth.py` preserving the existing public imports
+- Slice 5 extracts `TradeManager`, `RecentTradeTracker`, and trade-log helpers into `execution/trade_manager.py`, with `kalshi_auth.py` preserving the existing public imports
 
 Rules:
 
