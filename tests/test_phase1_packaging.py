@@ -73,6 +73,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "ops",
         "ops.health_monitor",
         "ops.logging",
+        "ops.notifications",
         "risk",
         "risk.kill_switch",
         "kalshi.execution",
@@ -81,6 +82,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "kalshi.ops",
         "kalshi.ops.health_monitor",
         "kalshi.ops.logging",
+        "kalshi.ops.notifications",
         "kalshi.risk",
         "kalshi.risk.kill_switch",
     ):
@@ -102,6 +104,10 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         flat_health = importlib.import_module("ops.health_monitor")
         assert Path(flat_health.__file__).resolve() == Path(pkg_health.__file__).resolve()
 
+        pkg_notifications = importlib.import_module("kalshi.ops.notifications")
+        flat_notifications = importlib.import_module("ops.notifications")
+        assert Path(flat_notifications.__file__).resolve() == Path(pkg_notifications.__file__).resolve()
+
         pkg_risk = importlib.import_module("kalshi.risk.kill_switch")
         flat_risk = importlib.import_module("risk.kill_switch")
         assert Path(flat_risk.__file__).resolve() == Path(pkg_risk.__file__).resolve()
@@ -113,6 +119,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "ops",
             "ops.health_monitor",
             "ops.logging",
+            "ops.notifications",
             "risk",
             "risk.kill_switch",
             "kalshi.execution",
@@ -121,6 +128,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "kalshi.ops",
             "kalshi.ops.health_monitor",
             "kalshi.ops.logging",
+            "kalshi.ops.notifications",
             "kalshi.risk",
             "kalshi.risk.kill_switch",
         ):
