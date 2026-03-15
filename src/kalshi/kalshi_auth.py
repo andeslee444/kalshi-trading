@@ -11,7 +11,7 @@ Usage:
     client.post("/portfolio/orders", body={...})
 """
 
-import json, time, base64, os, sys, logging, datetime, tempfile, fcntl, threading
+import json, time, base64, os, sys, logging, datetime, tempfile, fcntl
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -39,6 +39,13 @@ from ops.logging import (
     setup_logging as ops_setup_logging,
     setup_signal_handlers as ops_setup_signal_handlers,
     setup_unbuffered as ops_setup_unbuffered,
+)
+from ops.notifications import (
+    _reset_imessage_rate_limiter as ops_reset_imessage_rate_limiter,
+    _reset_webhook_rate_limiter as ops_reset_webhook_rate_limiter,
+    notify_imessage as ops_notify_imessage,
+    notify_webhook as ops_notify_webhook,
+    notify_whatsapp as ops_notify_whatsapp,
 )
 from risk.circuit_breaker import (
     CircuitBreaker as RiskCircuitBreaker,
@@ -856,166 +863,45 @@ class HealthCheckMonitor(OpsHealthCheckMonitor):
 
 
 def notify_whatsapp(message, phone=None, logger=None):
-    """Send a WhatsApp notification via openclaw CLI.
-
-    Args:
-        message: Text message to send.
-        phone: Phone number (E.164 format). If None, reads from bots-config.json.
-        logger: Optional logger instance.
-    """
-    import subprocess
-    _log = logger or logging.getLogger("notify")
-    if not phone:
-        phone = os.environ.get("NOTIFICATION_PHONE", "")
-    if not phone:
-        try:
-            cfg_path = PROJECT_DIR / "config" / "bots-config.json"
-            with open(cfg_path) as f:
-                cfg = json.load(f)
-            phone = cfg.get("notificationPhone", "")
-        except Exception:
-            pass
-    if not phone:
-        _log.warning("No notificationPhone configured — notification logged only")
-        return False
-    try:
-        result = subprocess.run(
-            ["openclaw", "message", "send", "--to", phone,
-             "--message", message, "--channel", "whatsapp"],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0:
-            _log.info("WhatsApp notification sent")
-            return True
-        else:
-            _log.warning("WhatsApp send failed: %s", result.stderr[:200])
-            return False
-    except FileNotFoundError:
-        _log.warning("openclaw CLI not found — notification logged only")
-        return False
-    except Exception as e:
-        _log.warning("WhatsApp error: %s", e)
-        return False
+    """Compatibility wrapper over the extracted ops.notifications module."""
+    return ops_notify_whatsapp(
+        message,
+        phone=phone,
+        logger=logger,
+        project_dir=PROJECT_DIR,
+    )
 
 
 # === Webhook Alerting ===
 
-_webhook_rate_limiter = {}  # message_prefix -> last_sent_timestamp
-_WEBHOOK_COOLDOWN_SECONDS = 1800  # 30 minutes
-
 
 def _reset_webhook_rate_limiter():
-    """Reset the webhook rate limiter (for testing)."""
-    _webhook_rate_limiter.clear()
+    """Compatibility wrapper over the extracted ops.notifications module."""
+    return ops_reset_webhook_rate_limiter()
 
 
 def notify_webhook(message, level="info", logger=None):
-    """Send an alert to a Slack or Discord webhook.
-
-    Auto-detects Slack vs Discord by URL pattern. Rate-limits duplicate
-    messages (same first 80 chars) to at most once per 30 minutes.
-
-    Args:
-        message: Alert message text.
-        level: "info", "warning", or "critical" — controls emoji prefix.
-        logger: Optional logger instance.
-
-    Returns:
-        True if sent, False if skipped (no URL, rate-limited, or error).
-    """
-    log = logger or _log
-    url = os.environ.get("ALERT_WEBHOOK_URL", "")
-    if not url:
-        return False
-
-    # Rate limiting: 30-minute cooldown per unique message prefix
-    prefix = message[:80]
-    now = time.time()
-    last_sent = _webhook_rate_limiter.get(prefix, 0)
-    if now - last_sent < _WEBHOOK_COOLDOWN_SECONDS:
-        return False
-
-    # Level-based emoji prefix
-    emoji = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨"}.get(level, "ℹ️")
-    full_message = f"{emoji} [{level.upper()}] {message}"
-
-    # Auto-detect Slack vs Discord by URL pattern
-    if "discord" in url.lower():
-        payload = {"content": full_message}
-    else:
-        payload = {"text": full_message}
-
-    try:
-        resp = requests.post(url, json=payload, timeout=10)
-        resp.raise_for_status()
-        _webhook_rate_limiter[prefix] = now
-        log.info("Webhook alert sent: %s", message[:100])
-        return True
-    except requests.exceptions.ConnectionError:
-        log.warning("Webhook connection error — alert not delivered")
-        return False
-    except requests.exceptions.HTTPError as e:
-        log.warning("Webhook HTTP error %s — alert not delivered", e.response.status_code if e.response else "?")
-        return False
-    except Exception as e:
-        log.warning("Webhook error: %s", e)
-        return False
+    """Compatibility wrapper over the extracted ops.notifications module."""
+    return ops_notify_webhook(
+        message,
+        level=level,
+        logger=logger or _log,
+        requests_module=requests,
+    )
 
 
 # === iMessage Alerting (BlueBubbles) ===
 
-_imessage_rate_limiter = {}
-_IMESSAGE_COOLDOWN_SECONDS = 1800  # 30 min
-
 
 def _reset_imessage_rate_limiter():
-    """Reset the iMessage rate limiter (for testing)."""
-    _imessage_rate_limiter.clear()
-
-
-def _send_imessage_blocking(message, prefix, logger):
-    """Blocking iMessage send (runs in background thread)."""
-    log = logger or _log
-    bb_url = os.environ.get("BLUEBUBBLES_URL", "")
-    bb_password = os.environ.get("BLUEBUBBLES_PASSWORD", "")
-    bb_chat = os.environ.get("BLUEBUBBLES_CHAT_GUID", "")
-    try:
-        r = requests.post(
-            f"{bb_url}/api/v1/message/text",
-            params={"password": bb_password},
-            json={"chatGuid": bb_chat, "message": message},
-            timeout=10,
-        )
-        r.raise_for_status()
-        _imessage_rate_limiter[prefix] = time.time()
-        log.info("iMessage sent: %s", prefix)
-    except Exception as e:
-        log.warning("iMessage send failed: %s", e)
+    """Compatibility wrapper over the extracted ops.notifications module."""
+    return ops_reset_imessage_rate_limiter()
 
 
 def notify_imessage(message, logger=None):
-    """Send an iMessage via BlueBubbles API (fire-and-forget).
-
-    Requires BLUEBUBBLES_URL, BLUEBUBBLES_PASSWORD, BLUEBUBBLES_CHAT_GUID env vars.
-    Rate-limits duplicate messages (same first 80 chars) to once per 30 minutes.
-    Sends in a daemon thread so callers are never blocked by network latency.
-
-    Returns:
-        True if dispatched, False if skipped (missing config or rate-limited).
-    """
-    bb_url = os.environ.get("BLUEBUBBLES_URL", "")
-    bb_password = os.environ.get("BLUEBUBBLES_PASSWORD", "")
-    bb_chat = os.environ.get("BLUEBUBBLES_CHAT_GUID", "")
-    if not bb_url or not bb_password or not bb_chat:
-        return False
-
-    prefix = message[:80]
-    now = time.time()
-    if now - _imessage_rate_limiter.get(prefix, 0) < _IMESSAGE_COOLDOWN_SECONDS:
-        return False
-
-    # Optimistically mark as sent to prevent duplicate dispatches
-    _imessage_rate_limiter[prefix] = now
-    t = threading.Thread(target=_send_imessage_blocking, args=(message, prefix, logger), daemon=True)
-    t.start()
-    return True
+    """Compatibility wrapper over the extracted ops.notifications module."""
+    return ops_notify_imessage(
+        message,
+        logger=logger,
+        requests_module=requests,
+    )
