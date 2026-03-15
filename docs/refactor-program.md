@@ -329,6 +329,7 @@ Key actions:
 Current bridge state:
 
 - Slice 1 extracts shared fee, sizing, and liquidity helpers into `domain/shared/sizing.py`
+- Slice 2 extracts the weather probability family into `domain/weather/models.py`
 - `probability.py` remains the compatibility import surface while strategy-specific models stay in place
 
 Acceptance gate:

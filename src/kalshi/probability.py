@@ -26,70 +26,27 @@ from domain.shared.sizing import (
     quarter_kelly_sell,
     uncertainty_kelly,
 )
+from domain.shared.stats import _norm_cdf, _skew_normal_cdf, _student_t_cdf
+from domain.weather.models import (
+    compute_adaptive_ensemble_weights as _compute_adaptive_ensemble_weights_impl,
+    ensemble_disagreement_score as _ensemble_disagreement_score_impl,
+    ensemble_spread_sigma_multiplier as _ensemble_spread_sigma_multiplier_impl,
+    ensemble_weather_probability as _ensemble_weather_probability_impl,
+    ensemble_weather_probability_v2 as _ensemble_weather_probability_v2_impl,
+    empirical_ensemble_probability as _empirical_ensemble_probability_impl,
+    nws_probability as _nws_probability_impl,
+    nws_sigma_for_hour as _nws_sigma_for_hour_impl,
+    weather_probability as _weather_probability_impl,
+    weather_sigma as _weather_sigma_impl,
+    weather_sigma_hourly as _weather_sigma_hourly_impl,
+)
 
 _log = logging.getLogger("probability")
-
-
-def _norm_cdf(x):
-    """Standard normal CDF. P(Z <= x) using math.erf."""
-    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
 
 def _norm_pdf(x):
     """Standard normal PDF. phi(x) = exp(-x^2/2) / sqrt(2*pi)."""
     return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
-
-
-def _owens_t(h, a):
-    """Owen's T function via 10-point Gauss-Legendre quadrature.
-
-    T(h, a) = (1/2pi) * integral_0^a exp(-0.5*h^2*(1+t^2)) / (1+t^2) dt
-
-    The integral is well-behaved and converges quickly with Gaussian quadrature.
-    Used by skew-normal CDF.
-    """
-    if abs(a) < 1e-15:
-        return 0.0
-
-    # 10-point Gauss-Legendre nodes and weights on [-1, 1]
-    gl_nodes = [
-        -0.9739065285171717, -0.8650633666889845, -0.6794095682990244,
-        -0.4333953941292472, -0.1488743389816312,
-        0.1488743389816312, 0.4333953941292472, 0.6794095682990244,
-        0.8650633666889845, 0.9739065285171717,
-    ]
-    gl_weights = [
-        0.0666713443086881, 0.1494513491505806, 0.2190863625159820,
-        0.2692667193099963, 0.2955242247147529,
-        0.2955242247147529, 0.2692667193099963, 0.2190863625159820,
-        0.1494513491505806, 0.0666713443086881,
-    ]
-
-    # Transform from [-1, 1] to [0, a]
-    half_a = a / 2.0
-    mid_a = a / 2.0
-
-    result = 0.0
-    h_sq = h * h
-    for i in range(10):
-        t = mid_a + half_a * gl_nodes[i]
-        t_sq = t * t
-        integrand = math.exp(-0.5 * h_sq * (1 + t_sq)) / (1 + t_sq)
-        result += gl_weights[i] * integrand
-
-    return result * half_a / (2.0 * math.pi)
-
-
-def _skew_normal_cdf(x, alpha=0.0):
-    """Skew-normal CDF. alpha=0 reduces to standard normal.
-
-    Positive alpha = right skew (warm bias), negative = left skew (cold bias).
-    Uses the closed-form: Phi_SN(x) = Phi(x) - 2*T(x, alpha)
-    where T(x, alpha) is Owen's T function.
-    """
-    result = _norm_cdf(x) - 2.0 * _owens_t(x, alpha)
-    # Clamp to [0, 1] to handle minor numerical precision issues from quadrature
-    return max(0.0, min(1.0, result))
 
 
 def _probit(p):
@@ -152,108 +109,6 @@ def _probit(p):
         q = math.sqrt(-2 * math.log(1 - p))
         return -(((((c1*q + c2)*q + c3)*q + c4)*q + c5)*q + c6) / \
                 ((((d1*q + d2)*q + d3)*q + d4)*q + 1)
-
-
-def _ln_gamma(x):
-    """Log-gamma via Lanczos approximation (g=7, n=9). No scipy needed."""
-    if x <= 0:
-        return float('inf')
-    coefs = [
-        0.99999999999980993,
-        676.5203681218851,
-        -1259.1392167224028,
-        771.32342877765313,
-        -176.61502916214059,
-        12.507343278686905,
-        -0.13857109526572012,
-        9.9843695780195716e-6,
-        1.5056327351493116e-7,
-    ]
-    if x < 0.5:
-        # Reflection formula
-        return math.log(math.pi / math.sin(math.pi * x)) - _ln_gamma(1 - x)
-    x -= 1
-    a = coefs[0]
-    t = x + 7.5
-    for i in range(1, 9):
-        a += coefs[i] / (x + i)
-    return 0.5 * math.log(2 * math.pi) + (x + 0.5) * math.log(t) - t + math.log(a)
-
-
-def _regularized_beta_cf(x, a, b, max_iter=200, tol=1e-12):
-    """Regularized incomplete beta I_x(a, b) via continued fraction (Numerical Recipes)."""
-    if x < 0 or x > 1:
-        return 0.0
-    if x == 0 or x == 1:
-        return x
-
-    # Use symmetry relation for better convergence
-    if x > (a + 1) / (a + b + 2):
-        return 1.0 - _regularized_beta_cf(1 - x, b, a, max_iter, tol)
-
-    # Prefactor: x^a * (1-x)^b / (a * B(a,b))
-    ln_prefactor = a * math.log(x) + b * math.log(1 - x) - math.log(a) \
-                   + _ln_gamma(a + b) - _ln_gamma(a) - _ln_gamma(b)
-    prefactor = math.exp(ln_prefactor)
-
-    # Modified Lentz continued fraction (Numerical Recipes style)
-    tiny = 1e-30
-    qab = a + b
-    qap = a + 1.0
-    qam = a - 1.0
-
-    c = 1.0
-    d = 1.0 - qab * x / qap
-    if abs(d) < tiny:
-        d = tiny
-    d = 1.0 / d
-    h = d
-
-    for m in range(1, max_iter + 1):
-        m2 = 2 * m
-        # Even step
-        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
-        d = 1.0 + aa * d
-        if abs(d) < tiny:
-            d = tiny
-        c = 1.0 + aa / c
-        if abs(c) < tiny:
-            c = tiny
-        d = 1.0 / d
-        h *= d * c
-
-        # Odd step
-        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
-        d = 1.0 + aa * d
-        if abs(d) < tiny:
-            d = tiny
-        c = 1.0 + aa / c
-        if abs(c) < tiny:
-            c = tiny
-        d = 1.0 / d
-        delta = d * c
-        h *= delta
-
-        if abs(delta - 1.0) < tol:
-            break
-
-    return prefactor * h
-
-
-def _student_t_cdf(x, df=6):
-    """Student's t CDF using regularized incomplete beta.
-
-    At df=6, tails are ~3x heavier than Gaussian at 3-sigma.
-    Converges to _norm_cdf as df -> infinity.
-    """
-    if df <= 0:
-        return _norm_cdf(x)
-    t2 = x * x
-    ix = _regularized_beta_cf(df / (df + t2), df / 2.0, 0.5)
-    cdf = 0.5 * ix
-    if x >= 0:
-        return 1.0 - cdf
-    return cdf
 
 
 # ─── Calibration loading ───
@@ -320,759 +175,117 @@ def check_calibration_freshness(max_age_days=7):
 
 def weather_probability(forecast_temp, threshold, direction, days_out=0, city=None,
                         sigma_override=None, hour_of_day=None, skew=0.0):
-    """CDF-based probability for KXHIGH weather markets.
-
-    sigma scales with forecast horizon: sigma = intercept + slope * sqrt(days_out)
-    Default: sigma = 1.5 + 0.5 * sqrt(days_out)
-    Sublinear (sqrt) scaling matches random-walk forecast error growth.
-
-    If config/calibration.json exists with per-city or global sigma parameters,
-    those override the defaults.
-
-    Args:
-        sigma_override: when set, replaces the computed sigma entirely.
-            Used by ensemble to pass spread-adjusted sigma.
-        hour_of_day: hour (0-23) for intra-day sigma decay on day-0 markets.
-            Only used when days_out == 0. None = use standard sigma.
-        skew: skew-normal alpha parameter (default 0.0 = symmetric).
-            Positive = right skew (warm bias), negative = left skew (cold bias).
-            Read from calibration.json weather.skew or weather.per_city.{city}.skew
-            if not explicitly provided (i.e., if 0.0).
-
-    direction="T": P(actual > threshold) = 1 - Phi((threshold - forecast) / sigma)
-    direction="B": P(threshold <= actual < threshold+1) = Phi((threshold+1 - forecast)/sigma) - Phi((threshold - forecast)/sigma)
-    """
-    if forecast_temp is None:
-        return None
-
-    cal = _load_calibration()
-    intercept = 1.5  # NWS MAE data shows day-0 error ~1.5°F (was 2.0; Brier 0.321 showed sigma too large)
-    slope = 0.5
-
-    weather_cal = cal.get("weather", {})
-    city_cal = weather_cal.get("per_city", {}).get(city, {}) if city else {}
-    if city_cal:
-        intercept = city_cal.get("sigma_intercept", intercept)
-        slope = city_cal.get("sigma_slope", slope)
-    elif weather_cal.get("global_sigma_intercept") is not None:
-        intercept = weather_cal["global_sigma_intercept"]
-        slope = weather_cal.get("global_sigma_slope", slope)
-
-    sigma = max(0.5, intercept + slope * math.sqrt(max(0, days_out)))
-
-    # Hour-of-day sigma adjustment for day-0 markets
-    if hour_of_day is not None and days_out == 0 and sigma_override is None:
-        sigma = weather_sigma_hourly(days_out=0, city=city, hour_of_day=hour_of_day)
-
-    # Allow callers (e.g. ensemble) to override sigma entirely
-    if sigma_override is not None and sigma_override > 0:
-        sigma = sigma_override
-
-    # Resolve skew parameter: explicit > per-city calibration > global calibration > 0.0
-    if skew == 0.0:
-        if city_cal:
-            skew = city_cal.get("skew", 0.0)
-        else:
-            skew = weather_cal.get("skew", 0.0)
-
-    # Degrees of freedom for Student's t (fat tails for forecast errors)
-    df = city_cal.get("df", weather_cal.get("df", 6))
-    if not isinstance(df, (int, float)) or df < 2:
-        _log.warning("Invalid df=%s in calibration, using default df=6", df)
-        df = 6
-
-    if direction == "T":
-        # P(actual > threshold)
-        z = (threshold - forecast_temp) / sigma
-        base_prob = 1.0 - _student_t_cdf(z, df)
-
-        # Skew correction: use skew-normal CDF to compute the asymmetric
-        # correction, then apply as an additive delta to the Student-t result.
-        # This preserves fat tails from Student-t while adding asymmetry.
-        # skew_normal_cdf(z, alpha) < norm_cdf(z) when alpha > 0 (right skew)
-        # => 1 - skew_normal_cdf > 1 - norm_cdf => P(above) increases with positive skew
-        if abs(skew) > 1e-10:
-            normal_prob = 1.0 - _norm_cdf(z)
-            skew_prob = 1.0 - _skew_normal_cdf(z, alpha=skew)
-            # Additive correction: difference between skew-normal and normal
-            skew_correction = skew_prob - normal_prob
-            base_prob = max(0.001, min(0.999, base_prob + skew_correction))
-
-        return base_prob
-    else:
-        # B = bracket: P(threshold <= actual < threshold + 1)
-        z_low = (threshold - forecast_temp) / sigma
-        z_high = (threshold + 1 - forecast_temp) / sigma
-        base_prob = _student_t_cdf(z_high, df) - _student_t_cdf(z_low, df)
-
-        # Skew correction for brackets (apply to both bounds)
-        if abs(skew) > 1e-10:
-            sn_high = _skew_normal_cdf(z_high, alpha=skew)
-            sn_low = _skew_normal_cdf(z_low, alpha=skew)
-            normal_diff = _norm_cdf(z_high) - _norm_cdf(z_low)
-            skew_diff = sn_high - sn_low
-            if abs(normal_diff) > 1e-10:
-                # Scale the Student-t bracket probability by the skew ratio
-                ratio = skew_diff / normal_diff
-                base_prob = max(0.0, base_prob * ratio)
-
-        return base_prob
+    return _weather_probability_impl(
+        forecast_temp,
+        threshold,
+        direction,
+        days_out=days_out,
+        city=city,
+        sigma_override=sigma_override,
+        hour_of_day=hour_of_day,
+        skew=skew,
+        load_calibration_func=_load_calibration,
+        logger=_log,
+    )
 
 
 def weather_sigma(days_out=0, city=None):
-    """Return the sigma used by weather_probability for a given horizon and city.
-
-    Useful for logging sigma_used in trade records for calibration.
-    """
-    cal = _load_calibration()
-    intercept = 1.5
-    slope = 0.5
-    weather_cal = cal.get("weather", {})
-    if city and city in weather_cal.get("per_city", {}):
-        city_cal = weather_cal["per_city"][city]
-        intercept = city_cal.get("sigma_intercept", intercept)
-        slope = city_cal.get("sigma_slope", slope)
-    elif weather_cal.get("global_sigma_intercept") is not None:
-        intercept = weather_cal["global_sigma_intercept"]
-        slope = weather_cal.get("global_sigma_slope", slope)
-    return max(0.5, intercept + slope * math.sqrt(max(0, days_out)))
+    return _weather_sigma_impl(
+        days_out=days_out,
+        city=city,
+        load_calibration_func=_load_calibration,
+    )
 
 
 def weather_sigma_hourly(days_out=0, city=None, hour_of_day=None):
-    """Sigma with intra-day decay for day-0 forecasts.
-
-    For days_out == 0, applies an hour-of-day decay factor to the base sigma:
-      - Before 6am (overnight): decay_factor = 1.2 (extra uncertainty)
-      - At hour 6 (morning): decay_factor = 1.0 (full daily sigma)
-      - Exponential decay from 6am onward: decay_factor = max(0.4, exp(-0.08 * (hour - 6)))
-      - At hour 14 (afternoon): ~40% reduction from morning
-      - At hour 17 (evening): ~60% reduction (forecast nearly settled)
-
-    For days_out > 0 or hour_of_day is None, returns weather_sigma unchanged.
-    """
-    base = weather_sigma(days_out, city)
-
-    if hour_of_day is None or days_out > 0:
-        return base
-
-    # Intra-day decay for day-0 markets
-    if hour_of_day < 6:
-        decay_factor = 1.2  # overnight extra uncertainty
-    else:
-        decay_factor = max(0.4, math.exp(-0.08 * (hour_of_day - 6)))
-
-    return max(0.5, base * decay_factor)
-
-
-def _resolve_weather_sigma(days_out=0, city=None, sigma_override=None, hour_of_day=None):
-    """Resolve the effective sigma used by weather_probability()."""
-    if sigma_override is not None and sigma_override > 0:
-        return sigma_override
-    if hour_of_day is not None and days_out == 0:
-        return weather_sigma_hourly(days_out=0, city=city, hour_of_day=hour_of_day)
-    return weather_sigma(days_out, city)
-
-
-def _normalize_weights(weight_map):
-    """Normalize a weight dict and drop non-positive entries."""
-    positive = {
-        model: weight for model, weight in weight_map.items()
-        if isinstance(weight, (int, float)) and weight > 0
-    }
-    total = sum(positive.values())
-    if total <= 0:
-        return {}
-    return {model: weight / total for model, weight in positive.items()}
-
-
-def _default_ensemble_weights(model_names, days_out=0):
-    """Conservative prior weights before live verification takes over."""
-    if days_out <= 1:
-        priors = {
-            "hrrr": 1.30,
-            "nam": 1.10,
-            "nbm": 1.05,
-            "gfs": 1.00,
-            "ecmwf": 0.95,
-            "graphcast": 1.00,
-            "icon": 0.85,
-            "aifs": 0.85,
-            "nws": 1.00,
-        }
-    elif days_out <= 3:
-        priors = {
-            "ecmwf": 1.15,
-            "graphcast": 1.10,
-            "gfs": 1.00,
-            "nbm": 1.00,
-            "aifs": 0.95,
-            "icon": 0.90,
-            "nam": 0.75,
-            "nws": 0.80,
-        }
-    else:
-        priors = {
-            "ecmwf": 1.20,
-            "graphcast": 1.10,
-            "gfs": 1.00,
-            "aifs": 0.95,
-            "icon": 0.90,
-            "nbm": 0.85,
-            "nws": 0.70,
-        }
-
-    weights = {}
-    for model_name in model_names:
-        weights[model_name] = priors.get(model_name, 1.0)
-    return _normalize_weights(weights)
-
-
-def _resolve_static_ensemble_weights(forecasts, days_out, ensemble_cal=None, static_weights=None):
-    """Merge tracked calibration priors with defaults for whatever models are present."""
-    default_weights = _default_ensemble_weights(forecasts.keys(), days_out)
-    if static_weights is None:
-        static_weights = (ensemble_cal or {}).get("weights", {})
-    if not static_weights:
-        return default_weights
-
-    merged = {}
-    for model_name in forecasts:
-        merged[model_name] = static_weights.get(model_name, default_weights.get(model_name, 0.0))
-    normalized = _normalize_weights(merged)
-    return normalized or default_weights
-
-
-def _load_backtest_brier():
-    """Load per-model Brier scores from backtest results for BMA weighting.
-
-    Returns dict like {"gfs": 0.15, "ecmwf": 0.12, "icon": 0.18} or None
-    if data isn't available.
-    """
-    backtest_path = Path(__file__).resolve().parent.parent.parent / "data" / "backtest-results.json"
-    try:
-        if backtest_path.exists():
-            data = json.loads(backtest_path.read_text())
-            per_model = data.get("weather", {}).get("per_model_brier")
-            if per_model and isinstance(per_model, dict):
-                # Validate all values are positive numbers
-                if all(isinstance(v, (int, float)) and v > 0 for v in per_model.values()):
-                    return per_model
-    except (json.JSONDecodeError, OSError, KeyError):
-        pass
-    return None
+    return _weather_sigma_hourly_impl(
+        days_out=days_out,
+        city=city,
+        hour_of_day=hour_of_day,
+        load_calibration_func=_load_calibration,
+    )
 
 
 def ensemble_weather_probability(forecasts, threshold, direction, days_out=0, city=None,
                                  sigma_multiplier=1.0, static_weights=None):
-    """Weighted ensemble averaging (linear opinion pool) for KXHIGH weather markets.
-
-    Combines GFS, ECMWF, and ICON forecasts with calibrated weights.
-    Each model produces an independent probability via weather_probability(),
-    and the ensemble is a weighted average.
-
-    Args:
-        forecasts: dict mapping model name to forecast temperature (F).
-                   e.g. {"gfs": 82.5, "ecmwf": 83.1, "icon": 81.8}
-        threshold: market threshold temperature (F).
-        direction: "T" (above threshold) or "B" (bracket).
-        days_out: forecast horizon in days.
-        city: city code for calibration lookup.
-        sigma_multiplier: multiplier applied to base sigma (default 1.0).
-            Values > 1 widen the distribution (more conservative).
-
-    Returns:
-        Weighted average probability (0-1).
-    """
-    cal = _load_calibration()
-    ensemble_cal = cal.get("ensemble", {})
-
-    # Try Brier-weighted BMA: weights proportional to 1/brier_score
-    brier_data = _load_backtest_brier()
-    if brier_data:
-        inv_brier = {}
-        for model_name in forecasts:
-            if model_name in brier_data:
-                inv_brier[model_name] = 1.0 / brier_data[model_name]
-        if len(inv_brier) >= 2:
-            total_inv = sum(inv_brier.values())
-            weights = {k: v / total_inv for k, v in inv_brier.items()}
-            dropped = [m for m in forecasts if m not in inv_brier]
-            if dropped:
-                _log.warning("BMA: dropping models with no Brier data: %s (weight=0)", dropped)
-            _log.debug("BMA weights from Brier: %s", weights)
-        else:
-            # Not enough Brier data — fall back to static weights
-            brier_data = None
-
-    if not brier_data:
-        weights = _resolve_static_ensemble_weights(
-            forecasts,
-            days_out,
-            ensemble_cal,
-            static_weights=static_weights,
-        )
-
-    # Compute sigma_override if multiplier != 1.0
-    sigma_kwarg = {}
-    if sigma_multiplier != 1.0 and sigma_multiplier > 0:
-        base_sigma = weather_sigma(days_out, city)
-        sigma_kwarg["sigma_override"] = base_sigma * sigma_multiplier
-
-    total_weight = 0.0
-    weighted_prob = 0.0
-
-    for model_name, temp in forecasts.items():
-        w = weights.get(model_name, 0.0)
-        if w <= 0:
-            continue
-        prob = weather_probability(temp, threshold, direction, days_out, city=city, **sigma_kwarg)
-        if prob is None:
-            continue
-        weighted_prob += w * prob
-        total_weight += w
-
-    if total_weight <= 0:
-        # No valid models — return None so callers can fall back to single-model
-        _log.error("ensemble_weather_probability: zero total weight for models %s", list(forecasts.keys()))
-        return None
-
-    return weighted_prob / total_weight
+    return _ensemble_weather_probability_impl(
+        forecasts,
+        threshold,
+        direction,
+        days_out=days_out,
+        city=city,
+        sigma_multiplier=sigma_multiplier,
+        static_weights=static_weights,
+        load_calibration_func=_load_calibration,
+        logger=_log,
+    )
 
 
 def ensemble_spread_sigma_multiplier(spread_f):
-    """Compute sigma multiplier based on ensemble model spread.
-
-    When GFS, ECMWF, and ICON disagree, forecast uncertainty is higher.
-    Wider ensemble spread → wider sigma → more conservative trading.
-
-    Args:
-        spread_f: Max - min forecast temperature across models (°F).
-
-    Returns:
-        Multiplier >= 1.0. Applied to base sigma in weather_probability().
-    """
-    if spread_f <= 2.0:
-        return 1.0  # Models agree — no adjustment
-    # Linear ramp: spread 2→10°F maps to multiplier 1.0→2.0
-    raw = 1.0 + (spread_f - 2.0) * 0.125
-    return min(raw, 2.5)  # Cap at 2.5x
-
-
-def _blend_weight_maps(default_weights, adaptive_weights, alpha):
-    """Blend adaptive weights back toward defaults when sample support is thin."""
-    alpha = max(0.0, min(1.0, alpha))
-    if alpha <= 0:
-        return dict(default_weights)
-    if alpha >= 1:
-        return dict(adaptive_weights)
-
-    merged = {}
-    for model_name in set(default_weights) | set(adaptive_weights):
-        merged[model_name] = (
-            (1.0 - alpha) * default_weights.get(model_name, 0.0)
-            + alpha * adaptive_weights.get(model_name, 0.0)
-        )
-    normalized = _normalize_weights(merged)
-    return normalized or dict(default_weights)
-
-
-def _adaptive_sample_confidence(model_payload, source):
-    """Estimate how much trust to place in adaptive weights from recent samples."""
-    pending_market_n = max(0, int(model_payload.get("pending_market_n", 0) or 0))
-    pending_snapshot_n = max(0, int(model_payload.get("pending_snapshot_n", 0) or 0))
-    if source == "brier":
-        resolved = max(0, int(model_payload.get("market_n", 0) or len(model_payload.get("brier_predictions", []))))
-        effective = resolved + 0.10 * min(pending_market_n, 50)
-        return min(1.0, effective / 40.0)
-
-    resolved = max(0, int(model_payload.get("n", 0) or 0))
-    effective = resolved + 0.05 * min(pending_snapshot_n, 50) + 0.10 * min(pending_market_n, 50)
-    return min(1.0, effective / 60.0)
+    return _ensemble_spread_sigma_multiplier_impl(spread_f)
 
 
 def compute_adaptive_ensemble_weights(verification_data, default_weights=None, return_details=False):
-    """Compute model weights from recent forecast verification data.
-
-    Uses inverse-Brier weighting when threshold-specific probabilities are
-    available. Otherwise falls back to inverse-MAE weighting from raw forecast
-    errors. Returns default_weights when verification data is insufficient.
-
-    Args:
-        verification_data: dict of {model_name: {"brier_predictions": [(pred_prob, actual_outcome), ...]}}
-            or None. Each brier_predictions entry is a list of (predicted_probability, 0_or_1) tuples.
-        default_weights: fallback weights dict {model_name: weight}. Returned when
-            verification data is insufficient.
-
-    Returns:
-        dict of {model_name: weight} summing to 1.0, or ``(weights, details)``
-        if ``return_details=True``.
-    """
-    if default_weights is None:
-        default_weights = {"gfs": 0.40, "ecmwf": 0.40, "icon": 0.20}
-
-    def _finalize(weights, method, blend_alpha, sample_confidence):
-        details = {
-            "method": method,
-            "blend_alpha": round(blend_alpha, 4),
-            "sample_confidence": round(sample_confidence, 4),
-        }
-        if return_details:
-            return weights, details
-        return weights
-
-    if not verification_data:
-        return _finalize(default_weights, "default", 0.0, 0.0)
-
-    # Compute Brier score per model when threshold-specific probabilities are available
-    model_briers = {}
-    min_samples = 20
-
-    for model_name, data in verification_data.items():
-        preds = data.get("brier_predictions", [])
-        if len(preds) < min_samples:
-            continue
-        # Brier score = mean((predicted - actual)^2)
-        brier = sum((p - a) ** 2 for p, a in preds) / len(preds)
-        if brier > 0:
-            model_briers[model_name] = brier
-
-    if len(model_briers) < 2:
-        model_maes = {}
-        min_mae_samples = 10
-        for model_name, data in verification_data.items():
-            mae = data.get("mae")
-            n = data.get("n", 0)
-            if isinstance(mae, (int, float)) and mae > 0 and n >= min_mae_samples:
-                model_maes[model_name] = mae
-        if len(model_maes) < 2:
-            return _finalize(default_weights, "default", 0.0, 0.0)
-        inv_mae = {m: 1.0 / mae for m, mae in model_maes.items()}
-        total = sum(inv_mae.values())
-        adaptive_weights = {m: w / total for m, w in inv_mae.items()}
-        confidences = [
-            _adaptive_sample_confidence(verification_data[m], "mae")
-            for m in adaptive_weights
-        ]
-        blend_alpha = sum(confidences) / len(confidences) if confidences else 0.0
-        weights = _blend_weight_maps(default_weights, adaptive_weights, blend_alpha)
-        return _finalize(weights, "inverse_mae", blend_alpha, blend_alpha)
-
-    # Inverse-Brier weighting
-    inv_brier = {m: 1.0 / b for m, b in model_briers.items()}
-    total = sum(inv_brier.values())
-    adaptive_weights = {m: w / total for m, w in inv_brier.items()}
-    confidences = [
-        _adaptive_sample_confidence(verification_data[m], "brier")
-        for m in adaptive_weights
-    ]
-    blend_alpha = sum(confidences) / len(confidences) if confidences else 0.0
-    weights = _blend_weight_maps(default_weights, adaptive_weights, blend_alpha)
-    return _finalize(weights, "inverse_brier", blend_alpha, blend_alpha)
+    return _compute_adaptive_ensemble_weights_impl(
+        verification_data,
+        default_weights=default_weights,
+        return_details=return_details,
+    )
 
 
 def ensemble_disagreement_score(model_probs):
-    """Compute disagreement between ensemble model probabilities.
-
-    Uses coefficient of variation (std/mean) of probabilities, normalized
-    to [0, 1]. When score > 0.3, signals regime uncertainty and the bot
-    should require higher edge threshold or skip the trade.
-
-    Args:
-        model_probs: dict of {model_name: probability} (values in [0, 1]).
-
-    Returns:
-        float in [0, 1] where 0 = perfect agreement, 1 = maximum disagreement.
-    """
-    if not model_probs or len(model_probs) < 2:
-        return 0.0
-
-    probs = [p for p in model_probs.values() if isinstance(p, (int, float))]
-    if len(probs) < 2:
-        return 0.0
-    mean_p = sum(probs) / len(probs)
-    denom = math.sqrt(max(mean_p * (1.0 - mean_p), 1e-6))
-    if denom <= 0:
-        return 0.0
-
-    # Standard deviation
-    variance = sum((p - mean_p) ** 2 for p in probs) / len(probs)
-    std_dev = math.sqrt(variance)
-    return min(1.0, std_dev / denom)
+    return _ensemble_disagreement_score_impl(model_probs)
 
 
 def ensemble_weather_probability_v2(forecasts, threshold, direction, days_out=0, city=None,
-                                     sigma_multiplier=1.0, hour_of_day=None,
-                                     verification_data=None, return_details=False,
-                                     static_weights=None, skew=0.0):
-    """Enhanced ensemble with adaptive weights, hour-aware sigma, and disagreement scoring.
-
-    Builds on ensemble_weather_probability with three additions:
-    1. Hour-of-day-aware sigma for day-0 markets
-    2. Adaptive weights from verification data (inverse-Brier weighting)
-    3. Disagreement score measuring ensemble model divergence
-
-    Args:
-        forecasts: dict mapping model name to forecast temperature (F).
-        threshold: market threshold temperature (F).
-        direction: "T" (above threshold) or "B" (bracket).
-        days_out: forecast horizon in days.
-        city: city code for calibration lookup.
-        sigma_multiplier: multiplier applied to base sigma (default 1.0).
-        hour_of_day: hour (0-23) for intra-day sigma decay on day-0 markets.
-        verification_data: dict for adaptive ensemble weights (from ForecastVerifier).
-        return_details: if True, return (prob, details_dict) with disagreement_score,
-            weights_used, per_model_probs. If False, return just prob (backward compatible).
-
-    Returns:
-        float probability, or (float, dict) if return_details=True.
-    """
-    cal = _load_calibration()
-    ensemble_cal = cal.get("ensemble", {})
-
-    # Determine weights: adaptive > backtest Brier > static
-    if verification_data:
-        defaults = _resolve_static_ensemble_weights(
-            forecasts,
-            days_out,
-            ensemble_cal,
-            static_weights=static_weights,
-        )
-        weights, adaptive_details = compute_adaptive_ensemble_weights(
-            verification_data,
-            default_weights=defaults,
-            return_details=True,
-        )
-    else:
-        adaptive_details = {"method": "static", "blend_alpha": 0.0, "sample_confidence": 0.0}
-        brier_data = _load_backtest_brier()
-        if brier_data:
-            inv_brier = {}
-            for model_name in forecasts:
-                if model_name in brier_data:
-                    inv_brier[model_name] = 1.0 / brier_data[model_name]
-            if len(inv_brier) >= 2:
-                total_inv = sum(inv_brier.values())
-                weights = {k: v / total_inv for k, v in inv_brier.items()}
-                adaptive_details = {"method": "backtest_brier", "blend_alpha": 1.0, "sample_confidence": 1.0}
-            else:
-                brier_data = None
-
-        if not verification_data and not brier_data:
-            weights = _resolve_static_ensemble_weights(
-                forecasts,
-                days_out,
-                ensemble_cal,
-                static_weights=static_weights,
-            )
-
-    # Compute sigma_override if multiplier != 1.0
-    sigma_kwarg = {}
-    if sigma_multiplier != 1.0 and sigma_multiplier > 0:
-        base_sigma = weather_sigma(days_out, city)
-        sigma_kwarg["sigma_override"] = base_sigma * sigma_multiplier
-
-    # Pass hour_of_day for day-0 intra-day sigma (only when no sigma_override)
-    hour_kwarg = {}
-    if hour_of_day is not None and days_out == 0 and "sigma_override" not in sigma_kwarg:
-        hour_kwarg["hour_of_day"] = hour_of_day
-
-    total_weight = 0.0
-    weighted_prob = 0.0
-    per_model_probs = {}
-    weighted_center = 0.0
-
-    for model_name, temp in forecasts.items():
-        w = weights.get(model_name, 0.0)
-        if w <= 0:
-            continue
-        prob = weather_probability(temp, threshold, direction, days_out, city=city,
-                                   skew=skew, **sigma_kwarg, **hour_kwarg)
-        if prob is None:
-            continue
-        per_model_probs[model_name] = prob
-        weighted_prob += w * prob
-        weighted_center += w * temp
-        total_weight += w
-
-    if total_weight <= 0:
-        if return_details:
-            return (None, {
-                "center_temp": None,
-                "disagreement_score": 0.0,
-                "method": "parametric_ensemble_v2",
-                "per_model_probs": {},
-                "sigma_used": None,
-                "weights_used": weights,
-            })
-        return None
-
-    final_prob = weighted_prob / total_weight
-    center_temp = weighted_center / total_weight
-    disagreement = ensemble_disagreement_score(per_model_probs)
-    sigma_used = _resolve_weather_sigma(
+                                    sigma_multiplier=1.0, hour_of_day=None,
+                                    verification_data=None, return_details=False,
+                                    static_weights=None, skew=0.0):
+    return _ensemble_weather_probability_v2_impl(
+        forecasts,
+        threshold,
+        direction,
         days_out=days_out,
         city=city,
-        sigma_override=sigma_kwarg.get("sigma_override"),
-        hour_of_day=hour_kwarg.get("hour_of_day"),
+        sigma_multiplier=sigma_multiplier,
+        hour_of_day=hour_of_day,
+        verification_data=verification_data,
+        return_details=return_details,
+        static_weights=static_weights,
+        skew=skew,
+        load_calibration_func=_load_calibration,
+        logger=_log,
     )
-
-    if return_details:
-            return (final_prob, {
-                "center_temp": center_temp,
-                "disagreement_score": disagreement,
-                "method": "parametric_ensemble_v2",
-                "weights_used": {k: v for k, v in weights.items() if k in per_model_probs},
-                "per_model_probs": per_model_probs,
-                "sigma_used": sigma_used,
-                "weight_method": adaptive_details.get("method", "static"),
-                "verification_confidence": adaptive_details.get("sample_confidence", 0.0),
-            })
-    return final_prob
 
 
 def empirical_ensemble_probability(member_temps, threshold, direction, bias_offset=0.0,
                                    extra_points=None, return_details=False):
-    """Empirical CDF from raw ensemble member temperatures.
-
-    Ranks ensemble members, applies optional station bias correction,
-    and computes KDE-smoothed probability. No parametric sigma assumption.
-
-    Args:
-        member_temps: list of forecast temperatures (F) from ensemble members.
-            Typically 82 members (31 GEFS + 51 ECMWF ENS).
-        threshold: market threshold temperature (F).
-        direction: "T" (P(T > threshold)) or "B" (P(threshold <= T < threshold+1)).
-        bias_offset: station bias correction (F) added to all members before CDF.
-            Positive = warm bias in forecasts (subtract from members).
-            Default 0.0 (no correction).
-        extra_points: optional iterable of deterministic temperatures blended into
-            the empirical distribution. Each item may be either
-            ``{"temp": 87.0, "weight": 0.6, "label": "hrrr"}`` or
-            ``(87.0, 0.6, "hrrr")``. Weights are relative to the base ensemble's
-            total mass of 1.0, not duplicated pseudo-members.
-        return_details: if True, return ``(prob, details_dict)``.
-
-    Returns:
-        float probability in [0, 1], or ``(prob, details)`` if return_details=True.
-    """
-    if not member_temps or len(member_temps) < 5:
-        return None
-
-    weighted_samples = [(t - bias_offset, 1.0 / len(member_temps), "ensemble") for t in member_temps]
-    base_mass = 1.0
-    extra_summary = {}
-    for point in extra_points or []:
-        if isinstance(point, dict):
-            temp = point.get("temp")
-            weight = point.get("weight")
-            label = point.get("label") or point.get("model") or "extra"
-        else:
-            try:
-                temp, weight, label = point
-            except (TypeError, ValueError):
-                continue
-        if temp is None or not isinstance(weight, (int, float)) or weight <= 0:
-            continue
-        weighted_samples.append((temp - bias_offset, weight, label))
-        base_mass += weight
-        extra_summary[label] = round(extra_summary.get(label, 0.0) + weight, 4)
-
-    normalized = [(temp, weight / base_mass, label) for temp, weight, label in weighted_samples]
-    mean = sum(weight * temp for temp, weight, _ in normalized)
-    variance = sum(weight * (temp - mean) ** 2 for temp, weight, _ in normalized)
-    std = math.sqrt(max(variance, 0.0)) if variance > 0 else 0.5
-
-    # Effective sample size prevents deterministic add-ons from creating fake confidence.
-    n_eff = 1.0 / max(sum(weight * weight for _, weight, _ in normalized), 1e-9)
-    n_eff = max(n_eff, 2.0)  # floor prevents degenerate bandwidth when one source dominates
-    h = max(0.5, 1.06 * std * n_eff ** (-1.0 / 5.0))
-
-    if direction == "T":
-        # P(T > threshold) using kernel CDF estimator
-        prob = sum(weight * (1.0 - _norm_cdf((threshold - temp) / h))
-                   for temp, weight, _ in normalized)
-    elif direction == "B":
-        # P(threshold <= T < threshold + 1) = CDF(threshold+1) - CDF(threshold)
-        cdf_upper = sum(weight * _norm_cdf((threshold + 1 - temp) / h)
-                        for temp, weight, _ in normalized)
-        cdf_lower = sum(weight * _norm_cdf((threshold - temp) / h)
-                        for temp, weight, _ in normalized)
-        prob = cdf_upper - cdf_lower
-    else:
-        return None
-
-    # Clamp to [0.01, 0.99] to avoid extremes with limited ensemble size
-    prob = max(0.01, min(0.99, prob))
-    if return_details:
-        return (prob, {
-            "bandwidth": h,
-            "center_temp": mean,
-            "effective_sample_size": n_eff,
-            "extra_weights": extra_summary,
-            "method": "empirical_ensemble",
-            "member_count": len(member_temps),
-            "sigma_used": max(0.5, std),
-        })
-    return prob
+    return _empirical_ensemble_probability_impl(
+        member_temps,
+        threshold,
+        direction,
+        bias_offset=bias_offset,
+        extra_points=extra_points,
+        return_details=return_details,
+    )
 
 
 def nws_sigma_for_hour(hour_of_day):
-    """NWS temperature uncertainty (sigma in degrees F) for a given hour.
-
-    Continuous exponential decay model:
-      sigma = max(0.5, 4.0 * exp(-0.18 * (hour - 6)))
-
-    Falls back to legacy step-function if calibration.json has nws.sigma_by_hour.
-
-    Exported for use in source-monitor CI-based edge gating.
-    """
-    cal = _load_calibration()
-    nws_section = cal.get("nws", {})
-    nws_cal = nws_section.get("sigma_by_hour", {})
-
-    if nws_cal:
-        # Legacy step-function: use calibrated values
-        if hour_of_day < 6:
-            return max(0.5, nws_cal.get("overnight", 5.0))
-        elif hour_of_day >= 17:
-            return max(0.5, nws_cal.get("17+", 0.5))
-        elif hour_of_day >= 15:
-            return max(0.5, nws_cal.get("15-16", 1.5))
-        else:
-            return max(0.5, nws_cal.get("before_15", 3.0))
-    else:
-        # Continuous model: exponential decay from morning uncertainty
-        if hour_of_day < 6:
-            return max(0.5, 5.0)
-        else:
-            return max(0.5, 4.0 * math.exp(-0.18 * (hour_of_day - 6)))
+    return _nws_sigma_for_hour_impl(
+        hour_of_day,
+        load_calibration_func=_load_calibration,
+    )
 
 
 def nws_probability(running_high, threshold, direction, hour_of_day):
-    """Probability for NWS actual-temp arbitrage (source-monitor).
-
-    Uses nws_sigma_for_hour() for residual uncertainty estimation.
-    Student-t CDF (df from calibration, default 6) for fat-tail modeling.
-
-    direction="T": P(final_high > threshold)
-    direction="B": P(threshold <= final_high < threshold+1)
-    """
-    cal = _load_calibration()
-    nws_df = cal.get("nws", {}).get("df", 6)
-    if not isinstance(nws_df, (int, float)) or nws_df < 2:
-        _log.warning("Invalid nws_df=%s in calibration, using default df=6", nws_df)
-        nws_df = 6
-
-    sigma = nws_sigma_for_hour(hour_of_day)
-
-    if direction == "T":
-        z = (threshold - running_high) / sigma
-        return 1.0 - _student_t_cdf(z, nws_df)
-    else:
-        # Bracket
-        z_low = (threshold - running_high) / sigma
-        z_high = (threshold + 1 - running_high) / sigma
-        return _student_t_cdf(z_high, nws_df) - _student_t_cdf(z_low, nws_df)
+    return _nws_probability_impl(
+        running_high,
+        threshold,
+        direction,
+        hour_of_day,
+        load_calibration_func=_load_calibration,
+        logger=_log,
+    )
 
 
 def info_arb_probability(observed, threshold, data_sigma_pct=0.05):

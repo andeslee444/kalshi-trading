@@ -69,7 +69,10 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
     for name in (
         "domain",
         "domain.shared",
+        "domain.shared.stats",
         "domain.shared.sizing",
+        "domain.weather",
+        "domain.weather.models",
         "execution",
         "execution.order_monitor",
         "execution.trade_manager",
@@ -83,7 +86,10 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "risk.kill_switch",
         "kalshi.domain",
         "kalshi.domain.shared",
+        "kalshi.domain.shared.stats",
         "kalshi.domain.shared.sizing",
+        "kalshi.domain.weather",
+        "kalshi.domain.weather.models",
         "kalshi.execution",
         "kalshi.execution.order_monitor",
         "kalshi.execution.trade_manager",
@@ -98,9 +104,17 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
     ):
         sys.modules.pop(name, None)
     try:
+        pkg_stats = importlib.import_module("kalshi.domain.shared.stats")
+        flat_stats = importlib.import_module("domain.shared.stats")
+        assert Path(flat_stats.__file__).resolve() == Path(pkg_stats.__file__).resolve()
+
         pkg_domain = importlib.import_module("kalshi.domain.shared.sizing")
         flat_domain = importlib.import_module("domain.shared.sizing")
         assert Path(flat_domain.__file__).resolve() == Path(pkg_domain.__file__).resolve()
+
+        pkg_weather = importlib.import_module("kalshi.domain.weather.models")
+        flat_weather = importlib.import_module("domain.weather.models")
+        assert Path(flat_weather.__file__).resolve() == Path(pkg_weather.__file__).resolve()
 
         pkg_execution = importlib.import_module("kalshi.execution.order_monitor")
         flat_execution = importlib.import_module("execution.order_monitor")
@@ -133,7 +147,10 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         for name in (
             "domain",
             "domain.shared",
+            "domain.shared.stats",
             "domain.shared.sizing",
+            "domain.weather",
+            "domain.weather.models",
             "execution",
             "execution.order_monitor",
             "execution.trade_manager",
@@ -147,7 +164,10 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "risk.kill_switch",
             "kalshi.domain",
             "kalshi.domain.shared",
+            "kalshi.domain.shared.stats",
             "kalshi.domain.shared.sizing",
+            "kalshi.domain.weather",
+            "kalshi.domain.weather.models",
             "kalshi.execution",
             "kalshi.execution.order_monitor",
             "kalshi.execution.trade_manager",
