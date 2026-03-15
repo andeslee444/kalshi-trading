@@ -26,6 +26,11 @@ from domain.shared.sizing import (
     quarter_kelly_sell,
     uncertainty_kelly,
 )
+from domain.crypto.models import (
+    crypto_price_probability as _crypto_price_probability_impl,
+    crypto_price_probability_heston as _crypto_price_probability_heston_impl,
+    crypto_price_probability_jd as _crypto_price_probability_jd_impl,
+)
 from domain.shared.stats import _norm_cdf, _skew_normal_cdf, _student_t_cdf
 from domain.weather.models import (
     compute_adaptive_ensemble_weights as _compute_adaptive_ensemble_weights_impl,
@@ -545,81 +550,18 @@ def crypto_price_probability(current_price, threshold, direction="above",
                               time_horizon_minutes=1440, realized_vol_pct=None,
                               iv_pct=None, use_ou=False, ou_half_life_minutes=None,
                               drift_pct=0.0, ou_target=None):
-    """Log-normal probability for crypto price markets (BTC/ETH).
-
-    Uses geometric Brownian motion: ln(S_T/S_0) ~ N((drift-0.5*sigma^2)*T, sigma^2*T)
-    where sigma is annualized volatility and drift is annualized return rate.
-
-    P(S_T > K) = Phi(d2) where d2 = (ln(S/K) + (drift-0.5*sigma^2)*T) / (sigma*sqrt(T))
-
-    Args:
-        current_price: current spot price (e.g. 67500 for BTC).
-        threshold: market threshold price.
-        direction: "above" for P(price > threshold),
-                   "below" for P(price < threshold).
-        time_horizon_minutes: time to settlement in minutes (default 1440 = 1 day).
-        realized_vol_pct: realized annualized volatility as decimal (e.g. 0.60 = 60%).
-        iv_pct: implied volatility as decimal. Takes precedence over realized.
-        drift_pct: annualized drift rate as decimal (default 0.0 = risk-neutral).
-                   Pass positive value for physical measure (e.g. 0.30 = 30% annual).
-        ou_target: OU mean-reversion target price (e.g. trailing VWAP).
-                   If None, OU drift adjustment is skipped even when use_ou=True.
-
-    Returns:
-        Probability (0-1).
-    """
-    if current_price <= 0 or threshold <= 0:
-        return 0.5
-
-    # Select volatility: IV > realized > default
-    if iv_pct is not None and iv_pct > 0:
-        sigma = iv_pct
-    elif realized_vol_pct is not None and realized_vol_pct > 0:
-        sigma = realized_vol_pct
-    else:
-        sigma = 0.60  # default ~60% annualized for BTC
-
-    # Convert time to annualized fraction (365.25 * 24 * 60 minutes per year)
-    T = time_horizon_minutes / (365.25 * 24 * 60)
-    if T <= 0:
-        return 1.0 if current_price > threshold else 0.0
-
-    # Ornstein-Uhlenbeck mean-reversion adjustment with smooth blend
-    ou_drift_adj = 0.0  # Additional drift from mean-reversion
-    if use_ou and ou_target is not None and ou_target > 0:
-        half_life = ou_half_life_minutes or 120  # default 2-hour half-life
-        theta_ou = math.log(2) / max(1, half_life)  # mean-reversion speed (per minute)
-        two_theta_T = 2 * theta_ou * time_horizon_minutes
-        if two_theta_T > 1e-10:
-            # OU variance adjustment: Var[X_T] = sigma^2 * (1-e^{-2*theta*T}) / (2*theta*T)
-            ou_factor = math.sqrt((1 - math.exp(-two_theta_T)) / two_theta_T)
-
-            # OU drift correction: mean-reversion pull toward ou_target (e.g. trailing VWAP)
-            # For log-price OU: E[X_T] = X_0 * e^{-theta*T} + mu * (1 - e^{-theta*T})
-            # Previously used threshold as target (bug: pulled toward every strike simultaneously)
-            theta_T_min = theta_ou * time_horizon_minutes
-            ou_drift_adj = (1 - math.exp(-theta_T_min)) * math.log(ou_target / current_price)
-
-            # Smooth blend: full OU below 180 min, linear taper to 1.0 at 300 min
-            if time_horizon_minutes > 180:
-                blend = max(0.0, (300 - time_horizon_minutes) / 120)
-                ou_factor = blend * ou_factor + (1 - blend) * 1.0
-                ou_drift_adj *= blend
-            sigma = sigma * ou_factor
-
-    sqrt_T = math.sqrt(T)
-    sigma_sqrt_T = sigma * sqrt_T
-
-    if sigma_sqrt_T <= 0:
-        return 1.0 if current_price > threshold else 0.0
-
-    # d2 with configurable drift + OU drift correction
-    d2 = (math.log(current_price / threshold) + (drift_pct - 0.5 * sigma**2) * T + ou_drift_adj) / sigma_sqrt_T
-    prob_above = _norm_cdf(d2)
-
-    if direction == "below":
-        return 1.0 - prob_above
-    return prob_above
+    return _crypto_price_probability_impl(
+        current_price,
+        threshold,
+        direction=direction,
+        time_horizon_minutes=time_horizon_minutes,
+        realized_vol_pct=realized_vol_pct,
+        iv_pct=iv_pct,
+        use_ou=use_ou,
+        ou_half_life_minutes=ou_half_life_minutes,
+        drift_pct=drift_pct,
+        ou_target=ou_target,
+    )
 
 
 def crypto_price_probability_jd(current_price, threshold, direction="above",
@@ -627,90 +569,19 @@ def crypto_price_probability_jd(current_price, threshold, direction="above",
                                   iv_pct=None, drift_pct=0.0,
                                   jump_intensity=1.0, jump_mean=-0.05,
                                   jump_std=0.10, max_jumps=10):
-    """Merton jump-diffusion probability for crypto price markets.
-
-    Extends GBM with Poisson jump process for fatter tails. Better pricing
-    for far-OTM crypto markets where flash crashes/rallies are underpriced
-    by pure GBM.
-
-    The model: dS/S = (mu - lambda*k)dt + sigma*dW + J*dN
-    where J ~ N(jump_mean, jump_std), N ~ Poisson(lambda*T).
-
-    P(S_T > K) = sum_{n=0}^{N_max} P(N=n) * P_n(S_T > K | n jumps)
-
-    where P_n is a GBM probability with adjusted sigma and drift.
-
-    Args:
-        current_price: Current spot price.
-        threshold: Market threshold price.
-        direction: "above" or "below".
-        time_horizon_minutes: Minutes to settlement.
-        realized_vol_pct: Annualized vol as decimal (e.g., 0.60).
-        iv_pct: Implied vol (takes precedence over realized).
-        drift_pct: Annualized drift rate.
-        jump_intensity: Average jumps per year (lambda). Default 1.0.
-        jump_mean: Mean log-jump size (default -0.05 = -5%, slight downward bias).
-        jump_std: Std of log-jump size (default 0.10 = 10%).
-        max_jumps: Max number of jumps to sum over (default 10).
-
-    Returns:
-        Probability (0-1).
-    """
-    if current_price <= 0 or threshold <= 0:
-        return 0.5
-
-    # Select volatility
-    if iv_pct is not None and iv_pct > 0:
-        sigma = iv_pct
-    elif realized_vol_pct is not None and realized_vol_pct > 0:
-        sigma = realized_vol_pct
-    else:
-        sigma = 0.60
-
-    T = time_horizon_minutes / (365.25 * 24 * 60)
-    if T <= 0:
-        return 1.0 if current_price > threshold else 0.0
-
-    # Compensator: k = E[e^J - 1] = exp(jump_mean + 0.5*jump_std^2) - 1
-    k = math.exp(jump_mean + 0.5 * jump_std ** 2) - 1
-    lambda_T = jump_intensity * T
-
-    log_S_K = math.log(current_price / threshold)
-    prob_above = 0.0
-
-    for n in range(max_jumps + 1):
-        # Poisson probability P(N = n)
-        if n == 0:
-            poisson_p = math.exp(-lambda_T)
-        else:
-            # log(P(N=n)) = n*log(lambda_T) - lambda_T - sum(log(1..n))
-            log_p = n * math.log(max(lambda_T, 1e-300)) - lambda_T
-            for i in range(1, n + 1):
-                log_p -= math.log(i)
-            poisson_p = math.exp(log_p)
-
-        if poisson_p < 1e-15:
-            break  # Negligible contribution
-
-        # Conditional GBM with n jumps:
-        # sigma_n^2 = sigma^2 + n * jump_std^2 / T
-        sigma_n_sq = sigma ** 2 + n * jump_std ** 2 / max(T, 1e-15)
-        sigma_n = math.sqrt(sigma_n_sq)
-
-        # drift_n = drift - lambda*k + n*jump_mean/T
-        drift_n = drift_pct - jump_intensity * k + n * jump_mean / max(T, 1e-15)
-
-        # d2 = (log(S/K) + (drift_n - 0.5*sigma_n^2)*T) / (sigma_n * sqrt(T))
-        sqrt_T = math.sqrt(T)
-        d2 = (log_S_K + (drift_n - 0.5 * sigma_n_sq) * T) / (sigma_n * sqrt_T)
-        prob_above += poisson_p * _norm_cdf(d2)
-
-    # Clamp to [0, 1]
-    prob_above = max(0.0, min(1.0, prob_above))
-
-    if direction == "below":
-        return 1.0 - prob_above
-    return prob_above
+    return _crypto_price_probability_jd_impl(
+        current_price,
+        threshold,
+        direction=direction,
+        time_horizon_minutes=time_horizon_minutes,
+        realized_vol_pct=realized_vol_pct,
+        iv_pct=iv_pct,
+        drift_pct=drift_pct,
+        jump_intensity=jump_intensity,
+        jump_mean=jump_mean,
+        jump_std=jump_std,
+        max_jumps=max_jumps,
+    )
 
 
 def crypto_price_probability_heston(
@@ -719,107 +590,18 @@ def crypto_price_probability_heston(
     v0=0.25, kappa=2.0, theta=0.25, xi=0.3, rho=-0.7,
     drift_pct=0.0,
 ):
-    """Heston stochastic volatility model for crypto binary options.
-
-    Uses Formulation 2 (Albrecher et al. 2007) of the characteristic function
-    for numerical stability. Computes P(S_T > K) via Fourier inversion.
-
-    Parameters:
-        current_price: Current spot price
-        threshold: Strike price
-        v0: Initial variance (e.g., 0.25 = 50% vol)
-        kappa: Mean-reversion speed of variance
-        theta: Long-run variance
-        xi: Vol-of-vol (volatility of variance process)
-        rho: Correlation between price and vol Brownian motions
-        drift_pct: Annualized drift (decimal)
-
-    Returns:
-        float: Probability in [0.001, 0.999]
-    """
-    import numpy as np
-    from scipy import integrate
-
-    T = time_horizon_minutes / (365.25 * 24 * 60)
-    if current_price <= 0 or threshold <= 0:
-        if direction == "above":
-            return 0.999 if current_price > threshold else 0.001
-        return 0.999 if current_price < threshold else 0.001
-    if T <= 0:
-        if direction == "above":
-            return 0.999 if current_price > threshold else 0.001
-        return 0.999 if current_price < threshold else 0.001
-
-    # Feller condition: 2*kappa*theta >= xi^2 ensures variance stays positive.
-    # When violated (e.g., GARCH-driven xi), the Fourier inversion becomes
-    # unreliable. Fall back to GBM with vol=sqrt(v0) for safety.
-    if 2 * kappa * theta < xi ** 2:
-        _log.warning("Heston Feller violated (2κθ=%.3f < ξ²=%.3f), falling back to GBM",
-                     2 * kappa * theta, xi ** 2)
-        vol = math.sqrt(max(v0, 1e-10))
-        return crypto_price_probability(
-            current_price, threshold, direction,
-            time_horizon_minutes, realized_vol_pct=vol, drift_pct=drift_pct,
-        )
-
-    S = current_price
-    K = threshold
-    mu = drift_pct
-    x = math.log(S / K)
-
-    def heston_cf_p2(phi):
-        """Heston CF for P2 (risk-neutral prob), Formulation 2 (stable)."""
-        u = -0.5
-        b = kappa
-
-        a_val = rho * xi * 1j * phi - b
-        d = np.sqrt(a_val ** 2 - xi ** 2 * (2 * u * 1j * phi - phi ** 2))
-
-        # Enforce Re(d) >= 0 to select correct branch
-        if np.real(d) < 0:
-            d = -d
-
-        # Formulation 2: |g| <= 1 always when Re(d) >= 0
-        denom = -a_val + d
-        if abs(denom) < 1e-15:
-            g = 0.0
-        else:
-            g = (-a_val - d) / denom
-
-        exp_neg_dT = np.exp(-d * T)
-
-        C = mu * 1j * phi * T + (kappa * theta / xi ** 2) * (
-            (-a_val - d) * T - 2 * np.log((1 - g * exp_neg_dT) / (1 - g + 1e-30))
-        )
-        D = ((-a_val - d) / xi ** 2) * (1 - exp_neg_dT) / (1 - g * exp_neg_dT + 1e-30)
-
-        return np.exp(C + D * v0 + 1j * phi * x)
-
-    def integrand_p2(phi):
-        """Integrand for P2 = 0.5 + (1/pi) * integral."""
-        cf = heston_cf_p2(phi)
-        return np.real(cf / (1j * phi))
-
-    # Adaptive upper limit: higher for low vol or short horizons
-    upper = max(200, min(1000, 50 / math.sqrt(v0 * T + 1e-10)))
-
-    try:
-        int2, _ = integrate.quad(integrand_p2, 1e-8, upper, limit=150)
-        P2 = 0.5 + int2 / math.pi
-    except Exception:
-        _log.warning("Heston integration failed (v0=%.3f, xi=%.3f, rho=%.3f), falling back to GBM",
-                     v0, xi, rho)
-        vol = math.sqrt(max(v0, 1e-10))
-        return crypto_price_probability(
-            current_price, threshold, direction,
-            time_horizon_minutes, realized_vol_pct=vol, drift_pct=drift_pct,
-        )
-
-    prob_above = max(0.001, min(0.999, P2))
-
-    if direction == "above":
-        return prob_above
-    return max(0.001, min(0.999, 1.0 - prob_above))
+    return _crypto_price_probability_heston_impl(
+        current_price,
+        threshold,
+        direction=direction,
+        time_horizon_minutes=time_horizon_minutes,
+        v0=v0,
+        kappa=kappa,
+        theta=theta,
+        xi=xi,
+        rho=rho,
+        drift_pct=drift_pct,
+    )
 
 
 # ─── Longshot bias model ───
