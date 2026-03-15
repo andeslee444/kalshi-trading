@@ -326,6 +326,11 @@ Key actions:
 - Move per-strategy parsers and model inputs next to their domains
 - Keep one shared sizing layer, but version model families independently
 
+Current bridge state:
+
+- Slice 1 extracts shared fee, sizing, and liquidity helpers into `domain/shared/sizing.py`
+- `probability.py` remains the compatibility import surface while strategy-specific models stay in place
+
 Acceptance gate:
 
 - Every production trade record includes:

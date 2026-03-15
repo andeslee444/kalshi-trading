@@ -67,6 +67,9 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         sys.path.remove(flat_src_dir)
         removed = True
     for name in (
+        "domain",
+        "domain.shared",
+        "domain.shared.sizing",
         "execution",
         "execution.order_monitor",
         "execution.trade_manager",
@@ -78,6 +81,9 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "ops.notifications",
         "risk",
         "risk.kill_switch",
+        "kalshi.domain",
+        "kalshi.domain.shared",
+        "kalshi.domain.shared.sizing",
         "kalshi.execution",
         "kalshi.execution.order_monitor",
         "kalshi.execution.trade_manager",
@@ -92,6 +98,10 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
     ):
         sys.modules.pop(name, None)
     try:
+        pkg_domain = importlib.import_module("kalshi.domain.shared.sizing")
+        flat_domain = importlib.import_module("domain.shared.sizing")
+        assert Path(flat_domain.__file__).resolve() == Path(pkg_domain.__file__).resolve()
+
         pkg_execution = importlib.import_module("kalshi.execution.order_monitor")
         flat_execution = importlib.import_module("execution.order_monitor")
         assert Path(flat_execution.__file__).resolve() == Path(pkg_execution.__file__).resolve()
@@ -121,6 +131,9 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         assert Path(flat_risk.__file__).resolve() == Path(pkg_risk.__file__).resolve()
     finally:
         for name in (
+            "domain",
+            "domain.shared",
+            "domain.shared.sizing",
             "execution",
             "execution.order_monitor",
             "execution.trade_manager",
@@ -132,6 +145,9 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "ops.notifications",
             "risk",
             "risk.kill_switch",
+            "kalshi.domain",
+            "kalshi.domain.shared",
+            "kalshi.domain.shared.sizing",
             "kalshi.execution",
             "kalshi.execution.order_monitor",
             "kalshi.execution.trade_manager",
