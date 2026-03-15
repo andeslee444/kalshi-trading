@@ -31,6 +31,11 @@ from domain.crypto.models import (
     crypto_price_probability_heston as _crypto_price_probability_heston_impl,
     crypto_price_probability_jd as _crypto_price_probability_jd_impl,
 )
+from domain.entertainment.models import (
+    album_data_sigma as _album_data_sigma_impl,
+    boxoffice_data_sigma as _boxoffice_data_sigma_impl,
+    info_arb_probability as _info_arb_probability_impl,
+)
 from domain.economics.models import (
     cpi_nowcast_sigma as _cpi_nowcast_sigma_impl,
     econ_nowcast_probability as _econ_nowcast_probability_impl,
@@ -299,74 +304,16 @@ def nws_probability(running_high, threshold, direction, hour_of_day):
 
 
 def info_arb_probability(observed, threshold, data_sigma_pct=0.05):
-    """CDF-based confidence for info-arb trades (album sales, box office).
-
-    observed = actual data (units sold, gross $)
-    threshold = market threshold
-    data_sigma_pct = uncertainty as fraction of threshold
-
-    P(final > threshold) = Phi((observed - threshold) / (threshold * data_sigma_pct))
-    """
-    sigma = threshold * data_sigma_pct
-    if sigma <= 0:
-        return 0.5
-    z = (observed - threshold) / sigma
-    return _norm_cdf(z)
+    return _info_arb_probability_impl(observed, threshold, data_sigma_pct=data_sigma_pct)
 
 
 def album_data_sigma(day_of_week, hours_since_publication=0, source=None):
-    """Day-dependent + time-decay uncertainty for album sales data.
-
-    day_of_week: 0=Monday ... 6=Sunday
-    hours_since_publication: hours since data was published (0=fresh).
-        Increases sigma by 50% per 48 hours of staleness, capped at 3x.
-    source: data source identifier for source-aware sigma:
-        "hdd-hits-top-50" → 2% (IS the settlement source, only chart correction risk)
-        "hdd-midweek-20"  → day-based (10-15%, building estimates can shift)
-        "hdd-article"     → 18% (text extraction, numbers may be projections/ranges)
-        None              → day-based legacy behavior (backward compatible)
-
-    Legacy day-based defaults (source=None or unknown source):
-        Mon/Tue (early projections): sigma = 15% of threshold
-        Wed/Thu (mid-week updates):  sigma = 10%
-        Fri+ (actual data):          sigma = 5%
-
-    Overridden by calibration.json album_sales.sigma_by_day or
-    album_sales.sigma_by_source if present.
-    """
-    cal = _load_calibration()
-    album_cal = cal.get("album_sales", {})
-    source_cal = album_cal.get("sigma_by_source", {})
-    day_cal = album_cal.get("sigma_by_day", {})
-
-    # Source-aware sigma: known sources get fixed sigma values
-    if source == "hdd-hits-top-50":
-        base_sigma = source_cal.get("hdd-hits-top-50", 0.02)
-    elif source == "hdd-midweek-20":
-        # Midweek estimates use day-based sigma (same range as legacy)
-        if day_of_week <= 1:
-            base_sigma = source_cal.get("hdd-midweek-20-mon-tue", day_cal.get("mon_tue", 0.15))
-        elif day_of_week <= 3:
-            base_sigma = source_cal.get("hdd-midweek-20-wed-thu", day_cal.get("wed_thu", 0.10))
-        else:
-            base_sigma = source_cal.get("hdd-midweek-20-fri-sun", day_cal.get("fri_sun", 0.05))
-    elif source == "hdd-article":
-        base_sigma = source_cal.get("hdd-article", 0.18)
-    else:
-        # Legacy behavior: day-based sigma (backward compatible)
-        if day_of_week <= 1:  # Mon, Tue
-            base_sigma = day_cal.get("mon_tue", 0.15)
-        elif day_of_week <= 3:  # Wed, Thu
-            base_sigma = day_cal.get("wed_thu", 0.10)
-        else:  # Fri, Sat, Sun
-            base_sigma = day_cal.get("fri_sun", 0.05)
-
-    # Time decay: data uncertainty grows 50% per 48 hours of staleness
-    if hours_since_publication > 0:
-        decay_factor = 1.0 + 0.5 * (hours_since_publication / 48.0)
-        base_sigma *= min(decay_factor, 3.0)  # cap at 3x
-
-    return base_sigma
+    return _album_data_sigma_impl(
+        day_of_week,
+        hours_since_publication=hours_since_publication,
+        source=source,
+        load_calibration_func=_load_calibration,
+    )
 
 
 def econ_nowcast_probability(nowcast_value, nowcast_sigma, threshold, direction="above", df=None):
@@ -397,34 +344,11 @@ def gdp_nowcast_sigma(days_to_release):
 
 
 def boxoffice_data_sigma(day_of_week, hours_since_publication=0):
-    """Day-dependent + time-decay uncertainty for box office data.
-
-    day_of_week: 0=Monday ... 6=Sunday
-    hours_since_publication: hours since data was published (0=fresh).
-        Increases sigma by 50% per 48 hours of staleness, capped at 3x.
-
-    Fri/Sat (estimates): sigma = 12%
-    Sun (Sunday actuals): sigma = 5%
-    Mon+ (final):         sigma = 4%
-
-    Overridden by calibration.json box_office.sigma_by_day if present.
-    """
-    cal = _load_calibration()
-    box_cal = cal.get("box_office", {}).get("sigma_by_day", {})
-
-    if day_of_week in (4, 5):  # Fri, Sat
-        base_sigma = box_cal.get("fri_sat", 0.12)
-    elif day_of_week == 6:  # Sun
-        base_sigma = box_cal.get("sun", 0.05)
-    else:  # Mon-Thu
-        base_sigma = box_cal.get("mon_thu", 0.04)
-
-    # Time decay: data uncertainty grows 50% per 48 hours of staleness
-    if hours_since_publication > 0:
-        decay_factor = 1.0 + 0.5 * (hours_since_publication / 48.0)
-        base_sigma *= min(decay_factor, 3.0)  # cap at 3x
-
-    return base_sigma
+    return _boxoffice_data_sigma_impl(
+        day_of_week,
+        hours_since_publication=hours_since_publication,
+        load_calibration_func=_load_calibration,
+    )
 
 
 # ─── Gas price probability model ───

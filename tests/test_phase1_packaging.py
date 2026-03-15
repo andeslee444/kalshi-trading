@@ -71,6 +71,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "domain.crypto.models",
         "domain.economics",
         "domain.economics.models",
+        "domain.entertainment",
+        "domain.entertainment.models",
         "domain",
         "domain.shared",
         "domain.shared.stats",
@@ -92,6 +94,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "kalshi.domain.crypto.models",
         "kalshi.domain.economics",
         "kalshi.domain.economics.models",
+        "kalshi.domain.entertainment",
+        "kalshi.domain.entertainment.models",
         "kalshi.domain",
         "kalshi.domain.shared",
         "kalshi.domain.shared.stats",
@@ -119,6 +123,10 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         pkg_economics = importlib.import_module("kalshi.domain.economics.models")
         flat_economics = importlib.import_module("domain.economics.models")
         assert Path(flat_economics.__file__).resolve() == Path(pkg_economics.__file__).resolve()
+
+        pkg_entertainment = importlib.import_module("kalshi.domain.entertainment.models")
+        flat_entertainment = importlib.import_module("domain.entertainment.models")
+        assert Path(flat_entertainment.__file__).resolve() == Path(pkg_entertainment.__file__).resolve()
 
         pkg_stats = importlib.import_module("kalshi.domain.shared.stats")
         flat_stats = importlib.import_module("domain.shared.stats")
@@ -165,6 +173,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "domain.crypto.models",
             "domain.economics",
             "domain.economics.models",
+            "domain.entertainment",
+            "domain.entertainment.models",
             "domain",
             "domain.shared",
             "domain.shared.stats",
@@ -186,6 +196,8 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "kalshi.domain.crypto.models",
             "kalshi.domain.economics",
             "kalshi.domain.economics.models",
+            "kalshi.domain.entertainment",
+            "kalshi.domain.entertainment.models",
             "kalshi.domain",
             "kalshi.domain.shared",
             "kalshi.domain.shared.stats",
