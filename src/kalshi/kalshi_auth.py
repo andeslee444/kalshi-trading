@@ -11,15 +11,12 @@ Usage:
     client.post("/portfolio/orders", body={...})
 """
 
-import json, time, base64, os, sys, logging, datetime, tempfile, fcntl
+import json, time, os, sys, logging, datetime, tempfile, fcntl
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from pathlib import Path
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.backends import default_backend
 from dotenv import load_dotenv
 
 from execution.order_monitor import OrderMonitor as ExecutionOrderMonitor
@@ -28,6 +25,13 @@ from execution.trade_manager import (
     TradeManager as ExecutionTradeManager,
     trim_trade_log as execution_trim_trade_log,
     validate_trade_config as execution_validate_trade_config,
+)
+from infra.kalshi_client import (
+    KalshiClient as InfraKalshiClient,
+    normalize_market as infra_normalize_market,
+    normalize_markets as infra_normalize_markets,
+    read_market_cache as infra_read_market_cache,
+    write_market_cache as infra_write_market_cache,
 )
 from ops.health_monitor import (
     BOT_SOURCE_MAP,
@@ -117,61 +121,14 @@ def round_half_up(value):
     return int(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
-# === Kalshi API v2 field normalization ===
-#
-# The Kalshi API v2 returns prices as dollar-amount strings (e.g., "0.86")
-# in fields suffixed with _dollars/_fp, but all bot code reads integer-cent
-# fields (e.g., yes_bid=86). This normalizer bridges the gap.
-
-# Maps API v2 dollar-string fields to the legacy integer-cent field names.
-# Each entry: (new_field, old_field, conversion_fn)
-# Uses round_half_up for prices (arithmetic rounding: 0.5 rounds UP, matching
-# exchange tick behavior) and int(float()) for volume/OI (truncation).
-def _dollars_to_cents(v):
-    """Convert dollar string to integer cents with arithmetic rounding."""
-    return round_half_up(float(v) * 100)
-
-_MARKET_FIELD_MAP = [
-    ("yes_bid_dollars",   "yes_bid",       _dollars_to_cents),
-    ("yes_ask_dollars",   "yes_ask",       _dollars_to_cents),
-    ("no_bid_dollars",    "no_bid",        _dollars_to_cents),
-    ("no_ask_dollars",    "no_ask",        _dollars_to_cents),
-    ("last_price_dollars", "last_price",   _dollars_to_cents),
-    ("volume_fp",         "volume",        lambda v: int(float(v))),
-    ("open_interest_fp",  "open_interest", lambda v: int(float(v))),
-]
-
-
 def normalize_market(m):
-    """Convert Kalshi API v2 dollar-string fields to integer-cent fields.
-
-    Mutates the dict in-place for performance (avoids copying thousands of
-    market dicts per scan). Also returns the dict for convenience.
-
-    Idempotent: if a legacy field already has a non-None value, it is not
-    overwritten. Safe to call on already-normalized data, cached data, or
-    test fixtures that use the old field names directly.
-    """
-    for new_field, old_field, convert in _MARKET_FIELD_MAP:
-        # Skip if legacy field already populated (idempotent guard)
-        existing = m.get(old_field)
-        if existing is not None:
-            continue
-        raw = m.get(new_field)
-        if raw is None:
-            continue
-        try:
-            m[old_field] = convert(raw)
-        except (ValueError, TypeError):
-            m[old_field] = 0
-    return m
+    """Compatibility wrapper over the extracted infra.kalshi_client module."""
+    return infra_normalize_market(m)
 
 
 def normalize_markets(markets):
-    """Normalize a list of market dicts in-place. Returns the same list."""
-    for m in markets:
-        normalize_market(m)
-    return markets
+    """Compatibility wrapper over the extracted infra.kalshi_client module."""
+    return infra_normalize_markets(markets)
 
 
 _log = logging.getLogger("kalshi_auth")
@@ -218,250 +175,45 @@ def setup_signal_handlers():
     )
 
 
-class KalshiClient:
-    """Kalshi API client with RSA-PSS authentication and retry logic."""
+class KalshiClient(InfraKalshiClient):
+    """Compatibility wrapper over the extracted infra.kalshi_client module."""
 
     def __init__(self, api_key=None, key_path=None, mode=None):
-        """Initialize client.
-
-        Args:
-            api_key: Kalshi API key. Falls back to KALSHI_API_KEY env var.
-            key_path: Path to RSA private key PEM file. Falls back to
-                      KALSHI_KEY_FILE env var, then default demo key path.
-            mode: "demo" or "production". Falls back to KALSHI_MODE env var,
-                  then defaults to "demo".
-        """
-        self.api_key = api_key or os.environ.get("KALSHI_API_KEY", "")
-        if not self.api_key:
-            raise ValueError(
-                "Kalshi API key required. Set KALSHI_API_KEY env var or pass api_key="
-            )
-
-        key_file = key_path or os.environ.get("KALSHI_KEY_FILE", str(DEFAULT_KEY_PATH))
-        key_path_obj = Path(key_file)
-        if not key_path_obj.is_absolute():
-            key_path_obj = PROJECT_DIR / key_file
-
-        try:
-            with open(key_path_obj, "rb") as f:
-                self.private_key = serialization.load_pem_private_key(
-                    f.read(), password=None, backend=default_backend()
-                )
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"RSA private key not found at {key_path_obj}. "
-                f"Set KALSHI_KEY_FILE env var to the correct path."
-            )
-        except Exception as e:
-            raise ValueError(f"Failed to load RSA private key from {key_path_obj}: {e}")
-
-        self.mode = mode or os.environ.get("KALSHI_MODE", "demo")
-        if self.mode == "production":
-            if os.environ.get("KALSHI_CONFIRM_PRODUCTION") != "yes":
-                raise ValueError(
-                    "Production mode requires KALSHI_CONFIRM_PRODUCTION=yes env var. "
-                    "Set this explicitly to confirm you intend to trade with real money."
-                )
-            _log.warning("PRODUCTION MODE ACTIVE — trading with real money")
-            self.base_url = PROD_BASE_URL
-        else:
-            self.base_url = DEMO_BASE_URL
-
-        # Persistent HTTP session for connection reuse (saves ~200-400ms per call)
-        self.session = requests.Session()
-
-        # Market cache: {cache_key: (timestamp, data)}
-        self._market_cache = {}
-
-    def _sign(self, method: str, path: str) -> dict:
-        """Generate authentication headers for a request."""
-        ts = str(int(time.time() * 1000))
-        path_clean = path.split("?")[0]
-        msg = f"{ts}{method}{path_clean}"
-        sig = self.private_key.sign(
-            msg.encode("utf-8"),
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.DIGEST_LENGTH,
-            ),
-            hashes.SHA256(),
+        super().__init__(
+            api_key=api_key,
+            key_path=key_path,
+            mode=mode,
+            project_dir=PROJECT_DIR,
+            default_key_path=DEFAULT_KEY_PATH,
+            demo_base_url=DEMO_BASE_URL,
+            prod_base_url=PROD_BASE_URL,
+            max_retries=MAX_RETRIES,
+            retry_backoff_base=RETRY_BACKOFF_BASE,
+            logger=_log,
+            requests_module=requests,
+            read_market_cache_func=read_market_cache,
+            write_market_cache_func=write_market_cache,
+            normalize_market_func=normalize_market,
+            normalize_markets_func=normalize_markets,
+            market_cache_path=MARKET_CACHE_PATH,
+            market_cache_ttl=MARKET_CACHE_TTL,
+            time_module=time,
         )
-        return {
-            "KALSHI-ACCESS-KEY": self.api_key,
-            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode("utf-8"),
-            "KALSHI-ACCESS-TIMESTAMP": ts,
-            "Content-Type": "application/json",
-        }
 
     def _request(self, method: str, path: str, body=None, timeout=15):
-        """Make an authenticated API request with retry on transient errors.
-
-        Only idempotent methods (GET, HEAD, OPTIONS) are retried on
-        ConnectionError/Timeout.  POST/DELETE are NOT retried because the
-        server may have already processed the request — retrying could
-        create duplicate orders.  Rate-limit 429 responses are safe to
-        retry for all methods.
-        """
-        url = self.base_url + path
-        full_path = "/trade-api/v2" + path
-        headers = self._sign(method, full_path)
-        is_idempotent = method in ("GET", "HEAD", "OPTIONS")
-
-        last_err = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                r = self.session.request(method, url, headers=headers, json=body, timeout=timeout)
-
-                # Don't retry client errors (4xx) except 429
-                if r.status_code == 429:
-                    wait = RETRY_BACKOFF_BASE * (2 ** attempt)
-                    _log.warning("Rate limited (429), retrying in %.1fs...", wait)
-                    time.sleep(wait)
-                    headers = self._sign(method, full_path)  # re-sign with fresh timestamp
-                    continue
-
-                r.raise_for_status()
-                if r.status_code == 204 or not r.content:
-                    return {}
-                try:
-                    return r.json()
-                except (ValueError, json.JSONDecodeError) as e:
-                    _log.error("Non-JSON response from %s %s (status %d): %s",
-                               method, path, r.status_code, r.text[:200])
-                    raise ValueError(
-                        f"Non-JSON response from {method} {path} "
-                        f"(status {r.status_code}): {r.text[:100]}"
-                    ) from e
-
-            except requests.exceptions.ConnectionError as e:
-                if not is_idempotent:
-                    _log.error("Non-retryable %s %s failed (ConnectionError): %s", method, path, e)
-                    raise
-                last_err = e
-                wait = RETRY_BACKOFF_BASE * (2 ** attempt)
-                _log.warning("Connection error, retrying in %.1fs... (%s)", wait, e)
-                time.sleep(wait)
-                headers = self._sign(method, full_path)
-            except requests.exceptions.Timeout as e:
-                if not is_idempotent:
-                    _log.error("Non-retryable %s %s failed (Timeout): %s", method, path, e)
-                    raise
-                last_err = e
-                wait = RETRY_BACKOFF_BASE * (2 ** attempt)
-                _log.warning("Timeout, retrying in %.1fs...", wait)
-                time.sleep(wait)
-                headers = self._sign(method, full_path)
-            except requests.exceptions.HTTPError:
-                raise  # Don't retry other HTTP errors
-            except Exception:
-                raise
-
-        raise last_err or Exception("Max retries exceeded")
-
-    def get(self, path: str, **kwargs):
-        """Make an authenticated GET request."""
-        return self._request("GET", path, **kwargs)
-
-    def post(self, path: str, body=None, **kwargs):
-        """Make an authenticated POST request."""
-        return self._request("POST", path, body=body, **kwargs)
-
-    def delete(self, path: str, **kwargs):
-        """Make an authenticated DELETE request."""
-        return self._request("DELETE", path, **kwargs)
-
-    def get_all_markets(self, prefix=None, status="open", max_pages=50, cache_ttl=0, use_shared_cache=True):
-        """Paginate through all open markets, optionally filtering by ticker prefix.
-
-        Args:
-            prefix: Only return markets whose ticker starts with this string.
-            status: Market status filter (default "open").
-            max_pages: Maximum pagination pages to fetch.
-            cache_ttl: When >0, return cached results if they are younger than
-                       this many seconds. Daemon bots can pass e.g. 300 (5 min)
-                       to avoid refetching identical market data every scan.
-            use_shared_cache: When True, check/update the cross-process file cache
-                       at data/market-cache.json. This avoids redundant API calls
-                       when multiple bots fetch the same prefix within 60s.
-        """
-        cache_key = f"{prefix or ''}:{status}"
-
-        # 1. Check in-memory cache (existing behavior)
-        if cache_ttl > 0 and cache_key in self._market_cache:
-            cached_time, cached_data = self._market_cache[cache_key]
-            if time.time() - cached_time < cache_ttl:
-                _log.debug("Market cache hit for %s (%d markets)", cache_key, len(cached_data))
-                return cached_data
-
-        # 2. Check shared file cache (cross-process)
-        if use_shared_cache and prefix and status == "open":
-            shared = read_market_cache(prefix=prefix)
-            if shared is not None:
-                _log.debug("Shared market cache hit for %s (%d markets)", prefix, len(shared))
-                if cache_ttl > 0:
-                    self._market_cache[cache_key] = (time.time(), shared)
-                return shared
-
-        # 3. Fetch from API
-        all_markets = []
-        cursor = None
-        for _ in range(max_pages):
-            path = f"/markets?status={status}&limit=1000"
-            if cursor:
-                path += f"&cursor={cursor}"
-            try:
-                data = self.get(path)
-            except Exception as e:
-                _log.error("Market page error: %s", e)
-                break
-            batch = data.get("markets", [])
-            if prefix:
-                for m in batch:
-                    if m.get("ticker", "").startswith(prefix):
-                        all_markets.append(m)
-            else:
-                all_markets.extend(batch)
-            cursor = data.get("cursor")
-            if not cursor or not batch:
-                break
-
-        if cursor and batch:
-            _log.warning(
-                "get_all_markets pagination may be truncated after %d pages (%d markets). "
-                "Increase max_pages if needed.", max_pages, len(all_markets)
-            )
-
-        # 3b. Normalize API v2 dollar-string fields to integer cents
-        normalize_markets(all_markets)
-
-        # 4. Update caches
-        if cache_ttl > 0:
-            self._market_cache[cache_key] = (time.time(), all_markets)
-
-        if use_shared_cache and prefix and status == "open":
-            try:
-                lock_path = MARKET_CACHE_PATH.with_suffix(".lock")
-                with open(lock_path, "w") as lock_fd:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                    try:
-                        existing = read_market_cache(max_age=MARKET_CACHE_TTL * 10) or {}
-                        if not isinstance(existing, dict):
-                            existing = {}
-                        existing[prefix] = all_markets
-                        write_market_cache(existing)
-                    finally:
-                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except Exception as e:
-                _log.debug("Failed to write shared market cache: %s", e)
-
-        return all_markets
+        if not hasattr(self, "requests_module"):
+            self.requests_module = requests
+        if not hasattr(self, "max_retries"):
+            self.max_retries = MAX_RETRIES
+        if not hasattr(self, "retry_backoff_base"):
+            self.retry_backoff_base = RETRY_BACKOFF_BASE
+        if not hasattr(self, "_time_module"):
+            self._time_module = time
+        if not hasattr(self, "_log"):
+            self._log = getattr(self, "log", _log)
+        return InfraKalshiClient._request(self, method, path, body=body, timeout=timeout)
 
     def get_market(self, ticker):
-        """Fetch a single market by ticker with field normalization.
-
-        Returns the normalized market dict, or None if not found.
-        Handles the API's ``{"market": {...}}`` wrapper automatically.
-        """
         try:
             data = self.get(f"/markets/{ticker}")
             market = data.get("market", data)
@@ -471,16 +223,6 @@ class KalshiClient:
         except Exception as e:
             _log.warning("get_market(%s) failed: %s", ticker, e)
             return None
-
-    def get_balance(self):
-        """Get portfolio balance. Returns (balance_cents, available_cents).
-
-        Also stores market_exposure (cost basis of open positions) on the client
-        for NAV approximation: NAV ~ balance + market_exposure.
-        """
-        data = self.get("/portfolio/balance")
-        self._market_exposure = data.get("market_exposure", 0)
-        return data.get("balance", 0), data.get("available_balance", data.get("balance", 0))
 
 
 # === Trade file utilities ===
@@ -505,48 +247,25 @@ def save_trade(trades_path: Path, trade: dict):
 
 # === Shared market data cache ===
 
-def write_market_cache(markets_by_prefix):
-    """Write market data to shared cache file (atomic write).
-
-    Args:
-        markets_by_prefix: Dict mapping prefix strings to market lists.
-    """
-    _atomic_write_json(MARKET_CACHE_PATH, {
-        "updated_at": time.time(),
-        "markets": markets_by_prefix,
-    })
+def write_market_cache(markets_by_prefix, *, cache_path=None, atomic_write_json_func=None, time_func=None):
+    """Compatibility wrapper over the extracted infra.kalshi_client module."""
+    return infra_write_market_cache(
+        markets_by_prefix,
+        cache_path=cache_path or MARKET_CACHE_PATH,
+        atomic_write_json_func=atomic_write_json_func or _atomic_write_json,
+        time_func=time_func or time.time,
+    )
 
 
-def read_market_cache(prefix=None, max_age=MARKET_CACHE_TTL):
-    """Read markets from shared cache if fresh enough.
-
-    Args:
-        prefix: Ticker prefix to look up. If None, returns all cached data.
-        max_age: Maximum age in seconds before cache is considered stale.
-
-    Returns:
-        List of market dicts if cache is fresh, or None if missing/stale.
-    """
-    try:
-        if not MARKET_CACHE_PATH.exists():
-            return None
-        data = json.loads(MARKET_CACHE_PATH.read_text())
-        age = time.time() - data.get("updated_at", 0)
-        if age > max_age:
-            return None
-        markets = data.get("markets", {})
-        if prefix is not None:
-            result = markets.get(prefix)
-            if isinstance(result, list):
-                normalize_markets(result)
-            return result
-        # Normalize all prefixes when returning full cache
-        for pfx, mkt_list in markets.items():
-            if isinstance(mkt_list, list):
-                normalize_markets(mkt_list)
-        return markets
-    except (json.JSONDecodeError, OSError, KeyError):
-        return None
+def read_market_cache(prefix=None, max_age=MARKET_CACHE_TTL, *, cache_path=None, normalize_markets_func=None, time_func=None):
+    """Compatibility wrapper over the extracted infra.kalshi_client module."""
+    return infra_read_market_cache(
+        prefix=prefix,
+        max_age=max_age,
+        cache_path=cache_path or MARKET_CACHE_PATH,
+        normalize_markets_func=normalize_markets_func or normalize_markets,
+        time_func=time_func or time.time,
+    )
 
 
 # === Concurrent fetch utility ===

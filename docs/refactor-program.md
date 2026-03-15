@@ -277,6 +277,7 @@ Current bridge state:
 - Slice 5 extracts `TradeManager`, `RecentTradeTracker`, and trade-log helpers into `execution/trade_manager.py`, with `kalshi_auth.py` preserving the existing public imports
 - Slice 6 extracts `HealthCheckMonitor` and the bot/source health contract into `ops/health_monitor.py`, with `kalshi_auth.py` preserving the existing public imports
 - Slice 7 extracts notification helpers into `ops/notifications.py`, with `kalshi_auth.py` preserving the existing public imports
+- Slice 8 extracts `KalshiClient`, market normalization, and market-cache helpers into `infra/kalshi_client.py`, with `kalshi_auth.py` preserving the existing public imports
 
 Rules:
 
