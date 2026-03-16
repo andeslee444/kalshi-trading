@@ -401,6 +401,7 @@ Current bridge state:
 - Slice 1 adds registry groundwork in `research/registry.py` and stamps `strategy_id`, `config_version`, and `model_version` metadata into shared trade and decision records
 - Slice 2 enriches weather bot trade and skip-decision records with explicit weather model descriptors and inline feature inputs
 - Slice 3 adds `research/opportunity_log.py` and mirrors skipped and selection-pruned weather opportunities into a canonical provenance-stamped artifact
+- Slice 4 extends explicit provenance and `opportunity_log` writes to crypto bot skipped opportunities and trade records
 
 ## Phase 8: Desk Operations And Governance
 
