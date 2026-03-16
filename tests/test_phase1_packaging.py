@@ -77,6 +77,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "domain.longshot.models",
         "domain",
         "research",
+        "research.missed_trade_analysis",
         "research.opportunity_log",
         "research.registry",
         "domain.shared",
@@ -105,6 +106,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "kalshi.domain.longshot.models",
         "kalshi.domain",
         "kalshi.research",
+        "kalshi.research.missed_trade_analysis",
         "kalshi.research.opportunity_log",
         "kalshi.research.registry",
         "kalshi.domain.shared",
@@ -145,6 +147,10 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         pkg_research = importlib.import_module("kalshi.research.registry")
         flat_research = importlib.import_module("research.registry")
         assert Path(flat_research.__file__).resolve() == Path(pkg_research.__file__).resolve()
+
+        pkg_missed_trade = importlib.import_module("kalshi.research.missed_trade_analysis")
+        flat_missed_trade = importlib.import_module("research.missed_trade_analysis")
+        assert Path(flat_missed_trade.__file__).resolve() == Path(pkg_missed_trade.__file__).resolve()
 
         pkg_opportunity_log = importlib.import_module("kalshi.research.opportunity_log")
         flat_opportunity_log = importlib.import_module("research.opportunity_log")
@@ -201,6 +207,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "domain.longshot.models",
             "domain",
             "research",
+            "research.missed_trade_analysis",
             "research.opportunity_log",
             "research.registry",
             "domain.shared",
@@ -229,6 +236,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "kalshi.domain.longshot.models",
             "kalshi.domain",
             "kalshi.research",
+            "kalshi.research.missed_trade_analysis",
             "kalshi.research.opportunity_log",
             "kalshi.research.registry",
             "kalshi.domain.shared",
