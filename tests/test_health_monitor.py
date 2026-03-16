@@ -99,6 +99,7 @@ class TestSourceTracking:
         hm.record_source_error("nws", "timeout")
         entry = hm._state["sources"]["nws"]
         assert entry["last_error"] is not None
+        assert entry["last_error_message"] == "timeout"
         assert entry["error_count"] == 1
 
     def test_consecutive_errors_accumulate(self, tmp_path):
@@ -114,6 +115,7 @@ class TestSourceTracking:
         assert hm._state["sources"]["nws"]["error_count"] == 2
         hm.record_source_success("nws")
         assert hm._state["sources"]["nws"]["error_count"] == 0
+        assert hm._state["sources"]["nws"]["last_error_message"] is None
 
     @patch("kalshi_auth.notify_imessage")
     @patch("kalshi_auth.notify_webhook")

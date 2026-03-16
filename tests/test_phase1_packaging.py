@@ -77,6 +77,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "domain.longshot.models",
         "domain",
         "research",
+        "research.source_catalog",
         "research.missed_trade_analysis",
         "research.opportunity_log",
         "research.registry",
@@ -106,6 +107,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "kalshi.domain.longshot.models",
         "kalshi.domain",
         "kalshi.research",
+        "kalshi.research.source_catalog",
         "kalshi.research.missed_trade_analysis",
         "kalshi.research.opportunity_log",
         "kalshi.research.registry",
@@ -151,6 +153,10 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         pkg_missed_trade = importlib.import_module("kalshi.research.missed_trade_analysis")
         flat_missed_trade = importlib.import_module("research.missed_trade_analysis")
         assert Path(flat_missed_trade.__file__).resolve() == Path(pkg_missed_trade.__file__).resolve()
+
+        pkg_source_catalog = importlib.import_module("kalshi.research.source_catalog")
+        flat_source_catalog = importlib.import_module("research.source_catalog")
+        assert Path(flat_source_catalog.__file__).resolve() == Path(pkg_source_catalog.__file__).resolve()
 
         pkg_opportunity_log = importlib.import_module("kalshi.research.opportunity_log")
         flat_opportunity_log = importlib.import_module("research.opportunity_log")
@@ -207,6 +213,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "domain.longshot.models",
             "domain",
             "research",
+            "research.source_catalog",
             "research.missed_trade_analysis",
             "research.opportunity_log",
             "research.registry",
@@ -236,6 +243,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "kalshi.domain.longshot.models",
             "kalshi.domain",
             "kalshi.research",
+            "kalshi.research.source_catalog",
             "kalshi.research.missed_trade_analysis",
             "kalshi.research.opportunity_log",
             "kalshi.research.registry",

@@ -507,6 +507,12 @@ class EventLedger:
     def get_decision_records(self, source_path=None):
         return self._fetch_event_payloads(EVENT_TYPE_TRADE_DECISION, source_path=source_path)
 
+    def get_source_observation_records(self, source_name=None):
+        records = self._fetch_event_payloads(EVENT_TYPE_SOURCE_OBSERVATION)
+        if source_name is None:
+            return records
+        return [record for record in records if record.get("source_name") == source_name]
+
     def get_verification_records(self, category=None):
         records = self._fetch_event_payloads(EVENT_TYPE_VERIFICATION_RESULT)
         if category is None:

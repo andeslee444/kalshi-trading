@@ -406,6 +406,7 @@ Current bridge state:
 - Slice 6 extends explicit provenance and `opportunity_log` writes to entertainment bot skipped opportunities and trade records
 - Slice 7 extends explicit provenance and `opportunity_log` writes to source-monitor skipped opportunities and trade records
 - Slice 8 adds canonical missed-trade analysis over `opportunity_log` in `research/missed_trade_analysis.py` plus a report CLI, so the new artifact can answer "why did we not trade?" without scanning per-bot decision logs
+- Slice 9 adds canonical `source_catalog` and a source scorecard CLI, wiring health-state error messages and ledger source observations into one report for freshness and parser-failure review
 
 ## Phase 8: Desk Operations And Governance
 

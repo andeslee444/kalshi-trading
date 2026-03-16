@@ -41,6 +41,7 @@ def test_record_source_error_opens_breaker_and_notifies(tmp_path):
 
     entry = monitor._state["sources"]["nws"]
     assert entry["error_count"] == 3
+    assert entry["last_error_message"] == "err3"
     assert entry["opened_at"] is not None
     assert [item[0] for item in notifications] == ["webhook", "imessage"]
 
@@ -52,6 +53,7 @@ def test_get_summary_marks_stale_and_error(tmp_path):
     monitor._state["sources"]["nws"] = {
         "last_success": None,
         "last_error": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "last_error_message": "timeout",
         "error_count": 3,
         "opened_at": time.time(),
     }
@@ -60,6 +62,7 @@ def test_get_summary_marks_stale_and_error(tmp_path):
 
     assert summary["bots"]["weather"]["status"] == "stale"
     assert summary["sources"]["nws"]["status"] == "error"
+    assert summary["sources"]["nws"]["last_error_message"] == "timeout"
     assert summary["overall"] == "critical"
 
 
