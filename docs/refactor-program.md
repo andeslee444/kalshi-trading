@@ -403,6 +403,7 @@ Current bridge state:
 - Slice 3 adds `research/opportunity_log.py` and mirrors skipped and selection-pruned weather opportunities into a canonical provenance-stamped artifact
 - Slice 4 extends explicit provenance and `opportunity_log` writes to crypto bot skipped opportunities and trade records
 - Slice 5 extends explicit provenance and `opportunity_log` writes to economics bot skipped opportunities and trade records
+- Slice 6 extends explicit provenance and `opportunity_log` writes to entertainment bot skipped opportunities and trade records
 
 ## Phase 8: Desk Operations And Governance
 
