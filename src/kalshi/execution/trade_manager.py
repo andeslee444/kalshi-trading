@@ -12,7 +12,7 @@ from pathlib import Path
 
 import requests
 
-from research.registry import ModelRegistry, StrategyConfigRegistry
+from research.registry import ModelRegistry, StrategyConfigRegistry, annotate_research_record
 from risk.circuit_breaker import CircuitBreaker, SHARED_BREAKER_PATH
 from risk.kill_switch import KILL_SWITCH_PATH, check_kill_switch, per_bot_halt_path
 from storage import TradeStore, atomic_write_json, load_trades, save_decision, save_trade
@@ -273,57 +273,19 @@ class TradeManager:
             strategy_id = getattr(log, "name", None)
         return strategy_id, getattr(self, "_config_version", None)
 
-    def _resolve_model_version(self, record):
-        model_version = record.get("model_version")
-        if model_version:
-            return model_version
-
-        model_name = record.get("model_name") or record.get("sizing_method")
-        registry = getattr(self, "_model_registry", None)
-        if not model_name or registry is None:
-            return None
-
-        strategy_id, _ = self._resolve_research_context()
-        descriptor = {
-            "strategy_id": strategy_id,
-            "model_name": model_name,
-        }
-        for key in ("model_family", "model_type", "sizing_method"):
-            value = record.get(key)
-            if value is not None:
-                descriptor[key] = value
-        custom_descriptor = record.get("model_descriptor")
-        if isinstance(custom_descriptor, dict):
-            descriptor.update(custom_descriptor)
-
-        try:
-            entry = registry.register(
-                model_name,
-                descriptor,
-                strategy_id=strategy_id,
-                source_bot=record.get("source_bot"),
-                source_path=self.trades_path,
-            )
-            return entry.get("model_version")
-        except Exception as e:
-            self.log.warning("Failed to register model metadata for %s: %s", model_name, e)
-            return None
-
     def _apply_research_metadata(self, record):
         strategy_id, config_version = self._resolve_research_context()
-        if record.get("strategy_id") is None and strategy_id is not None:
-            record["strategy_id"] = strategy_id
-        if record.get("config_version") is None and config_version is not None:
-            record["config_version"] = config_version
-        if record.get("model_name") is None and record.get("sizing_method") is not None:
-            record["model_name"] = record.get("sizing_method")
-        if record.get("feature_snapshot_id") is None and record.get("model_inputs") is None:
-            inline_model_inputs = record.get("inline_model_inputs")
-            if inline_model_inputs is not None:
-                record["model_inputs"] = inline_model_inputs
-        model_version = self._resolve_model_version(record)
-        if model_version is not None:
-            record["model_version"] = model_version
+        record.update(
+            annotate_research_record(
+                record,
+                strategy_id=strategy_id,
+                config_version=config_version,
+                model_registry=getattr(self, "_model_registry", None),
+                source_bot=record.get("source_bot"),
+                source_path=self.trades_path,
+                logger=self.log,
+            )
+        )
 
     def _reset_daily_if_needed(self):
         today = datetime.date.today().isoformat()

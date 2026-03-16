@@ -37,6 +37,70 @@ def _coerce_path(path):
     return str(Path(path))
 
 
+def _resolve_model_version(record, *, strategy_id=None, model_registry=None, source_bot=None, source_path=None, logger=None):
+    model_version = record.get("model_version")
+    if model_version:
+        return model_version
+
+    model_name = record.get("model_name") or record.get("sizing_method")
+    if not model_name or model_registry is None:
+        return None
+
+    descriptor = {
+        "strategy_id": strategy_id,
+        "model_name": model_name,
+    }
+    for key in ("model_family", "model_type", "sizing_method"):
+        value = record.get(key)
+        if value is not None:
+            descriptor[key] = value
+    custom_descriptor = record.get("model_descriptor")
+    if isinstance(custom_descriptor, dict):
+        descriptor.update(custom_descriptor)
+
+    try:
+        entry = model_registry.register(
+            model_name,
+            descriptor,
+            strategy_id=strategy_id,
+            source_bot=source_bot or record.get("source_bot"),
+            source_path=source_path,
+        )
+        return entry.get("model_version")
+    except Exception as e:
+        (logger or _log).warning("Failed to register model metadata for %s: %s", model_name, e)
+        return None
+
+
+def annotate_research_record(record, *, strategy_id=None, config_version=None, model_registry=None, source_bot=None, source_path=None, logger=None):
+    """Apply shared provenance metadata to a persisted artifact record."""
+    normalized = dict(record)
+    if normalized.get("strategy_id") is None and strategy_id is not None:
+        normalized["strategy_id"] = strategy_id
+    if normalized.get("config_version") is None and config_version is not None:
+        normalized["config_version"] = config_version
+    if normalized.get("source_bot") is None and source_bot is not None:
+        normalized["source_bot"] = source_bot
+    if normalized.get("model_name") is None and normalized.get("sizing_method") is not None:
+        normalized["model_name"] = normalized.get("sizing_method")
+    if normalized.get("feature_snapshot_id") is None and normalized.get("model_inputs") is None:
+        inline_model_inputs = normalized.get("inline_model_inputs")
+        if inline_model_inputs is not None:
+            normalized["model_inputs"] = inline_model_inputs
+
+    model_version = _resolve_model_version(
+        normalized,
+        strategy_id=normalized.get("strategy_id"),
+        model_registry=model_registry,
+        source_bot=normalized.get("source_bot"),
+        source_path=source_path,
+        logger=logger,
+    )
+    if model_version is not None:
+        normalized["model_version"] = model_version
+    return normalized
+
+
 class StrategyConfigRegistry:
     """Canonical registry for strategy/bot config snapshots."""
 
@@ -133,4 +197,5 @@ __all__ = [
     "DEFAULT_STRATEGY_CONFIG_REGISTRY_PATH",
     "ModelRegistry",
     "StrategyConfigRegistry",
+    "annotate_research_record",
 ]
