@@ -15,6 +15,7 @@ from capital_allocator import PortfolioAllocator
 from forecast_verifier import ForecastVerifier, DEFAULT_STATION_MAP, NWSCrossCheckVerifier
 from weather_data import EnsembleCollector, HRRRFetcher, NAMFetcher, PreviousRunsFetcher, OrderBookDepth, next_model_run, latest_available_model_run, canonical_model_name, open_meteo_model_name, STATION_MAP, NWSForecastFetcher, BiasCorrector
 from singleton_lock import acquire_process_singleton, release_process_singleton
+from research.opportunity_log import OpportunityLog
 
 # === Config ===
 CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-config.json"
@@ -30,6 +31,7 @@ allocator = None
 health = None
 order_monitor = None
 trade_manager = None
+opportunity_log = None
 
 
 def _release_singleton_lock():
@@ -848,6 +850,51 @@ def _weather_research_fields(parsed, *, forecast_temp=None, sigma_used=None, pro
         "feature_snapshot_id": feature_snapshot_id,
         "inline_model_inputs": model_inputs,
     }
+
+
+def _record_weather_opportunity(ticker, side, action, reason, *, opportunity_stage,
+                                opportunity_log_obj=None, edge=None, price_cents=None, **extra):
+    log_obj = opportunity_log_obj or opportunity_log
+    if log_obj is None:
+        return None
+
+    record = {
+        "ticker": ticker,
+        "side": side,
+        "action": action,
+        "reason": reason,
+        "opportunity_stage": opportunity_stage,
+    }
+    if edge is not None:
+        record["edge"] = round(edge, 4)
+    if price_cents is not None:
+        record["price_cents"] = price_cents
+    record.update(extra)
+    return log_obj.record(record)
+
+
+def _log_weather_decision(ticker, side, action, reason, *, edge=None, price_cents=None,
+                          opportunity_log_obj=None, **extra):
+    trade_manager.log_decision(
+        ticker,
+        side,
+        action,
+        reason,
+        edge=edge,
+        price_cents=price_cents,
+        **extra,
+    )
+    return _record_weather_opportunity(
+        ticker,
+        side,
+        action,
+        reason,
+        opportunity_stage="decision",
+        opportunity_log_obj=opportunity_log_obj,
+        edge=edge,
+        price_cents=price_cents,
+        **extra,
+    )
 
 
 def _apply_live_model_bias(city, forecasts, city_model_bias=None):
@@ -1758,12 +1805,18 @@ def scan_and_trade():
         distance = abs(forecast_temp - parsed["threshold"])
         if distance < min_forecast_distance:
             ss.skip("near_threshold")
-            trade_manager.log_decision(ticker, "skip", "skipped", "near_threshold",
-                                       forecast=forecast_temp, threshold=parsed["threshold"],
-                                       distance=round(distance, 1),
-                                       min_distance=round(min_forecast_distance, 1),
-                                       sigma=round(sigma, 2),
-                                       **research_fields)
+            _log_weather_decision(
+                ticker,
+                "skip",
+                "skipped",
+                "near_threshold",
+                forecast=forecast_temp,
+                threshold=parsed["threshold"],
+                distance=round(distance, 1),
+                min_distance=round(min_forecast_distance, 1),
+                sigma=round(sigma, 2),
+                **research_fields,
+            )
             continue
 
         yes_bid = m.get("yes_bid", 0)
@@ -1791,7 +1844,7 @@ def scan_and_trade():
             displayed_edge = displayed_plan["edge"] if displayed_plan else None
             if isinstance(displayed_edge, (int, float)) and displayed_edge < 0:
                 ss.skip("negative_edge")
-                trade_manager.log_decision(
+                _log_weather_decision(
                     ticker,
                     side,
                     "skipped",
@@ -1812,11 +1865,15 @@ def scan_and_trade():
         # Guard: never trade on negative edge (model says we'd lose money)
         if edge_yes < 0:
             ss.skip("negative_edge")
-            trade_manager.log_decision(ticker, side,
-                                       "skipped", "negative_edge",
-                                       edge=edge_yes,
-                                       price_cents=entry_plan["price"],
-                                       **research_fields)
+            _log_weather_decision(
+                ticker,
+                side,
+                "skipped",
+                "negative_edge",
+                edge=edge_yes,
+                price_cents=entry_plan["price"],
+                **research_fields,
+            )
             continue
 
         # Adjust edge threshold for high ensemble spread or disagreement (defense in depth)
@@ -1832,7 +1889,7 @@ def scan_and_trade():
         if edge_yes >= effective_edge_threshold:
             if parsed["direction"] == "B" and edge_yes < base_edge_threshold * 2:
                 ss.skip("bracket_low_edge")
-                trade_manager.log_decision(
+                _log_weather_decision(
                     ticker,
                     side,
                     "skipped",
@@ -1874,7 +1931,7 @@ def scan_and_trade():
             })
         else:
             ss.skip("low_edge")
-            trade_manager.log_decision(
+            _log_weather_decision(
                 ticker, side, "skipped",
                 "edge below threshold", edge=edge_yes,
                 price_cents=entry_plan["price"],
@@ -1896,8 +1953,29 @@ def scan_and_trade():
             len(opportunities) + len(pruned_opportunities),
             remaining_trade_slots,
         )
-        for _ in pruned_opportunities:
+        for opp in pruned_opportunities:
             ss.skip("selection_pruned")
+            parsed = opp.get("parsed", {})
+            _record_weather_opportunity(
+                opp["ticker"],
+                opp.get("side"),
+                "pruned",
+                "selection_pruned",
+                opportunity_stage="selection",
+                edge=opp.get("edge"),
+                price_cents=opp.get("entry_price"),
+                city=opp.get("city"),
+                settlement_date=parsed.get("date"),
+                direction=parsed.get("direction"),
+                threshold=parsed.get("threshold"),
+                forecast=opp.get("forecast"),
+                market_price=opp.get("market_price"),
+                model_prob=opp.get("our_prob"),
+                days_out=opp.get("days_out"),
+                execution_mode=opp.get("execution_mode"),
+                probability_method=opp.get("probability_method"),
+                **opp.get("research_fields", {}),
+            )
     log.info(f"Found {len(opportunities)} opportunities with edge >= {base_edge_threshold*100:.0f}%")
 
     for opp in opportunities:
@@ -1919,20 +1997,30 @@ def scan_and_trade():
             cooldown_secs = get_dedup_cooldown(days_out_val)
             log.info(f"  Skipping {ticker}: local dedup cooldown ({cooldown_secs}s for day-{days_out_val})")
             ss.skip("dedup_cooldown")
-            trade_manager.log_decision(ticker, "yes" if opp["our_prob"] > 0.5 else "no",
-                                       "skipped", f"dedup_cooldown ({cooldown_secs}s for day-{days_out_val})",
-                                       edge=edge, price_cents=yes_ask if opp["our_prob"] > 0.5 else no_ask,
-                                       **opp.get("research_fields", {}))
+            _log_weather_decision(
+                ticker,
+                "yes" if opp["our_prob"] > 0.5 else "no",
+                "skipped",
+                f"dedup_cooldown ({cooldown_secs}s for day-{days_out_val})",
+                edge=edge,
+                price_cents=yes_ask if opp["our_prob"] > 0.5 else no_ask,
+                **opp.get("research_fields", {}),
+            )
             continue
 
         # Rec 1: Brackets require 2x edge threshold (higher model uncertainty)
         if is_bracket and edge < base_edge_threshold * 2:
             log.info(f"  Skipping bracket {ticker}: edge {edge*100:.1f}% < {base_edge_threshold*200:.0f}% (2x threshold)")
             ss.skip("bracket_low_edge")
-            trade_manager.log_decision(ticker, opp["side"], "skipped",
-                                       f"bracket edge {edge*100:.1f}% < 2x threshold",
-                                       edge=edge, price_cents=yes_ask if opp["side"] == "yes" else no_ask,
-                                       **opp.get("research_fields", {}))
+            _log_weather_decision(
+                ticker,
+                opp["side"],
+                "skipped",
+                f"bracket edge {edge*100:.1f}% < 2x threshold",
+                edge=edge,
+                price_cents=yes_ask if opp["side"] == "yes" else no_ask,
+                **opp.get("research_fields", {}),
+            )
             continue
 
         # Edge is always positive (computed against the price we'd actually quote/pay)
@@ -1959,7 +2047,7 @@ def scan_and_trade():
                     if maker_plan is None:
                         log.info(f"  Skipping {ticker}: insufficient depth ({side_depth} < {min_depth})")
                         ss.skip("low_depth")
-                        trade_manager.log_decision(
+                        _log_weather_decision(
                             ticker,
                             side,
                             "skipped",
@@ -1982,7 +2070,7 @@ def scan_and_trade():
                     )
                     if edge < opp.get("effective_edge_threshold", base_edge_threshold):
                         ss.skip("low_depth")
-                        trade_manager.log_decision(
+                        _log_weather_decision(
                             ticker,
                             side,
                             "skipped",
@@ -1996,16 +2084,28 @@ def scan_and_trade():
         if side == "yes" and ((yes_ask and yes_ask < 99) or execution_mode == "maker"):
             # Config-level YES disable — if set, skip all weather YES trades
             if config.get("disableWeatherYes", False):
-                trade_manager.log_decision(ticker, "yes", "skipped", "weather YES disabled by config",
-                                            edge=edge, price_cents=price or yes_ask,
-                                            **opp.get("research_fields", {}))
+                _log_weather_decision(
+                    ticker,
+                    "yes",
+                    "skipped",
+                    "weather YES disabled by config",
+                    edge=edge,
+                    price_cents=price or yes_ask,
+                    **opp.get("research_fields", {}),
+                )
                 continue
             # Rec 2: NO-only weather constraint — skip YES unless edge >= 15%
             # YES side has 0% historical win rate; only trade with very high conviction
             if edge < 0.15:
-                trade_manager.log_decision(ticker, "yes", "skipped", f"YES edge {edge*100:.1f}% < 15% minimum",
-                                            edge=edge, price_cents=price or yes_ask,
-                                            **opp.get("research_fields", {}))
+                _log_weather_decision(
+                    ticker,
+                    "yes",
+                    "skipped",
+                    f"YES edge {edge*100:.1f}% < 15% minimum",
+                    edge=edge,
+                    price_cents=price or yes_ask,
+                    **opp.get("research_fields", {}),
+                )
                 continue
             if execution_mode == "maker":
                 order_type = "maker-limit"
@@ -2054,9 +2154,15 @@ def scan_and_trade():
         if not budget.approved:
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             ss.skip("allocator_denied")
-            trade_manager.log_decision(ticker, side, "skipped", f"allocator denied: {budget.reason}",
-                                       edge=edge, price_cents=price,
-                                       **opp.get("research_fields", {}))
+            _log_weather_decision(
+                ticker,
+                side,
+                "skipped",
+                f"allocator denied: {budget.reason}",
+                edge=edge,
+                price_cents=price,
+                **opp.get("research_fields", {}),
+            )
             continue
 
         # Position sizing based on market type, conviction, and calibration status
@@ -2130,9 +2236,15 @@ def scan_and_trade():
         if count <= 0:
             log.info(f"  Kelly says 0 contracts for {ticker} (edge too small for price), skipping")
             ss.skip("kelly_zero")
-            trade_manager.log_decision(ticker, side, "skipped", "kelly_zero: edge too small for price",
-                                       edge=edge, price_cents=price,
-                                       **opp.get("research_fields", {}))
+            _log_weather_decision(
+                ticker,
+                side,
+                "skipped",
+                "kelly_zero: edge too small for price",
+                edge=edge,
+                price_cents=price,
+                **opp.get("research_fields", {}),
+            )
             continue
 
         log.info(f"\n-> TRADE: {reasoning}")
@@ -2240,6 +2352,15 @@ def build_app(project_dir=None):
         "maxDailyLoss": loaded_config.get("maxDailyLoss", 10),
         "maxDailyLossPct": loaded_config.get("maxDailyLossPct"),
     }, logger=logger, order_monitor=order_monitor_obj, cooldown_hours=0.5, bot_name="weather")
+    opportunity_log_obj = OpportunityLog(
+        project_dir / "data" / "opportunity-log.json",
+        logger=logger,
+        strategy_id=trade_manager_obj.strategy_id,
+        config_version=getattr(trade_manager_obj, "_config_version", None),
+        model_registry=getattr(trade_manager_obj, "_model_registry", None),
+        source_bot=getattr(logger, "name", None),
+        source_path=trades_path,
+    )
     trim_trade_log(trades_path)
 
     verification_enabled = loaded_config.get("verification", {}).get("enabled", True)
@@ -2290,6 +2411,7 @@ def build_app(project_dir=None):
         "health": health_monitor,
         "order_monitor": order_monitor_obj,
         "trade_manager": trade_manager_obj,
+        "opportunity_log": opportunity_log_obj,
         "ENSEMBLE_ENABLED": loaded_config.get("ensemble", {}).get("enabled", False),
         "OPEN_METEO_BASE": open_meteo_base,
         "_endpoint_route_warned": set(),

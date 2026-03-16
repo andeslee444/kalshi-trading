@@ -25,18 +25,19 @@ def _load_weather_provenance_helpers():
     ns = {"json": json, "hashlib": hashlib, "re": re}
     exec(_extract_function_source(source, "_weather_model_name"), ns)
     exec(_extract_function_source(source, "_weather_research_fields"), ns)
-    return ns["_weather_model_name"], ns["_weather_research_fields"], source
+    exec(_extract_function_source(source, "_record_weather_opportunity"), ns)
+    return ns["_weather_model_name"], ns["_weather_research_fields"], ns["_record_weather_opportunity"], source
 
 
 def test_weather_model_name_normalizes_probability_method():
-    model_name, _research_fields, _source = _load_weather_provenance_helpers()
+    model_name, _research_fields, _record_weather_opportunity, _source = _load_weather_provenance_helpers()
 
     assert model_name("parametric_ensemble_v2") == "weather_parametric_ensemble_v2"
     assert model_name("Single Model") == "weather_single_model"
 
 
 def test_weather_research_fields_include_descriptor_and_inputs():
-    _model_name, research_fields, _source = _load_weather_provenance_helpers()
+    _model_name, research_fields, _record_weather_opportunity, _source = _load_weather_provenance_helpers()
 
     fields = research_fields(
         {"city": "MIA", "date": "2026-03-15", "direction": "T", "threshold": 86},
@@ -62,7 +63,7 @@ def test_weather_research_fields_include_descriptor_and_inputs():
 
 
 def test_weather_research_fields_snapshot_id_changes_with_inputs():
-    _model_name, research_fields, _source = _load_weather_provenance_helpers()
+    _model_name, research_fields, _record_weather_opportunity, _source = _load_weather_provenance_helpers()
 
     base = research_fields(
         {"city": "MIA", "date": "2026-03-15", "direction": "T", "threshold": 86},
@@ -78,8 +79,39 @@ def test_weather_research_fields_snapshot_id_changes_with_inputs():
     assert base["feature_snapshot_id"] != changed["feature_snapshot_id"]
 
 
-def test_weather_bot_source_threads_research_fields_into_trade_and_decision_calls():
-    _model_name, _research_fields, source = _load_weather_provenance_helpers()
+def test_record_weather_opportunity_sets_stage_and_rounds_edge():
+    _model_name, _research_fields, record_weather_opportunity, _source = _load_weather_provenance_helpers()
+
+    class StubOpportunityLog:
+        def __init__(self):
+            self.records = []
+
+        def record(self, record):
+            self.records.append(record)
+            return record
+
+    sink = StubOpportunityLog()
+    record = record_weather_opportunity(
+        "KXHIGHMIA-26MAR15-T86",
+        "no",
+        "pruned",
+        "selection_pruned",
+        opportunity_stage="selection",
+        opportunity_log_obj=sink,
+        edge=0.123456,
+        price_cents=44,
+        model_name="weather_single_model",
+    )
+
+    assert record["opportunity_stage"] == "selection"
+    assert record["edge"] == 0.1235
+    assert sink.records[-1]["model_name"] == "weather_single_model"
+
+
+def test_weather_bot_source_threads_research_fields_into_trade_and_opportunity_calls():
+    _model_name, _research_fields, _record_weather_opportunity, source = _load_weather_provenance_helpers()
 
     assert "**research_fields" in source
     assert '**opp.get("research_fields", {})' in source
+    assert "_log_weather_decision(" in source
+    assert 'opportunity_stage="selection"' in source
