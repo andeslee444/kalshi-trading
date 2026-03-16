@@ -148,18 +148,30 @@ class HealthCheckMonitor:
 
     def record_source_success(self, source):
         if source not in self._state["sources"]:
-            self._state["sources"][source] = {"last_success": None, "last_error": None, "error_count": 0}
+            self._state["sources"][source] = {
+                "last_success": None,
+                "last_error": None,
+                "last_error_message": None,
+                "error_count": 0,
+            }
         self._state["sources"][source]["last_success"] = self._utc_now_iso()
         self._state["sources"][source]["error_count"] = 0
         self._state["sources"][source]["opened_at"] = None
+        self._state["sources"][source]["last_error_message"] = None
         self._dirty_sources.add(source)
         self._save()
 
     def record_source_error(self, source, msg=""):
         if source not in self._state["sources"]:
-            self._state["sources"][source] = {"last_success": None, "last_error": None, "error_count": 0}
+            self._state["sources"][source] = {
+                "last_success": None,
+                "last_error": None,
+                "last_error_message": None,
+                "error_count": 0,
+            }
         data = self._state["sources"][source]
         data["last_error"] = self._utc_now_iso()
+        data["last_error_message"] = str(msg) if msg else None
         data["error_count"] = data.get("error_count", 0) + 1
         if data["error_count"] >= self.source_breaker_threshold and data.get("opened_at") is None:
             data["opened_at"] = time.time()
@@ -172,11 +184,17 @@ class HealthCheckMonitor:
 
     def trip_source_breaker(self, source, msg="", error_count=None):
         if source not in self._state["sources"]:
-            self._state["sources"][source] = {"last_success": None, "last_error": None, "error_count": 0}
+            self._state["sources"][source] = {
+                "last_success": None,
+                "last_error": None,
+                "last_error_message": None,
+                "error_count": 0,
+            }
         data = self._state["sources"][source]
         threshold = error_count if isinstance(error_count, int) and error_count > 0 else self.source_breaker_threshold
         was_open = data.get("error_count", 0) >= threshold and data.get("opened_at") is not None
         data["last_error"] = self._utc_now_iso()
+        data["last_error_message"] = str(msg) if msg else None
         data["error_count"] = max(data.get("error_count", 0), threshold)
         data["opened_at"] = time.time()
         if not was_open:
@@ -235,6 +253,7 @@ class HealthCheckMonitor:
                 "error_count": error_count,
                 "last_success": data.get("last_success"),
                 "last_error": data.get("last_error"),
+                "last_error_message": data.get("last_error_message"),
             }
 
         for bot, data in self._state.get("bots", {}).items():

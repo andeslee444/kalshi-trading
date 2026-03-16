@@ -150,3 +150,28 @@ def test_dashboard_load_trades_safe_uses_ledger_when_enabled(tmp_path):
     with patch.dict(dashboard.os.environ, {"KALSHI_DASHBOARD_DATA_SOURCE": "ledger"}):
         with patch.object(dashboard, "_ledger", return_value=FakeLedger()):
             assert dashboard.load_trades_safe(trade_path) == ledger_rows
+
+
+def test_event_ledger_returns_source_observation_records(tmp_path):
+    ledger = EventLedger(tmp_path / "ledger.sqlite3")
+
+    ledger.record_source_observation(
+        "nws",
+        "nws_20260316_145900.json",
+        "hash-nws",
+        observed_at="2026-03-16T14:59:00+00:00",
+        extra={"ext": "json"},
+    )
+    ledger.record_source_observation(
+        "hdd",
+        "hdd_20260316_150000.json",
+        "hash-hdd",
+        observed_at="2026-03-16T15:00:00+00:00",
+    )
+
+    all_records = ledger.get_source_observation_records()
+    nws_records = ledger.get_source_observation_records("nws")
+
+    assert len(all_records) == 2
+    assert len(nws_records) == 1
+    assert nws_records[0]["snapshot_name"] == "nws_20260316_145900.json"
