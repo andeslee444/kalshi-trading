@@ -3,7 +3,7 @@
 Scans KXHIGH temperature markets, compares to Open-Meteo forecasts, and places trades on edge.
 """
 
-import json, time, datetime, os, sys, re, threading
+import json, time, datetime, os, sys, re, threading, hashlib
 import requests
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -778,6 +778,75 @@ def _weather_bias_trade_fields(bias_applied=None, hist_bias=None, live_bias=None
         "bias_alpha": _rounded(alpha, 4),
         "bias_capped": bool(meta.get("capped", False)),
         "bias_conflict": bool(meta.get("conflict", False)),
+    }
+
+
+def _weather_model_name(probability_method):
+    method = re.sub(r"[^a-z0-9]+", "_", str(probability_method or "single_model").lower()).strip("_")
+    return f"weather_{method or 'single_model'}"
+
+
+def _weather_research_fields(parsed, *, forecast_temp=None, sigma_used=None, probability_method=None,
+                             market_type="threshold", execution_mode=None, days_out=None, city=None,
+                             per_model_probs=None, weights_used=None, model_run_tags=None,
+                             verification_confidence=None, bias_fields=None):
+    resolved_city = city or parsed.get("city")
+    resolved_method = probability_method or "single_model"
+    descriptor = {
+        "model_family": "weather",
+        "model_type": "probability",
+        "probability_method": resolved_method,
+        "market_type": market_type,
+        "city": resolved_city,
+        "days_out": days_out,
+        "direction": parsed.get("direction"),
+        "threshold": parsed.get("threshold"),
+    }
+    if execution_mode:
+        descriptor["execution_mode"] = execution_mode
+    if model_run_tags:
+        descriptor["model_run_tags"] = dict(model_run_tags)
+    if isinstance(verification_confidence, (int, float)):
+        descriptor["verification_confidence"] = round(float(verification_confidence), 4)
+
+    model_inputs = {
+        "city": resolved_city,
+        "date": parsed.get("date"),
+        "days_out": days_out,
+        "forecast_temp": round(float(forecast_temp), 3) if isinstance(forecast_temp, (int, float)) else forecast_temp,
+        "sigma_used": round(float(sigma_used), 4) if isinstance(sigma_used, (int, float)) else sigma_used,
+        "direction": parsed.get("direction"),
+        "threshold": parsed.get("threshold"),
+        "probability_method": resolved_method,
+    }
+    if per_model_probs:
+        model_inputs["per_model_probs"] = {
+            key: round(float(value), 4) if isinstance(value, (int, float)) else value
+            for key, value in per_model_probs.items()
+        }
+    if weights_used:
+        model_inputs["weights_used"] = {
+            key: round(float(value), 4) if isinstance(value, (int, float)) else value
+            for key, value in weights_used.items()
+        }
+    if model_run_tags:
+        model_inputs["model_run_tags"] = dict(model_run_tags)
+    if isinstance(verification_confidence, (int, float)):
+        model_inputs["verification_confidence"] = round(float(verification_confidence), 4)
+    if isinstance(bias_fields, dict):
+        model_inputs["bias"] = {
+            key: value for key, value in bias_fields.items() if value is not None
+        }
+
+    snapshot_payload = json.dumps(model_inputs, sort_keys=True, separators=(",", ":"))
+    feature_snapshot_id = f"weather:{hashlib.sha256(snapshot_payload.encode('utf-8')).hexdigest()[:16]}"
+    return {
+        "model_name": _weather_model_name(resolved_method),
+        "model_family": "weather",
+        "model_type": "probability",
+        "model_descriptor": descriptor,
+        "feature_snapshot_id": feature_snapshot_id,
+        "inline_model_inputs": model_inputs,
     }
 
 
@@ -1655,6 +1724,30 @@ def scan_and_trade():
             except Exception as e:
                 log.debug("Market verification record failed for %s: %s", ticker, e)
 
+        bias_fields = _weather_bias_trade_fields(
+            bias_applied=bias,
+            hist_bias=hist_bias,
+            live_bias=live_bias,
+            live_n=live_n,
+            live_confidence=live_confidence,
+            alpha=alpha,
+            bias_meta=bias_meta,
+        )
+        research_fields = _weather_research_fields(
+            parsed,
+            forecast_temp=forecast_temp,
+            sigma_used=sigma_used,
+            probability_method=probability_method,
+            market_type="bracket" if parsed["direction"] == "B" else "threshold",
+            days_out=days_out,
+            city=city,
+            per_model_probs=per_model_probs,
+            weights_used=weights_used,
+            model_run_tags=model_run_tags,
+            verification_confidence=verification_confidence,
+            bias_fields=bias_fields,
+        )
+
         # Skip near-threshold coinflips — dynamic based on calibrated sigma
         # With sigma=4.7F (global), min_distance=2.35F. For NY day-0 (sigma=3.1F), 1.55F.
         # Floor of 1.0F prevents degenerate cases.
@@ -1669,7 +1762,8 @@ def scan_and_trade():
                                        forecast=forecast_temp, threshold=parsed["threshold"],
                                        distance=round(distance, 1),
                                        min_distance=round(min_forecast_distance, 1),
-                                       sigma=round(sigma, 2))
+                                       sigma=round(sigma, 2),
+                                       **research_fields)
             continue
 
         yes_bid = m.get("yes_bid", 0)
@@ -1704,6 +1798,7 @@ def scan_and_trade():
                     "negative_edge",
                     edge=displayed_edge,
                     price_cents=displayed_plan["price"] if displayed_plan else None,
+                    **research_fields,
                 )
             elif displayed_plan is None and maker_plan is None:
                 ss.skip("illiquid" if not liquid else "no_price")
@@ -1720,7 +1815,8 @@ def scan_and_trade():
             trade_manager.log_decision(ticker, side,
                                        "skipped", "negative_edge",
                                        edge=edge_yes,
-                                       price_cents=entry_plan["price"])
+                                       price_cents=entry_plan["price"],
+                                       **research_fields)
             continue
 
         # Adjust edge threshold for high ensemble spread or disagreement (defense in depth)
@@ -1743,6 +1839,7 @@ def scan_and_trade():
                     f"bracket edge {edge_yes*100:.1f}% < 2x threshold",
                     edge=edge_yes,
                     price_cents=entry_plan["price"],
+                    **research_fields,
                 )
                 continue
             opportunities.append({
@@ -1766,15 +1863,14 @@ def scan_and_trade():
                 "execution_mode": entry_plan["execution_mode"],
                 "entry_price": entry_plan["price"],
                 "maker_plan": maker_plan,
-                **_weather_bias_trade_fields(
-                    bias_applied=bias,
-                    hist_bias=hist_bias,
-                    live_bias=live_bias,
-                    live_n=live_n,
-                    live_confidence=live_confidence,
-                    alpha=alpha,
-                    bias_meta=bias_meta,
+                "research_fields": dict(
+                    research_fields,
+                    model_descriptor=dict(
+                        research_fields["model_descriptor"],
+                        execution_mode=entry_plan["execution_mode"],
+                    ),
                 ),
+                **bias_fields,
             })
         else:
             ss.skip("low_edge")
@@ -1782,6 +1878,7 @@ def scan_and_trade():
                 ticker, side, "skipped",
                 "edge below threshold", edge=edge_yes,
                 price_cents=entry_plan["price"],
+                **research_fields,
             )
 
     # Sort by edge magnitude
@@ -1824,7 +1921,8 @@ def scan_and_trade():
             ss.skip("dedup_cooldown")
             trade_manager.log_decision(ticker, "yes" if opp["our_prob"] > 0.5 else "no",
                                        "skipped", f"dedup_cooldown ({cooldown_secs}s for day-{days_out_val})",
-                                       edge=edge, price_cents=yes_ask if opp["our_prob"] > 0.5 else no_ask)
+                                       edge=edge, price_cents=yes_ask if opp["our_prob"] > 0.5 else no_ask,
+                                       **opp.get("research_fields", {}))
             continue
 
         # Rec 1: Brackets require 2x edge threshold (higher model uncertainty)
@@ -1833,7 +1931,8 @@ def scan_and_trade():
             ss.skip("bracket_low_edge")
             trade_manager.log_decision(ticker, opp["side"], "skipped",
                                        f"bracket edge {edge*100:.1f}% < 2x threshold",
-                                       edge=edge, price_cents=yes_ask if opp["side"] == "yes" else no_ask)
+                                       edge=edge, price_cents=yes_ask if opp["side"] == "yes" else no_ask,
+                                       **opp.get("research_fields", {}))
             continue
 
         # Edge is always positive (computed against the price we'd actually quote/pay)
@@ -1867,6 +1966,7 @@ def scan_and_trade():
                             f"insufficient depth ({side_depth} < {min_depth})",
                             edge=edge,
                             price_cents=yes_ask if side == "yes" else no_ask,
+                            **opp.get("research_fields", {}),
                         )
                         continue
                     execution_mode = "maker"
@@ -1889,6 +1989,7 @@ def scan_and_trade():
                             "maker edge below threshold after thin-book repricing",
                             edge=edge,
                             price_cents=price,
+                            **opp.get("research_fields", {}),
                         )
                         continue
 
@@ -1896,13 +1997,15 @@ def scan_and_trade():
             # Config-level YES disable — if set, skip all weather YES trades
             if config.get("disableWeatherYes", False):
                 trade_manager.log_decision(ticker, "yes", "skipped", "weather YES disabled by config",
-                                            edge=edge, price_cents=price or yes_ask)
+                                            edge=edge, price_cents=price or yes_ask,
+                                            **opp.get("research_fields", {}))
                 continue
             # Rec 2: NO-only weather constraint — skip YES unless edge >= 15%
             # YES side has 0% historical win rate; only trade with very high conviction
             if edge < 0.15:
                 trade_manager.log_decision(ticker, "yes", "skipped", f"YES edge {edge*100:.1f}% < 15% minimum",
-                                            edge=edge, price_cents=price or yes_ask)
+                                            edge=edge, price_cents=price or yes_ask,
+                                            **opp.get("research_fields", {}))
                 continue
             if execution_mode == "maker":
                 order_type = "maker-limit"
@@ -1952,7 +2055,8 @@ def scan_and_trade():
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             ss.skip("allocator_denied")
             trade_manager.log_decision(ticker, side, "skipped", f"allocator denied: {budget.reason}",
-                                       edge=edge, price_cents=price)
+                                       edge=edge, price_cents=price,
+                                       **opp.get("research_fields", {}))
             continue
 
         # Position sizing based on market type, conviction, and calibration status
@@ -2027,7 +2131,8 @@ def scan_and_trade():
             log.info(f"  Kelly says 0 contracts for {ticker} (edge too small for price), skipping")
             ss.skip("kelly_zero")
             trade_manager.log_decision(ticker, side, "skipped", "kelly_zero: edge too small for price",
-                                       edge=edge, price_cents=price)
+                                       edge=edge, price_cents=price,
+                                       **opp.get("research_fields", {}))
             continue
 
         log.info(f"\n-> TRADE: {reasoning}")
@@ -2075,6 +2180,7 @@ def scan_and_trade():
             bias_alpha=opp.get("bias_alpha"),
             bias_capped=opp.get("bias_capped"),
             bias_conflict=opp.get("bias_conflict"),
+            **opp.get("research_fields", {}),
         )
         if result:
             ss.trades_placed += 1

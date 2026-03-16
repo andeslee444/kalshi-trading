@@ -37,6 +37,10 @@ _log = logging.getLogger("capital_allocator")
 from kalshi_auth import notify_webhook
 
 
+def _local_now_iso():
+    return datetime.datetime.now().astimezone().isoformat()
+
+
 def _load_dict_snapshot(path, logger=None):
     data = SnapshotStore(path, logger=logger or _log).load(default={})
     return data if isinstance(data, dict) else {}
@@ -354,6 +358,8 @@ class PortfolioAllocator:
             # Get current NAV (cash + cost basis of open positions)
             total_balance, _ = self._get_balance()
             exposure = getattr(self.client, '_market_exposure', 0) if self.client else 0
+            if not isinstance(exposure, (int, float)):
+                exposure = 0
             nav = total_balance + exposure
             if nav <= 0:
                 return False
@@ -626,7 +632,7 @@ class PortfolioAllocator:
         quality = compute_signal_quality(bot_name, edge)
         self._traded_tickers[ticker] = {
             "bot": bot_name,
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "timestamp": _local_now_iso(),
             "signal_quality": round(quality, 4),
             "edge": round(abs(edge), 4),
             "risk_cents": risk_cents,
