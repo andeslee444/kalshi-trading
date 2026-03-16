@@ -11,7 +11,7 @@ Usage:
     python3 src/kalshi/economics-bot.py --once    # single scan
 """
 
-import json, time, datetime, os, sys, re, argparse, math
+import json, time, datetime, os, sys, re, argparse, math, hashlib
 import requests
 from bs4 import BeautifulSoup
 from pathlib import Path
@@ -31,6 +31,7 @@ from capital_allocator import PortfolioAllocator
 from cpi_belief_filter import CPIBeliefFilter
 from scenario_engine import compute_scenario_weights, scenario_probability
 from singleton_lock import acquire_process_singleton
+from research.opportunity_log import OpportunityLog
 try:
     from macro_engine import MacroEngine
 except ImportError:
@@ -90,6 +91,112 @@ health = None
 macro = None
 order_monitor = None
 trade_manager = None
+opportunity_log = None
+
+
+def _economics_model_name(market_type, *, source_kind="nowcast"):
+    normalized_market = re.sub(r"[^a-z0-9]+", "_", str(market_type or "other").lower()).strip("_")
+    normalized_source = re.sub(r"[^a-z0-9]+", "_", str(source_kind or "nowcast").lower()).strip("_")
+    return f"economics_{normalized_source}_{normalized_market or 'other'}"
+
+
+def _economics_research_fields(*, market_type=None, threshold=None, direction_type=None,
+                               source_kind="nowcast", nowcast_value=None, posterior_sigma=None,
+                               days_to_release=None, scenario_agreement=None, per_scenario=None,
+                               scenario_weights=None, nowcast_age_hours=None,
+                               data_source_timestamp=None, truflation_cpi=None,
+                               tips_breakeven=None, gdpnow_value=None, gas_price=None,
+                               fedwatch_prob=None):
+    descriptor = {
+        "model_family": "economics",
+        "model_type": "probability",
+        "market_type": market_type,
+        "source_kind": source_kind,
+        "direction_type": direction_type,
+        "days_to_release": days_to_release,
+    }
+
+    model_inputs = {
+        "market_type": market_type,
+        "threshold": round(float(threshold), 4) if isinstance(threshold, (int, float)) else threshold,
+        "direction_type": direction_type,
+        "source_kind": source_kind,
+        "nowcast_value": round(float(nowcast_value), 6) if isinstance(nowcast_value, (int, float)) else nowcast_value,
+        "posterior_sigma": round(float(posterior_sigma), 6) if isinstance(posterior_sigma, (int, float)) else posterior_sigma,
+        "days_to_release": days_to_release,
+        "scenario_agreement": round(float(scenario_agreement), 6) if isinstance(scenario_agreement, (int, float)) else scenario_agreement,
+        "per_scenario": {
+            key: round(float(value), 6) if isinstance(value, (int, float)) else value
+            for key, value in (per_scenario or {}).items()
+        } if isinstance(per_scenario, dict) else per_scenario,
+        "scenario_weights": {
+            key: round(float(value), 6) if isinstance(value, (int, float)) else value
+            for key, value in (scenario_weights or {}).items()
+        } if isinstance(scenario_weights, dict) else scenario_weights,
+        "nowcast_age_hours": round(float(nowcast_age_hours), 4) if isinstance(nowcast_age_hours, (int, float)) else nowcast_age_hours,
+        "data_source_timestamp": data_source_timestamp,
+        "truflation_cpi": round(float(truflation_cpi), 6) if isinstance(truflation_cpi, (int, float)) else truflation_cpi,
+        "tips_breakeven": round(float(tips_breakeven), 6) if isinstance(tips_breakeven, (int, float)) else tips_breakeven,
+        "gdpnow_value": round(float(gdpnow_value), 6) if isinstance(gdpnow_value, (int, float)) else gdpnow_value,
+        "gas_price": round(float(gas_price), 6) if isinstance(gas_price, (int, float)) else gas_price,
+        "fedwatch_prob": round(float(fedwatch_prob), 6) if isinstance(fedwatch_prob, (int, float)) else fedwatch_prob,
+    }
+
+    snapshot_payload = json.dumps(model_inputs, sort_keys=True, separators=(",", ":"))
+    feature_snapshot_id = f"economics:{hashlib.sha256(snapshot_payload.encode('utf-8')).hexdigest()[:16]}"
+    return {
+        "model_name": _economics_model_name(market_type, source_kind=source_kind),
+        "model_family": "economics",
+        "model_type": "probability",
+        "model_descriptor": descriptor,
+        "feature_snapshot_id": feature_snapshot_id,
+        "inline_model_inputs": model_inputs,
+    }
+
+
+def _record_economics_opportunity(ticker, side, action, reason, *, opportunity_stage,
+                                  opportunity_log_obj=None, edge=None, price_cents=None, **extra):
+    log_obj = opportunity_log_obj or opportunity_log
+    if log_obj is None:
+        return None
+
+    record = {
+        "ticker": ticker,
+        "side": side,
+        "action": action,
+        "reason": reason,
+        "opportunity_stage": opportunity_stage,
+    }
+    if edge is not None:
+        record["edge"] = round(edge, 4)
+    if price_cents is not None:
+        record["price_cents"] = price_cents
+    record.update(extra)
+    return log_obj.record(record)
+
+
+def _log_economics_decision(ticker, side, action, reason, *, edge=None, price_cents=None,
+                            opportunity_log_obj=None, **extra):
+    trade_manager.log_decision(
+        ticker,
+        side,
+        action,
+        reason,
+        edge=edge,
+        price_cents=price_cents,
+        **extra,
+    )
+    return _record_economics_opportunity(
+        ticker,
+        side,
+        action,
+        reason,
+        opportunity_stage="decision",
+        opportunity_log_obj=opportunity_log_obj,
+        edge=edge,
+        price_cents=price_cents,
+        **extra,
+    )
 
 def _classify_econ_market(ticker):
     """Classify economics market type from ticker."""
@@ -1023,8 +1130,14 @@ def scan_and_trade():
         threshold, direction_type = parse_econ_threshold(m)
         if threshold is None:
             ss.skip("no_threshold")
-            trade_manager.log_decision(ticker, "skip", "skipped", "no_threshold",
-                                       market_type=market_type, title=title[:80])
+            _log_economics_decision(
+                ticker,
+                "skip",
+                "skipped",
+                "no_threshold",
+                market_type=market_type,
+                title=title[:80],
+            )
             continue
 
         # Determine which nowcast value to use
@@ -1050,15 +1163,27 @@ def scan_and_trade():
 
         if nowcast_value is None:
             ss.skip("no_nowcast")
-            trade_manager.log_decision(ticker, "skip", "skipped", "no_nowcast",
-                                       market_type=market_type, title=title[:80])
+            _log_economics_decision(
+                ticker,
+                "skip",
+                "skipped",
+                "no_nowcast",
+                market_type=market_type,
+                title=title[:80],
+            )
             continue
 
         # Skip nowcast-based trades when data is stale
         if nowcast_stale:
             ss.skip("stale_nowcast")
-            trade_manager.log_decision(ticker, "skip", "skipped", "stale_nowcast",
-                                       market_type=market_type, cache_age_hours=round(_nowcast_cache_age_hours(), 1))
+            _log_economics_decision(
+                ticker,
+                "skip",
+                "skipped",
+                "stale_nowcast",
+                market_type=market_type,
+                cache_age_hours=round(_nowcast_cache_age_hours(), 1),
+            )
             continue
 
         ss.markets_evaluated += 1
@@ -1066,8 +1191,14 @@ def scan_and_trade():
         # Liquidity check — skip thin markets with no exit path
         if not is_market_liquid(m, min_volume=5, max_spread=25):
             ss.skip("illiquid")
-            trade_manager.log_decision(ticker, "skip", "skipped", "illiquid",
-                                       market_type=market_type, title=title[:80])
+            _log_economics_decision(
+                ticker,
+                "skip",
+                "skipped",
+                "illiquid",
+                market_type=market_type,
+                title=title[:80],
+            )
             continue
 
         # Estimate uncertainty — use market-type-specific sigma
@@ -1112,6 +1243,23 @@ def scan_and_trade():
             scenario_weights=scenario_weights,
         )
         prob = result.probability
+        research_fields = _economics_research_fields(
+            market_type=market_type,
+            threshold=threshold,
+            direction_type=direction_type,
+            source_kind="nowcast",
+            nowcast_value=fused_nowcast,
+            posterior_sigma=posterior_sigma,
+            days_to_release=days_to_release,
+            scenario_agreement=result.agreement,
+            per_scenario=result.per_scenario,
+            scenario_weights=scenario_weights,
+            nowcast_age_hours=source_info["nowcast_age_hours"],
+            data_source_timestamp=source_info["data_source_timestamp"],
+            truflation_cpi=truflation_cpi,
+            tips_breakeven=tips_breakeven,
+            gdpnow_value=gdpnow_value,
+        )
 
         yes_ask = m.get("yes_ask", 0)
         no_ask = m.get("no_ask", 0)
@@ -1136,16 +1284,29 @@ def scan_and_trade():
                     "per_scenario": result.per_scenario,
                     "nowcast_age_hours": source_info["nowcast_age_hours"],
                     "data_source_timestamp": source_info["data_source_timestamp"],
+                    "research_fields": research_fields,
                 })
             else:
-                trade_manager.log_decision(
-                    ticker, "yes", "skipped", f"edge below threshold ({required_edge:.1%})",
-                    edge=edge, price_cents=yes_ask,
+                _log_economics_decision(
+                    ticker,
+                    "yes",
+                    "skipped",
+                    f"edge below threshold ({required_edge:.1%})",
+                    edge=edge,
+                    price_cents=yes_ask,
+                    **research_fields,
                 )
         else:
             no_prob = 1.0 - prob
             if not no_ask:
-                trade_manager.log_decision(ticker, "no", "skipped", "no_no_ask", price_cents=0)
+                _log_economics_decision(
+                    ticker,
+                    "no",
+                    "skipped",
+                    "no_no_ask",
+                    price_cents=0,
+                    **research_fields,
+                )
                 continue
             edge = no_prob - no_ask / 100
             if edge > required_edge:
@@ -1160,11 +1321,17 @@ def scan_and_trade():
                     "per_scenario": result.per_scenario,
                     "nowcast_age_hours": source_info["nowcast_age_hours"],
                     "data_source_timestamp": source_info["data_source_timestamp"],
+                    "research_fields": research_fields,
                 })
             else:
-                trade_manager.log_decision(
-                    ticker, "no", "skipped", f"edge below threshold ({required_edge:.1%})",
-                    edge=edge, price_cents=no_ask,
+                _log_economics_decision(
+                    ticker,
+                    "no",
+                    "skipped",
+                    f"edge below threshold ({required_edge:.1%})",
+                    edge=edge,
+                    price_cents=no_ask,
+                    **research_fields,
                 )
 
     # Gas price markets
@@ -1177,9 +1344,29 @@ def scan_and_trade():
             threshold, direction_type = parse_gas_threshold(gm)
             if threshold is None:
                 continue
+            gas_timestamp = datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            gas_research_fields = _economics_research_fields(
+                market_type="GAS",
+                threshold=threshold,
+                direction_type=direction_type,
+                source_kind="gas",
+                nowcast_value=gas_price,
+                posterior_sigma=gas_price * 0.02,
+                days_to_release=0,
+                nowcast_age_hours=0.0,
+                data_source_timestamp=gas_timestamp,
+                gas_price=gas_price,
+            )
             if not is_market_liquid(gm, min_volume=5, max_spread=25):
-                trade_manager.log_decision(ticker, "skip", "skipped", "illiquid",
-                                           market_type="GAS", title=gm.get("title", "")[:80])
+                _log_economics_decision(
+                    ticker,
+                    "skip",
+                    "skipped",
+                    "illiquid",
+                    market_type="GAS",
+                    title=gm.get("title", "")[:80],
+                    **gas_research_fields,
+                )
                 continue
             direction = "above" if direction_type == "T" else "below"
             prob = gas_price_probability(gas_price, threshold, direction)
@@ -1199,12 +1386,20 @@ def scan_and_trade():
                         "nowcast_value": gas_price, "sigma": gas_price * 0.02,
                         "days_to_release": 0,
                         "nowcast_age_hours": 0.0,
-                        "data_source_timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+                        "data_source_timestamp": gas_timestamp,
+                        "research_fields": gas_research_fields,
                     })
             else:
                 no_prob = 1.0 - prob
                 if not no_ask:
-                    trade_manager.log_decision(ticker, "no", "skipped", "no_no_ask", price_cents=0)
+                    _log_economics_decision(
+                        ticker,
+                        "no",
+                        "skipped",
+                        "no_no_ask",
+                        price_cents=0,
+                        **gas_research_fields,
+                    )
                     continue
                 edge = no_prob - no_ask / 100
                 if edge > GAS_EDGE_THRESHOLD:
@@ -1214,7 +1409,8 @@ def scan_and_trade():
                         "nowcast_value": gas_price, "sigma": gas_price * 0.02,
                         "days_to_release": 0,
                         "nowcast_age_hours": 0.0,
-                        "data_source_timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+                        "data_source_timestamp": gas_timestamp,
+                        "research_fields": gas_research_fields,
                     })
 
     # Fed rate decision markets
@@ -1228,6 +1424,19 @@ def scan_and_trade():
                 cme_prob = match_fed_market_to_fedwatch(fm, fedwatch)
                 if cme_prob is None:
                     continue
+                fed_timestamp = datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+                fed_research_fields = _economics_research_fields(
+                    market_type="FED",
+                    threshold=0,
+                    direction_type="T",
+                    source_kind="fedwatch",
+                    nowcast_value=cme_prob,
+                    posterior_sigma=0,
+                    days_to_release=0,
+                    nowcast_age_hours=0.0,
+                    data_source_timestamp=fed_timestamp,
+                    fedwatch_prob=cme_prob,
+                )
 
                 yes_ask = fm.get("yes_ask", 0)
                 no_ask = fm.get("no_ask", 0)
@@ -1245,7 +1454,8 @@ def scan_and_trade():
                         "nowcast_value": cme_prob, "sigma": 0,
                         "days_to_release": 0,
                         "nowcast_age_hours": 0.0,
-                        "data_source_timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+                        "data_source_timestamp": fed_timestamp,
+                        "research_fields": fed_research_fields,
                     })
                 elif (-edge) > EDGE_THRESHOLD:
                     # Kalshi overpriced YES -> buy NO
@@ -1258,7 +1468,8 @@ def scan_and_trade():
                             "nowcast_value": cme_prob, "sigma": 0,
                             "days_to_release": 0,
                             "nowcast_age_hours": 0.0,
-                            "data_source_timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+                            "data_source_timestamp": fed_timestamp,
+                            "research_fields": fed_research_fields,
                         })
 
     # Sort by edge
@@ -1287,8 +1498,15 @@ def scan_and_trade():
         if not budget.approved:
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             ss.skip("allocator_denied")
-            trade_manager.log_decision(ticker, side, "skipped", f"allocator denied: {budget.reason}",
-                                       edge=edge, price_cents=yes_ask if side == "yes" else no_ask)
+            _log_economics_decision(
+                ticker,
+                side,
+                "skipped",
+                f"allocator denied: {budget.reason}",
+                edge=edge,
+                price_cents=yes_ask if side == "yes" else no_ask,
+                **opp.get("research_fields", {}),
+            )
             continue
 
         # Concentration check
@@ -1296,8 +1514,15 @@ def scan_and_trade():
         if not allowed:
             log.info(f"  Concentration limit hit for {ticker}: {conc_reason}")
             ss.skip("concentration_limit")
-            trade_manager.log_decision(ticker, side, "skipped", f"concentration: {conc_reason}",
-                                       edge=edge, price_cents=yes_ask if side == "yes" else no_ask)
+            _log_economics_decision(
+                ticker,
+                side,
+                "skipped",
+                f"concentration: {conc_reason}",
+                edge=edge,
+                price_cents=yes_ask if side == "yes" else no_ask,
+                **opp.get("research_fields", {}),
+            )
             continue
 
         price = compute_limit_price(yes_bid, yes_ask, side, edge=edge) or (yes_ask if side == "yes" else no_ask)
@@ -1324,8 +1549,15 @@ def scan_and_trade():
             )
         if count <= 0:
             ss.skip("kelly_zero")
-            trade_manager.log_decision(ticker, side, "skipped", "kelly_zero: edge too small for price",
-                                       edge=edge, price_cents=price)
+            _log_economics_decision(
+                ticker,
+                side,
+                "skipped",
+                "kelly_zero: edge too small for price",
+                edge=edge,
+                price_cents=price,
+                **opp.get("research_fields", {}),
+            )
             continue
 
         # Hard cap on contract count (penny contracts can produce absurd Kelly sizes)
@@ -1373,7 +1605,8 @@ def scan_and_trade():
                                             ]),
                                             scenario_agreement=round(opp.get("scenario_agreement", 0), 4),
                                             nowcast_age_hours=opp.get("nowcast_age_hours"),
-                                            data_source_timestamp=opp.get("data_source_timestamp"))
+                                            data_source_timestamp=opp.get("data_source_timestamp"),
+                                            **opp.get("research_fields", {}))
         if result:
             ss.trades_placed += 1
             actual_risk = result.get("cost_cents", risk)
@@ -1440,6 +1673,15 @@ def build_app(project_dir=None):
         "maxDailyLoss": max_daily_loss,
         "maxDailyLossPct": loaded_econ_config.get("maxDailyLossPct"),
     }, logger=logger, order_monitor=order_monitor_obj, bot_name="economics")
+    opportunity_log_obj = OpportunityLog(
+        project_dir / "data" / "opportunity-log.json",
+        logger=logger,
+        strategy_id=trade_manager_obj.strategy_id,
+        config_version=getattr(trade_manager_obj, "_config_version", None),
+        model_registry=getattr(trade_manager_obj, "_model_registry", None),
+        source_bot=getattr(logger, "name", None),
+        source_path=trades_path,
+    )
     trim_trade_log(trades_path)
     return install_app_context(globals(), AppContext({
         "PROJECT_DIR": project_dir,
@@ -1460,6 +1702,7 @@ def build_app(project_dir=None):
         "macro": macro_engine,
         "order_monitor": order_monitor_obj,
         "trade_manager": trade_manager_obj,
+        "opportunity_log": opportunity_log_obj,
     }))
 
 
