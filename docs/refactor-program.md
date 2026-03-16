@@ -404,6 +404,7 @@ Current bridge state:
 - Slice 4 extends explicit provenance and `opportunity_log` writes to crypto bot skipped opportunities and trade records
 - Slice 5 extends explicit provenance and `opportunity_log` writes to economics bot skipped opportunities and trade records
 - Slice 6 extends explicit provenance and `opportunity_log` writes to entertainment bot skipped opportunities and trade records
+- Slice 7 extends explicit provenance and `opportunity_log` writes to source-monitor skipped opportunities and trade records
 
 ## Phase 8: Desk Operations And Governance
 
