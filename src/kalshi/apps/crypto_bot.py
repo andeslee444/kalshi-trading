@@ -13,7 +13,7 @@ Usage:
     python3 src/kalshi/crypto-bot.py --once    # single scan
 """
 
-import json, time, datetime, os, sys, re, argparse, math
+import json, time, datetime, os, sys, re, argparse, math, hashlib
 import requests
 from pathlib import Path
 from app_bootstrap import AppContext, install_app_context
@@ -35,6 +35,7 @@ from regime_detector import RegimeDetector, regime_kelly_multiplier
 from crypto_models import EnsembleModel, smooth_edge_threshold, horizon_kelly_fraction, horizon_vol_weights, AR1VolForecast, vol_skew_multiplier
 from vol_forecaster import GARCHForecaster, DCCCorrelation, intraday_vol_multiplier, correct_bid_ask_bounce
 from singleton_lock import acquire_process_singleton
+from research.opportunity_log import OpportunityLog
 
 # === Paths ===
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
@@ -57,6 +58,7 @@ allocator = None
 health = None
 order_monitor = None
 trade_manager = None
+opportunity_log = None
 pf_config = None
 filter_mgr = None
 pf_staleness_seconds = 24 * 3600
@@ -244,6 +246,123 @@ def compute_trailing_drift(asset):
     if abs(annualized) > 2.0:
         log.debug(f"  Drift capped: raw={annualized*100:.0f}% -> {capped*100:.0f}%")
     return capped
+
+
+def _crypto_model_name(parsed, *, use_ou=False, filtered=True):
+    market_type = parsed.get("market_type") or ("bracket" if parsed.get("direction") == "B" else "standard")
+    normalized_type = re.sub(r"[^a-z0-9]+", "_", str(market_type).lower()).strip("_")
+    parts = ["crypto", "ensemble", normalized_type or "standard", "ou" if use_ou else "gbm"]
+    if filtered:
+        parts.append("particle_filter")
+    return "_".join(parts)
+
+
+def _crypto_research_fields(parsed, *, current_price=None, minutes_to_settle=None, vol_used=None,
+                            raw_prob=None, filtered_est=None, current_regime=None, drift_pct=None,
+                            iv=None, rv=None, garch_forecast=None, season_mult=None, skew_mult=None,
+                            use_ou=False, ou_half_life_minutes=None, ou_target=None,
+                            ou_shadow_prob=None, heston_params=None):
+    filtered_prob = getattr(filtered_est, "prob", None)
+    market_type = parsed.get("market_type") or ("bracket" if parsed.get("direction") == "B" else "standard")
+    descriptor = {
+        "model_family": "crypto",
+        "model_type": "probability",
+        "asset": parsed.get("asset"),
+        "market_type": market_type,
+        "direction": parsed.get("direction"),
+        "filtered": filtered_est is not None,
+        "use_ou": bool(use_ou),
+    }
+    if current_regime is not None:
+        descriptor["regime"] = current_regime
+    if use_ou and ou_half_life_minutes is not None:
+        descriptor["ou_half_life_minutes"] = ou_half_life_minutes
+
+    model_inputs = {
+        "asset": parsed.get("asset"),
+        "date": parsed.get("date"),
+        "threshold": round(float(parsed.get("threshold")), 4) if isinstance(parsed.get("threshold"), (int, float)) else parsed.get("threshold"),
+        "direction": parsed.get("direction"),
+        "market_type": market_type,
+        "settlement_hour": parsed.get("settlement_hour"),
+        "current_price": round(float(current_price), 4) if isinstance(current_price, (int, float)) else current_price,
+        "minutes_to_settle": minutes_to_settle,
+        "vol_used": round(float(vol_used), 6) if isinstance(vol_used, (int, float)) else vol_used,
+        "raw_prob": round(float(raw_prob), 6) if isinstance(raw_prob, (int, float)) else raw_prob,
+        "filtered_prob": round(float(filtered_prob), 6) if isinstance(filtered_prob, (int, float)) else filtered_prob,
+        "filtered_ci_low": round(float(getattr(filtered_est, "ci_low", None)), 6) if isinstance(getattr(filtered_est, "ci_low", None), (int, float)) else getattr(filtered_est, "ci_low", None),
+        "filtered_ci_high": round(float(getattr(filtered_est, "ci_high", None)), 6) if isinstance(getattr(filtered_est, "ci_high", None), (int, float)) else getattr(filtered_est, "ci_high", None),
+        "filtered_trend": getattr(filtered_est, "trend", None),
+        "filtered_updates": getattr(filtered_est, "n_updates", None),
+        "regime": current_regime,
+        "drift_pct": round(float(drift_pct), 6) if isinstance(drift_pct, (int, float)) else drift_pct,
+        "iv": round(float(iv), 6) if isinstance(iv, (int, float)) else iv,
+        "rv": round(float(rv), 6) if isinstance(rv, (int, float)) else rv,
+        "garch_forecast": round(float(garch_forecast), 6) if isinstance(garch_forecast, (int, float)) else garch_forecast,
+        "season_mult": round(float(season_mult), 6) if isinstance(season_mult, (int, float)) else season_mult,
+        "skew_mult": round(float(skew_mult), 6) if isinstance(skew_mult, (int, float)) else skew_mult,
+        "ou_target": round(float(ou_target), 6) if isinstance(ou_target, (int, float)) else ou_target,
+        "ou_shadow_prob": round(float(ou_shadow_prob), 6) if isinstance(ou_shadow_prob, (int, float)) else ou_shadow_prob,
+        "heston_params": {
+            key: round(float(value), 6) if isinstance(value, (int, float)) else value
+            for key, value in (heston_params or {}).items()
+        } if isinstance(heston_params, dict) else heston_params,
+    }
+    snapshot_payload = json.dumps(model_inputs, sort_keys=True, separators=(",", ":"))
+    feature_snapshot_id = f"crypto:{hashlib.sha256(snapshot_payload.encode('utf-8')).hexdigest()[:16]}"
+    return {
+        "model_name": _crypto_model_name(parsed, use_ou=use_ou, filtered=filtered_est is not None),
+        "model_family": "crypto",
+        "model_type": "probability",
+        "model_descriptor": descriptor,
+        "feature_snapshot_id": feature_snapshot_id,
+        "inline_model_inputs": model_inputs,
+    }
+
+
+def _record_crypto_opportunity(ticker, side, action, reason, *, opportunity_stage,
+                               opportunity_log_obj=None, edge=None, price_cents=None, **extra):
+    log_obj = opportunity_log_obj or opportunity_log
+    if log_obj is None:
+        return None
+
+    record = {
+        "ticker": ticker,
+        "side": side,
+        "action": action,
+        "reason": reason,
+        "opportunity_stage": opportunity_stage,
+    }
+    if edge is not None:
+        record["edge"] = round(edge, 4)
+    if price_cents is not None:
+        record["price_cents"] = price_cents
+    record.update(extra)
+    return log_obj.record(record)
+
+
+def _log_crypto_decision(ticker, side, action, reason, *, edge=None, price_cents=None,
+                         opportunity_log_obj=None, **extra):
+    trade_manager.log_decision(
+        ticker,
+        side,
+        action,
+        reason,
+        edge=edge,
+        price_cents=price_cents,
+        **extra,
+    )
+    return _record_crypto_opportunity(
+        ticker,
+        side,
+        action,
+        reason,
+        opportunity_stage="decision",
+        opportunity_log_obj=opportunity_log_obj,
+        edge=edge,
+        price_cents=price_cents,
+        **extra,
+    )
 
 
 # === Data Sources ===
@@ -978,8 +1097,14 @@ def scan_and_trade():
                 continue
             if not bracket_eligible(m):
                 ss.skip("bracket_illiquid")
-                trade_manager.log_decision(ticker, "yes", "skipped", "bracket_illiquid",
-                                           volume=m.get("volume", 0), asset=asset)
+                _log_crypto_decision(
+                    ticker,
+                    "yes",
+                    "skipped",
+                    "bracket_illiquid",
+                    volume=m.get("volume", 0),
+                    asset=asset,
+                )
                 continue
 
         # Estimate time to settlement
@@ -1076,6 +1201,26 @@ def scan_and_trade():
         filtered_est = pf.estimate()
         raw_prob = prob
         prob = filtered_est.prob  # use filtered probability for edge computation
+        research_fields = _crypto_research_fields(
+            parsed,
+            current_price=current_price,
+            minutes_to_settle=minutes_to_settle,
+            vol_used=vol_to_use,
+            raw_prob=raw_prob,
+            filtered_est=filtered_est,
+            current_regime=current_regime,
+            drift_pct=drift,
+            iv=iv,
+            rv=rv,
+            garch_forecast=garch_forecast,
+            season_mult=season_mult,
+            skew_mult=skew_mult,
+            use_ou=USE_OU,
+            ou_half_life_minutes=OU_HALF_LIFE,
+            ou_target=ou_tgt,
+            ou_shadow_prob=ou_shadow_prob,
+            heston_params=heston_params,
+        )
 
         yes_ask = m.get("yes_ask", 0) or 0
         no_ask = m.get("no_ask", 0) or 0
@@ -1109,14 +1254,23 @@ def scan_and_trade():
                     "is_bracket": direction == "B",
                     "raw_prob": raw_prob, "filtered_est": filtered_est,
                     "ou_shadow_prob": ou_shadow_prob,
+                    "research_fields": research_fields,
                 })
             else:
                 reason = "net edge below threshold" if net_edge <= eff_threshold else "edge below threshold"
-                trade_manager.log_decision(
-                    ticker, "yes", "skipped", reason,
-                    edge=edge, net_edge=round(net_edge, 4), fee_pp=round(fee_pp, 4),
-                    price_cents=market_price, asset=asset, vol_used=round(vol_to_use, 4),
+                _log_crypto_decision(
+                    ticker,
+                    "yes",
+                    "skipped",
+                    reason,
+                    edge=edge,
+                    net_edge=round(net_edge, 4),
+                    fee_pp=round(fee_pp, 4),
+                    price_cents=market_price,
+                    asset=asset,
+                    vol_used=round(vol_to_use, 4),
                     ou_shadow_prob=round(ou_shadow_prob, 4) if ou_shadow_prob is not None else None,
+                    **research_fields,
                 )
         elif prob <= 0.5:
             no_prob = 1.0 - prob
@@ -1136,14 +1290,23 @@ def scan_and_trade():
                     "is_bracket": direction == "B",
                     "raw_prob": raw_prob, "filtered_est": filtered_est,
                     "ou_shadow_prob": ou_shadow_prob,
+                    "research_fields": research_fields,
                 })
             else:
                 reason = "net edge below threshold" if net_edge <= eff_threshold else "edge below threshold"
-                trade_manager.log_decision(
-                    ticker, "no", "skipped", reason,
-                    edge=edge, net_edge=round(net_edge, 4), fee_pp=round(fee_pp, 4),
-                    price_cents=no_ask, asset=asset, vol_used=round(vol_to_use, 4),
+                _log_crypto_decision(
+                    ticker,
+                    "no",
+                    "skipped",
+                    reason,
+                    edge=edge,
+                    net_edge=round(net_edge, 4),
+                    fee_pp=round(fee_pp, 4),
+                    price_cents=no_ask,
+                    asset=asset,
+                    vol_used=round(vol_to_use, 4),
                     ou_shadow_prob=round(ou_shadow_prob, 4) if ou_shadow_prob is not None else None,
+                    **research_fields,
                 )
 
     # Sort by edge
@@ -1170,10 +1333,18 @@ def scan_and_trade():
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             ss.skip("allocator_denied")
             _ou_sp = opp.get("ou_shadow_prob")
-            trade_manager.log_decision(ticker, side, "skipped", f"allocator denied: {budget.reason}",
-                                       edge=edge, price_cents=yes_ask if side == "yes" else no_ask,
-                                       asset=opp["asset"], vol_used=round(opp["vol_used"], 4),
-                                       ou_shadow_prob=round(_ou_sp, 4) if _ou_sp is not None else None)
+            _log_crypto_decision(
+                ticker,
+                side,
+                "skipped",
+                f"allocator denied: {budget.reason}",
+                edge=edge,
+                price_cents=yes_ask if side == "yes" else no_ask,
+                asset=opp["asset"],
+                vol_used=round(opp["vol_used"], 4),
+                ou_shadow_prob=round(_ou_sp, 4) if _ou_sp is not None else None,
+                **opp.get("research_fields", {}),
+            )
             continue
 
         if opp.get("is_bracket"):
@@ -1226,10 +1397,18 @@ def scan_and_trade():
         if count <= 0:
             ss.skip("kelly_zero")
             _ou_sp = opp.get("ou_shadow_prob")
-            trade_manager.log_decision(ticker, side, "skipped", "kelly_zero: edge too small for price",
-                                       edge=edge, price_cents=price,
-                                       asset=opp["asset"], vol_used=round(opp["vol_used"], 4),
-                                       ou_shadow_prob=round(_ou_sp, 4) if _ou_sp is not None else None)
+            _log_crypto_decision(
+                ticker,
+                side,
+                "skipped",
+                "kelly_zero: edge too small for price",
+                edge=edge,
+                price_cents=price,
+                asset=opp["asset"],
+                vol_used=round(opp["vol_used"], 4),
+                ou_shadow_prob=round(_ou_sp, 4) if _ou_sp is not None else None,
+                **opp.get("research_fields", {}),
+            )
             continue
 
         # Determine vol_source for trade record
@@ -1253,9 +1432,15 @@ def scan_and_trade():
         validated_market = _validate_tradeable_market(ticker)
         if not validated_market:
             ss.skip("invalid_market")
-            trade_manager.log_decision(
-                ticker, side, "skipped", "market unavailable before order",
-                edge=edge, price_cents=price, asset=opp["asset"],
+            _log_crypto_decision(
+                ticker,
+                side,
+                "skipped",
+                "market unavailable before order",
+                edge=edge,
+                price_cents=price,
+                asset=opp["asset"],
+                **opp.get("research_fields", {}),
             )
             continue
 
@@ -1284,7 +1469,8 @@ def scan_and_trade():
                                             pf_kelly_mult=round(kelly_mult, 4),
                                             regime_mult=round(regime_mult, 4),
                                             regime=regime_detector.current_regime(),
-                                            ou_shadow_prob=round(opp["ou_shadow_prob"], 4) if opp.get("ou_shadow_prob") is not None else None)
+                                            ou_shadow_prob=round(opp["ou_shadow_prob"], 4) if opp.get("ou_shadow_prob") is not None else None,
+                                            **opp.get("research_fields", {}))
         if result:
             ss.trades_placed += 1
             allocator.record_trade("crypto", ticker, result.get("cost_cents", risk), edge=edge)
@@ -1352,6 +1538,15 @@ def build_app(project_dir=None):
         "maxDailyLoss": max_daily_loss,
         "maxDailyLossPct": loaded_crypto_config.get("maxDailyLossPct"),
     }, logger=logger, cooldown_hours=0.5, order_monitor=order_monitor_obj, bot_name="crypto")
+    opportunity_log_obj = OpportunityLog(
+        project_dir / "data" / "opportunity-log.json",
+        logger=logger,
+        strategy_id=trade_manager_obj.strategy_id,
+        config_version=getattr(trade_manager_obj, "_config_version", None),
+        model_registry=getattr(trade_manager_obj, "_model_registry", None),
+        source_bot=getattr(logger, "name", None),
+        source_path=trades_path,
+    )
     trim_trade_log(trades_path)
 
     particle_filter_config = FilterConfig(
@@ -1410,6 +1605,7 @@ def build_app(project_dir=None):
         "health": health_monitor,
         "order_monitor": order_monitor_obj,
         "trade_manager": trade_manager_obj,
+        "opportunity_log": opportunity_log_obj,
         "pf_config": particle_filter_config,
         "filter_mgr": filter_manager,
         "pf_staleness_seconds": pf_max_age,
