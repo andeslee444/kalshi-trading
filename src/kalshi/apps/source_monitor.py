@@ -16,6 +16,7 @@ from app_bootstrap import AppContext, install_app_context
 from event_ledger import get_event_ledger
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, quarter_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, nws_sigma_for_hour
+from research.opportunity_log import OpportunityLog
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
 from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_threshold, check_sanity_health
 from capital_allocator import PortfolioAllocator
@@ -34,6 +35,115 @@ allocator = None
 health = None
 order_monitor = None
 trade_manager = None
+opportunity_log = None
+
+
+def _source_monitor_model_name(source_kind, *, direction=None):
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(source_kind or "source_monitor").lower()).strip("_")
+    if normalized in {"album", "boxoffice"}:
+        return f"entertainment_info_arb_{normalized}"
+    if normalized == "nws":
+        market_type = "bracket" if str(direction or "").upper() == "B" else "threshold"
+        return f"weather_nws_observation_{market_type}"
+    return f"source_monitor_{normalized or 'source_monitor'}"
+
+
+def _source_monitor_research_fields(*, source_kind, observed_value, threshold=None, confidence=None,
+                                    sigma=None, data_age_hours=None, source_name=None,
+                                    entity_name=None, market_title=None, city=None,
+                                    direction=None, hour=None, observation_timestamp=None,
+                                    observation_age_minutes=None, **extra_inputs):
+    normalized_kind = str(source_kind or "").lower()
+    model_family = "weather" if normalized_kind == "nws" else "entertainment"
+    descriptor = {
+        "model_family": model_family,
+        "model_type": "probability",
+        "source_kind": source_kind,
+    }
+    if normalized_kind == "nws":
+        descriptor["market_type"] = "bracket" if str(direction or "").upper() == "B" else "threshold"
+    if direction:
+        descriptor["direction"] = direction
+    if city:
+        descriptor["city"] = city
+
+    model_inputs = {
+        "source_kind": source_kind,
+        "observed_value": round(float(observed_value), 6) if isinstance(observed_value, (int, float)) else observed_value,
+        "threshold": round(float(threshold), 6) if isinstance(threshold, (int, float)) else threshold,
+        "confidence": round(float(confidence), 6) if isinstance(confidence, (int, float)) else confidence,
+        "sigma": round(float(sigma), 6) if isinstance(sigma, (int, float)) else sigma,
+        "data_age_hours": round(float(data_age_hours), 6) if isinstance(data_age_hours, (int, float)) else data_age_hours,
+        "source_name": source_name,
+        "entity_name": entity_name,
+        "market_title": market_title,
+        "city": city,
+        "direction": direction,
+        "hour": hour,
+        "observation_timestamp": observation_timestamp,
+        "observation_age_minutes": round(float(observation_age_minutes), 6) if isinstance(observation_age_minutes, (int, float)) else observation_age_minutes,
+    }
+    for key, value in extra_inputs.items():
+        if isinstance(value, float):
+            model_inputs[key] = round(value, 6)
+        else:
+            model_inputs[key] = value
+
+    snapshot_payload = json.dumps(model_inputs, sort_keys=True, separators=(",", ":"))
+    feature_snapshot_id = f"{model_family}:{hashlib.sha256(snapshot_payload.encode('utf-8')).hexdigest()[:16]}"
+    return {
+        "model_name": _source_monitor_model_name(source_kind, direction=direction),
+        "model_family": model_family,
+        "model_type": "probability",
+        "model_descriptor": descriptor,
+        "feature_snapshot_id": feature_snapshot_id,
+        "inline_model_inputs": model_inputs,
+    }
+
+
+def _record_source_monitor_opportunity(ticker, side, action, reason, *, opportunity_stage,
+                                       opportunity_log_obj=None, edge=None, price_cents=None, **extra):
+    log_obj = opportunity_log_obj or opportunity_log
+    if log_obj is None:
+        return None
+
+    record = {
+        "ticker": ticker,
+        "side": side,
+        "action": action,
+        "reason": reason,
+        "opportunity_stage": opportunity_stage,
+    }
+    if edge is not None:
+        record["edge"] = round(edge, 4)
+    if price_cents is not None:
+        record["price_cents"] = price_cents
+    record.update(extra)
+    return log_obj.record(record)
+
+
+def _log_source_monitor_decision(ticker, side, action, reason, *, edge=None, price_cents=None,
+                                 opportunity_log_obj=None, **extra):
+    trade_manager.log_decision(
+        ticker,
+        side,
+        action,
+        reason,
+        edge=edge,
+        price_cents=price_cents,
+        **extra,
+    )
+    return _record_source_monitor_opportunity(
+        ticker,
+        side,
+        action,
+        reason,
+        opportunity_stage="decision",
+        opportunity_log_obj=opportunity_log_obj,
+        edge=edge,
+        price_cents=price_cents,
+        **extra,
+    )
 
 def save_snapshot(source_name, content, ext="html"):
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -281,24 +391,53 @@ def evaluate_album_trade(market, sale, ss=None):
     title = market.get("title", "")
     units = sale["units"]
     artist = sale["artist"]
+    parse_research_fields = _source_monitor_research_fields(
+        source_kind="album",
+        observed_value=units,
+        source_name=sale.get("source", ""),
+        entity_name=artist,
+        market_title=title,
+        chart_date=sale.get("chart_date"),
+        units=units,
+        artist=artist,
+    )
 
     threshold = parse_album_threshold(title, ticker)
     if not threshold:
         log.info(f"  Could not parse threshold from market: {title}")
         if ss:
             ss.skip("threshold_parse_fail")
-        trade_manager.log_decision(ticker, "skip", "skipped", "threshold_parse_fail",
-                                   price_cents=market.get("yes_ask", 0))
+        _log_source_monitor_decision(
+            ticker,
+            "skip",
+            "skipped",
+            "threshold_parse_fail",
+            price_cents=market.get("yes_ask", 0),
+            **parse_research_fields,
+        )
         return
 
     data_age_hours = compute_data_age_hours(sale.get("chart_date"))
+    stale_research_fields = _source_monitor_research_fields(
+        source_kind="album",
+        observed_value=units,
+        threshold=threshold,
+        data_age_hours=data_age_hours,
+        source_name=sale.get("source", ""),
+        entity_name=artist,
+        market_title=title,
+        chart_date=sale.get("chart_date"),
+        units=units,
+        artist=artist,
+    )
     if data_age_hours > MAX_DATA_AGE_HOURS:
         log.info(f"  {artist}: data {data_age_hours:.0f}h stale (>{MAX_DATA_AGE_HOURS}h), skipping")
         if ss:
             ss.skip("stale_data")
-        trade_manager.log_decision(
+        _log_source_monitor_decision(
             ticker, "skip", "skipped", f"data {data_age_hours:.0f}h stale",
             edge=0, price_cents=market.get("yes_ask", 0),
+            **stale_research_fields,
         )
         return
     sigma = album_data_sigma(datetime.datetime.now().weekday(), hours_since_publication=data_age_hours, source=sale.get("source", ""))
@@ -310,15 +449,31 @@ def evaluate_album_trade(market, sale, ss=None):
         outcome = "no"
         confidence = 1.0 - confidence
 
+    research_fields = _source_monitor_research_fields(
+        source_kind="album",
+        observed_value=units,
+        threshold=threshold,
+        confidence=confidence,
+        sigma=sigma,
+        data_age_hours=data_age_hours,
+        source_name=sale.get("source", ""),
+        entity_name=artist,
+        market_title=title,
+        chart_date=sale.get("chart_date"),
+        units=units,
+        artist=artist,
+    )
+
     if confidence < 0.60:
         log.info(f"  {artist}: {units} units vs {threshold} threshold, confidence {confidence*100:.0f}% too low")
         if ss:
             ss.skip("low_confidence")
-        trade_manager.log_decision(
+        _log_source_monitor_decision(
             ticker, outcome, "skipped", "confidence below 60%",
             edge=confidence - 0.5, price_cents=market.get("yes_ask", 0),
             confidence=round(confidence, 4), sigma=round(sigma, 4),
             units=units, threshold=threshold, source=sale.get("source", ""),
+            **research_fields,
         )
         return
 
@@ -334,11 +489,12 @@ def evaluate_album_trade(market, sale, ss=None):
         if edge <= min_edge:
             if ss:
                 ss.skip("low_edge")
-            trade_manager.log_decision(
+            _log_source_monitor_decision(
                 ticker, outcome, "skipped", "edge_below_min",
                 edge=round(edge, 4), price_cents=yes_ask,
                 confidence=round(confidence, 4), sigma=round(sigma, 4), min_edge=min_edge,
                 units=units, threshold=threshold, source=sale.get("source", ""),
+                **research_fields,
             )
             return
         budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence, source_type="info_arb")
@@ -346,10 +502,11 @@ def evaluate_album_trade(market, sale, ss=None):
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             if ss:
                 ss.skip("allocator_denied")
-            trade_manager.log_decision(
+            _log_source_monitor_decision(
                 ticker, outcome, "skipped", f"allocator_denied: {budget.reason}",
                 edge=round(edge, 4), price_cents=yes_ask,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
+                **research_fields,
             )
             return
         price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
@@ -358,10 +515,11 @@ def evaluate_album_trade(market, sale, ss=None):
         if count <= 0:
             if ss:
                 ss.skip("kelly_zero")
-            trade_manager.log_decision(
+            _log_source_monitor_decision(
                 ticker, outcome, "skipped", "kelly_zero",
                 edge=round(edge, 4), price_cents=price,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
+                **research_fields,
             )
             return
         reasoning = f"HDD confirms {artist} sold {units/1000:.0f}K units vs {threshold/1000:.0f}K threshold. YES at {price}c, confidence {confidence*100:.0f}%"
@@ -376,7 +534,8 @@ def evaluate_album_trade(market, sale, ss=None):
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
                                             artist=artist, units=units, threshold=threshold,
-                                            data_sigma=round(sigma, 4), source_type="album")
+                                            data_sigma=round(sigma, 4), source_type="album",
+                                            **research_fields)
         if result:
             if ss:
                 ss.trades_placed += 1
@@ -385,6 +544,7 @@ def evaluate_album_trade(market, sale, ss=None):
                 edge=round(edge, 4), price_cents=price, count=count,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
                 units=units, threshold=threshold, source=sale.get("source", ""),
+                **research_fields,
             )
             allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)
 
@@ -393,11 +553,12 @@ def evaluate_album_trade(market, sale, ss=None):
         if edge <= min_edge:
             if ss:
                 ss.skip("low_edge")
-            trade_manager.log_decision(
+            _log_source_monitor_decision(
                 ticker, outcome, "skipped", "edge_below_min",
                 edge=round(edge, 4), price_cents=no_ask,
                 confidence=round(confidence, 4), sigma=round(sigma, 4), min_edge=min_edge,
                 units=units, threshold=threshold, source=sale.get("source", ""),
+                **research_fields,
             )
             return
         budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence, source_type="info_arb")
@@ -405,10 +566,11 @@ def evaluate_album_trade(market, sale, ss=None):
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             if ss:
                 ss.skip("allocator_denied")
-            trade_manager.log_decision(
+            _log_source_monitor_decision(
                 ticker, outcome, "skipped", f"allocator_denied: {budget.reason}",
                 edge=round(edge, 4), price_cents=no_ask,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
+                **research_fields,
             )
             return
         price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
@@ -417,10 +579,11 @@ def evaluate_album_trade(market, sale, ss=None):
         if count <= 0:
             if ss:
                 ss.skip("kelly_zero")
-            trade_manager.log_decision(
+            _log_source_monitor_decision(
                 ticker, outcome, "skipped", "kelly_zero",
                 edge=round(edge, 4), price_cents=price,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
+                **research_fields,
             )
             return
         reasoning = f"HDD confirms {artist} sold {units/1000:.0f}K units vs {threshold/1000:.0f}K threshold. NO at {price}c, confidence {confidence*100:.0f}%"
@@ -435,7 +598,8 @@ def evaluate_album_trade(market, sale, ss=None):
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
                                             artist=artist, units=units, threshold=threshold,
-                                            data_sigma=round(sigma, 4), source_type="album")
+                                            data_sigma=round(sigma, 4), source_type="album",
+                                            **research_fields)
         if result:
             if ss:
                 ss.trades_placed += 1
@@ -444,6 +608,7 @@ def evaluate_album_trade(market, sale, ss=None):
                 edge=round(edge, 4), price_cents=price, count=count,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
                 units=units, threshold=threshold, source=sale.get("source", ""),
+                **research_fields,
             )
             allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)
 
@@ -672,13 +837,28 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
     title = market.get("title", "")
     gross = movie["gross"]
     movie_title = movie["title"]
+    parse_research_fields = _source_monitor_research_fields(
+        source_kind="boxoffice",
+        observed_value=gross,
+        source_name=movie.get("source", ""),
+        entity_name=movie_title,
+        market_title=title,
+        gross=gross,
+        movie_title=movie_title,
+    )
 
     threshold_match = re.search(r'\$(\d+(?:\.\d+)?)\s*[MmBb](?:illion)?', title)
     if not threshold_match:
         if ss:
             ss.skip("threshold_parse_fail")
-        trade_manager.log_decision(ticker, "skip", "skipped", "threshold_parse_fail",
-                                   price_cents=market.get("yes_ask", 0))
+        _log_source_monitor_decision(
+            ticker,
+            "skip",
+            "skipped",
+            "threshold_parse_fail",
+            price_cents=market.get("yes_ask", 0),
+            **parse_research_fields,
+        )
         return
 
     threshold = float(threshold_match.group(1)) * 1_000_000
@@ -695,14 +875,29 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
         outcome = "no"
         confidence = 1.0 - confidence
 
+    research_fields = _source_monitor_research_fields(
+        source_kind="boxoffice",
+        observed_value=gross,
+        threshold=threshold,
+        confidence=confidence,
+        sigma=sigma,
+        data_age_hours=box_age_hours,
+        source_name=movie.get("source", ""),
+        entity_name=movie_title,
+        market_title=title,
+        gross=gross,
+        movie_title=movie_title,
+    )
+
     if confidence < 0.60:
         if ss:
             ss.skip("low_confidence")
-        trade_manager.log_decision(
+        _log_source_monitor_decision(
             ticker, outcome, "skipped", "confidence below 60%",
             edge=confidence - 0.5, price_cents=market.get("yes_ask", 0),
             confidence=round(confidence, 4), sigma=round(sigma, 4),
             gross=gross, threshold=threshold, source=movie.get("source", ""),
+            **research_fields,
         )
         return
 
@@ -718,11 +913,12 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
         if edge <= min_edge:
             if ss:
                 ss.skip("low_edge")
-            trade_manager.log_decision(
+            _log_source_monitor_decision(
                 ticker, outcome, "skipped", "edge_below_min",
                 edge=round(edge, 4), price_cents=yes_ask,
                 confidence=round(confidence, 4), sigma=round(sigma, 4), min_edge=min_edge,
                 gross=gross, threshold=threshold, source=movie.get("source", ""),
+                **research_fields,
             )
             return
         budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence, source_type="info_arb")
@@ -730,10 +926,11 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             if ss:
                 ss.skip("allocator_denied")
-            trade_manager.log_decision(
+            _log_source_monitor_decision(
                 ticker, outcome, "skipped", f"allocator_denied: {budget.reason}",
                 edge=round(edge, 4), price_cents=yes_ask,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
+                **research_fields,
             )
             return
         price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
@@ -742,10 +939,11 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
         if count <= 0:
             if ss:
                 ss.skip("kelly_zero")
-            trade_manager.log_decision(
+            _log_source_monitor_decision(
                 ticker, outcome, "skipped", "kelly_zero",
                 edge=round(edge, 4), price_cents=price,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
+                **research_fields,
             )
             return
         reasoning = f"Box office data shows {movie_title} at ${gross/1e6:.1f}M vs ${threshold/1e6:.0f}M threshold (conf {confidence*100:.0f}%)"
@@ -759,7 +957,8 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
                                             movie_title=movie_title, gross=gross, threshold=threshold,
-                                            data_sigma=round(sigma, 4), source_type="boxoffice")
+                                            data_sigma=round(sigma, 4), source_type="boxoffice",
+                                            **research_fields)
         if result:
             if ss:
                 ss.trades_placed += 1
@@ -768,6 +967,7 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
                 edge=round(edge, 4), price_cents=price, count=count,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
                 gross=gross, threshold=threshold, source=movie.get("source", ""),
+                **research_fields,
             )
             allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)
 
@@ -776,11 +976,12 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
         if edge <= min_edge:
             if ss:
                 ss.skip("low_edge")
-            trade_manager.log_decision(
+            _log_source_monitor_decision(
                 ticker, outcome, "skipped", "edge_below_min",
                 edge=round(edge, 4), price_cents=no_ask,
                 confidence=round(confidence, 4), sigma=round(sigma, 4), min_edge=min_edge,
                 gross=gross, threshold=threshold, source=movie.get("source", ""),
+                **research_fields,
             )
             return
         budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=confidence, source_type="info_arb")
@@ -788,10 +989,11 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             if ss:
                 ss.skip("allocator_denied")
-            trade_manager.log_decision(
+            _log_source_monitor_decision(
                 ticker, outcome, "skipped", f"allocator_denied: {budget.reason}",
                 edge=round(edge, 4), price_cents=no_ask,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
+                **research_fields,
             )
             return
         price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
@@ -800,10 +1002,11 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
         if count <= 0:
             if ss:
                 ss.skip("kelly_zero")
-            trade_manager.log_decision(
+            _log_source_monitor_decision(
                 ticker, outcome, "skipped", "kelly_zero",
                 edge=round(edge, 4), price_cents=price,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
+                **research_fields,
             )
             return
         reasoning = f"Box office data shows {movie_title} at ${gross/1e6:.1f}M vs ${threshold/1e6:.0f}M threshold (conf {confidence*100:.0f}%)"
@@ -817,7 +1020,8 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
                                             kelly_fraction=kelly_details.get("kelly_fraction"),
                                             bankroll_used=kelly_details.get("bankroll_used"),
                                             movie_title=movie_title, gross=gross, threshold=threshold,
-                                            data_sigma=round(sigma, 4), source_type="boxoffice")
+                                            data_sigma=round(sigma, 4), source_type="boxoffice",
+                                            **research_fields)
         if result:
             if ss:
                 ss.trades_placed += 1
@@ -826,6 +1030,7 @@ def evaluate_boxoffice_trade(market, movie, ss=None):
                 edge=round(edge, 4), price_cents=price, count=count,
                 confidence=round(confidence, 4), sigma=round(sigma, 4),
                 gross=gross, threshold=threshold, source=movie.get("source", ""),
+                **research_fields,
             )
             allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)
 
@@ -1032,6 +1237,25 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                 is_bracket = (direction == "B")
 
                 prob = nws_probability(running_high, threshold, direction, city_hour)
+                selected_confidence = prob if prob > 0.5 else 1.0 - prob
+                research_fields = _source_monitor_research_fields(
+                    source_kind="nws",
+                    observed_value=running_high,
+                    threshold=threshold,
+                    confidence=selected_confidence,
+                    source_name=temp_data[city].get("station"),
+                    market_title=m.get("title", ""),
+                    city=city,
+                    direction=direction,
+                    hour=city_hour,
+                    observation_timestamp=temp_data[city].get("timestamp"),
+                    observation_age_minutes=temp_data[city].get("obs_age_minutes"),
+                    running_high=round(running_high, 1),
+                    current_temp=temp_data[city].get("temp_f"),
+                    station=temp_data[city].get("station"),
+                    obs_count=temp_data[city].get("obs_count"),
+                    is_bracket=is_bracket,
+                )
 
                 yes_ask = m.get("yes_ask", 0)
                 no_ask = m.get("no_ask", 0)
@@ -1040,8 +1264,16 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                 if not is_market_liquid(m):
                     if ss:
                         ss.skip("illiquid")
-                    trade_manager.log_decision(ticker, "skip", "skipped", "illiquid",
-                                               price_cents=yes_ask, yes_bid=yes_bid, volume=m.get("volume", 0))
+                    _log_source_monitor_decision(
+                        ticker,
+                        "skip",
+                        "skipped",
+                        "illiquid",
+                        price_cents=yes_ask,
+                        yes_bid=yes_bid,
+                        volume=m.get("volume", 0),
+                        **research_fields,
+                    )
                     continue
 
                 # Determine trade side and edge
@@ -1057,20 +1289,22 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     if edge <= min_edge:
                         if ss:
                             ss.skip("low_edge")
-                        trade_manager.log_decision(
+                        _log_source_monitor_decision(
                             ticker, "yes", "skipped", "edge_below_min",
                             edge=round(edge, 4), price_cents=yes_ask, min_edge=min_edge,
                             confidence=round(prob, 4), running_high=round(running_high, 1),
                             city=city, threshold=threshold, hour=city_hour,
+                            **research_fields,
                         )
                         continue
                     budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=prob, source_type="nws")
                     if not budget.approved:
                         if ss:
                             ss.skip("allocator_denied")
-                        trade_manager.log_decision(
+                        _log_source_monitor_decision(
                             ticker, "yes", "skipped", f"allocator_denied: {budget.reason}",
                             edge=round(edge, 4), price_cents=yes_ask, confidence=round(prob, 4),
+                            **research_fields,
                         )
                         continue
                     price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
@@ -1079,9 +1313,10 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     if count <= 0:
                         if ss:
                             ss.skip("kelly_zero")
-                        trade_manager.log_decision(
+                        _log_source_monitor_decision(
                             ticker, "yes", "skipped", "kelly_zero",
                             edge=round(edge, 4), price_cents=price, confidence=round(prob, 4),
+                            **research_fields,
                         )
                         continue
                     if direction == "T":
@@ -1100,7 +1335,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                                                         running_high=round(running_high, 1),
                                                         hour_of_day=city_hour,
                                                         city=city, direction=direction, threshold=threshold,
-                                                        source_type="nws")
+                                                        source_type="nws",
+                                                        **research_fields)
                     if result:
                         if ss:
                             ss.trades_placed += 1
@@ -1109,6 +1345,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             edge=round(edge, 4), price_cents=price, count=count,
                             confidence=round(prob, 4), running_high=round(running_high, 1),
                             city=city, threshold=threshold, hour=city_hour,
+                            **research_fields,
                         )
                         allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)
 
@@ -1120,20 +1357,22 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     if edge <= min_edge:
                         if ss:
                             ss.skip("low_edge")
-                        trade_manager.log_decision(
+                        _log_source_monitor_decision(
                             ticker, "no", "skipped", "edge_below_min",
                             edge=round(edge, 4), price_cents=no_ask, min_edge=min_edge,
                             confidence=round(no_prob, 4), running_high=round(running_high, 1),
                             city=city, threshold=threshold, hour=city_hour,
+                            **research_fields,
                         )
                         continue
                     budget = allocator.request_budget("source-monitor", ticker, edge=edge, confidence=no_prob, source_type="nws")
                     if not budget.approved:
                         if ss:
                             ss.skip("allocator_denied")
-                        trade_manager.log_decision(
+                        _log_source_monitor_decision(
                             ticker, "no", "skipped", f"allocator_denied: {budget.reason}",
                             edge=round(edge, 4), price_cents=no_ask, confidence=round(no_prob, 4),
+                            **research_fields,
                         )
                         continue
                     price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
@@ -1142,9 +1381,10 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     if count <= 0:
                         if ss:
                             ss.skip("kelly_zero")
-                        trade_manager.log_decision(
+                        _log_source_monitor_decision(
                             ticker, "no", "skipped", "kelly_zero",
                             edge=round(edge, 4), price_cents=price, confidence=round(no_prob, 4),
+                            **research_fields,
                         )
                         continue
                     if direction == "T":
@@ -1163,7 +1403,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                                                         running_high=round(running_high, 1),
                                                         hour_of_day=city_hour,
                                                         city=city, direction=direction, threshold=threshold,
-                                                        source_type="nws")
+                                                        source_type="nws",
+                                                        **research_fields)
                     if result:
                         if ss:
                             ss.trades_placed += 1
@@ -1172,6 +1413,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             edge=round(edge, 4), price_cents=price, count=count,
                             confidence=round(no_prob, 4), running_high=round(running_high, 1),
                             city=city, threshold=threshold, hour=city_hour,
+                            **research_fields,
                         )
                         allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)
 
@@ -1227,6 +1469,15 @@ def build_app(project_dir=None):
         "maxDailyLoss": loaded_config["maxDailyLoss"],
         "maxDailyLossPct": loaded_config.get("maxDailyLossPct"),
     }, logger=logger, order_monitor=order_monitor_obj, bot_name="source-monitor")
+    opportunity_log_obj = OpportunityLog(
+        project_dir / "data" / "opportunity-log.json",
+        logger=logger,
+        strategy_id=trade_manager_obj.strategy_id,
+        config_version=getattr(trade_manager_obj, "_config_version", None),
+        model_registry=getattr(trade_manager_obj, "_model_registry", None),
+        source_bot=getattr(logger, "name", None),
+        source_path=trades_path,
+    )
     trim_trade_log(trades_path)
     return install_app_context(globals(), AppContext({
         "PROJECT_DIR": project_dir,
@@ -1241,6 +1492,7 @@ def build_app(project_dir=None):
         "health": health_monitor,
         "order_monitor": order_monitor_obj,
         "trade_manager": trade_manager_obj,
+        "opportunity_log": opportunity_log_obj,
     }))
 
 
