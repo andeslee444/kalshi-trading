@@ -583,6 +583,15 @@ def _incident_action_severity(entry: dict) -> str:
     return "review"
 
 
+def _incident_attention_sort_key(entry: dict):
+    severity_rank = {"critical": 0, "warning": 1, "review": 2, "info": 3}
+    status = entry.get("_status") or str(entry.get("status") or "open").strip().lower()
+    status_rank = 0 if status != "closed" else 1
+    severity = _incident_action_severity(entry)
+    updated_at = entry.get("updated_at") or entry.get("opened_at") or ""
+    return (status_rank, severity_rank.get(severity, 9), updated_at)
+
+
 def _operator_actions_payload(*, bots, health, circuit_breaker_open, parity_report, experiments_state, incidents_state):
     actions = []
 
@@ -683,7 +692,9 @@ def _operator_actions_payload(*, bots, health, circuit_breaker_open, parity_repo
             "artifact": "data/experiment-runs.json",
         })
 
-    for entry in _iter_incidents_needing_attention(incidents_state)[:5]:
+    incident_candidates = _iter_incidents_needing_attention(incidents_state)
+    incident_candidates.sort(key=_incident_attention_sort_key)
+    for entry in incident_candidates[:5]:
         incident_id = entry.get("incident_id")
         summary = str(entry.get("summary") or "Incident review needs attention.")
         status = str(entry.get("status") or "open")
