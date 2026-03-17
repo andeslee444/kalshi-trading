@@ -377,3 +377,111 @@ class TestBotsEndpoint:
 
         assert running is True
         assert pid == 12345
+
+
+class TestOperatorActionsEndpoint:
+    """Test /api/operator-actions returns actionable remediation guidance."""
+
+    def test_operator_actions_include_stale_bots_sources_parity_and_promotions(self, client, dashboard, tmp_path):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stale = (now - datetime.timedelta(minutes=45)).isoformat()
+        health_state = {
+            "sources": {
+                "nws": {
+                    "error_count": 2,
+                    "last_error_message": "parser returned no rows",
+                }
+            },
+            "bots": {
+                "source-monitor": {"last_heartbeat": stale, "error_count": 2},
+            },
+        }
+        supervisor_state = {
+            "monitor": {"restart_count": 2, "started_at": time.time() - 3600},
+        }
+        allocator_state = {
+            "circuit_breaker": {"failures": 5, "max_failures": 5},
+        }
+        parity_report = {"overall_ok": False}
+        experiment_runs = {
+            "entries": {
+                "exp-1": {
+                    "experiment_id": "exp-1",
+                    "promotion_stage": "shadow",
+                    "status": "shadow",
+                    "updated_at": "2026-03-17T01:00:00+00:00",
+                }
+            }
+        }
+
+        def fake_load_json(path_obj):
+            if path_obj == dashboard.HEALTH_STATE_PATH:
+                return health_state
+            if path_obj == dashboard.SUPERVISOR_STATE_PATH:
+                return supervisor_state
+            if path_obj == dashboard.BOTS_CONFIG_PATH:
+                return {}
+            if path_obj == dashboard.WEATHER_CONFIG_PATH:
+                return {}
+            if path_obj == dashboard.ALLOCATOR_STATE_PATH:
+                return allocator_state
+            if path_obj == dashboard.LEDGER_PARITY_REPORT_PATH:
+                return parity_report
+            if path_obj == dashboard.EXPERIMENT_RUNS_PATH:
+                return experiment_runs
+            return None
+
+        with patch.object(dashboard, "load_json_safe", side_effect=fake_load_json), \
+             patch.object(dashboard, "is_bot_running", side_effect=lambda name: (True, 222) if name == "monitor" else (False, None)), \
+             patch.object(dashboard, "get_weather_actual_source_summary", return_value={}), \
+             patch.object(dashboard, "get_weather_nws_crosscheck_summary", return_value={}), \
+             patch.object(dashboard, "KILL_SWITCH_PATH", tmp_path / "HALT"), \
+             patch("builtins.open", side_effect=FileNotFoundError):
+            dashboard.cache._store.clear()
+            resp = client.get("/api/operator-actions")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        categories = {row["category"] for row in data["actions"]}
+
+        assert data["summary"]["warning"] >= 3
+        assert "circuit_breaker" in categories
+        assert "stale_bot" in categories
+        assert "degraded_source" in categories
+        assert "parity_regression" in categories
+        assert "promotion_review" in categories
+        assert any(row["command"] == "python3 scripts/supervisor.py restart monitor" for row in data["actions"])
+        assert any(row["command"] == "python3 scripts/ledger-parity-report.py --json" for row in data["actions"])
+        assert any(row["command"] == "python3 scripts/promotion-workflow.py show exp-1" for row in data["actions"])
+
+    def test_operator_actions_returns_empty_when_system_is_clear(self, client, dashboard, tmp_path):
+        def fake_load_json(path_obj):
+            if path_obj == dashboard.HEALTH_STATE_PATH:
+                return {"sources": {}, "bots": {}}
+            if path_obj == dashboard.SUPERVISOR_STATE_PATH:
+                return {}
+            if path_obj == dashboard.BOTS_CONFIG_PATH:
+                return {}
+            if path_obj == dashboard.WEATHER_CONFIG_PATH:
+                return {}
+            if path_obj == dashboard.ALLOCATOR_STATE_PATH:
+                return {}
+            if path_obj == dashboard.LEDGER_PARITY_REPORT_PATH:
+                return {"overall_ok": True}
+            if path_obj == dashboard.EXPERIMENT_RUNS_PATH:
+                return {"entries": {}}
+            return None
+
+        with patch.object(dashboard, "load_json_safe", side_effect=fake_load_json), \
+             patch.object(dashboard, "is_bot_running", return_value=(False, None)), \
+             patch.object(dashboard, "get_weather_actual_source_summary", return_value={}), \
+             patch.object(dashboard, "get_weather_nws_crosscheck_summary", return_value={}), \
+             patch.object(dashboard, "KILL_SWITCH_PATH", tmp_path / "HALT"), \
+             patch("builtins.open", side_effect=FileNotFoundError):
+            dashboard.cache._store.clear()
+            resp = client.get("/api/operator-actions")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["summary"]["total"] == 0
+        assert data["actions"] == []
