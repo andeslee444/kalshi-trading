@@ -14,6 +14,44 @@ usage() {
   exit 1
 }
 
+protected_download_files() {
+  python3 -c "
+from pathlib import Path
+import sys
+proj = Path('$PROJECT_DIR')
+sys.path.insert(0, str(proj / 'src' / 'kalshi'))
+from bot_registry import DECISION_FILE_SPECS
+from trade_files import TRADE_FILES
+
+files = {tf['filename'] for tf in TRADE_FILES}
+files.update(spec['filename'] for spec in DECISION_FILE_SPECS)
+files.update({
+    'allocator-state.json',
+    'backtest-results.json',
+    'beatrelease-state.json',
+    'circuit-breaker-state.json',
+    'correlation-state.json',
+    'crypto-price-history.json',
+    'deposits.json',
+    'econ-nowcast-cache.json',
+    'financial-snapshot.json',
+    'health-state.json',
+    'macro-cache.json',
+    'nowcast-history.json',
+    'performance-metrics.json',
+    'pf-state-crypto.json',
+    'regime-state.json',
+    'scan-summaries.json',
+    'weather-nws-cross-check.json',
+    'weather-verification.json',
+})
+for path in (proj / 'data').glob('*-metrics.json'):
+    files.add(path.name)
+for name in sorted(files):
+    print(name)
+"
+}
+
 # Common exclude/include flags for data/ sync
 # Strategy: exclude everything, then include only what we want
 sync_filters() {
@@ -216,11 +254,9 @@ cmd_download() {
 
   # Check for local modifications that would be overwritten
   echo "Checking for local changes..."
-  for f in $(python3 -c "
-import sys; sys.path.insert(0, '$PROJECT_DIR/src/kalshi')
-from trade_files import TRADE_FILES
-for tf in TRADE_FILES: print(tf['filename'])
-"); do
+  preserve_filters=()
+  preserved_files=()
+  while IFS= read -r f; do
     local_file="$PROJECT_DIR/data/$f"
     if [ -f "$local_file" ]; then
       local_mod=$(stat -f%m "$local_file" 2>/dev/null || stat -c%Y "$local_file" 2>/dev/null || echo 0)
@@ -234,17 +270,24 @@ dt = datetime.fromisoformat(info['LastModified'].replace('+00:00',''))
 print(int(dt.timestamp()))
 " 2>/dev/null || echo 0)
         if [ "$local_mod" -gt "$remote_mod" ] 2>/dev/null; then
-          echo "WARNING: Local $f is newer than S3 — local changes will be preserved"
+          echo "WARNING: Local $f is newer than S3 — preserving local copy"
+          preserve_filters+=("--exclude=$f")
+          preserved_files+=("$f")
         fi
       fi
     fi
-  done
+  done < <(protected_download_files)
 
   # Sync data/ trade logs using --exact-timestamps for safer comparison
   # (--size-only is fragile: truncation or reconciliation changes size without
   # adding new trades, causing incorrect overwrite decisions)
   aws s3 sync "s3://${BUCKET}/data/" "$PROJECT_DIR/data/" \
-    $(sync_filters) --exact-timestamps
+    $(sync_filters) "${preserve_filters[@]}" --exact-timestamps
+
+  if [ "${#preserved_files[@]}" -gt 0 ]; then
+    echo "Preserved newer local artifacts:"
+    printf '  %s\n' "${preserved_files[@]}"
+  fi
 
   # Sync bot log files
   aws s3 sync "s3://${BUCKET}/data/logs/" "$PROJECT_DIR/data/logs/" \

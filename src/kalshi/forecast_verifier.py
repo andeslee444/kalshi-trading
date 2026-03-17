@@ -60,6 +60,7 @@ class ForecastVerifier:
 
     STATE_ARTIFACT_TYPE = WEATHER_VERIFICATION_ARTIFACT
     STATE_SCHEMA_VERSION = WEATHER_VERIFICATION_SCHEMA_VERSION
+    LEDGER_VERIFICATION_CATEGORY = "weather_verification"
 
     def __init__(self, state_path, logger=None):
         """
@@ -611,9 +612,27 @@ class ForecastVerifier:
                     len(self.state["pending"]),
                     len(self.state["verified"]),
                 )
+                self.sync_verified_to_ledger()
         except Exception as e:
             self.log.warning("Failed to load verification state: %s (starting fresh)", e)
             self.state = self._normalize_state(None)
+
+    def sync_verified_to_ledger(self):
+        """Replay verified state rows into the ledger idempotently."""
+        synced = 0
+        for record in self.state.get("verified", []):
+            try:
+                self._ledger.record_verification_result(
+                    record,
+                    source_path=self.state_path,
+                    category=self.LEDGER_VERIFICATION_CATEGORY,
+                )
+                synced += 1
+            except Exception as e:
+                self.log.warning("Failed to sync verification record to ledger: %s", e)
+        if synced:
+            self.log.info("Synced %d verified records to event ledger", synced)
+        return synced
 
     def cleanup(self, max_age_days=90):
         """Remove verification records older than max_age_days."""
@@ -716,6 +735,7 @@ class NWSCrossCheckVerifier(ForecastVerifier):
 
     STATE_ARTIFACT_TYPE = WEATHER_NWS_CROSSCHECK_ARTIFACT
     STATE_SCHEMA_VERSION = WEATHER_NWS_CROSSCHECK_SCHEMA_VERSION
+    LEDGER_VERIFICATION_CATEGORY = "weather_nws_crosscheck"
 
     def record_comparison(
         self,

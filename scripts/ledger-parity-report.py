@@ -49,6 +49,8 @@ def _overall_ok(report):
     for row in rows:
         if not row:
             continue
+        if row.get("comparison_status") == "no_overlap":
+            continue
         if "count_match" in row and not row["count_match"]:
             return False
         if "hash_match" in row and not row["hash_match"]:
@@ -92,17 +94,25 @@ def main():
         print(f"[{section}]")
         for row in report.get(section, []):
             path = row.get("path")
+            mode = row.get("comparison_mode")
+            status = row.get("comparison_status")
             if section == "verification":
                 print(
-                    f"  {path}: legacy_verified={row.get('legacy_verified_count')} "
-                    f"ledger_verified={row.get('ledger_verified_count')} "
+                    f"  {path}: mode={mode} status={status} "
+                    f"legacy_verified={row.get('legacy_verified_count')}/"
+                    f"{row.get('legacy_verified_total_count')} "
+                    f"ledger_verified={row.get('ledger_verified_count')}/"
+                    f"{row.get('ledger_verified_total_count')} "
                     f"hash_match={row.get('verified_hash_match')}"
                 )
             else:
+                extra = row.get("ledger_extra_count")
+                extra_str = f" extra={extra}" if extra is not None else ""
                 print(
-                    f"  {path}: legacy={row.get('legacy_count')} "
-                    f"ledger={row.get('ledger_count')} "
-                    f"hash_match={row.get('hash_match')}"
+                    f"  {path}: mode={mode} status={status} "
+                    f"legacy={row.get('legacy_count')}/{row.get('legacy_total_count')} "
+                    f"ledger={row.get('ledger_count')}/{row.get('ledger_total_count')} "
+                    f"hash_match={row.get('hash_match')}{extra_str}"
                 )
 
 

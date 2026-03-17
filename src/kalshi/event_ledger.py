@@ -9,6 +9,7 @@ import logging
 import os
 import sqlite3
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 
 from artifact_contracts import normalize_trade_attribution
@@ -57,6 +58,22 @@ def _event_date(ts):
     if not ts or not isinstance(ts, str):
         return None
     return ts[:10]
+
+
+def _parse_timestamp(ts):
+    if not ts or not isinstance(ts, str):
+        return None
+    try:
+        dt = _dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    return dt.astimezone(_dt.timezone.utc)
+
+
+def _iso_or_none(dt):
+    return dt.isoformat() if dt is not None else None
 
 
 def _trade_event_key(trade, source_path=None):
@@ -143,8 +160,16 @@ class EventLedger:
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
+    @contextmanager
+    def _connection(self):
+        conn = self._connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
+
     def ensure_schema(self):
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS metadata (
@@ -215,7 +240,7 @@ class EventLedger:
         payload_json = _json_dumps(payload)
         payload_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
         event_date = _event_date(event_time)
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO events (
@@ -464,9 +489,24 @@ class EventLedger:
             query += " AND source_path = ?"
             params.append(_safe_path(source_path))
         query += " ORDER BY event_time ASC, event_id ASC"
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(query, params).fetchall()
         return [json.loads(row["payload_json"]) for row in rows]
+
+    def _fetch_event_window(self, event_type, *, source_path=None):
+        self.ensure_schema()
+        query = """
+            SELECT MIN(event_time) AS min_event_time, MAX(event_time) AS max_event_time
+            FROM events
+            WHERE event_type = ?
+        """
+        params = [event_type]
+        if source_path is not None:
+            query += " AND source_path = ?"
+            params.append(_safe_path(source_path))
+        with self._connection() as conn:
+            row = conn.execute(query, params).fetchone()
+        return _parse_timestamp(row["min_event_time"]), _parse_timestamp(row["max_event_time"])
 
     def get_trade_records(self, source_path=None):
         orders = self._fetch_event_payloads(EVENT_TYPE_ORDER_SUBMITTED, source_path=source_path)
@@ -666,18 +706,27 @@ class EventLedger:
         trade_specs = trade_specs or []
         decision_specs = decision_specs or []
         verification_specs = verification_specs or []
+        decision_coverage_start, decision_coverage_end = self._fetch_event_window(EVENT_TYPE_TRADE_DECISION)
 
         for spec in trade_specs:
             path = Path(spec["path"])
             legacy = self._load_json_list(path)
             ledger = self.get_trade_records(path)
-            report["trade_logs"].append(self._compare_records(path, legacy, ledger))
+            report["trade_logs"].append(self._compare_trade_records(path, legacy, ledger))
 
         for spec in decision_specs:
             path = Path(spec["path"])
             legacy = self._load_json_list(path)
             ledger = self.get_decision_records(path)
-            report["decision_logs"].append(self._compare_records(path, legacy, ledger))
+            report["decision_logs"].append(
+                self._compare_decision_records(
+                    path,
+                    legacy,
+                    ledger,
+                    coverage_start=decision_coverage_start,
+                    coverage_end=decision_coverage_end,
+                )
+            )
 
         for spec in verification_specs:
             path = Path(spec["path"])
@@ -691,18 +740,16 @@ class EventLedger:
                 self._normalize_verification_row(record)
                 for record in self.get_verification_records(category=category)
             ]
-            report["verification"].append({
-                "path": str(path),
-                "legacy_verified_count": len(legacy_verified),
-                "ledger_verified_count": len(ledger_verified),
-                "verified_hash_match": _record_hash(legacy_verified) == _record_hash(ledger_verified),
-            })
+            row = self._compare_verification_records(path, legacy_verified, ledger_verified)
+            row["verified_hash_match"] = row.pop("hash_match")
+            row.pop("count_match", None)
+            report["verification"].append(row)
 
         return report
 
     def save_parity_report(self, report, scope="default"):
         self.ensure_schema()
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO parity_reports(run_at, scope, report_json)
@@ -732,21 +779,378 @@ class EventLedger:
         except (OSError, ValueError, json.JSONDecodeError):
             return {}
 
-    @staticmethod
-    def _compare_records(path, legacy, ledger):
+    @classmethod
+    def _record_timestamp(cls, record, time_fields):
+        for field in time_fields:
+            dt = _parse_timestamp(record.get(field))
+            if dt is not None:
+                return dt
+        return None
+
+    @classmethod
+    def _window_bounds(cls, records, time_fields):
+        timestamps = [
+            cls._record_timestamp(record, time_fields)
+            for record in records
+        ]
+        timestamps = [dt for dt in timestamps if dt is not None]
+        if not timestamps:
+            return None, None
+        return min(timestamps), max(timestamps)
+
+    @classmethod
+    def _filter_records_by_window(cls, records, time_fields, start=None, end=None):
+        filtered = []
+        for record in records:
+            dt = cls._record_timestamp(record, time_fields)
+            if dt is None:
+                continue
+            if start is not None and dt < start:
+                continue
+            if end is not None and dt > end:
+                continue
+            filtered.append(record)
+        return filtered
+
+    @classmethod
+    def _sort_records_for_parity(cls, records, time_fields):
+        def _key(record):
+            dt = cls._record_timestamp(record, time_fields)
+            return (
+                _iso_or_none(dt) or "",
+                _json_dumps(record),
+            )
+
+        return sorted(records, key=_key)
+
+    @classmethod
+    def _dedupe_records(cls, records):
+        deduped = []
+        seen = set()
+        for record in records:
+            key = _json_dumps(record)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(record)
+        return deduped
+
+    @classmethod
+    def _normalize_trade_row(cls, record):
+        normalized = dict(record)
+        normalized.pop("fill_count", None)
+        if normalized.get("fill_price_cents") == 0:
+            normalized["fill_price_cents"] = None
+        return normalized
+
+    @classmethod
+    def _ordered_subsequence_positions(cls, records, candidate_records):
+        if not records:
+            return []
+        candidate_keys = [_json_dumps(record) for record in candidate_records]
+        positions = []
+        cursor = 0
+        for record in records:
+            record_key = _json_dumps(record)
+            while cursor < len(candidate_keys) and candidate_keys[cursor] != record_key:
+                cursor += 1
+            if cursor >= len(candidate_keys):
+                return None
+            positions.append(cursor)
+            cursor += 1
+        return positions
+
+    @classmethod
+    def _annotate_ledger_superset(cls, row, records, candidate_records):
+        positions = cls._ordered_subsequence_positions(records, candidate_records)
+        row["legacy_is_ordered_subsequence"] = positions is not None
+        if positions is None:
+            return row
+        row["comparison_mode"] = "ordered_subsequence"
+        row["comparison_status"] = "ledger_superset"
+        row["ledger_extra_count"] = max(0, len(candidate_records) - len(records))
+        row["legacy_subsequence_start_index"] = positions[0] if positions else None
+        row["legacy_subsequence_end_index"] = positions[-1] if positions else None
+        row["count_match"] = len(records) == len(candidate_records)
+        row["hash_match"] = row["count_match"] and _record_hash(records) == _record_hash(candidate_records)
+        return row
+
+    @classmethod
+    def _compare_overlap_records(
+        cls,
+        path,
+        legacy,
+        ledger,
+        *,
+        legacy_time_fields,
+        ledger_time_fields=None,
+        normalize_row=None,
+        sort_records=True,
+        comparison_mode="overlap_window",
+        legacy_total_key="legacy_total_count",
+        ledger_total_key="ledger_total_count",
+        legacy_count_key="legacy_count",
+        ledger_count_key="ledger_count",
+    ):
+        ledger_time_fields = ledger_time_fields or legacy_time_fields
+        normalize_row = normalize_row or (lambda record: dict(record))
+        legacy_window_start, legacy_window_end = cls._window_bounds(legacy, legacy_time_fields)
+        ledger_window_start, ledger_window_end = cls._window_bounds(ledger, ledger_time_fields)
+
+        overlap_start = None
+        overlap_end = None
+        legacy_subset = []
+        ledger_subset = []
+        status = "matched"
+
+        if (
+            legacy_window_start is not None and
+            ledger_window_start is not None
+        ):
+            overlap_start = max(legacy_window_start, ledger_window_start)
+            overlap_end = min(legacy_window_end, ledger_window_end)
+
+        if overlap_start is None or overlap_end is None or overlap_start > overlap_end:
+            status = "no_overlap"
+        else:
+            legacy_subset = cls._filter_records_by_window(
+                legacy,
+                legacy_time_fields,
+                start=overlap_start,
+                end=overlap_end,
+            )
+            ledger_subset = cls._filter_records_by_window(
+                ledger,
+                ledger_time_fields,
+                start=overlap_start,
+                end=overlap_end,
+            )
+
+        comparable_legacy = [normalize_row(record) for record in legacy_subset]
+        comparable_ledger = [normalize_row(record) for record in ledger_subset]
+        if sort_records:
+            comparable_legacy = cls._sort_records_for_parity(comparable_legacy, legacy_time_fields)
+            comparable_ledger = cls._sort_records_for_parity(comparable_ledger, ledger_time_fields)
+
+        count_match = len(comparable_legacy) == len(comparable_ledger)
+        hash_match = _record_hash(comparable_legacy) == _record_hash(comparable_ledger)
+        if status != "no_overlap" and (not count_match or not hash_match):
+            status = "mismatch"
+
         return {
             "path": str(path),
-            "legacy_count": len(legacy),
-            "ledger_count": len(ledger),
-            "count_match": len(legacy) == len(ledger),
-            "hash_match": _record_hash(legacy) == _record_hash(ledger),
+            "comparison_mode": comparison_mode,
+            "comparison_status": status,
+            legacy_total_key: len(legacy),
+            ledger_total_key: len(ledger),
+            legacy_count_key: len(comparable_legacy),
+            ledger_count_key: len(comparable_ledger),
+            "count_match": True if status == "no_overlap" else count_match,
+            "hash_match": True if status == "no_overlap" else hash_match,
+            "legacy_window_start": _iso_or_none(legacy_window_start),
+            "legacy_window_end": _iso_or_none(legacy_window_end),
+            "ledger_window_start": _iso_or_none(ledger_window_start),
+            "ledger_window_end": _iso_or_none(ledger_window_end),
+            "comparison_window_start": _iso_or_none(overlap_start),
+            "comparison_window_end": _iso_or_none(overlap_end),
         }
 
     @staticmethod
     def _normalize_verification_row(record):
         normalized = dict(record)
         normalized.pop("category", None)
+        normalized.pop("verified_at", None)
         return normalized
+
+    @classmethod
+    def _compare_trade_records(cls, path, legacy, ledger):
+        row = cls._compare_overlap_records(
+            path,
+            legacy,
+            ledger,
+            legacy_time_fields=("timestamp",),
+            ledger_time_fields=("timestamp",),
+            normalize_row=cls._normalize_trade_row,
+        )
+        if row.get("comparison_status") != "mismatch":
+            return row
+
+        legacy_window_start, legacy_window_end = cls._window_bounds(legacy, ("timestamp",))
+        ledger_window_start, ledger_window_end = cls._window_bounds(ledger, ("timestamp",))
+        if (
+            legacy_window_start is None or
+            legacy_window_end is None or
+            ledger_window_start is None or
+            ledger_window_end is None
+        ):
+            return row
+        overlap_start = max(legacy_window_start, ledger_window_start)
+        overlap_end = min(legacy_window_end, ledger_window_end)
+        if overlap_start > overlap_end:
+            return row
+
+        comparable_legacy = [
+            cls._normalize_trade_row(record)
+            for record in cls._filter_records_by_window(
+                legacy,
+                ("timestamp",),
+                start=overlap_start,
+                end=overlap_end,
+            )
+        ]
+        comparable_ledger = [
+            cls._normalize_trade_row(record)
+            for record in cls._filter_records_by_window(
+                ledger,
+                ("timestamp",),
+                start=overlap_start,
+                end=overlap_end,
+            )
+        ]
+        comparable_legacy = cls._sort_records_for_parity(comparable_legacy, ("timestamp",))
+        comparable_ledger = cls._sort_records_for_parity(comparable_ledger, ("timestamp",))
+        return cls._annotate_ledger_superset(row, comparable_legacy, comparable_ledger)
+
+    @classmethod
+    def _compare_decision_records(cls, path, legacy, ledger, *, coverage_start=None, coverage_end=None):
+        legacy_window_start, legacy_window_end = cls._window_bounds(legacy, ("timestamp",))
+        ledger_window_start, ledger_window_end = cls._window_bounds(ledger, ("timestamp",))
+        if (
+            not ledger and
+            legacy_window_end is not None and
+            coverage_start is not None and
+            legacy_window_end < coverage_start
+        ):
+            return {
+                "path": str(path),
+                "comparison_mode": "latest_suffix",
+                "comparison_status": "no_overlap",
+                "legacy_total_count": len(legacy),
+                "ledger_total_count": 0,
+                "legacy_count": 0,
+                "ledger_count": 0,
+                "count_match": True,
+                "hash_match": True,
+                "legacy_window_start": _iso_or_none(legacy_window_start),
+                "legacy_window_end": _iso_or_none(legacy_window_end),
+                "ledger_window_start": _iso_or_none(ledger_window_start),
+                "ledger_window_end": _iso_or_none(ledger_window_end),
+                "ledger_coverage_window_start": _iso_or_none(coverage_start),
+                "ledger_coverage_window_end": _iso_or_none(coverage_end),
+                "comparison_window_start": None,
+                "comparison_window_end": None,
+            }
+        if legacy_window_end is not None:
+            ledger_recent = cls._filter_records_by_window(
+                ledger,
+                ("timestamp",),
+                end=legacy_window_end,
+            )
+        else:
+            ledger_recent = list(ledger)
+        ledger_subset = ledger_recent[-len(legacy):] if legacy else []
+        comparable_legacy = [dict(record) for record in legacy]
+        comparable_ledger = [dict(record) for record in ledger_subset]
+        count_match = len(comparable_legacy) == len(comparable_ledger)
+        hash_match = _record_hash(comparable_legacy) == _record_hash(comparable_ledger)
+        status = "matched"
+        if not count_match or not hash_match:
+            status = "mismatch"
+        comparison_window_start, comparison_window_end = cls._window_bounds(
+            comparable_ledger or comparable_legacy,
+            ("timestamp",),
+        )
+        row = {
+            "path": str(path),
+            "comparison_mode": "latest_suffix",
+            "comparison_status": status,
+            "legacy_total_count": len(legacy),
+            "ledger_total_count": len(ledger),
+            "legacy_count": len(comparable_legacy),
+            "ledger_count": len(comparable_ledger),
+            "count_match": count_match,
+            "hash_match": hash_match,
+            "legacy_window_start": _iso_or_none(legacy_window_start),
+            "legacy_window_end": _iso_or_none(legacy_window_end),
+            "ledger_window_start": _iso_or_none(ledger_window_start),
+            "ledger_window_end": _iso_or_none(ledger_window_end),
+            "ledger_coverage_window_start": _iso_or_none(coverage_start),
+            "ledger_coverage_window_end": _iso_or_none(coverage_end),
+            "comparison_window_start": _iso_or_none(comparison_window_start),
+            "comparison_window_end": _iso_or_none(comparison_window_end),
+        }
+        if row["comparison_status"] == "mismatch":
+            row = cls._annotate_ledger_superset(row, comparable_legacy, ledger_recent)
+            if row.get("comparison_status") == "ledger_superset":
+                row["ledger_count"] = len(ledger_recent)
+        return row
+
+    @classmethod
+    def _compare_verification_records(cls, path, legacy_verified, ledger_verified):
+        row = cls._compare_overlap_records(
+            path,
+            legacy_verified,
+            ledger_verified,
+            legacy_time_fields=("recorded_at", "verified_at"),
+            ledger_time_fields=("recorded_at", "verified_at"),
+            normalize_row=cls._normalize_verification_row,
+            comparison_mode="overlap_window",
+            legacy_total_key="legacy_verified_total_count",
+            ledger_total_key="ledger_verified_total_count",
+            legacy_count_key="legacy_verified_count",
+            ledger_count_key="ledger_verified_count",
+        )
+        if row.get("comparison_status") == "no_overlap":
+            return row
+
+        legacy_window_start, legacy_window_end = cls._window_bounds(legacy_verified, ("recorded_at", "verified_at"))
+        ledger_window_start, ledger_window_end = cls._window_bounds(ledger_verified, ("recorded_at", "verified_at"))
+        if (
+            legacy_window_start is None or
+            legacy_window_end is None or
+            ledger_window_start is None or
+            ledger_window_end is None
+        ):
+            return row
+        overlap_start = max(legacy_window_start, ledger_window_start)
+        overlap_end = min(legacy_window_end, ledger_window_end)
+        if overlap_start > overlap_end:
+            return row
+
+        comparable_legacy = [
+            cls._normalize_verification_row(record)
+            for record in cls._filter_records_by_window(
+                legacy_verified,
+                ("recorded_at", "verified_at"),
+                start=overlap_start,
+                end=overlap_end,
+            )
+        ]
+        comparable_ledger = [
+            cls._normalize_verification_row(record)
+            for record in cls._filter_records_by_window(
+                ledger_verified,
+                ("recorded_at", "verified_at"),
+                start=overlap_start,
+                end=overlap_end,
+            )
+        ]
+        comparable_legacy = cls._dedupe_records(
+            cls._sort_records_for_parity(comparable_legacy, ("recorded_at", "verified_at"))
+        )
+        comparable_ledger = cls._dedupe_records(
+            cls._sort_records_for_parity(comparable_ledger, ("recorded_at", "verified_at"))
+        )
+
+        row["legacy_verified_count"] = len(comparable_legacy)
+        row["ledger_verified_count"] = len(comparable_ledger)
+        row["count_match"] = len(comparable_legacy) == len(comparable_ledger)
+        row["hash_match"] = _record_hash(comparable_legacy) == _record_hash(comparable_ledger)
+        row["comparison_mode"] = "deduped_overlap_window"
+        row["comparison_status"] = "matched" if row["count_match"] and row["hash_match"] else "mismatch"
+        if row["comparison_status"] == "mismatch":
+            row = cls._annotate_ledger_superset(row, comparable_legacy, comparable_ledger)
+        return row
 
 
 def get_event_ledger(path=None, logger=None):

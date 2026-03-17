@@ -28,6 +28,7 @@ _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src" / "kalshi")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
+from event_ledger import get_event_ledger
 from kalshi_auth import KalshiClient, load_trades, _atomic_write_json, setup_logging
 from trade_files import ALL_TRADE_PATHS
 
@@ -35,6 +36,47 @@ log = setup_logging("backfill")
 
 # Use canonical trade file list from trade_files module
 TRADE_FILES = ALL_TRADE_PATHS
+
+
+def _sync_settled_trades_to_ledger(trade_file, trades, ledger):
+    """Mirror settled local trade rows into the ledger idempotently."""
+    synced = 0
+    for trade in trades:
+        if trade.get("action", "buy") != "buy":
+            continue
+        if trade.get("settlement_result") is None:
+            continue
+        try:
+            ledger.record_settlement(trade, source_path=trade_file)
+            synced += 1
+        except Exception as e:
+            log.warning(
+                "Failed to dual-write settlement for %s in %s: %s",
+                trade.get("ticker", "?"),
+                Path(trade_file).name,
+                e,
+            )
+    return synced
+
+
+def sync_local_settlements_to_ledger():
+    """Sync settled local trade rows into the ledger without querying the API."""
+    ledger = get_event_ledger(logger=log)
+    total_synced = 0
+
+    for trade_file in TRADE_FILES:
+        if not trade_file.exists():
+            continue
+        trades = load_trades(trade_file)
+        if not trades:
+            continue
+        synced = _sync_settled_trades_to_ledger(trade_file, trades, ledger)
+        if synced:
+            log.info("  %s: synced %d settled rows to ledger", trade_file.name, synced)
+            total_synced += synced
+
+    log.info("Ledger settlement sync complete: %d settled rows mirrored", total_synced)
+    return total_synced
 
 
 def _query_market(client, ticker):
@@ -64,6 +106,7 @@ def _query_market(client, ticker):
 def backfill(dry_run=False):
     """Walk all trade files, query unsettled tickers, annotate records."""
     client = KalshiClient()
+    ledger = get_event_ledger(logger=log)
 
     # Gather all unsettled tickers first to batch queries
     unsettled_tickers = set()
@@ -154,6 +197,8 @@ def backfill(dry_run=False):
             if not dry_run:
                 _atomic_write_json(trade_file, trades)
             total_annotated += file_modified
+        if not dry_run:
+            _sync_settled_trades_to_ledger(trade_file, trades, ledger)
 
     log.info("Backfill complete: %d records annotated%s",
              total_annotated, " (DRY RUN)" if dry_run else "")
@@ -254,9 +299,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Backfill settlement results from Kalshi API")
     parser.add_argument("--dry-run", action="store_true", help="Preview changes without writing")
     parser.add_argument("--report", action="store_true", help="Summary report only (no backfill)")
+    parser.add_argument(
+        "--sync-ledger-only",
+        action="store_true",
+        help="Sync settled local trade rows into the ledger without API calls",
+    )
     args = parser.parse_args()
 
-    if not args.report:
+    if args.sync_ledger_only:
+        sync_local_settlements_to_ledger()
+    elif not args.report:
         backfill(dry_run=args.dry_run)
 
     summary_report()

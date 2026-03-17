@@ -424,6 +424,35 @@ class TestForecastVerifier:
         assert verifier.state["schema_version"] == 1
         assert verifier.state["pending"][0]["city"] == "MIA"
 
+    def test_load_syncs_verified_rows_to_weather_ledger(self, tmp_path):
+        path = tmp_path / "weather-verification.json"
+        verified = {
+            "city": "MIA",
+            "date": "2026-03-10",
+            "models": {"gfs": 82.0},
+            "actual_high": 80.0,
+            "errors": {"gfs": 2.0},
+            "record_kind": "snapshot",
+            "recorded_at": "2026-03-10T12:00:00+00:00",
+            "verified_at": "2026-03-11T12:00:00+00:00",
+            "actual_source": "nws_cli",
+        }
+        path.write_text(json.dumps({
+            "pending": [],
+            "verified": [verified],
+            "stats": {},
+        }))
+
+        verifier = ForecastVerifier(path)
+        verifier._ledger = MagicMock()
+        verifier.load()
+
+        verifier._ledger.record_verification_result.assert_called_once_with(
+            verified,
+            source_path=path,
+            category="weather_verification",
+        )
+
     def test_nws_crosscheck_persists_distinct_artifact_type(self, tmp_path):
         verifier = NWSCrossCheckVerifier(tmp_path / "weather-nws-cross-check.json")
         verifier.record_comparison("DEN", "2026-03-14", 68.0, 60.0)
@@ -456,3 +485,38 @@ class TestForecastVerifier:
 
         record = verifier.state["verified"][0]
         assert set(NWS_CROSSCHECK_VERIFIED_FIELDS).issubset(record)
+
+    def test_nws_crosscheck_load_syncs_verified_rows_to_crosscheck_ledger(self, tmp_path):
+        path = tmp_path / "weather-nws-cross-check.json"
+        verified = {
+            "city": "DEN",
+            "date": "2026-03-10",
+            "open_meteo_temp": 68.0,
+            "nws_temp": 60.0,
+            "open_meteo_minus_nws": 8.0,
+            "mode": "advisory_only",
+            "recorded_at": "2026-03-10T12:00:00+00:00",
+            "actual_high": 65.0,
+            "actual_source": "nws_cli",
+            "open_meteo_error": 3.0,
+            "nws_error": -5.0,
+            "open_meteo_abs_error": 3.0,
+            "nws_abs_error": 5.0,
+            "winner": "open_meteo",
+            "verified_at": "2026-03-11T12:00:00+00:00",
+        }
+        path.write_text(json.dumps({
+            "pending": [],
+            "verified": [verified],
+            "stats": {},
+        }))
+
+        verifier = NWSCrossCheckVerifier(path)
+        verifier._ledger = MagicMock()
+        verifier.load()
+
+        verifier._ledger.record_verification_result.assert_called_once_with(
+            verified,
+            source_path=path,
+            category="weather_nws_crosscheck",
+        )
