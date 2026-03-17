@@ -31,6 +31,7 @@ order_monitor = None
 SCAN_INTERVAL = 15
 
 BAYES_PARAMS_PATH = PROJECT_DIR / "config" / "bayes-params.json"
+BAYES_PROCESSED_SETTLEMENTS_PATH = DATA_DIR / "strategy-bayes-processed-settlements.json"
 edge_estimator = None
 correlation_sizer = None
 scheduler = None
@@ -50,6 +51,85 @@ trade_manager = None
 
 # Multi-outcome futures where longshot bias model doesn't apply
 TOURNAMENT_PREFIXES = ("KXMARMAD-",)
+_SETTLED_RESULTS = frozenset({"won", "lost"})
+
+
+def _load_strategy_trade_history():
+    try:
+        from kalshi_auth import load_trades
+        return load_trades(TRADES_JSON_PATH)
+    except Exception:
+        return []
+
+
+def _processed_settlement_key(trade_record):
+    order_id = str(trade_record.get("order_id") or "").strip()
+    if order_id:
+        return f"order:{order_id}"
+    ticker = str(trade_record.get("ticker") or "").strip()
+    timestamp = str(trade_record.get("timestamp") or "").strip()
+    strategy = str(trade_record.get("strategy") or "").strip()
+    settlement_result = str(trade_record.get("settlement_result") or "").strip()
+    if not ticker:
+        return None
+    return "fallback:" + "|".join((
+        ticker,
+        timestamp,
+        strategy,
+        settlement_result,
+    ))
+
+
+def _iter_settled_strategy_trades(trades):
+    def _sort_key(trade_record):
+        return (
+            str(trade_record.get("timestamp") or ""),
+            str(trade_record.get("order_id") or ""),
+            str(trade_record.get("ticker") or ""),
+        )
+
+    for trade_record in sorted(trades, key=_sort_key):
+        if trade_record.get("settlement_result") in _SETTLED_RESULTS:
+            yield trade_record
+
+
+def _write_processed_settlement_keys(keys, *, bootstrapped=False):
+    payload = {
+        "processed_settlement_keys": sorted(str(key) for key in keys if key),
+        "last_updated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "bootstrapped": bool(bootstrapped),
+    }
+    _atomic_write_json(BAYES_PROCESSED_SETTLEMENTS_PATH, payload)
+
+
+def _load_processed_settlement_keys(local_trades):
+    path = Path(BAYES_PROCESSED_SETTLEMENTS_PATH)
+    try:
+        if path.exists():
+            data = json.loads(path.read_text())
+            if isinstance(data, dict):
+                raw = data.get("processed_settlement_keys", [])
+            elif isinstance(data, list):
+                raw = data
+            else:
+                raw = []
+            return {str(key) for key in raw if key}
+    except Exception as e:
+        if log:
+            log.warning(f"Failed to load processed settlement keys: {e}")
+
+    bootstrapped = {
+        key
+        for key in (_processed_settlement_key(trade_record) for trade_record in _iter_settled_strategy_trades(local_trades))
+        if key
+    }
+    _write_processed_settlement_keys(bootstrapped, bootstrapped=True)
+    if bootstrapped and log:
+        log.info(
+            "Bootstrapped Bayesian settlement tracker with %d settled strategy orders",
+            len(bootstrapped),
+        )
+    return bootstrapped
 
 def find_longshot_sells(markets, bankroll):
     """Find contracts priced <=30c YES to SELL (exploit longshot bias).
@@ -418,68 +498,73 @@ def find_longshot_buys(markets, bankroll):
 def check_settled_trades():
     """Check if any previous trades have settled and update Bayesian model."""
     settled = []
+    settled_list = []
     try:
         positions = client.get("/portfolio/positions")
         for p in positions.get("market_positions", []):
             if p.get("settlement_status") == "settled":
                 settled.append(p)
-
-        try:
-            settlements = client.get("/portfolio/settlements")
-            settled_list = settlements.get("settlements", [])
-            # Update Bayesian edge model with settlement outcomes
-            if settled_list and _bayesian_edge_enabled:
-                # Load our trade records to determine strategy (buy vs sell side)
-                our_trades = {}
-                try:
-                    from kalshi_auth import load_trades
-                    for t in load_trades(TRADES_JSON_PATH):
-                        our_trades[t.get("ticker", "")] = t
-                except Exception:
-                    pass
-
-                for s in settled_list:
-                    ticker = s.get("ticker", "")
-                    if not ticker:
-                        continue
-                    # Only process settlements for OUR strategy trades
-                    trade_rec = our_trades.get(ticker)
-                    if not trade_rec:
-                        continue
-
-                    category = classify_ticker_category(ticker)
-                    strategy = trade_rec.get("strategy", "")
-                    price_cents = trade_rec.get("yes_price_at_entry", 5)
-
-                    # Determine outcome: prefer local settlement_result
-                    local_result = trade_rec.get("settlement_result")
-                    if local_result == "won":
-                        won = True
-                    elif local_result == "lost":
-                        won = False
-                    else:
-                        won = s.get("revenue", 0) > 0
-
-                    # Fix side conflation: for buy-side trades (YES 70-99c),
-                    # convert to NO-equivalent price (1-30c) before bucketing
-                    if strategy == "longshot_buy" and price_cents > 30:
-                        price_cents = 100 - price_cents  # NO-equivalent for bucketing
-                        # For buy-side: "won" means YES resolved (buyer wins)
-                        # For the Becker model, this means the longshot (NO side) LOST
-                        won = not won  # flip: buyer winning = seller losing
-
-                    # Clamp to valid bucket range
-                    price_cents = max(1, min(30, price_cents))
-                    edge_estimator.update_posterior(category, price_cents, won)
-                try:
-                    edge_estimator.save_params(BAYES_PARAMS_PATH)
-                except Exception as e:
-                    log.warning(f"Failed to save Bayes params: {e}")
-            return settled_list
-        except Exception:
-            pass
     except Exception as e:
-        log.error(f"  Error checking settlements: {e}")
+        log.error(f"  Error checking settled positions: {e}")
+
+    try:
+        settlements = client.get("/portfolio/settlements")
+        settled_list = settlements.get("settlements", [])
+    except Exception:
+        pass
+
+    # Update Bayesian edge model from local settled trade records exactly once.
+    if _bayesian_edge_enabled:
+        local_trades = _load_strategy_trade_history()
+        processed_keys = _load_processed_settlement_keys(local_trades)
+        updated = False
+        new_count = 0
+
+        for trade_rec in _iter_settled_strategy_trades(local_trades):
+            settlement_key = _processed_settlement_key(trade_rec)
+            if settlement_key is None or settlement_key in processed_keys:
+                continue
+
+            ticker = trade_rec.get("ticker", "")
+            if not ticker:
+                processed_keys.add(settlement_key)
+                continue
+
+            category = classify_ticker_category(ticker)
+            strategy = trade_rec.get("strategy", "")
+            price_cents = trade_rec.get("yes_price_at_entry", 5)
+            local_result = trade_rec.get("settlement_result")
+            won = local_result == "won"
+            try:
+                price_cents = int(price_cents)
+            except Exception:
+                price_cents = 5
+
+            # For buy-side trades, bucket on the NO-equivalent longshot price.
+            if strategy == "longshot_buy" and price_cents > 30:
+                price_cents = 100 - price_cents
+                won = not won
+
+            price_cents = max(1, min(30, int(price_cents)))
+            edge_estimator.update_posterior(category, price_cents, won)
+            processed_keys.add(settlement_key)
+            updated = True
+            new_count += 1
+
+        if updated:
+            try:
+                edge_estimator.save_params(BAYES_PARAMS_PATH)
+                _write_processed_settlement_keys(processed_keys)
+                if log:
+                    log.info(
+                        "Updated Bayesian settlement state with %d newly settled strategy orders",
+                        new_count,
+                    )
+            except Exception as e:
+                log.warning(f"Failed to save Bayesian settlement state: {e}")
+
+    if settled_list:
+        return settled_list
     return settled
 
 def run_scan():
@@ -858,6 +943,7 @@ def build_app(project_dir=None):
     max_bet = strategy_cfg.get("maxTradeAmount", 10) * 100
     scan_interval = strategy_cfg.get("scanIntervalMinutes", 15)
     bayes_params_path = project_dir / "config" / "bayes-params.json"
+    bayes_processed_settlements_path = data_dir / "strategy-bayes-processed-settlements.json"
     fill_model_path = data_dir / strategy_cfg.get("fillModelPath", "strategy-fill-model.json")
     edge_estimator_obj = BayesianEdgeEstimator(params_path=bayes_params_path)
     daily_budget = strategy_cfg.get("maxDailyLoss", 100) * 100
@@ -901,6 +987,7 @@ def build_app(project_dir=None):
         "order_monitor": order_monitor_obj,
         "SCAN_INTERVAL": scan_interval,
         "BAYES_PARAMS_PATH": bayes_params_path,
+        "BAYES_PROCESSED_SETTLEMENTS_PATH": bayes_processed_settlements_path,
         "edge_estimator": edge_estimator_obj,
         "correlation_sizer": correlation_sizer_obj,
         "_wave_scheduling_enabled": wave_scheduling_enabled,
