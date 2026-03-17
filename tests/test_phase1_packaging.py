@@ -80,6 +80,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "research.source_catalog",
         "research.missed_trade_analysis",
         "research.opportunity_log",
+        "research.promotion_workflow",
         "research.registry",
         "research.trade_attribution",
         "domain.shared",
@@ -111,6 +112,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "kalshi.research.source_catalog",
         "kalshi.research.missed_trade_analysis",
         "kalshi.research.opportunity_log",
+        "kalshi.research.promotion_workflow",
         "kalshi.research.registry",
         "kalshi.research.trade_attribution",
         "kalshi.domain.shared",
@@ -163,6 +165,10 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         pkg_opportunity_log = importlib.import_module("kalshi.research.opportunity_log")
         flat_opportunity_log = importlib.import_module("research.opportunity_log")
         assert Path(flat_opportunity_log.__file__).resolve() == Path(pkg_opportunity_log.__file__).resolve()
+
+        pkg_promotion_workflow = importlib.import_module("kalshi.research.promotion_workflow")
+        flat_promotion_workflow = importlib.import_module("research.promotion_workflow")
+        assert Path(flat_promotion_workflow.__file__).resolve() == Path(pkg_promotion_workflow.__file__).resolve()
 
         pkg_trade_attribution = importlib.import_module("kalshi.research.trade_attribution")
         flat_trade_attribution = importlib.import_module("research.trade_attribution")
@@ -222,6 +228,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "research.source_catalog",
             "research.missed_trade_analysis",
             "research.opportunity_log",
+            "research.promotion_workflow",
             "research.registry",
             "research.trade_attribution",
             "domain.shared",
@@ -253,6 +260,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "kalshi.research.source_catalog",
             "kalshi.research.missed_trade_analysis",
             "kalshi.research.opportunity_log",
+            "kalshi.research.promotion_workflow",
             "kalshi.research.registry",
             "kalshi.research.trade_attribution",
             "kalshi.domain.shared",

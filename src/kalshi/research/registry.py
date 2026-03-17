@@ -211,6 +211,14 @@ class ExperimentRunRegistry:
             normalizer=normalize_experiment_runs,
         )
 
+    def load(self):
+        return self._store.load(default={})
+
+    def get(self, experiment_id):
+        state = self.load()
+        entry = state.get("entries", {}).get(experiment_id)
+        return dict(entry) if isinstance(entry, dict) else None
+
     def register(
         self,
         experiment_id,
