@@ -409,6 +409,7 @@ Current bridge state:
 - Slice 9 adds canonical `source_catalog` and a source scorecard CLI, wiring health-state error messages and ledger source observations into one report for freshness and parser-failure review
 - Slice 10 adds canonical `experiment_runs` registry support and records calibration suggestion/apply lifecycle events from `scripts/calibration-pipeline.py`, so model-promotion decisions are linked to stable experiment ids and status history
 - Slice 11 adds canonical `trade_attribution` persistence in `research/trade_attribution.py` and wires `scripts/daily-attribution.py` through it, so post-trade attribution snapshots and ledger events share one normalized artifact contract
+- Slice 12 adds `research/promotion_workflow.py` plus a promotion CLI, so experiment runs can advance through explicit `research -> shadow -> capped_live -> live` transitions or audited rollbacks instead of relying on implicit stage changes
 
 ## Phase 8: Desk Operations And Governance
 
