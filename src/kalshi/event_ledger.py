@@ -11,6 +11,8 @@ import sqlite3
 from collections import defaultdict
 from pathlib import Path
 
+from artifact_contracts import normalize_trade_attribution
+
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 DEFAULT_LEDGER_PATH = PROJECT_DIR / "data" / "event-ledger.sqlite3"
 LEDGER_SCHEMA_VERSION = 1
@@ -401,17 +403,19 @@ class EventLedger:
             legacy_key=event_id,
         )
 
-    def record_post_trade_attribution(self, report, report_name="daily_attribution"):
-        timestamp = report.get("generated_at") or _utc_now_iso()
-        event_id = f"attribution:{report_name}:{timestamp}"
-        payload = dict(report)
+    def record_post_trade_attribution(self, report, report_name="daily_attribution", source_path=None):
+        payload = normalize_trade_attribution(report)
+        payload["report_name"] = payload.get("report_name") or report_name
+        timestamp = payload.get("generated_at") or _utc_now_iso()
+        event_id = f"attribution:{payload['report_name']}:{timestamp}"
         payload.setdefault("report_name", report_name)
         self.record_event(
             event_type=EVENT_TYPE_POST_TRADE_ATTRIBUTION,
             event_id=event_id,
             payload=payload,
             event_time=timestamp,
-            source_artifact="attribution_report",
+            source_artifact="trade_attribution",
+            source_path=source_path,
             legacy_key=event_id,
         )
 

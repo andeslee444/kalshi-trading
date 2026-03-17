@@ -9,8 +9,6 @@ Usage:
 
 import argparse
 import datetime
-import json
-import os
 import sys
 from pathlib import Path
 
@@ -19,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"
 from pnl_attribution import PnLAttributor
 from edge_monitor import EdgeMonitor
 from event_ledger import DEFAULT_LEDGER_PATH, get_event_ledger
+from research.trade_attribution import TradeAttributionArtifact
 from trade_files import TRADE_FILES as _CANONICAL_TRADE_FILES
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -103,15 +102,17 @@ def main():
     print_report(report)
 
     if args.save:
-        out_path = DATA_DIR / "attribution-report.json"
-        with open(str(out_path) + ".tmp", "w") as f:
-            json.dump(report, f, indent=2)
-        os.replace(str(out_path) + ".tmp", str(out_path))
+        artifact = TradeAttributionArtifact(path=DATA_DIR / "attribution-report.json")
+        saved_report = artifact.save(report)
         try:
-            get_event_ledger(path=DEFAULT_LEDGER_PATH).record_post_trade_attribution(report)
+            get_event_ledger(path=DEFAULT_LEDGER_PATH).record_post_trade_attribution(
+                saved_report,
+                report_name=saved_report.get("report_name", "daily_attribution"),
+                source_path=artifact.path,
+            )
         except Exception:
             pass
-        print(f"\nSaved to {out_path}")
+        print(f"\nSaved to {artifact.path}")
 
     check_edge_decay(notify=args.notify)
 
