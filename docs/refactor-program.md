@@ -447,6 +447,7 @@ Acceptance gate:
 Current bridge state:
 
 - Slice 1 adds the desk-ops baseline in `docs/desk-ops/`, including the service ownership matrix, change-management policy, incident template, and runbooks for stale bots, source freshness, ledger parity, and promotion rollback
+- Slice 2 adds `docs/desk-ops/operating-cadence.md`, turning the daily, weekly, and monthly review loops into concrete command-and-artifact checklists tied to the current reporting and promotion workflow
 
 Estimated size:
 

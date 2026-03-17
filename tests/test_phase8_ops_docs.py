@@ -16,6 +16,7 @@ def test_phase8_docs_exist():
     required = [
         DOCS_ROOT / "README.md",
         DOCS_ROOT / "service-ownership.md",
+        DOCS_ROOT / "operating-cadence.md",
         DOCS_ROOT / "change-management.md",
         DOCS_ROOT / "incident-template.md",
         RUNBOOKS_ROOT / "README.md",
@@ -35,6 +36,20 @@ def test_phase8_readme_keeps_operating_cadence():
     assert "### Monthly" in text
     assert "python3 scripts/reconcile-trades.py" in text
     assert "python3 scripts/source-scorecard.py" in text
+
+
+def test_operating_cadence_covers_daily_weekly_monthly_reviews():
+    text = _read(DOCS_ROOT / "operating-cadence.md")
+    assert "## Daily Checklist" in text
+    assert "## Weekly Checklist" in text
+    assert "## Monthly Checklist" in text
+    assert "python3 scripts/reconcile-trades.py" in text
+    assert "python3 scripts/daily-attribution.py --save" in text
+    assert "python3 scripts/source-scorecard.py" in text
+    assert "python3 scripts/supervisor.py status" in text
+    assert "python3 scripts/calibration-pipeline.py --dry-run" in text
+    assert "python3 scripts/analyze-performance.py --reconcile" in text
+    assert "python3 scripts/promotion-workflow.py show <experiment_id>" in text
 
 
 def test_service_ownership_covers_core_services():
