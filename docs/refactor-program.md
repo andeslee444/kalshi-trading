@@ -444,6 +444,10 @@ Acceptance gate:
 - runbooks exist for top failure modes
 - postmortems are linked to follow-up code or config changes
 
+Current bridge state:
+
+- Slice 1 adds the desk-ops baseline in `docs/desk-ops/`, including the service ownership matrix, change-management policy, incident template, and runbooks for stale bots, source freshness, ledger parity, and promotion rollback
+
 Estimated size:
 
 - ongoing
