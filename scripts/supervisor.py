@@ -17,8 +17,10 @@ Usage:
 import argparse
 import datetime
 import fcntl
+import functools
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -109,6 +111,10 @@ BOT_LOG_NAMES = {
     if name in BOT_COMMANDS
 }
 
+_LEGACY_WRAPPER_MODULE_RE = re.compile(
+    r'bootstrap_legacy_wrapper\(globals\(\),\s*"([^"]+)"\s*\)'
+)
+
 
 def _find_bot_processes(cmd):
     """Find PIDs of running processes matching a bot command.
@@ -123,40 +129,113 @@ def _find_bot_processes(cmd):
     script_index = next((idx for idx, part in enumerate(cmd) if part.endswith(".py")), None)
     script_path = cmd[script_index] if script_index is not None else None
     script_args = cmd[script_index + 1:] if script_index is not None else []
-    pattern = script_path or " ".join(cmd)
     my_pid = os.getpid()
-    try:
-        output = subprocess.check_output(["pgrep", "-fl", pattern], text=True)
-        pids = []
+    module_aliases = _legacy_wrapper_module_aliases(script_path) if script_path else ()
+    patterns = []
+    if script_path:
+        patterns.append(script_path)
+        patterns.extend(module_aliases)
+    else:
+        patterns.append(" ".join(cmd))
+
+    seen_pids = set()
+    pids = []
+    for pattern in dict.fromkeys(patterns):
+        try:
+            output = subprocess.check_output(["pgrep", "-fl", pattern], text=True)
+        except subprocess.CalledProcessError:
+            continue
+
         for line in output.strip().split("\n"):
             line = line.strip()
-            if line:
-                pid_str, _, command = line.partition(" ")
-                if not pid_str.isdigit():
+            if not line:
+                continue
+            pid_str, _, command = line.partition(" ")
+            if not pid_str.isdigit():
+                continue
+            pid = int(pid_str)
+            if pid == my_pid or pid in seen_pids:
+                continue
+
+            if script_path:
+                parts = command.split()
+                if not _matches_python_entrypoint(
+                    parts,
+                    script_path=script_path,
+                    script_args=script_args,
+                    module_aliases=module_aliases,
+                ):
                     continue
-                pid = int(pid_str)
-                if pid != my_pid:
-                    if script_path:
-                        parts = command.split()
-                        if not parts:
-                            continue
-                        exe_name = Path(parts[0]).name.lower()
-                        if "python" not in exe_name:
-                            continue
-                        try:
-                            path_index = parts.index(script_path, 1)
-                        except ValueError:
-                            continue
-                        trailing_args = parts[path_index + 1:]
-                        if script_args:
-                            if trailing_args[:len(script_args)] != script_args:
-                                continue
-                        elif trailing_args:
-                            continue
-                    pids.append(pid)
-        return pids
-    except subprocess.CalledProcessError:
-        return []
+            seen_pids.add(pid)
+            pids.append(pid)
+    return pids
+
+
+@functools.lru_cache(maxsize=None)
+def _legacy_wrapper_module_aliases(script_path):
+    if not script_path:
+        return ()
+
+    path = Path(script_path)
+    if not path.is_absolute():
+        path = PROJECT_DIR / path
+
+    try:
+        text = path.read_text()
+    except OSError:
+        return ()
+
+    match = _LEGACY_WRAPPER_MODULE_RE.search(text)
+    if not match:
+        return ()
+
+    module_name = match.group(1)
+    aliases = [module_name]
+    if not module_name.startswith("src."):
+        aliases.insert(0, f"src.{module_name}")
+    return tuple(dict.fromkeys(aliases))
+
+
+def _matches_python_entrypoint(parts, *, script_path, script_args, module_aliases):
+    if not parts:
+        return False
+    exe_name = Path(parts[0]).name.lower()
+    if "python" not in exe_name:
+        return False
+
+    if _matches_script_entrypoint(parts, script_path=script_path, script_args=script_args):
+        return True
+
+    return _matches_module_entrypoint(parts, module_aliases=module_aliases, script_args=script_args)
+
+
+def _matches_script_entrypoint(parts, *, script_path, script_args):
+    try:
+        path_index = parts.index(script_path, 1)
+    except ValueError:
+        return False
+
+    trailing_args = parts[path_index + 1:]
+    if script_args:
+        return trailing_args[:len(script_args)] == script_args
+    return not trailing_args
+
+
+def _matches_module_entrypoint(parts, *, module_aliases, script_args):
+    if not module_aliases:
+        return False
+
+    for idx, part in enumerate(parts[1:], start=1):
+        if part != "-m" or idx + 1 >= len(parts):
+            continue
+        module_name = parts[idx + 1]
+        if module_name not in module_aliases:
+            continue
+        trailing_args = parts[idx + 2:]
+        if script_args:
+            return trailing_args[:len(script_args)] == script_args
+        return not trailing_args
+    return False
 
 
 def _parse_iso_date(date_str):

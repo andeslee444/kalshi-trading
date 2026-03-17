@@ -101,6 +101,27 @@ CITY_TIMEZONES = {
 }
 
 
+def _safe_close_response(response):
+    if response is None:
+        return
+    try:
+        response.close()
+    except Exception:
+        pass
+
+
+def _buffer_and_close_response(response):
+    if response is None:
+        return None
+    try:
+        _ = response.content
+    except Exception:
+        pass
+    finally:
+        _safe_close_response(response)
+    return response
+
+
 def _local_today(city_code):
     """Return today's date (ISO string) in the local timezone for a city."""
     tz = ZoneInfo(CITY_TIMEZONES.get(city_code, "America/New_York"))
@@ -278,10 +299,12 @@ def fetch_parallel(urls, headers=None, timeout=20, max_workers=5):
     results = {}
 
     def _fetch_one(url):
+        response = None
         try:
-            r = requests.get(url, headers=headers, timeout=timeout)
-            return url, r
+            response = requests.get(url, headers=headers, timeout=timeout)
+            return url, _buffer_and_close_response(response)
         except Exception as e:
+            _safe_close_response(response)
             _log.warning("Parallel fetch failed for %s: %s", url, e)
             return url, None
 
@@ -305,16 +328,23 @@ def retry_request(method, url, max_retries=3, backoff_base=1.0, **kwargs):
     kwargs.setdefault("timeout", 20)
     last_err = None
     for attempt in range(max_retries):
+        response = None
         try:
-            r = requests.request(method, url, **kwargs)
-            if r.status_code == 429:
+            response = requests.request(method, url, **kwargs)
+            if response.status_code == 429:
+                _safe_close_response(response)
                 wait = backoff_base * (2 ** attempt)
                 _log.warning("Rate limited (429) on %s, retrying in %.1fs...", url, wait)
                 time.sleep(wait)
                 continue
-            r.raise_for_status()
-            return r
+            try:
+                response.raise_for_status()
+            except requests.exceptions.HTTPError:
+                _safe_close_response(response)
+                raise
+            return _buffer_and_close_response(response)
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            _safe_close_response(response)
             last_err = e
             wait = backoff_base * (2 ** attempt)
             _log.warning("Transient error on %s, retrying in %.1fs... (%s)", url, wait, e)
@@ -322,6 +352,7 @@ def retry_request(method, url, max_retries=3, backoff_base=1.0, **kwargs):
         except requests.exceptions.HTTPError:
             raise
         except Exception:
+            _safe_close_response(response)
             raise
     raise last_err or Exception(f"Max retries exceeded for {url}")
 
@@ -562,7 +593,8 @@ class HealthCheckMonitor(OpsHealthCheckMonitor):
 
     def __init__(self, state_path=None, staleness_minutes=60, auto_halt=False, logger=None,
                  alert_cooldown_minutes=30, per_bot_halt_cooldown_seconds=600,
-                 source_breaker_threshold=5, source_breaker_cooldown_seconds=600):
+                 source_breaker_threshold=5, source_breaker_cooldown_seconds=600,
+                 ignored_bot_names=None):
         super().__init__(
             state_path=state_path,
             staleness_minutes=staleness_minutes,
@@ -572,6 +604,7 @@ class HealthCheckMonitor(OpsHealthCheckMonitor):
             per_bot_halt_cooldown_seconds=per_bot_halt_cooldown_seconds,
             source_breaker_threshold=source_breaker_threshold,
             source_breaker_cooldown_seconds=source_breaker_cooldown_seconds,
+            ignored_bot_names=ignored_bot_names,
             atomic_write_json_func=_atomic_write_json,
             utc_now_iso_func=_utc_now_iso,
             notify_webhook_func=lambda *args, **kwargs: notify_webhook(*args, **kwargs),

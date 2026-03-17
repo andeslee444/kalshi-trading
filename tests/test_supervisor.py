@@ -595,15 +595,48 @@ class TestFindBotProcesses:
         assert pids == [1234]
 
     def test_uses_script_path_pattern_for_python_bots(self):
-        """Python bot discovery should match by script path, not literal python3."""
-        with patch.object(supervisor.subprocess, "check_output", return_value="") as mock_check_output, \
+        """Legacy wrapper bots should search both script and module entrypoints."""
+        with patch.object(
+            supervisor.subprocess,
+            "check_output",
+            side_effect=[
+                subprocess.CalledProcessError(1, "pgrep"),
+                subprocess.CalledProcessError(1, "pgrep"),
+                subprocess.CalledProcessError(1, "pgrep"),
+            ],
+        ) as mock_check_output, \
              patch.object(supervisor.os, "getpid", return_value=9999):
             supervisor._find_bot_processes(["python3", "src/kalshi/weather-bot.py"])
 
-        mock_check_output.assert_called_once_with(
-            ["pgrep", "-fl", "src/kalshi/weather-bot.py"],
-            text=True,
-        )
+        assert mock_check_output.call_args_list == [
+            ((["pgrep", "-fl", "src/kalshi/weather-bot.py"],), {"text": True}),
+            ((["pgrep", "-fl", "src.kalshi.apps.weather_bot"],), {"text": True}),
+            ((["pgrep", "-fl", "kalshi.apps.weather_bot"],), {"text": True}),
+        ]
+
+    def test_finds_module_form_legacy_wrapper_processes(self):
+        """Supervisor should detect wrapper bots launched via python -m module form."""
+        side_effect = [
+            subprocess.CalledProcessError(1, "pgrep"),
+            "7224 /opt/homebrew/Python -u -m src.kalshi.apps.weather_bot\n",
+            subprocess.CalledProcessError(1, "pgrep"),
+        ]
+        with patch.object(supervisor.subprocess, "check_output", side_effect=side_effect), \
+             patch.object(supervisor.os, "getpid", return_value=9999):
+            pids = supervisor._find_bot_processes(["python3", "src/kalshi/weather-bot.py"])
+        assert pids == [7224]
+
+    def test_matches_module_form_with_required_args(self):
+        """Module-form launches should still honor required trailing args."""
+        side_effect = [
+            subprocess.CalledProcessError(1, "pgrep"),
+            "7225 /opt/homebrew/Python -u -m src.kalshi.apps.hdd_scraper monitor\n",
+            subprocess.CalledProcessError(1, "pgrep"),
+        ]
+        with patch.object(supervisor.subprocess, "check_output", side_effect=side_effect), \
+             patch.object(supervisor.os, "getpid", return_value=9999):
+            pids = supervisor._find_bot_processes(["python3", "src/kalshi/hdd-scraper.py", "monitor"])
+        assert pids == [7225]
 
     def test_ignores_non_python_commands_that_reference_script(self):
         """Editors or shells mentioning the script should not be treated as bot workers."""

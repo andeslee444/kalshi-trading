@@ -27,6 +27,27 @@ SANITY_API_VERSION = "2021-10-21"
 SANITY_BASE = f"https://{SANITY_PROJECT}.api.sanity.io/v{SANITY_API_VERSION}/data/query/{SANITY_DATASET}"
 
 
+def _safe_close_response(response):
+    if response is None:
+        return
+    try:
+        response.close()
+    except Exception:
+        pass
+
+
+def _buffer_and_close_response(response):
+    if response is None:
+        return None
+    try:
+        _ = response.content
+    except Exception:
+        pass
+    finally:
+        _safe_close_response(response)
+    return response
+
+
 # ============================================================
 # SANITY CMS QUERIES
 # ============================================================
@@ -49,11 +70,18 @@ def sanity_query(groq_query):
     """Execute a GROQ query against HDD's Sanity CMS with retry."""
     import time as _time
     for attempt in range(3):
+        response = None
         try:
-            r = requests.get(SANITY_BASE, params={"query": groq_query}, timeout=20)
-            r.raise_for_status()
-            return r.json().get("result")
+            response = requests.get(SANITY_BASE, params={"query": groq_query}, timeout=20)
+            try:
+                response.raise_for_status()
+            except requests.HTTPError:
+                _safe_close_response(response)
+                raise
+            response = _buffer_and_close_response(response)
+            return response.json().get("result")
         except (requests.RequestException, requests.HTTPError) as e:
+            _safe_close_response(response)
             if attempt < 2:
                 wait = 2 ** attempt
                 _log.warning("Sanity query failed (attempt %d/3): %s, retrying in %ds", attempt + 1, e, wait)
@@ -283,10 +311,13 @@ def check_sanity_health(project_id="8aky18h3"):
     """
     url = f"https://{project_id}.api.sanity.io/v2023-05-03/data/query/production"
     params = {"query": '*[_type == "chart"][0]{_id}'}
+    response = None
     try:
-        resp = requests.get(url, params=params, timeout=10)
-        return resp.status_code == 200
+        response = requests.get(url, params=params, timeout=10)
+        response = _buffer_and_close_response(response)
+        return response.status_code == 200
     except Exception:
+        _safe_close_response(response)
         return False
 
 

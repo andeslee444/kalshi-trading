@@ -238,9 +238,10 @@ class TestHddHealthCheck:
     def test_check_sanity_health_success(self):
         """Health check returns True when Sanity responds."""
         from hdd_parser import check_sanity_health
-        with patch("requests.get") as mock_get:
-            mock_get.return_value = MagicMock(status_code=200, json=lambda: {"result": []})
+        response = MagicMock(status_code=200, json=lambda: {"result": []}, content=b'{"result":[]}')
+        with patch("requests.get", return_value=response):
             assert check_sanity_health("8aky18h3") is True
+        response.close.assert_called_once()
 
     def test_check_sanity_health_failure(self):
         """Health check returns False on timeout/error."""
@@ -251,6 +252,21 @@ class TestHddHealthCheck:
     def test_check_sanity_health_bad_status(self):
         """Health check returns False on non-200 response."""
         from hdd_parser import check_sanity_health
-        with patch("requests.get") as mock_get:
-            mock_get.return_value = MagicMock(status_code=500)
+        response = MagicMock(status_code=500, content=b"error")
+        with patch("requests.get", return_value=response):
             assert check_sanity_health("8aky18h3") is False
+        response.close.assert_called_once()
+
+    def test_sanity_query_closes_response(self):
+        from hdd_parser import sanity_query
+
+        response = MagicMock()
+        response.status_code = 200
+        response.content = b'{"result":[]}'
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"result": []}
+
+        with patch("requests.get", return_value=response):
+            assert sanity_query('*[_type=="chart"][0]{_id}') == []
+
+        response.close.assert_called_once()

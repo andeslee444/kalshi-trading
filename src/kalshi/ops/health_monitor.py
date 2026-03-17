@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from artifact_contracts import normalize_health_state, normalize_health_summary
+from bot_registry import ALWAYS_DISABLED_BOT_IDS, BOT_CONFIG_KEY_MAP, BOT_HEALTH_KEY_MAP
 from risk.kill_switch import per_bot_halt_path
 from storage import atomic_write_json
 
@@ -38,6 +39,28 @@ def _utc_now_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def _load_ignored_bot_names(project_dir=PROJECT_DIR):
+    ignored = {
+        health_key
+        for bot_id in ALWAYS_DISABLED_BOT_IDS
+        if (health_key := BOT_HEALTH_KEY_MAP.get(bot_id))
+    }
+
+    config_path = Path(project_dir) / "config" / "bots-config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return ignored
+
+    for bot_id, config_key in BOT_CONFIG_KEY_MAP.items():
+        bot_cfg = config.get(config_key, {})
+        if isinstance(bot_cfg, dict) and bot_cfg.get("enabled") is False:
+            health_key = BOT_HEALTH_KEY_MAP.get(bot_id)
+            if health_key:
+                ignored.add(health_key)
+    return ignored
+
+
 class HealthCheckMonitor:
     """Tracks data source health and bot liveness."""
 
@@ -51,6 +74,7 @@ class HealthCheckMonitor:
         per_bot_halt_cooldown_seconds=600,
         source_breaker_threshold=5,
         source_breaker_cooldown_seconds=600,
+        ignored_bot_names=None,
         *,
         atomic_write_json_func=atomic_write_json,
         utc_now_iso_func=_utc_now_iso,
@@ -75,6 +99,11 @@ class HealthCheckMonitor:
         self._notify_imessage = notify_imessage_func or (lambda *args, **kwargs: False)
         self._per_bot_halt_path = per_bot_halt_path_func
         self._bot_source_map = BOT_SOURCE_MAP if bot_source_map is None else bot_source_map
+        self._ignored_bot_names = (
+            set(_load_ignored_bot_names())
+            if ignored_bot_names is None
+            else set(ignored_bot_names)
+        )
         self._state = normalize_health_state(None)
         self._dirty_bots = set()
         self._dirty_sources = set()
@@ -257,6 +286,8 @@ class HealthCheckMonitor:
             }
 
         for bot, data in self._state.get("bots", {}).items():
+            if bot in self._ignored_bot_names:
+                continue
             last_hb = data.get("last_heartbeat")
             stale = False
             if last_hb:
@@ -289,6 +320,8 @@ class HealthCheckMonitor:
         issues = []
 
         for bot, info in self._state.get("bots", {}).items():
+            if bot in self._ignored_bot_names:
+                continue
             hb = info.get("last_heartbeat")
             if hb:
                 try:

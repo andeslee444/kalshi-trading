@@ -79,6 +79,23 @@ class TestBotHeartbeat:
         hm.record_bot_heartbeat("economics")
         assert len(hm._state["bots"]) == 3
 
+    def test_disabled_bots_are_ignored_in_health_checks(self, tmp_path):
+        hm = self._make_monitor(
+            tmp_path,
+            staleness_minutes=30,
+            ignored_bot_names={"hdd-monitor", "cross-platform-arb"},
+        )
+        old_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=60)).isoformat()
+        hm._state["bots"]["weather"] = {"last_heartbeat": old_time}
+        hm._state["bots"]["hdd-monitor"] = {"last_heartbeat": old_time}
+        hm._state["bots"]["cross-platform-arb"] = {"last_heartbeat": old_time}
+
+        issues = hm.check_health()
+
+        assert any("bot/weather stale" in issue for issue in issues)
+        assert not any("bot/hdd-monitor stale" in issue for issue in issues)
+        assert not any("bot/cross-platform-arb stale" in issue for issue in issues)
+
 
 class TestSourceTracking:
     """Test source success/error recording."""
@@ -331,6 +348,16 @@ class TestHealthSummary:
         summary = mon.get_summary()
         assert "weather" in summary["bots"]
         assert set(HEALTH_SUMMARY_BOT_FIELDS).issubset(summary["bots"]["weather"])
+
+    def test_summary_omits_ignored_bots(self, tmp_path):
+        mon = self._make_monitor(tmp_path, ignored_bot_names={"hdd-monitor"})
+        mon.record_bot_heartbeat("weather")
+        mon.record_bot_heartbeat("hdd-monitor")
+
+        summary = mon.get_summary()
+
+        assert "weather" in summary["bots"]
+        assert "hdd-monitor" not in summary["bots"]
 
     def test_summary_overall_healthy(self, tmp_path):
         mon = self._make_monitor(tmp_path)

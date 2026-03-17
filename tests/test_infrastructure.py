@@ -95,6 +95,43 @@ class TestWebhookRequireSecret:
             sys.path.pop(0)
 
 
+class TestHttpResponseLifecycle:
+
+    def test_retry_request_closes_success_response(self):
+        import kalshi_auth
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b'{"ok": true}'
+        mock_response.raise_for_status.return_value = None
+
+        with patch.object(kalshi_auth.requests, "request", return_value=mock_response):
+            response = kalshi_auth.retry_request("GET", "https://example.com")
+
+        assert response is mock_response
+        mock_response.close.assert_called_once()
+
+    def test_fetch_parallel_closes_each_response(self):
+        import kalshi_auth
+
+        first = MagicMock()
+        first.status_code = 200
+        first.content = b"alpha"
+        second = MagicMock()
+        second.status_code = 200
+        second.content = b"beta"
+
+        with patch.object(kalshi_auth.requests, "get", side_effect=[first, second]):
+            results = kalshi_auth.fetch_parallel(
+                ["https://example.com/a", "https://example.com/b"],
+                max_workers=2,
+            )
+
+        assert set(results) == {"https://example.com/a", "https://example.com/b"}
+        first.close.assert_called_once()
+        second.close.assert_called_once()
+
+
 # ===================================================================
 # Crypto vol reader tests — calls real _get_latest_crypto_vol
 # ===================================================================

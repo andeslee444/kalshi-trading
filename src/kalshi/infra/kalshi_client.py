@@ -31,6 +31,27 @@ MARKET_CACHE_TTL = 60
 _log = logging.getLogger("kalshi-client")
 
 
+def _safe_close_response(response):
+    if response is None:
+        return
+    try:
+        response.close()
+    except Exception:
+        pass
+
+
+def _buffer_and_close_response(response):
+    if response is None:
+        return None
+    try:
+        _ = response.content
+    except Exception:
+        pass
+    finally:
+        _safe_close_response(response)
+    return response
+
+
 def _round_half_up(value):
     return int(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
@@ -228,17 +249,28 @@ class KalshiClient:
 
         last_err = None
         for attempt in range(max_retries):
+            response = None
             try:
                 response = self.session.request(method, url, headers=headers, json=body, timeout=timeout)
                 if response.status_code == 429:
+                    _safe_close_response(response)
                     wait = retry_backoff_base * (2 ** attempt)
                     log.warning("Rate limited (429), retrying in %.1fs...", wait)
                     time_module.sleep(wait)
                     headers = self._sign(method, full_path)
                     continue
 
-                response.raise_for_status()
-                if response.status_code == 204 or not response.content:
+                try:
+                    response.raise_for_status()
+                except requests_module.exceptions.HTTPError:
+                    _safe_close_response(response)
+                    raise
+
+                if response.status_code == 204:
+                    _safe_close_response(response)
+                    return {}
+                response = _buffer_and_close_response(response)
+                if not response.content:
                     return {}
                 try:
                     return response.json()
@@ -256,6 +288,7 @@ class KalshiClient:
                     ) from exc
 
             except requests_module.exceptions.ConnectionError as exc:
+                _safe_close_response(response)
                 if not is_idempotent:
                     log.error("Non-retryable %s %s failed (ConnectionError): %s", method, path, exc)
                     raise
@@ -265,6 +298,7 @@ class KalshiClient:
                 time_module.sleep(wait)
                 headers = self._sign(method, full_path)
             except requests_module.exceptions.Timeout as exc:
+                _safe_close_response(response)
                 if not is_idempotent:
                     log.error("Non-retryable %s %s failed (Timeout): %s", method, path, exc)
                     raise
@@ -275,7 +309,10 @@ class KalshiClient:
                 headers = self._sign(method, full_path)
             except requests_module.exceptions.HTTPError:
                 raise
+            except ValueError:
+                raise
             except Exception:
+                _safe_close_response(response)
                 raise
 
         raise last_err or Exception("Max retries exceeded")
