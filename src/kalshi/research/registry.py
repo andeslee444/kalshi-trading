@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 
 from artifact_contracts import (
+    normalize_experiment_runs,
     normalize_model_registry,
     normalize_strategy_config_registry,
 )
@@ -16,6 +17,7 @@ from storage import StateStore
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[3]
+DEFAULT_EXPERIMENT_RUNS_PATH = PROJECT_DIR / "data" / "experiment-runs.json"
 DEFAULT_MODEL_REGISTRY_PATH = PROJECT_DIR / "data" / "model-registry.json"
 DEFAULT_STRATEGY_CONFIG_REGISTRY_PATH = PROJECT_DIR / "data" / "strategy-config-registry.json"
 
@@ -35,6 +37,10 @@ def _coerce_path(path):
     if path is None:
         return None
     return str(Path(path))
+
+
+def _coerce_metadata(metadata):
+    return dict(metadata) if isinstance(metadata, dict) else None
 
 
 def _resolve_model_version(record, *, strategy_id=None, model_registry=None, source_bot=None, source_path=None, logger=None):
@@ -192,9 +198,94 @@ class ModelRegistry:
         return dict(state["entries"][entry_key])
 
 
+class ExperimentRunRegistry:
+    """Canonical registry for experiment and promotion lifecycle events."""
+
+    def __init__(self, path=DEFAULT_EXPERIMENT_RUNS_PATH, logger=None, state_store_cls=StateStore, utc_now_iso_func=_utc_now_iso):
+        self.path = Path(path)
+        self.log = logger or _log
+        self._utc_now_iso = utc_now_iso_func
+        self._store = state_store_cls(
+            self.path,
+            logger=self.log,
+            normalizer=normalize_experiment_runs,
+        )
+
+    def register(
+        self,
+        experiment_id,
+        experiment_type,
+        *,
+        strategy_id=None,
+        source_bot=None,
+        source_path=None,
+        status=None,
+        promotion_stage=None,
+        metadata=None,
+        artifact_path=None,
+        event_type="registered",
+        event_at=None,
+    ):
+        experiment_id = experiment_id or "unknown"
+        metadata_payload = _coerce_metadata(metadata)
+        event_at = event_at or self._utc_now_iso()
+        artifact_path_str = _coerce_path(artifact_path)
+        source_path_str = _coerce_path(source_path)
+
+        def updater(state):
+            entries = state.setdefault("entries", {})
+            current = dict(entries.get(experiment_id, {}))
+            history = list(current.get("history", [])) if isinstance(current.get("history"), list) else []
+            artifact_paths = list(current.get("artifact_paths", [])) if isinstance(current.get("artifact_paths"), list) else []
+            if artifact_path_str and artifact_path_str not in artifact_paths:
+                artifact_paths.append(artifact_path_str)
+
+            entry = {
+                "experiment_id": experiment_id,
+                "experiment_type": current.get("experiment_type") or experiment_type or "unknown",
+                "strategy_id": strategy_id if strategy_id is not None else current.get("strategy_id"),
+                "source_bot": source_bot if source_bot is not None else current.get("source_bot"),
+                "source_path": source_path_str if source_path is not None else current.get("source_path"),
+                "registered_at": current.get("registered_at") or event_at,
+                "updated_at": event_at,
+                "status": status if status is not None else current.get("status"),
+                "promotion_stage": promotion_stage if promotion_stage is not None else current.get("promotion_stage"),
+                "artifact_paths": artifact_paths,
+            }
+
+            merged_metadata = dict(current.get("metadata", {})) if isinstance(current.get("metadata"), dict) else {}
+            if metadata_payload:
+                merged_metadata.update(metadata_payload)
+            if merged_metadata:
+                entry["metadata"] = merged_metadata
+
+            history_event = {
+                "event_type": event_type,
+                "event_at": event_at,
+            }
+            if status is not None:
+                history_event["status"] = status
+            if promotion_stage is not None:
+                history_event["promotion_stage"] = promotion_stage
+            if artifact_path_str is not None:
+                history_event["artifact_path"] = artifact_path_str
+            if metadata_payload:
+                history_event["metadata"] = metadata_payload
+            history.append(history_event)
+            entry["history"] = history
+
+            entries[experiment_id] = entry
+            return state
+
+        state = self._store.update(updater, default={})
+        return dict(state["entries"][experiment_id])
+
+
 __all__ = [
+    "DEFAULT_EXPERIMENT_RUNS_PATH",
     "DEFAULT_MODEL_REGISTRY_PATH",
     "DEFAULT_STRATEGY_CONFIG_REGISTRY_PATH",
+    "ExperimentRunRegistry",
     "ModelRegistry",
     "StrategyConfigRegistry",
     "annotate_research_record",

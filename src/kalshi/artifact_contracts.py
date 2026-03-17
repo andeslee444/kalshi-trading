@@ -117,6 +117,7 @@ SUPERVISOR_STATE_ARTIFACT = "supervisor_state"
 FINANCIAL_SNAPSHOT_ARTIFACT = "financial_snapshot"
 MODEL_REGISTRY_ARTIFACT = "model_registry"
 STRATEGY_CONFIG_REGISTRY_ARTIFACT = "strategy_config_registry"
+EXPERIMENT_RUNS_ARTIFACT = "experiment_runs"
 
 HEALTH_STATE_SCHEMA_VERSION = 1
 ALLOCATOR_STATE_SCHEMA_VERSION = 1
@@ -126,6 +127,7 @@ SUPERVISOR_STATE_SCHEMA_VERSION = 1
 FINANCIAL_SNAPSHOT_SCHEMA_VERSION = 1
 MODEL_REGISTRY_SCHEMA_VERSION = 1
 STRATEGY_CONFIG_REGISTRY_SCHEMA_VERSION = 1
+EXPERIMENT_RUNS_SCHEMA_VERSION = 1
 
 
 def with_schema_metadata(data, artifact_type, schema_version):
@@ -247,6 +249,15 @@ def normalize_strategy_config_registry(data):
         data,
         STRATEGY_CONFIG_REGISTRY_ARTIFACT,
         STRATEGY_CONFIG_REGISTRY_SCHEMA_VERSION,
+    )
+
+
+def normalize_experiment_runs(data):
+    """Normalize experiment-runs.json while preserving unknown entry payloads."""
+    return normalize_registry_state(
+        data,
+        EXPERIMENT_RUNS_ARTIFACT,
+        EXPERIMENT_RUNS_SCHEMA_VERSION,
     )
 
 
