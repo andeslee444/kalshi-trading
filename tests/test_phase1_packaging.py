@@ -81,6 +81,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "research.missed_trade_analysis",
         "research.opportunity_log",
         "research.registry",
+        "research.trade_attribution",
         "domain.shared",
         "domain.shared.stats",
         "domain.shared.sizing",
@@ -111,6 +112,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "kalshi.research.missed_trade_analysis",
         "kalshi.research.opportunity_log",
         "kalshi.research.registry",
+        "kalshi.research.trade_attribution",
         "kalshi.domain.shared",
         "kalshi.domain.shared.stats",
         "kalshi.domain.shared.sizing",
@@ -161,6 +163,10 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         pkg_opportunity_log = importlib.import_module("kalshi.research.opportunity_log")
         flat_opportunity_log = importlib.import_module("research.opportunity_log")
         assert Path(flat_opportunity_log.__file__).resolve() == Path(pkg_opportunity_log.__file__).resolve()
+
+        pkg_trade_attribution = importlib.import_module("kalshi.research.trade_attribution")
+        flat_trade_attribution = importlib.import_module("research.trade_attribution")
+        assert Path(flat_trade_attribution.__file__).resolve() == Path(pkg_trade_attribution.__file__).resolve()
 
         pkg_stats = importlib.import_module("kalshi.domain.shared.stats")
         flat_stats = importlib.import_module("domain.shared.stats")
@@ -217,6 +223,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "research.missed_trade_analysis",
             "research.opportunity_log",
             "research.registry",
+            "research.trade_attribution",
             "domain.shared",
             "domain.shared.stats",
             "domain.shared.sizing",
@@ -247,6 +254,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "kalshi.research.missed_trade_analysis",
             "kalshi.research.opportunity_log",
             "kalshi.research.registry",
+            "kalshi.research.trade_attribution",
             "kalshi.domain.shared",
             "kalshi.domain.shared.stats",
             "kalshi.domain.shared.sizing",

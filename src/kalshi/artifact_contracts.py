@@ -118,6 +118,7 @@ FINANCIAL_SNAPSHOT_ARTIFACT = "financial_snapshot"
 MODEL_REGISTRY_ARTIFACT = "model_registry"
 STRATEGY_CONFIG_REGISTRY_ARTIFACT = "strategy_config_registry"
 EXPERIMENT_RUNS_ARTIFACT = "experiment_runs"
+TRADE_ATTRIBUTION_ARTIFACT = "trade_attribution"
 
 HEALTH_STATE_SCHEMA_VERSION = 1
 ALLOCATOR_STATE_SCHEMA_VERSION = 1
@@ -128,6 +129,7 @@ FINANCIAL_SNAPSHOT_SCHEMA_VERSION = 1
 MODEL_REGISTRY_SCHEMA_VERSION = 1
 STRATEGY_CONFIG_REGISTRY_SCHEMA_VERSION = 1
 EXPERIMENT_RUNS_SCHEMA_VERSION = 1
+TRADE_ATTRIBUTION_SCHEMA_VERSION = 1
 
 
 def with_schema_metadata(data, artifact_type, schema_version):
@@ -259,6 +261,25 @@ def normalize_experiment_runs(data):
         EXPERIMENT_RUNS_ARTIFACT,
         EXPERIMENT_RUNS_SCHEMA_VERSION,
     )
+
+
+def normalize_trade_attribution(data):
+    """Normalize the canonical post-trade attribution artifact."""
+    normalized = with_schema_metadata(
+        data,
+        TRADE_ATTRIBUTION_ARTIFACT,
+        TRADE_ATTRIBUTION_SCHEMA_VERSION,
+    )
+    generated_at = normalized.get("generated_at")
+    normalized["generated_at"] = generated_at if isinstance(generated_at, str) else None
+
+    report_name = normalized.get("report_name")
+    normalized["report_name"] = report_name if isinstance(report_name, str) and report_name else "daily_attribution"
+
+    for key in ("by_bot", "by_edge_bucket", "by_regime", "by_sizing", "by_market_type", "summary"):
+        value = normalized.get(key)
+        normalized[key] = dict(value) if isinstance(value, dict) else {}
+    return normalized
 
 
 def normalize_financial_snapshot(data):
