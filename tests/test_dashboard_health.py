@@ -413,6 +413,18 @@ class TestOperatorActionsEndpoint:
                 }
             }
         }
+        incident_reviews = {
+            "entries": {
+                "INC-17": {
+                    "incident_id": "INC-17",
+                    "summary": "NWS parser failure still under review",
+                    "severity": "sev2",
+                    "owner": "andes",
+                    "status": "open",
+                    "updated_at": "2026-03-17T02:00:00+00:00",
+                }
+            }
+        }
 
         def fake_load_json(path_obj):
             if path_obj == dashboard.HEALTH_STATE_PATH:
@@ -429,6 +441,8 @@ class TestOperatorActionsEndpoint:
                 return parity_report
             if path_obj == dashboard.EXPERIMENT_RUNS_PATH:
                 return experiment_runs
+            if path_obj == dashboard.INCIDENT_REVIEWS_PATH:
+                return incident_reviews
             return None
 
         with patch.object(dashboard, "load_json_safe", side_effect=fake_load_json), \
@@ -450,9 +464,11 @@ class TestOperatorActionsEndpoint:
         assert "degraded_source" in categories
         assert "parity_regression" in categories
         assert "promotion_review" in categories
+        assert "incident_open" in categories
         assert any(row["command"] == "python3 scripts/supervisor.py restart monitor" for row in data["actions"])
         assert any(row["command"] == "python3 scripts/ledger-parity-report.py --json" for row in data["actions"])
         assert any(row["command"] == "python3 scripts/promotion-workflow.py show exp-1" for row in data["actions"])
+        assert any(row["command"] == "python3 scripts/incident-workflow.py show INC-17" for row in data["actions"])
 
     def test_operator_actions_returns_empty_when_system_is_clear(self, client, dashboard, tmp_path):
         def fake_load_json(path_obj):
@@ -470,6 +486,8 @@ class TestOperatorActionsEndpoint:
                 return {"overall_ok": True}
             if path_obj == dashboard.EXPERIMENT_RUNS_PATH:
                 return {"entries": {}}
+            if path_obj == dashboard.INCIDENT_REVIEWS_PATH:
+                return {"entries": {}}
             return None
 
         with patch.object(dashboard, "load_json_safe", side_effect=fake_load_json), \
@@ -485,3 +503,105 @@ class TestOperatorActionsEndpoint:
         data = resp.json()
         assert data["summary"]["total"] == 0
         assert data["actions"] == []
+
+    def test_operator_actions_include_closed_incident_missing_follow_up(self, client, dashboard, tmp_path):
+        def fake_load_json(path_obj):
+            if path_obj == dashboard.HEALTH_STATE_PATH:
+                return {"sources": {}, "bots": {}}
+            if path_obj == dashboard.SUPERVISOR_STATE_PATH:
+                return {}
+            if path_obj == dashboard.BOTS_CONFIG_PATH:
+                return {}
+            if path_obj == dashboard.WEATHER_CONFIG_PATH:
+                return {}
+            if path_obj == dashboard.ALLOCATOR_STATE_PATH:
+                return {}
+            if path_obj == dashboard.LEDGER_PARITY_REPORT_PATH:
+                return {"overall_ok": True}
+            if path_obj == dashboard.EXPERIMENT_RUNS_PATH:
+                return {"entries": {}}
+            if path_obj == dashboard.INCIDENT_REVIEWS_PATH:
+                return {
+                    "entries": {
+                        "INC-22": {
+                            "incident_id": "INC-22",
+                            "summary": "Rollback complete but follow-up change not linked",
+                            "severity": "sev3",
+                            "owner": "andes",
+                            "status": "closed",
+                            "updated_at": "2026-03-17T03:00:00+00:00",
+                        }
+                    }
+                }
+            return None
+
+        with patch.object(dashboard, "load_json_safe", side_effect=fake_load_json), \
+             patch.object(dashboard, "is_bot_running", return_value=(False, None)), \
+             patch.object(dashboard, "get_weather_actual_source_summary", return_value={}), \
+             patch.object(dashboard, "get_weather_nws_crosscheck_summary", return_value={}), \
+             patch.object(dashboard, "KILL_SWITCH_PATH", tmp_path / "HALT"), \
+             patch("builtins.open", side_effect=FileNotFoundError):
+            dashboard.cache._store.clear()
+            resp = client.get("/api/operator-actions")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["summary"]["review"] == 1
+        assert data["actions"][0]["category"] == "incident_followup"
+        assert data["actions"][0]["command"] == "python3 scripts/incident-workflow.py show INC-22"
+
+    def test_operator_actions_prioritize_critical_incidents_over_more_recent_low_severity_items(self, client, dashboard, tmp_path):
+        incidents = {
+            "entries": {
+                "INC-critical": {
+                    "incident_id": "INC-critical",
+                    "summary": "Live trading risk control failure",
+                    "severity": "sev1",
+                    "owner": "andes",
+                    "status": "open",
+                    "updated_at": "2026-03-17T01:00:00+00:00",
+                },
+            }
+        }
+        for idx in range(6):
+            incidents["entries"][f"INC-low-{idx}"] = {
+                "incident_id": f"INC-low-{idx}",
+                "summary": f"Low severity follow-up {idx}",
+                "severity": "sev3",
+                "owner": "andes",
+                "status": "closed",
+                "updated_at": f"2026-03-17T0{idx + 2}:00:00+00:00",
+            }
+
+        def fake_load_json(path_obj):
+            if path_obj == dashboard.HEALTH_STATE_PATH:
+                return {"sources": {}, "bots": {}}
+            if path_obj == dashboard.SUPERVISOR_STATE_PATH:
+                return {}
+            if path_obj == dashboard.BOTS_CONFIG_PATH:
+                return {}
+            if path_obj == dashboard.WEATHER_CONFIG_PATH:
+                return {}
+            if path_obj == dashboard.ALLOCATOR_STATE_PATH:
+                return {}
+            if path_obj == dashboard.LEDGER_PARITY_REPORT_PATH:
+                return {"overall_ok": True}
+            if path_obj == dashboard.EXPERIMENT_RUNS_PATH:
+                return {"entries": {}}
+            if path_obj == dashboard.INCIDENT_REVIEWS_PATH:
+                return incidents
+            return None
+
+        with patch.object(dashboard, "load_json_safe", side_effect=fake_load_json), \
+             patch.object(dashboard, "is_bot_running", return_value=(False, None)), \
+             patch.object(dashboard, "get_weather_actual_source_summary", return_value={}), \
+             patch.object(dashboard, "get_weather_nws_crosscheck_summary", return_value={}), \
+             patch.object(dashboard, "KILL_SWITCH_PATH", tmp_path / "HALT"), \
+             patch("builtins.open", side_effect=FileNotFoundError):
+            dashboard.cache._store.clear()
+            resp = client.get("/api/operator-actions")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        commands = [row["command"] for row in data["actions"]]
+        assert "python3 scripts/incident-workflow.py show INC-critical" in commands
