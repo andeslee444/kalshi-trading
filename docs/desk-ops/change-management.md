@@ -11,6 +11,7 @@ Use this workflow for:
 - risk-limit or allocator changes that alter live exposure
 
 Do not update `data/experiment-runs.json` by hand. Use the promotion workflow so the lifecycle remains auditable.
+Do not track incident follow-up links only in a free-form doc. Use `data/incident-reviews.json` through the incident workflow so PRs, config rollbacks, and experiment ids stay queryable.
 
 ## Required Evidence Before Promotion
 
@@ -38,6 +39,7 @@ Inspect an experiment:
 
 ```bash
 python3 scripts/promotion-workflow.py show <experiment_id>
+python3 scripts/incident-workflow.py show <incident_id>
 ```
 
 Advance one stage:
@@ -52,6 +54,7 @@ Rollback a stage:
 
 ```bash
 python3 scripts/promotion-workflow.py rollback <experiment_id> --to research --actor <name> --reason "performance regression"
+python3 scripts/incident-workflow.py link <incident_id> --pr-number <pr_number> --config-version <config_version> --experiment-id <experiment_id> --note "rollback follow-up"
 ```
 
 Apply a calibration suggestion:
@@ -65,6 +68,7 @@ python3 scripts/calibration-pipeline.py --apply-suggestion data/calibration-sugg
 - Stage rollback and config rollback are separate actions. Record both when both happen.
 - If a live calibration was already applied, review `config/calibration-backup.json` and restore the live config through an auditable change, not an undocumented local edit.
 - Every rollback must include a reason, actor, and linked incident or review note.
+- When a promotion or rollback is driven by an incident, update the canonical incident record with the PR, config version, and experiment id before closing it.
 
 ## Change Record Minimum
 

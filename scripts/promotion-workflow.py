@@ -42,6 +42,11 @@ def main():
     promote_parser.add_argument("--actor")
     promote_parser.add_argument("--note")
     promote_parser.add_argument("--status")
+    promote_parser.add_argument("--incident-id")
+    promote_parser.add_argument("--config-version")
+    promote_parser.add_argument("--model-version")
+    promote_parser.add_argument("--pr-number", type=int)
+    promote_parser.add_argument("--change-ref")
     promote_parser.add_argument("--metadata-json")
 
     rollback_parser = subparsers.add_parser("rollback", help="Move an experiment back to an earlier stage")
@@ -50,6 +55,11 @@ def main():
     rollback_parser.add_argument("--actor")
     rollback_parser.add_argument("--reason")
     rollback_parser.add_argument("--status", default="rolled_back")
+    rollback_parser.add_argument("--incident-id")
+    rollback_parser.add_argument("--config-version")
+    rollback_parser.add_argument("--model-version")
+    rollback_parser.add_argument("--pr-number", type=int)
+    rollback_parser.add_argument("--change-ref")
     rollback_parser.add_argument("--metadata-json")
 
     args = parser.parse_args()
@@ -72,6 +82,11 @@ def main():
                 actor=args.actor,
                 note=args.note,
                 status=args.status,
+                incident_id=args.incident_id,
+                config_version=args.config_version,
+                model_version=args.model_version,
+                pr_number=args.pr_number,
+                change_ref=args.change_ref,
                 metadata=_load_metadata(args.metadata_json),
             )
         else:
@@ -81,6 +96,11 @@ def main():
                 actor=args.actor,
                 reason=args.reason,
                 status=args.status,
+                incident_id=args.incident_id,
+                config_version=args.config_version,
+                model_version=args.model_version,
+                pr_number=args.pr_number,
+                change_ref=args.change_ref,
                 metadata=_load_metadata(args.metadata_json),
             )
     except (PromotionWorkflowError, json.JSONDecodeError) as e:

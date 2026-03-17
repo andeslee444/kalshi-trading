@@ -49,6 +49,16 @@ def test_promotion_workflow_promote_cli_updates_registry(tmp_path, monkeypatch, 
             "andes",
             "--note",
             "start shadow rollout",
+            "--incident-id",
+            "INC-17",
+            "--config-version",
+            "cfg-17",
+            "--model-version",
+            "mdl-17",
+            "--pr-number",
+            "38",
+            "--change-ref",
+            "config/calibration-backup.json",
         ],
     )
 
@@ -58,3 +68,5 @@ def test_promotion_workflow_promote_cli_updates_registry(tmp_path, monkeypatch, 
     assert output["promotion_stage"] == "shadow"
     state = json.loads(registry_path.read_text())
     assert state["entries"]["exp-1"]["history"][-1]["event_type"] == "promoted_to_shadow"
+    assert state["entries"]["exp-1"]["history"][-1]["metadata"]["incident_id"] == "INC-17"
+    assert state["entries"]["exp-1"]["history"][-1]["metadata"]["config_version"] == "cfg-17"

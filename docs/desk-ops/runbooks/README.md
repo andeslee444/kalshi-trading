@@ -14,4 +14,5 @@ These runbooks cover the highest-value operational failure modes first.
 - Prefer supervisor actions over ad hoc process management.
 - Prefer canonical reports over manual JSON inspection when a report exists.
 - Record rollbacks and promotions through `scripts/promotion-workflow.py`.
+- Record incidents and follow-up links through `scripts/incident-workflow.py`.
 - Link incidents back to a code PR or config change before closing them.

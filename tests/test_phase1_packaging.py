@@ -78,6 +78,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "domain",
         "research",
         "research.source_catalog",
+        "research.incident_registry",
         "research.missed_trade_analysis",
         "research.opportunity_log",
         "research.promotion_workflow",
@@ -110,6 +111,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         "kalshi.domain",
         "kalshi.research",
         "kalshi.research.source_catalog",
+        "kalshi.research.incident_registry",
         "kalshi.research.missed_trade_analysis",
         "kalshi.research.opportunity_log",
         "kalshi.research.promotion_workflow",
@@ -161,6 +163,10 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
         pkg_source_catalog = importlib.import_module("kalshi.research.source_catalog")
         flat_source_catalog = importlib.import_module("research.source_catalog")
         assert Path(flat_source_catalog.__file__).resolve() == Path(pkg_source_catalog.__file__).resolve()
+
+        pkg_incident_registry = importlib.import_module("kalshi.research.incident_registry")
+        flat_incident_registry = importlib.import_module("research.incident_registry")
+        assert Path(flat_incident_registry.__file__).resolve() == Path(pkg_incident_registry.__file__).resolve()
 
         pkg_opportunity_log = importlib.import_module("kalshi.research.opportunity_log")
         flat_opportunity_log = importlib.import_module("research.opportunity_log")
@@ -226,6 +232,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "domain",
             "research",
             "research.source_catalog",
+            "research.incident_registry",
             "research.missed_trade_analysis",
             "research.opportunity_log",
             "research.promotion_workflow",
@@ -258,6 +265,7 @@ def test_subpackage_aliases_resolve_extracted_phase5_modules():
             "kalshi.domain",
             "kalshi.research",
             "kalshi.research.source_catalog",
+            "kalshi.research.incident_registry",
             "kalshi.research.missed_trade_analysis",
             "kalshi.research.opportunity_log",
             "kalshi.research.promotion_workflow",
