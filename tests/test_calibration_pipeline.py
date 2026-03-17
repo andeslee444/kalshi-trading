@@ -458,6 +458,76 @@ class TestCalibrationHistory:
             pipeline._atomic_write_json = orig
 
 
+class TestExperimentRegistryIntegration:
+    """Tests for calibration suggestion/apply lifecycle writes."""
+
+    def test_generate_suggestion_records_experiment_registry_entry(self, pipeline, tmp_path):
+        orig_atomic = pipeline._atomic_write_json
+        orig_suggestion_dir = pipeline.SUGGESTION_DIR
+        orig_experiment_runs_path = pipeline.EXPERIMENT_RUNS_PATH
+        pipeline._atomic_write_json = _real_atomic_write
+        pipeline.SUGGESTION_DIR = tmp_path / "calibration-suggestions"
+        pipeline.EXPERIMENT_RUNS_PATH = tmp_path / "experiment-runs.json"
+        try:
+            proposed = {"weather": {"global_brier": 0.28, "n": 69}}
+            current = {"weather": {"global_brier": 0.33, "n": 69}}
+            improvements = {"weather": {"before": 0.33, "after": 0.28, "improvement_pct": 15.2}}
+
+            suggestion_path = pipeline.generate_suggestion(proposed, current, improvements)
+
+            suggestion = json.loads(suggestion_path.read_text())
+            state = json.loads(pipeline.EXPERIMENT_RUNS_PATH.read_text())
+            entry = state["entries"][suggestion["experiment_id"]]
+            assert suggestion["experiment_type"] == "calibration_suggestion"
+            assert entry["status"] == "suggested"
+            assert entry["promotion_stage"] == "research"
+            assert entry["history"][-1]["event_type"] == "suggestion_generated"
+        finally:
+            pipeline._atomic_write_json = orig_atomic
+            pipeline.SUGGESTION_DIR = orig_suggestion_dir
+            pipeline.EXPERIMENT_RUNS_PATH = orig_experiment_runs_path
+
+    def test_apply_suggestion_updates_experiment_registry_entry(self, pipeline, tmp_path):
+        orig_atomic = pipeline._atomic_write_json
+        orig_suggestion_dir = pipeline.SUGGESTION_DIR
+        orig_experiment_runs_path = pipeline.EXPERIMENT_RUNS_PATH
+        orig_calibration_path = pipeline.CALIBRATION_PATH
+        orig_backup_path = pipeline.CALIBRATION_BACKUP_PATH
+        orig_history_dir = pipeline.HISTORY_DIR
+        orig_results_path = pipeline.RESULTS_PATH
+        pipeline._atomic_write_json = _real_atomic_write
+        pipeline.SUGGESTION_DIR = tmp_path / "calibration-suggestions"
+        pipeline.EXPERIMENT_RUNS_PATH = tmp_path / "experiment-runs.json"
+        pipeline.CALIBRATION_PATH = tmp_path / "calibration.json"
+        pipeline.CALIBRATION_BACKUP_PATH = tmp_path / "calibration-backup.json"
+        pipeline.HISTORY_DIR = tmp_path / "calibration-history"
+        pipeline.RESULTS_PATH = tmp_path / "backtest-results.json"
+        try:
+            pipeline.CALIBRATION_PATH.write_text(json.dumps({"weather": {"global_brier": 0.33, "n": 69}}))
+            proposed = {"weather": {"global_brier": 0.28, "n": 69}}
+            current = {"weather": {"global_brier": 0.33, "n": 69}}
+            improvements = {"weather": {"before": 0.33, "after": 0.28, "improvement_pct": 15.2}}
+
+            suggestion_path = pipeline.generate_suggestion(proposed, current, improvements)
+            assert pipeline.apply_suggestion(str(suggestion_path), apply_mode="manual") is True
+
+            state = json.loads(pipeline.EXPERIMENT_RUNS_PATH.read_text())
+            suggestion = json.loads(suggestion_path.read_text())
+            entry = state["entries"][suggestion["experiment_id"]]
+            assert entry["status"] == "applied"
+            assert entry["promotion_stage"] == "live"
+            assert entry["history"][-1]["event_type"] == "applied"
+            assert entry["history"][-1]["metadata"]["apply_mode"] == "manual"
+        finally:
+            pipeline._atomic_write_json = orig_atomic
+            pipeline.SUGGESTION_DIR = orig_suggestion_dir
+            pipeline.EXPERIMENT_RUNS_PATH = orig_experiment_runs_path
+            pipeline.CALIBRATION_PATH = orig_calibration_path
+            pipeline.CALIBRATION_BACKUP_PATH = orig_backup_path
+            pipeline.HISTORY_DIR = orig_history_dir
+            pipeline.RESULTS_PATH = orig_results_path
+
+
 # ---------------------------------------------------------------------------
 # Auto-Apply Decision Tests
 # ---------------------------------------------------------------------------

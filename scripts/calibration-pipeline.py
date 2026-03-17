@@ -25,6 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"))
 
 from kalshi_auth import _atomic_write_json, notify_whatsapp, setup_logging, setup_unbuffered
+from research.registry import ExperimentRunRegistry
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -37,6 +38,8 @@ SUGGESTION_DIR = DATA_DIR / "calibration-suggestions"
 CALIBRATION_PATH = PROJECT_DIR / "config" / "calibration.json"
 CALIBRATION_BACKUP_PATH = PROJECT_DIR / "config" / "calibration-backup.json"
 HISTORY_DIR = DATA_DIR / "calibration-history"
+EXPERIMENT_RUNS_PATH = DATA_DIR / "experiment-runs.json"
+PIPELINE_SOURCE_PATH = Path(__file__).resolve()
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DRIFT_THRESHOLD = 0.10   # 10% degradation triggers drift alert
@@ -527,7 +530,46 @@ def evaluate_suggestion(proposed_calibration, current_calibration):
     }
 
 
-def generate_suggestion(proposed_calibration, current_calibration, improvements):
+def _experiment_registry():
+    return ExperimentRunRegistry(EXPERIMENT_RUNS_PATH)
+
+
+def _suggestion_experiment_id(suggestion_path):
+    return f"calibration:{Path(suggestion_path).stem}"
+
+
+def _record_experiment_event(
+    experiment_id,
+    *,
+    status,
+    promotion_stage,
+    metadata=None,
+    artifact_path=None,
+    event_type,
+    event_at=None,
+    experiment_type="calibration_suggestion",
+    experiment_registry=None,
+):
+    try:
+        registry = experiment_registry or _experiment_registry()
+        registry.register(
+            experiment_id,
+            experiment_type,
+            strategy_id="calibration",
+            source_bot="calibration-pipeline",
+            source_path=PIPELINE_SOURCE_PATH,
+            status=status,
+            promotion_stage=promotion_stage,
+            metadata=metadata,
+            artifact_path=artifact_path,
+            event_type=event_type,
+            event_at=event_at,
+        )
+    except Exception as e:
+        log.warning("Failed to write experiment registry event for %s: %s", experiment_id, e)
+
+
+def generate_suggestion(proposed_calibration, current_calibration, improvements, experiment_registry=None):
     """Write a timestamped suggestion file for human review.
 
     Filenames are unique: calibration-suggestion-YYYY-MM-DD.json (appends -N if same-day exists).
@@ -556,8 +598,11 @@ def generate_suggestion(proposed_calibration, current_calibration, improvements)
             f"({imp['before']:.4f} -> {imp['after']:.4f})"
         )
     trigger = "; ".join(trigger_parts) if trigger_parts else "Improvement detected"
+    experiment_id = _suggestion_experiment_id(suggestion_path)
 
     suggestion = {
+        "experiment_id": experiment_id,
+        "experiment_type": "calibration_suggestion",
         "generated_at": now.isoformat(),
         "trigger": trigger,
         "current_calibration": current_calibration,
@@ -571,6 +616,20 @@ def generate_suggestion(proposed_calibration, current_calibration, improvements)
     }
 
     _atomic_write_json(suggestion_path, suggestion)
+    _record_experiment_event(
+        experiment_id,
+        status="suggested",
+        promotion_stage="research",
+        metadata={
+            "trigger": trigger,
+            "improvements": improvements,
+            "generated_at": now.isoformat(),
+        },
+        artifact_path=suggestion_path,
+        event_type="suggestion_generated",
+        event_at=now.isoformat(),
+        experiment_registry=experiment_registry,
+    )
     log.info(f"Calibration suggestion generated: {suggestion_path}")
     return suggestion_path
 
@@ -602,7 +661,7 @@ def archive_calibration(calibration_data, history_dir=None):
     return path
 
 
-def apply_suggestion(suggestion_path):
+def apply_suggestion(suggestion_path, *, apply_mode="manual", experiment_registry=None):
     """Apply a calibration suggestion file.
 
     Archives current calibration to history, backs up to calibration-backup.json,
@@ -620,9 +679,19 @@ def apply_suggestion(suggestion_path):
         log.error(f"Failed to parse suggestion file: {e}")
         return False
 
+    experiment_id = suggestion.get("experiment_id") or _suggestion_experiment_id(suggestion_path)
     proposed = suggestion.get("proposed_calibration")
     if not proposed:
         log.error("Suggestion file missing proposed_calibration")
+        _record_experiment_event(
+            experiment_id,
+            status="apply_failed",
+            promotion_stage="research",
+            metadata={"apply_mode": apply_mode, "failure_reason": "missing proposed_calibration"},
+            artifact_path=suggestion_path,
+            event_type="apply_failed",
+            experiment_registry=experiment_registry,
+        )
         return False
 
     # Archive current calibration before overwriting
@@ -658,6 +727,20 @@ def apply_suggestion(suggestion_path):
     else:
         log.warning("No backtest results found -- baselines not updated")
 
+    _record_experiment_event(
+        experiment_id,
+        status="applied",
+        promotion_stage="live",
+        metadata={
+            "apply_mode": apply_mode,
+            "trigger": suggestion.get("trigger"),
+            "generated_at": suggestion.get("generated_at"),
+            "applied_at": datetime.now(timezone.utc).isoformat(),
+        },
+        artifact_path=suggestion_path,
+        event_type="auto_applied" if apply_mode == "auto_apply" else "applied",
+        experiment_registry=experiment_registry,
+    )
     return True
 
 
@@ -819,7 +902,7 @@ def main():
         )
         if apply_decision:
             log.info(f"Auto-apply: {apply_reason}")
-            success = apply_suggestion(str(suggestion_path))
+            success = apply_suggestion(str(suggestion_path), apply_mode="auto_apply")
             if success:
                 auto_applied = True
                 log.info("Auto-applied calibration suggestion")
@@ -828,6 +911,14 @@ def main():
                 log.error("Auto-apply failed during apply_suggestion()")
         else:
             log.info(f"Auto-apply skipped: {apply_reason}")
+            _record_experiment_event(
+                _suggestion_experiment_id(suggestion_path),
+                status="suggested",
+                promotion_stage="research",
+                metadata={"apply_reason": apply_reason},
+                artifact_path=suggestion_path,
+                event_type="auto_apply_skipped",
+            )
     elif args.auto_apply:
         apply_reason = "no suggestion generated"
         log.info("Auto-apply skipped: no suggestion generated")
