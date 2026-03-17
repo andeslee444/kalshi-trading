@@ -37,11 +37,20 @@ Use this template for production incidents, failed promotions, severe source out
 
 ## Artifacts Reviewed
 
+- `data/incident-reviews.json`
 - `data/experiment-runs.json`
 - `data/attribution-report.json`
 - `data/source-catalog.json`
 - `data/ledger-parity-report.json`
 - relevant bot logs in `data/logs/`
+
+## Canonical Commands
+
+```bash
+python3 scripts/incident-workflow.py open <incident_id> --summary "<summary>" --severity <severity> --owner <name>
+python3 scripts/incident-workflow.py link <incident_id> --pr-number <pr_number> --config-version <config_version> --experiment-id <experiment_id> --note "follow-up change"
+python3 scripts/incident-workflow.py close <incident_id> --actor <name> --resolution "<resolution>"
+```
 
 ## Mitigation
 
@@ -61,4 +70,6 @@ Use this template for production incidents, failed promotions, severe source out
 - PR:
 - Incident ticket:
 - Promotion record:
+- Experiment id:
+- Config version:
 - Post-incident review:

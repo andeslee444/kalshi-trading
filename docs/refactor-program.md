@@ -449,6 +449,7 @@ Current bridge state:
 - Slice 1 adds the desk-ops baseline in `docs/desk-ops/`, including the service ownership matrix, change-management policy, incident template, and runbooks for stale bots, source freshness, ledger parity, and promotion rollback
 - Slice 2 adds `docs/desk-ops/operating-cadence.md`, turning the daily, weekly, and monthly review loops into concrete command-and-artifact checklists tied to the current reporting and promotion workflow
 - Slice 3 adds `/api/operator-actions` on the dashboard system tab, so stale bots, degraded sources, parity regressions, and open promotion decisions now point to concrete remediation commands instead of only passive warnings
+- Slice 4 adds a canonical `incident_reviews` registry plus incident and promotion workflow link fields, so postmortems and promotion decisions now reference explicit PRs, experiment ids, and config/model versions instead of only free-form notes
 
 Estimated size:
 

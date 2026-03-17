@@ -58,6 +58,11 @@ class PromotionWorkflow:
         actor=None,
         note=None,
         status=None,
+        incident_id=None,
+        config_version=None,
+        model_version=None,
+        pr_number=None,
+        change_ref=None,
         metadata=None,
         artifact_path=None,
         event_at=None,
@@ -72,6 +77,11 @@ class PromotionWorkflow:
             current_stage,
             actor=actor,
             note=note,
+            incident_id=incident_id,
+            config_version=config_version,
+            model_version=model_version,
+            pr_number=pr_number,
+            change_ref=change_ref,
             metadata=metadata,
         )
 
@@ -97,6 +107,11 @@ class PromotionWorkflow:
         actor=None,
         reason=None,
         status="rolled_back",
+        incident_id=None,
+        config_version=None,
+        model_version=None,
+        pr_number=None,
+        change_ref=None,
         metadata=None,
         artifact_path=None,
         event_at=None,
@@ -111,6 +126,11 @@ class PromotionWorkflow:
             current_stage,
             actor=actor,
             note=reason,
+            incident_id=incident_id,
+            config_version=config_version,
+            model_version=model_version,
+            pr_number=pr_number,
+            change_ref=change_ref,
             metadata=metadata,
             note_key="reason",
         )
@@ -169,7 +189,19 @@ class PromotionWorkflow:
             )
 
     @staticmethod
-    def _event_metadata(current_stage, *, actor=None, note=None, metadata=None, note_key="note"):
+    def _event_metadata(
+        current_stage,
+        *,
+        actor=None,
+        note=None,
+        incident_id=None,
+        config_version=None,
+        model_version=None,
+        pr_number=None,
+        change_ref=None,
+        metadata=None,
+        note_key="note",
+    ):
         payload = _coerce_metadata(metadata)
         if current_stage is not None:
             payload["from_stage"] = current_stage
@@ -177,6 +209,16 @@ class PromotionWorkflow:
             payload["actor"] = actor
         if note:
             payload[note_key] = note
+        if incident_id:
+            payload["incident_id"] = str(incident_id)
+        if config_version:
+            payload["config_version"] = str(config_version)
+        if model_version:
+            payload["model_version"] = str(model_version)
+        if pr_number is not None:
+            payload["pr_number"] = int(pr_number)
+        if change_ref:
+            payload["change_ref"] = str(change_ref)
         return payload or None
 
 

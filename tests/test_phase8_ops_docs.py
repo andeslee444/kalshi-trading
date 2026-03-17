@@ -73,8 +73,16 @@ def test_change_management_references_canonical_promotion_workflow():
     for stage in ("research", "shadow", "capped_live", "live"):
         assert f"`{stage}`" in text
     assert "python3 scripts/promotion-workflow.py" in text
+    assert "python3 scripts/incident-workflow.py" in text
     assert "data/experiment-runs.json" in text
     assert "config/calibration-backup.json" in text
+
+
+def test_incident_template_references_canonical_incident_registry():
+    text = _read(DOCS_ROOT / "incident-template.md")
+    assert "data/incident-reviews.json" in text
+    assert "python3 scripts/incident-workflow.py open <incident_id>" in text
+    assert "python3 scripts/incident-workflow.py link <incident_id>" in text
 
 
 def test_runbooks_include_required_sections():

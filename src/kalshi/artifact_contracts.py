@@ -119,6 +119,7 @@ MODEL_REGISTRY_ARTIFACT = "model_registry"
 STRATEGY_CONFIG_REGISTRY_ARTIFACT = "strategy_config_registry"
 EXPERIMENT_RUNS_ARTIFACT = "experiment_runs"
 TRADE_ATTRIBUTION_ARTIFACT = "trade_attribution"
+INCIDENT_REVIEWS_ARTIFACT = "incident_reviews"
 
 HEALTH_STATE_SCHEMA_VERSION = 1
 ALLOCATOR_STATE_SCHEMA_VERSION = 1
@@ -130,6 +131,7 @@ MODEL_REGISTRY_SCHEMA_VERSION = 1
 STRATEGY_CONFIG_REGISTRY_SCHEMA_VERSION = 1
 EXPERIMENT_RUNS_SCHEMA_VERSION = 1
 TRADE_ATTRIBUTION_SCHEMA_VERSION = 1
+INCIDENT_REVIEWS_SCHEMA_VERSION = 1
 
 
 def with_schema_metadata(data, artifact_type, schema_version):
@@ -260,6 +262,15 @@ def normalize_experiment_runs(data):
         data,
         EXPERIMENT_RUNS_ARTIFACT,
         EXPERIMENT_RUNS_SCHEMA_VERSION,
+    )
+
+
+def normalize_incident_reviews(data):
+    """Normalize incident-reviews.json while preserving unknown entry payloads."""
+    return normalize_registry_state(
+        data,
+        INCIDENT_REVIEWS_ARTIFACT,
+        INCIDENT_REVIEWS_SCHEMA_VERSION,
     )
 
 

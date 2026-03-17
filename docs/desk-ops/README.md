@@ -7,6 +7,7 @@ It is intentionally practical:
 - service ownership is recorded against the actual bot and process ids in the codebase
 - operator commands point at the current scripts and artifacts
 - promotion and rollback steps use the canonical `experiment_runs` workflow
+- incidents and postmortems use the canonical `incident_reviews` workflow
 
 Until named humans are assigned, ownership is by functional role instead of person.
 

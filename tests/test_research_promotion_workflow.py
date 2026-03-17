@@ -34,6 +34,11 @@ def test_promote_advances_one_stage_and_records_metadata(tmp_path):
         target_stage="shadow",
         actor="andes",
         note="start shadow rollout",
+        incident_id="INC-17",
+        config_version="cfg-2026-03-17",
+        model_version="mdl-weather-v3",
+        pr_number=38,
+        change_ref="config/calibration-backup.json",
         metadata={"shadow_markets": 12},
     )
 
@@ -42,6 +47,11 @@ def test_promote_advances_one_stage_and_records_metadata(tmp_path):
     assert entry["history"][-1]["event_type"] == "promoted_to_shadow"
     assert entry["history"][-1]["metadata"]["from_stage"] == "research"
     assert entry["history"][-1]["metadata"]["actor"] == "andes"
+    assert entry["history"][-1]["metadata"]["incident_id"] == "INC-17"
+    assert entry["history"][-1]["metadata"]["config_version"] == "cfg-2026-03-17"
+    assert entry["history"][-1]["metadata"]["model_version"] == "mdl-weather-v3"
+    assert entry["history"][-1]["metadata"]["pr_number"] == 38
+    assert entry["history"][-1]["metadata"]["change_ref"] == "config/calibration-backup.json"
     assert entry["history"][-1]["metadata"]["shadow_markets"] == 12
 
 

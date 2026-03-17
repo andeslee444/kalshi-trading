@@ -75,6 +75,31 @@ def test_experiment_run_registry_tracks_history_and_artifacts(tmp_path):
     assert entry["history"][1]["metadata"]["apply_mode"] == "manual"
 
 
+def test_experiment_run_registry_preserves_explicit_change_refs_in_metadata(tmp_path):
+    registry = ExperimentRunRegistry(tmp_path / "experiment-runs.json")
+
+    entry = registry.register(
+        "exp-42",
+        "shadow_rollout",
+        strategy_id="weather",
+        source_bot="promotion-workflow",
+        status="shadow",
+        promotion_stage="shadow",
+        metadata={
+            "incident_id": "INC-17",
+            "config_version": "cfg-17",
+            "model_version": "mdl-17",
+            "pr_number": 38,
+            "change_ref": "config/calibration-backup.json",
+        },
+        event_type="promoted_to_shadow",
+        event_at="2026-03-17T10:00:00+00:00",
+    )
+
+    assert entry["metadata"]["incident_id"] == "INC-17"
+    assert entry["history"][-1]["metadata"]["pr_number"] == 38
+
+
 def test_annotate_research_record_uses_explicit_strategy_and_source_bot(tmp_path):
     registry = ModelRegistry(tmp_path / "model-registry.json")
 
