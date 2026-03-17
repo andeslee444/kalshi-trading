@@ -1215,6 +1215,11 @@ async function loadSystem() {
   });
   const crosscheck = health?.weather_nws_crosscheck || null;
   const actionableWeather = Object.values(crosscheck?.actionable || {});
+  const operatorSummary = operatorActions?.summary || {};
+  const operatorCritical = Number(operatorSummary.critical || 0);
+  const operatorWarning = Number(operatorSummary.warning || 0);
+  const operatorReview = Number(operatorSummary.review || 0);
+  const operatorNeedsAttention = (operatorCritical + operatorWarning + operatorReview) > 0;
 
   let bannerHtml, bannerBg;
   if (killSwitch) {
@@ -1229,11 +1234,17 @@ async function loadSystem() {
       <div class="flex items-center gap-3"><span class="dot dot-yellow"></span><span class="font-medium text-yellow-400">Circuit Breaker Open — API Errors Detected</span></div>
       <div class="text-xs text-slate-400">${runningBots.length} live · ${staleBots.length} stale · ${degradedSources.length} degraded sources</div>
     </div>`;
-  } else if (staleBots.length > 0 || actionableWeather.length > 0 || degradedSources.length > 0) {
+  } else if (operatorCritical > 0) {
+    bannerBg = 'rgba(244,63,94,0.1)';
+    bannerHtml = `<div class="space-y-2">
+      <div class="flex items-center gap-3"><span class="dot dot-red"></span><span class="font-medium text-rose-400">Critical Operator Review Needed</span></div>
+      <div class="text-xs text-slate-400">${operatorSummary.total || 0} operator actions · ${operatorCritical} critical</div>
+    </div>`;
+  } else if (staleBots.length > 0 || actionableWeather.length > 0 || degradedSources.length > 0 || operatorNeedsAttention) {
     bannerBg = 'rgba(234,179,8,0.1)';
     bannerHtml = `<div class="space-y-2">
       <div class="flex items-center gap-3"><span class="dot dot-yellow"></span><span class="font-medium text-yellow-400">Operator Attention Needed</span></div>
-      <div class="text-xs text-slate-400">${runningBots.length} live · ${staleBots.length} stale · ${degradedSources.length} degraded sources · ${actionableWeather.length} weather review actions</div>
+      <div class="text-xs text-slate-400">${runningBots.length} live · ${staleBots.length} stale · ${degradedSources.length} degraded sources · ${operatorSummary.total || 0} operator actions</div>
     </div>`;
   } else if (runningBots.length > 0) {
     bannerBg = 'rgba(16,185,129,0.08)';
@@ -1254,7 +1265,8 @@ async function loadSystem() {
   // Update header badge
   const badge = document.getElementById('system-badge');
   if (killSwitch) { badge.textContent = 'Paused'; badge.className = 'pill'; badge.style.cssText = 'background:rgba(244,63,94,0.15);color:#f43f5e;font-size:0.6875rem;padding:2px 10px;border-radius:9999px;font-weight:600;'; }
-  else if (staleBots.length > 0 || cbOpen || actionableWeather.length > 0 || degradedSources.length > 0) { badge.textContent = 'Warning'; badge.className = 'pill'; badge.style.cssText = 'background:rgba(234,179,8,0.15);color:#eab308;font-size:0.6875rem;padding:2px 10px;border-radius:9999px;font-weight:600;'; }
+  else if (operatorCritical > 0) { badge.textContent = 'Critical'; badge.className = 'pill'; badge.style.cssText = 'background:rgba(244,63,94,0.15);color:#f43f5e;font-size:0.6875rem;padding:2px 10px;border-radius:9999px;font-weight:600;'; }
+  else if (staleBots.length > 0 || cbOpen || actionableWeather.length > 0 || degradedSources.length > 0 || operatorNeedsAttention) { badge.textContent = 'Warning'; badge.className = 'pill'; badge.style.cssText = 'background:rgba(234,179,8,0.15);color:#eab308;font-size:0.6875rem;padding:2px 10px;border-radius:9999px;font-weight:600;'; }
   else if (runningBots.length > 0) { badge.textContent = 'Live'; badge.className = 'pill'; badge.style.cssText = 'background:rgba(16,185,129,0.15);color:#10b981;font-size:0.6875rem;padding:2px 10px;border-radius:9999px;font-weight:600;'; }
   else { badge.textContent = 'Offline'; badge.className = 'pill pill-default'; badge.style.cssText = ''; }
 
@@ -1373,7 +1385,7 @@ async function loadSystem() {
     </div>
   `);
   document.getElementById('operator-signals').innerHTML =
-    actionRows.join('') || '<div class="flex items-start gap-3 py-1"><span class="dot dot-green mt-1"></span><div><div class="text-sm text-emerald-300">No immediate operator action</div><div class="text-xs text-slate-500">Bots, sources, parity, and promotion workflow all look consistent.</div></div></div>';
+    actionRows.join('') || '<div class="flex items-start gap-3 py-1"><span class="dot dot-green mt-1"></span><div><div class="text-sm text-emerald-300">No immediate operator action</div><div class="text-xs text-slate-500">Bots, sources, parity, incidents, and promotion workflow all look consistent.</div></div></div>';
 
   // Weather NWS cross-check
   if (crosscheck) {

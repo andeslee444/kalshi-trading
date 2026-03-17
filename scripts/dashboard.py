@@ -52,6 +52,7 @@ WEATHER_NWS_CROSSCHECK_PATH = DATA_DIR / "weather-nws-cross-check.json"
 ALLOCATOR_STATE_PATH = DATA_DIR / "allocator-state.json"
 LEDGER_PARITY_REPORT_PATH = DATA_DIR / "ledger-parity-report.json"
 EXPERIMENT_RUNS_PATH = DATA_DIR / "experiment-runs.json"
+INCIDENT_REVIEWS_PATH = DATA_DIR / "incident-reviews.json"
 KILL_SWITCH_PATH = DATA_DIR / "HALT_TRADING"
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
 WEATHER_CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-config.json"
@@ -549,7 +550,40 @@ def _iter_open_experiments(state):
     return rows
 
 
-def _operator_actions_payload(*, bots, health, circuit_breaker_open, parity_report, experiments_state):
+def _incident_has_follow_up_links(entry: dict) -> bool:
+    return any(
+        entry.get(field)
+        for field in ("pr_numbers", "change_refs", "experiment_ids", "config_versions", "model_versions")
+    )
+
+
+def _iter_incidents_needing_attention(state):
+    entries = state.get("entries", {}) if isinstance(state, dict) else {}
+    rows = []
+    for incident_id, entry in entries.items():
+        if not isinstance(entry, dict):
+            continue
+        item = dict(entry)
+        item["incident_id"] = item.get("incident_id") or incident_id
+        item["_status"] = str(item.get("status") or "open").strip().lower()
+        item["_has_follow_up_links"] = _incident_has_follow_up_links(item)
+        if item["_status"] != "closed" or not item["_has_follow_up_links"]:
+            rows.append(item)
+    rows.sort(key=lambda row: row.get("updated_at") or row.get("opened_at") or "", reverse=True)
+    return rows
+
+
+def _incident_action_severity(entry: dict) -> str:
+    status = entry.get("_status") or str(entry.get("status") or "open").strip().lower()
+    severity = str(entry.get("severity") or "").strip().lower()
+    if status != "closed":
+        if severity in {"sev0", "sev1", "critical"}:
+            return "critical"
+        return "warning"
+    return "review"
+
+
+def _operator_actions_payload(*, bots, health, circuit_breaker_open, parity_report, experiments_state, incidents_state):
     actions = []
 
     if KILL_SWITCH_PATH.exists():
@@ -647,6 +681,29 @@ def _operator_actions_payload(*, bots, health, circuit_breaker_open, parity_repo
             "detail": f"Experiment is still in {stage} with status {status}. Review before advancing, holding, or rolling back.",
             "command": f"python3 scripts/promotion-workflow.py show {experiment_id}",
             "artifact": "data/experiment-runs.json",
+        })
+
+    for entry in _iter_incidents_needing_attention(incidents_state)[:5]:
+        incident_id = entry.get("incident_id")
+        summary = str(entry.get("summary") or "Incident review needs attention.")
+        status = str(entry.get("status") or "open")
+        owner = str(entry.get("owner") or "unassigned")
+        severity = str(entry.get("severity") or "unknown")
+        missing_links = not entry.get("_has_follow_up_links", False)
+        detail = f"{summary} Current status {status}, severity {severity}, owner {owner}."
+        if missing_links:
+            detail += " No linked PR, config, model, or experiment follow-up is recorded yet."
+        actions.append({
+            "severity": _incident_action_severity(entry),
+            "category": "incident_open" if entry.get("_status") != "closed" else "incident_followup",
+            "title": (
+                f"Open incident: {incident_id}"
+                if entry.get("_status") != "closed"
+                else f"Incident follow-up missing: {incident_id}"
+            ),
+            "detail": detail,
+            "command": f"python3 scripts/incident-workflow.py show {incident_id}",
+            "artifact": "data/incident-reviews.json",
         })
 
     severity_rank = {"critical": 0, "warning": 1, "review": 2, "info": 3}
@@ -1186,6 +1243,7 @@ async def api_operator_actions():
     breaker_open = bool(cb) and (cb.get("failures", 0) >= cb.get("max_failures", 5))
     parity_report = load_json_safe(LEDGER_PARITY_REPORT_PATH)
     experiments_state = load_json_safe(EXPERIMENT_RUNS_PATH)
+    incidents_state = load_json_safe(INCIDENT_REVIEWS_PATH)
 
     payload = _operator_actions_payload(
         bots=bots,
@@ -1193,6 +1251,7 @@ async def api_operator_actions():
         circuit_breaker_open=breaker_open,
         parity_report=parity_report,
         experiments_state=experiments_state,
+        incidents_state=incidents_state,
     )
     cache.set("operator_actions", payload, ttl=30)
     return payload
