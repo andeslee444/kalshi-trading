@@ -301,9 +301,9 @@
       <!-- Status Banner -->
       <div id="system-banner" class="card"></div>
 
-      <!-- Operator Signals -->
+      <!-- Operator Actions -->
       <div class="card">
-        <div class="section-label">Operator Signals</div>
+        <div class="section-label">Operator Actions</div>
         <div id="operator-signals" class="space-y-2">
           <div class="text-slate-500 text-sm">Loading...</div>
         </div>
@@ -1194,10 +1194,11 @@ function toggleDecisions() {
 
 // ─── SYSTEM TAB ───
 async function loadSystem() {
-  const [bots, health, risk] = await Promise.all([
+  const [bots, health, risk, operatorActions] = await Promise.all([
     fetchJSON('/api/bots'),
     fetchJSON('/api/health'),
     fetchJSON('/api/risk'),
+    fetchJSON('/api/operator-actions'),
   ]);
 
   cachedBots = bots || [];
@@ -1347,29 +1348,32 @@ async function loadSystem() {
       '<div class="text-slate-500 text-sm">No verification data</div>';
   }
 
-  // Operator Signals
-  const signals = [];
-  if (killSwitch) {
-    signals.push('<div class="flex items-start gap-3 py-1"><span class="dot dot-red mt-1"></span><div><div class="text-sm text-rose-300">Trading halt is active</div><div class="text-xs text-slate-500">Clear the kill switch before expecting any new orders.</div></div></div>');
-  }
-  if (cbOpen) {
-    signals.push('<div class="flex items-start gap-3 py-1"><span class="dot dot-yellow mt-1"></span><div><div class="text-sm text-yellow-300">Circuit breaker is open</div><div class="text-xs text-slate-500">Check recent source failures and retry paths before trusting silent bots.</div></div></div>');
-  }
-  if (staleBots.length > 0) {
-    const names = staleBots.map(b => b.display_name || b.name).join(', ');
-    signals.push(`<div class="flex items-start gap-3 py-1"><span class="dot dot-yellow mt-1"></span><div><div class="text-sm text-yellow-200">Stale bots: ${names}</div><div class="text-xs text-slate-500">Heartbeat age exceeded expected scan cadence.</div></div></div>`);
-  }
-  if (degradedSources.length > 0) {
-    const names = degradedSources.slice(0, 4).map(([name]) => name).join(', ');
-    signals.push(`<div class="flex items-start gap-3 py-1"><span class="dot dot-yellow mt-1"></span><div><div class="text-sm text-yellow-200">Degraded sources: ${names}${degradedSources.length > 4 ? ' +' + (degradedSources.length - 4) : ''}</div><div class="text-xs text-slate-500">Source freshness or error status is outside normal operating range.</div></div></div>`);
-  }
-  if (actionableWeather.length > 0) {
-    for (const rec of actionableWeather.slice(0, 4)) {
-      signals.push(`<div class="flex items-start gap-3 py-1"><span class="dot dot-yellow mt-1"></span><div><div class="text-sm text-yellow-100">${rec.city}: ${rec.current_mode.replace(/_/g, ' ')} → ${rec.recommended_mode.replace(/_/g, ' ')}</div><div class="text-xs text-slate-500">${rec.reason}</div></div></div>`);
-    }
-  }
+  // Operator Actions
+  const actionDot = {
+    critical: 'dot-red',
+    warning: 'dot-yellow',
+    review: 'dot-yellow',
+    info: 'dot-gray',
+  };
+  const actionTitle = {
+    critical: 'text-rose-300',
+    warning: 'text-yellow-200',
+    review: 'text-yellow-100',
+    info: 'text-slate-300',
+  };
+  const actionRows = (operatorActions?.actions || []).map(action => `
+    <div class="flex items-start gap-3 py-1">
+      <span class="dot ${actionDot[action.severity] || 'dot-gray'} mt-1"></span>
+      <div class="min-w-0">
+        <div class="text-sm ${actionTitle[action.severity] || 'text-slate-300'}">${action.title}</div>
+        <div class="text-xs text-slate-500">${action.detail}</div>
+        ${action.command ? `<div class="mono text-xs text-slate-400 mt-1">${action.command}</div>` : ''}
+        ${action.artifact ? `<div class="text-[11px] text-slate-600 mt-1">${action.artifact}</div>` : ''}
+      </div>
+    </div>
+  `);
   document.getElementById('operator-signals').innerHTML =
-    signals.join('') || '<div class="flex items-start gap-3 py-1"><span class="dot dot-green mt-1"></span><div><div class="text-sm text-emerald-300">No immediate operator action</div><div class="text-xs text-slate-500">Bots, sources, and weather cross-check controls look consistent.</div></div></div>';
+    actionRows.join('') || '<div class="flex items-start gap-3 py-1"><span class="dot dot-green mt-1"></span><div><div class="text-sm text-emerald-300">No immediate operator action</div><div class="text-xs text-slate-500">Bots, sources, parity, and promotion workflow all look consistent.</div></div></div>';
 
   // Weather NWS cross-check
   if (crosscheck) {

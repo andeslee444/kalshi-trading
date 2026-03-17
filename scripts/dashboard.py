@@ -50,6 +50,8 @@ SUPERVISOR_STATE_PATH = PID_DIR / "supervisor-state.json"
 WEATHER_VERIFICATION_PATH = DATA_DIR / "weather-verification.json"
 WEATHER_NWS_CROSSCHECK_PATH = DATA_DIR / "weather-nws-cross-check.json"
 ALLOCATOR_STATE_PATH = DATA_DIR / "allocator-state.json"
+LEDGER_PARITY_REPORT_PATH = DATA_DIR / "ledger-parity-report.json"
+EXPERIMENT_RUNS_PATH = DATA_DIR / "experiment-runs.json"
 KILL_SWITCH_PATH = DATA_DIR / "HALT_TRADING"
 BOTS_CONFIG_PATH = PROJECT_DIR / "config" / "bots-config.json"
 WEATHER_CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-config.json"
@@ -472,12 +474,11 @@ def _runtime_age_minutes(started_at) -> float | None:
         return None
 
 
-@app.get("/api/bots")
-async def api_bots():
-    health_data = load_json_safe(HEALTH_STATE_PATH) or {}
-    supervisor_state = load_json_safe(SUPERVISOR_STATE_PATH) or {}
-    bots_config = load_json_safe(BOTS_CONFIG_PATH) or {}
-    weather_config = load_json_safe(WEATHER_CONFIG_PATH) or {}
+def _build_bot_status_rows(*, health_data=None, supervisor_state=None, bots_config=None, weather_config=None):
+    health_data = health_data or {}
+    supervisor_state = supervisor_state or {}
+    bots_config = bots_config or {}
+    weather_config = weather_config or {}
     bot_health = health_data.get("bots", {})
 
     result = []
@@ -519,6 +520,162 @@ async def api_bots():
         })
 
     return result
+
+
+def _source_needs_attention(info: dict) -> bool:
+    status = str(info.get("status", "") or "").lower()
+    error_count = int(info.get("error_count", 0) or 0)
+    return (
+        info.get("fresh") is False
+        or (status and status not in {"ok", "healthy", "fresh"})
+        or error_count > 0
+        or info.get("opened_at") is not None
+    )
+
+
+def _iter_open_experiments(state):
+    entries = state.get("entries", {}) if isinstance(state, dict) else {}
+    rows = []
+    for experiment_id, entry in entries.items():
+        if not isinstance(entry, dict):
+            continue
+        stage = str(entry.get("promotion_stage") or "").strip().lower()
+        if not stage or stage == "live":
+            continue
+        item = dict(entry)
+        item["experiment_id"] = item.get("experiment_id") or experiment_id
+        rows.append(item)
+    rows.sort(key=lambda row: row.get("updated_at") or row.get("registered_at") or "", reverse=True)
+    return rows
+
+
+def _operator_actions_payload(*, bots, health, circuit_breaker_open, parity_report, experiments_state):
+    actions = []
+
+    if KILL_SWITCH_PATH.exists():
+        actions.append({
+            "severity": "critical",
+            "category": "kill_switch",
+            "title": "Trading halt is active",
+            "detail": "Global kill switch is set. No new risk should be added until the halt is cleared.",
+            "command": "python3 scripts/supervisor.py status",
+            "artifact": "data/HALT_TRADING",
+        })
+
+    if circuit_breaker_open:
+        actions.append({
+            "severity": "warning",
+            "category": "circuit_breaker",
+            "title": "Circuit breaker is open",
+            "detail": "Allocator breaker state indicates recent API or execution failures that need review before trusting silent bots.",
+            "command": "python3 scripts/source-scorecard.py",
+            "artifact": "data/allocator-state.json",
+        })
+
+    for bot in bots:
+        if bot.get("status") != "stale":
+            continue
+        display_name = bot.get("display_name") or bot.get("name")
+        age = bot.get("heartbeat_age_min")
+        age_text = f"{round(age)}m" if isinstance(age, (int, float)) else "unknown"
+        actions.append({
+            "severity": "warning",
+            "category": "stale_bot",
+            "title": f"Stale bot: {display_name}",
+            "detail": f"Heartbeat age {age_text} exceeds the expected operating cadence for this bot.",
+            "command": f"python3 scripts/supervisor.py restart {bot['name']}",
+            "artifact": "data/pids/supervisor-state.json",
+        })
+
+    for source_name, info in sorted((health.get("sources") or {}).items()):
+        if not isinstance(info, dict) or not _source_needs_attention(info):
+            continue
+        message = info.get("last_error_message") or "Source freshness or parser status is outside normal range."
+        actions.append({
+            "severity": "warning",
+            "category": "degraded_source",
+            "title": f"Source needs review: {source_name}",
+            "detail": message,
+            "command": "python3 scripts/source-scorecard.py",
+            "artifact": "data/health-state.json",
+        })
+
+    if isinstance(parity_report, dict):
+        if parity_report.get("overall_ok") is False:
+            actions.append({
+                "severity": "warning",
+                "category": "parity_regression",
+                "title": "Ledger parity regression detected",
+                "detail": "Saved legacy-vs-ledger parity report is not clean. Keep affected readers in legacy mode until the mismatch is understood.",
+                "command": "python3 scripts/ledger-parity-report.py --json",
+                "artifact": "data/ledger-parity-report.json",
+            })
+    elif _use_ledger_reads():
+        actions.append({
+            "severity": "review",
+            "category": "parity_missing",
+            "title": "No saved ledger parity report",
+            "detail": "Dashboard is reading from ledger mode without a saved parity report to confirm the current bridge state.",
+            "command": "python3 scripts/ledger-parity-report.py --json",
+            "artifact": "data/ledger-parity-report.json",
+        })
+
+    crosscheck = health.get("weather_nws_crosscheck") or {}
+    actionable = crosscheck.get("actionable", {}) if isinstance(crosscheck, dict) else {}
+    for rec in list(actionable.values())[:4]:
+        if not isinstance(rec, dict):
+            continue
+        current_mode = str(rec.get("current_mode", "")).replace("_", " ")
+        recommended = str(rec.get("recommended_mode", "")).replace("_", " ")
+        actions.append({
+            "severity": "review",
+            "category": "weather_crosscheck",
+            "title": f"Weather mode review: {rec.get('city', 'unknown')}",
+            "detail": f"Current mode {current_mode} vs recommended {recommended}.",
+            "command": "python3 scripts/weather-verification-summary.py --lookback-days 7 30",
+            "artifact": "data/weather-nws-cross-check.json",
+        })
+
+    for entry in _iter_open_experiments(experiments_state)[:5]:
+        experiment_id = entry.get("experiment_id")
+        stage = str(entry.get("promotion_stage") or "unknown")
+        status = str(entry.get("status") or "unknown")
+        actions.append({
+            "severity": "review",
+            "category": "promotion_review",
+            "title": f"Promotion decision open: {experiment_id}",
+            "detail": f"Experiment is still in {stage} with status {status}. Review before advancing, holding, or rolling back.",
+            "command": f"python3 scripts/promotion-workflow.py show {experiment_id}",
+            "artifact": "data/experiment-runs.json",
+        })
+
+    severity_rank = {"critical": 0, "warning": 1, "review": 2, "info": 3}
+    actions.sort(key=lambda action: (severity_rank.get(action["severity"], 9), action["title"]))
+    counts = {key: sum(1 for action in actions if action["severity"] == key) for key in severity_rank}
+    return {
+        "summary": {
+            "total": len(actions),
+            "critical": counts["critical"],
+            "warning": counts["warning"],
+            "review": counts["review"],
+            "info": counts["info"],
+        },
+        "actions": actions,
+    }
+
+
+@app.get("/api/bots")
+async def api_bots():
+    health_data = load_json_safe(HEALTH_STATE_PATH) or {}
+    supervisor_state = load_json_safe(SUPERVISOR_STATE_PATH) or {}
+    bots_config = load_json_safe(BOTS_CONFIG_PATH) or {}
+    weather_config = load_json_safe(WEATHER_CONFIG_PATH) or {}
+    return _build_bot_status_rows(
+        health_data=health_data,
+        supervisor_state=supervisor_state,
+        bots_config=bots_config,
+        weather_config=weather_config,
+    )
 
 
 @app.get("/api/account")
@@ -1014,6 +1171,31 @@ async def api_health():
     if weather_nws_crosscheck:
         health_data["weather_nws_crosscheck"] = weather_nws_crosscheck
     return health_data
+
+
+@app.get("/api/operator-actions")
+async def api_operator_actions():
+    cached = cache.get("operator_actions")
+    if cached is not None:
+        return cached
+
+    health = await api_health()
+    bots = await api_bots()
+    allocator_state = load_json_safe(ALLOCATOR_STATE_PATH) or {}
+    cb = allocator_state.get("circuit_breaker", {}) if isinstance(allocator_state, dict) else {}
+    breaker_open = bool(cb) and (cb.get("failures", 0) >= cb.get("max_failures", 5))
+    parity_report = load_json_safe(LEDGER_PARITY_REPORT_PATH)
+    experiments_state = load_json_safe(EXPERIMENT_RUNS_PATH)
+
+    payload = _operator_actions_payload(
+        bots=bots,
+        health=health,
+        circuit_breaker_open=breaker_open,
+        parity_report=parity_report,
+        experiments_state=experiments_state,
+    )
+    cache.set("operator_actions", payload, ttl=30)
+    return payload
 
 
 BACKTEST_RESULTS_PATH = DATA_DIR / "backtest-results.json"
