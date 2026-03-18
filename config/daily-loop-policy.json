@@ -1,0 +1,47 @@
+{
+  "phase4_observation": {
+    "enabled": true,
+    "parity_required_until": "2026-03-31",
+    "auto_promote": false,
+    "auto_config_write": false
+  },
+  "health_gate": {
+    "parity_failure_severity": "critical",
+    "snapshot_failure_severity": "critical",
+    "source_error_severity": "warning",
+    "bot_stale_severity": "warning",
+    "bot_stale_minutes": 120,
+    "max_auto_restarts_per_bot_per_day": 1,
+    "crash_loop_threshold": 3,
+    "crash_loop_window_minutes": 60
+  },
+  "improvement": {
+    "missed_ev_high_cents": 500,
+    "missed_ev_moderate_cents": 100,
+    "weak_realized_edge_pct": 2.0,
+    "execution_quality_degradation_pct": 20.0,
+    "min_trades_for_edge_assessment": 5,
+    "min_trades_for_execution_assessment": 10
+  },
+  "promotion": {
+    "block_on_open_parity_incident": true,
+    "block_on_open_source_incident": true,
+    "block_on_open_execution_incident": true,
+    "min_shadow_days": 7,
+    "min_capped_live_days": 14
+  },
+  "constraint_analysis": {
+    "top_denied_limit": 10,
+    "lookback_days": 1,
+    "min_edge_for_ev_estimate": 0.02,
+    "reallocation_threshold_cents": 200
+  },
+  "capital_efficiency": {
+    "target_utilization_pct": 50.0,
+    "idle_capital_warning_pct": 80.0
+  },
+  "follow_through": {
+    "stale_recommendation_days": 7,
+    "stale_incident_days": 14
+  }
+}

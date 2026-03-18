@@ -92,6 +92,15 @@ def _trade_event_key(trade, source_path=None):
     return "trade:" + "|".join(str(p) for p in parts)
 
 
+def _history_event_key(base_key, payload, *, event_time=None, source_path=None):
+    material = {
+        "event_time": event_time or "",
+        "payload": payload,
+        "source_path": _safe_path(source_path),
+    }
+    return f"{base_key}:{_payload_hash(material)}"
+
+
 def _decision_event_key(decision, source_path=None):
     parts = [
         _safe_path(source_path),
@@ -142,6 +151,15 @@ def _verification_event_key(record, category):
         str(record.get("days_out", "")),
     ]
     return "verify:" + "|".join(str(p) for p in parts)
+
+
+def _coerce_int(value):
+    try:
+        if value in (None, ""):
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class EventLedger:
@@ -310,17 +328,23 @@ class EventLedger:
             legacy_key=event_id,
         )
         if payload.get("status"):
+            status_payload = {
+                "timestamp": payload.get("timestamp"),
+                "ticker": payload.get("ticker"),
+                "order_id": payload.get("order_id"),
+                "status": payload.get("status"),
+                "action": payload.get("action"),
+                "side": payload.get("side"),
+            }
             self.record_event(
                 event_type=EVENT_TYPE_ORDER_UPDATE,
-                event_id=f"{event_id}:status",
-                payload={
-                    "timestamp": payload.get("timestamp"),
-                    "ticker": payload.get("ticker"),
-                    "order_id": payload.get("order_id"),
-                    "status": payload.get("status"),
-                    "action": payload.get("action"),
-                    "side": payload.get("side"),
-                },
+                event_id=_history_event_key(
+                    f"{event_id}:status",
+                    status_payload,
+                    event_time=payload.get("timestamp"),
+                    source_path=source_path,
+                ),
+                payload=status_payload,
                 event_time=payload.get("timestamp"),
                 bot_name=payload.get("source_bot"),
                 ticker=payload.get("ticker"),
@@ -330,18 +354,24 @@ class EventLedger:
                 legacy_key=event_id,
             )
         if payload.get("best_bid") is not None or payload.get("best_ask") is not None:
+            market_payload = {
+                "timestamp": payload.get("timestamp"),
+                "ticker": payload.get("ticker"),
+                "order_id": payload.get("order_id"),
+                "best_bid": payload.get("best_bid"),
+                "best_ask": payload.get("best_ask"),
+                "spread": payload.get("spread"),
+                "volume": payload.get("volume"),
+            }
             self.record_event(
                 event_type=EVENT_TYPE_MARKET_SNAPSHOT,
-                event_id=f"{event_id}:market",
-                payload={
-                    "timestamp": payload.get("timestamp"),
-                    "ticker": payload.get("ticker"),
-                    "order_id": payload.get("order_id"),
-                    "best_bid": payload.get("best_bid"),
-                    "best_ask": payload.get("best_ask"),
-                    "spread": payload.get("spread"),
-                    "volume": payload.get("volume"),
-                },
+                event_id=_history_event_key(
+                    f"{event_id}:market",
+                    market_payload,
+                    event_time=payload.get("timestamp"),
+                    source_path=source_path,
+                ),
+                payload=market_payload,
                 event_time=payload.get("timestamp"),
                 bot_name=payload.get("source_bot"),
                 ticker=payload.get("ticker"),
@@ -355,12 +385,19 @@ class EventLedger:
         order_id = fill_record.get("order_id")
         if not order_id:
             return
-        event_id = f"fill:{order_id}"
+        payload = dict(fill_record)
+        event_time = payload.get("timestamp") or payload.get("created_time") or _utc_now_iso()
+        event_id = _history_event_key(
+            f"fill:{order_id}",
+            payload,
+            event_time=event_time,
+            source_path=source_path,
+        )
         self.record_event(
             event_type=EVENT_TYPE_FILL,
             event_id=event_id,
-            payload=dict(fill_record),
-            event_time=fill_record.get("timestamp") or fill_record.get("created_time") or _utc_now_iso(),
+            payload=payload,
+            event_time=event_time,
             bot_name=fill_record.get("source_bot"),
             ticker=fill_record.get("ticker"),
             order_id=order_id,
@@ -512,11 +549,36 @@ class EventLedger:
         orders = self._fetch_event_payloads(EVENT_TYPE_ORDER_SUBMITTED, source_path=source_path)
         fills = self._fetch_event_payloads(EVENT_TYPE_FILL, source_path=source_path)
         settlements = self._fetch_event_payloads(EVENT_TYPE_SETTLEMENT, source_path=source_path)
-        fill_by_order = {
-            record.get("order_id"): record
-            for record in fills
-            if record.get("order_id")
-        }
+        fill_by_order = {}
+        for record in fills:
+            order_id = record.get("order_id")
+            if not order_id:
+                continue
+            price = _coerce_int(record.get("fill_price_cents"))
+            fill_count = _coerce_int(record.get("fill_count"))
+            aggregated = fill_by_order.setdefault(
+                order_id,
+                {
+                    "fill_count": 0,
+                    "fill_price_cents": None,
+                    "last_fill_price_cents": None,
+                    "last_fill_time": "",
+                    "weighted_fill_value": 0,
+                },
+            )
+            if price is not None and fill_count is not None and fill_count > 0:
+                aggregated["weighted_fill_value"] += price * fill_count
+                aggregated["fill_count"] += fill_count
+                aggregated["fill_price_cents"] = int(
+                    aggregated["weighted_fill_value"] / aggregated["fill_count"]
+                )
+            event_time = record.get("timestamp") or record.get("created_time") or ""
+            if event_time >= aggregated["last_fill_time"]:
+                aggregated["last_fill_time"] = event_time
+                if price is not None:
+                    aggregated["last_fill_price_cents"] = price
+            if aggregated["fill_price_cents"] is None:
+                aggregated["fill_price_cents"] = aggregated["last_fill_price_cents"]
         settlement_by_key = {}
         for record in settlements:
             order_id = record.get("order_id")
@@ -534,7 +596,7 @@ class EventLedger:
             if fill:
                 if fill.get("fill_price_cents") is not None:
                     merged["fill_price_cents"] = fill.get("fill_price_cents")
-                if fill.get("fill_count") is not None:
+                if fill.get("fill_count"):
                     merged["fill_count"] = fill.get("fill_count")
             if settle:
                 for key in (
@@ -706,13 +768,22 @@ class EventLedger:
         trade_specs = trade_specs or []
         decision_specs = decision_specs or []
         verification_specs = verification_specs or []
+        trade_coverage_start, trade_coverage_end = self._fetch_event_window(EVENT_TYPE_ORDER_SUBMITTED)
         decision_coverage_start, decision_coverage_end = self._fetch_event_window(EVENT_TYPE_TRADE_DECISION)
 
         for spec in trade_specs:
             path = Path(spec["path"])
             legacy = self._load_json_list(path)
             ledger = self.get_trade_records(path)
-            report["trade_logs"].append(self._compare_trade_records(path, legacy, ledger))
+            report["trade_logs"].append(
+                self._compare_trade_records(
+                    path,
+                    legacy,
+                    ledger,
+                    coverage_start=trade_coverage_start,
+                    coverage_end=trade_coverage_end,
+                )
+            )
 
         for spec in decision_specs:
             path = Path(spec["path"])
@@ -736,11 +807,22 @@ class EventLedger:
                 self._normalize_verification_row(record)
                 for record in legacy_state.get("verified", [])
             ]
+            raw_ledger_verified = self.get_verification_records(category=category)
             ledger_verified = [
                 self._normalize_verification_row(record)
-                for record in self.get_verification_records(category=category)
+                for record in raw_ledger_verified
             ]
-            row = self._compare_verification_records(path, legacy_verified, ledger_verified)
+            verification_coverage_start, verification_coverage_end = self._window_bounds(
+                raw_ledger_verified,
+                ("recorded_at", "verified_at"),
+            )
+            row = self._compare_verification_records(
+                path,
+                legacy_verified,
+                ledger_verified,
+                coverage_start=verification_coverage_start,
+                coverage_end=verification_coverage_end,
+            )
             row["verified_hash_match"] = row.pop("hash_match")
             row.pop("count_match", None)
             report["verification"].append(row)
@@ -891,6 +973,8 @@ class EventLedger:
         ledger_total_key="ledger_total_count",
         legacy_count_key="legacy_count",
         ledger_count_key="ledger_count",
+        coverage_start=None,
+        coverage_end=None,
     ):
         ledger_time_fields = ledger_time_fields or legacy_time_fields
         normalize_row = normalize_row or (lambda record: dict(record))
@@ -936,6 +1020,12 @@ class EventLedger:
         hash_match = _record_hash(comparable_legacy) == _record_hash(comparable_ledger)
         if status != "no_overlap" and (not count_match or not hash_match):
             status = "mismatch"
+        pre_coverage = (
+            status == "no_overlap" and
+            legacy_window_end is not None and
+            coverage_start is not None and
+            legacy_window_end < coverage_start
+        )
 
         return {
             "path": str(path),
@@ -947,10 +1037,13 @@ class EventLedger:
             ledger_count_key: len(comparable_ledger),
             "count_match": True if status == "no_overlap" else count_match,
             "hash_match": True if status == "no_overlap" else hash_match,
+            "pre_coverage": pre_coverage,
             "legacy_window_start": _iso_or_none(legacy_window_start),
             "legacy_window_end": _iso_or_none(legacy_window_end),
             "ledger_window_start": _iso_or_none(ledger_window_start),
             "ledger_window_end": _iso_or_none(ledger_window_end),
+            "ledger_coverage_window_start": _iso_or_none(coverage_start),
+            "ledger_coverage_window_end": _iso_or_none(coverage_end),
             "comparison_window_start": _iso_or_none(overlap_start),
             "comparison_window_end": _iso_or_none(overlap_end),
         }
@@ -963,7 +1056,7 @@ class EventLedger:
         return normalized
 
     @classmethod
-    def _compare_trade_records(cls, path, legacy, ledger):
+    def _compare_trade_records(cls, path, legacy, ledger, *, coverage_start=None, coverage_end=None):
         row = cls._compare_overlap_records(
             path,
             legacy,
@@ -971,6 +1064,8 @@ class EventLedger:
             legacy_time_fields=("timestamp",),
             ledger_time_fields=("timestamp",),
             normalize_row=cls._normalize_trade_row,
+            coverage_start=coverage_start,
+            coverage_end=coverage_end,
         )
         if row.get("comparison_status") != "mismatch":
             return row
@@ -1031,6 +1126,7 @@ class EventLedger:
                 "ledger_count": 0,
                 "count_match": True,
                 "hash_match": True,
+                "pre_coverage": True,
                 "legacy_window_start": _iso_or_none(legacy_window_start),
                 "legacy_window_end": _iso_or_none(legacy_window_end),
                 "ledger_window_start": _iso_or_none(ledger_window_start),
@@ -1070,6 +1166,7 @@ class EventLedger:
             "ledger_count": len(comparable_ledger),
             "count_match": count_match,
             "hash_match": hash_match,
+            "pre_coverage": False,
             "legacy_window_start": _iso_or_none(legacy_window_start),
             "legacy_window_end": _iso_or_none(legacy_window_end),
             "ledger_window_start": _iso_or_none(ledger_window_start),
@@ -1086,7 +1183,15 @@ class EventLedger:
         return row
 
     @classmethod
-    def _compare_verification_records(cls, path, legacy_verified, ledger_verified):
+    def _compare_verification_records(
+        cls,
+        path,
+        legacy_verified,
+        ledger_verified,
+        *,
+        coverage_start=None,
+        coverage_end=None,
+    ):
         row = cls._compare_overlap_records(
             path,
             legacy_verified,
@@ -1099,6 +1204,8 @@ class EventLedger:
             ledger_total_key="ledger_verified_total_count",
             legacy_count_key="legacy_verified_count",
             ledger_count_key="ledger_verified_count",
+            coverage_start=coverage_start,
+            coverage_end=coverage_end,
         )
         if row.get("comparison_status") == "no_overlap":
             return row

@@ -18,6 +18,8 @@ Use this runbook when ledger-backed readers disagree with the legacy JSON artifa
 python3 scripts/ledger-parity-report.py --json
 ```
 
+Treat `comparison_status: "no_overlap"` as acceptable only when the row also reports `pre_coverage: true`. Any other `no_overlap` means ledger coverage is missing for records that should already exist.
+
 2. Compare legacy and ledger read paths on the same report:
 
 ```bash
@@ -37,5 +39,6 @@ python3 scripts/daily-attribution.py --save --use-ledger
 ## Exit Criteria
 
 - parity report returns `overall_ok: True`
+- any `comparison_status: "no_overlap"` rows are explicitly marked `pre_coverage: true`
 - the affected reader produces the same business totals in legacy and ledger mode
 - the root cause is documented in a PR or incident follow-up

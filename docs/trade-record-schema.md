@@ -37,11 +37,11 @@
 | fill_price_cents | int | Kalshi API (immediate) | Plan 1 |
 | slippage_cents | int | Computed | Plan 1 |
 
-## Settlement Fields (added by reconcile-trades.py)
+## Settlement Fields (added by settlement reconciliation/backfill)
 
 | Field | Type | Source |
 |-------|------|--------|
-| settlement_result | "won" or "lost" | reconcile |
-| settlement_revenue_cents | int | reconcile |
+| settlement_result | "won" or "lost" | reconcile/backfill |
+| settlement_revenue_cents | int gross payout (100c per winning contract, 0 for losses) | reconcile/backfill |
 | fill_price_cents | int (if not set at trade time) | reconcile |
-| realized_edge | float | reconcile |
+| realized_edge | float | reconcile/backfill |

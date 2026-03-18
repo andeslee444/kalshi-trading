@@ -15,6 +15,7 @@ Until named humans are assigned, ownership is by functional role instead of pers
 
 - [service-ownership.md](./service-ownership.md)
 - [operating-cadence.md](./operating-cadence.md)
+- [self-healing-improvement-loop.md](./self-healing-improvement-loop.md)
 - [change-management.md](./change-management.md)
 - [incident-template.md](./incident-template.md)
 - [runbooks/README.md](./runbooks/README.md)

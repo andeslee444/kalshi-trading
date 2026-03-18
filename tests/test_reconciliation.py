@@ -44,7 +44,12 @@ def _annotate_trade(trade, settlements, fills):
         else:
             trade["settlement_result"] = "won" if not yes_won else "lost"
 
-        trade["settlement_revenue_cents"] = s["revenue_cents"]
+        filled_count = trade.get("count", 1) or 1
+        if order_id and order_id in fills:
+            api_fill_count = fills[order_id].get("fill_count")
+            if api_fill_count:
+                filled_count = api_fill_count
+        trade["settlement_revenue_cents"] = 100 * filled_count if trade["settlement_result"] == "won" else 0
         modified = True
 
     # Match fill price
@@ -183,6 +188,7 @@ class TestAnnotateTrade:
         result = _annotate_trade(trade_buy, settlements, {})
         assert result is True
         assert trade_buy["settlement_result"] == "won"
+        assert trade_buy["settlement_revenue_cents"] == 100
 
     def test_legacy_records_without_action_are_annotated(self):
         """Old records without action field should still be annotated."""
@@ -196,6 +202,7 @@ class TestAnnotateTrade:
         result = _annotate_trade(trade_old, settlements, {})
         assert result is True
         assert trade_old["settlement_result"] == "lost"
+        assert trade_old["settlement_revenue_cents"] == 0
 
     def test_already_annotated_skipped(self):
         """Records with settlement_result already set should be skipped."""
@@ -273,3 +280,16 @@ class TestAnnotateTrade:
         _annotate_trade(trade, {"T": {"yes_won": True, "revenue_cents": 65}}, fills)
         assert trade["fill_price_cents"] == 35
         assert trade["realized_edge"] == 0.65  # 1.0 - 0.35
+
+    def test_settlement_revenue_uses_local_trade_size_not_portfolio_ticker_total(self):
+        """Settlement payout should be per-trade, not the full portfolio revenue for the ticker."""
+        trade = {"ticker": "T", "action": "buy", "side": "yes", "count": 2}
+        _annotate_trade(trade, {"T": {"yes_won": True, "revenue_cents": 900}}, {})
+        assert trade["settlement_revenue_cents"] == 200
+
+    def test_settlement_revenue_prefers_actual_fill_count_when_available(self):
+        """Partial fills should settle on the executed quantity, not the original order size."""
+        trade = {"ticker": "T", "action": "buy", "side": "yes", "count": 3, "order_id": "order1"}
+        fills = {"order1": {"fill_price_cents": 35, "fill_count": 1}}
+        _annotate_trade(trade, {"T": {"yes_won": True, "revenue_cents": 300}}, fills)
+        assert trade["settlement_revenue_cents"] == 100

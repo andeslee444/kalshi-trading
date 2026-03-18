@@ -57,17 +57,22 @@ def _compute_pnl_cents(trade):
         return 0, False
 
     cost = trade.get("cost_cents", 0) or 0
+    fill_count = trade.get("fill_count")
+    if fill_count in (None, ""):
+        fill_count = trade.get("count", 0) or 0
+    else:
+        try:
+            fill_count = int(fill_count)
+        except (TypeError, ValueError):
+            fill_count = trade.get("count", 0) or 0
     revenue = trade.get("settlement_revenue_cents")
 
-    if revenue is not None:
-        return revenue - cost, True
-
-    # Fallback: infer from binary settlement result
-    count = trade.get("count", 0) or 0
     if settlement in ("won", "yes", True, 1):
-        return (100 * count) - cost, True
+        return (100 * fill_count) - cost, True
     elif settlement in ("lost", "no", False, 0):
         return -cost, True
+    if revenue is not None:
+        return revenue - cost, True
 
     return 0, False
 

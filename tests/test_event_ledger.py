@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from event_ledger import EventLedger
+from event_ledger import EVENT_TYPE_FILL, EVENT_TYPE_ORDER_UPDATE, EventLedger
 from pnl_attribution import PnLAttributor
 
 
@@ -68,6 +68,59 @@ def test_event_ledger_reconstructs_settled_trade_view(tmp_path):
     assert rows[0]["best_ask"] == 52
 
 
+def test_event_ledger_preserves_partial_fill_history_and_aggregates_trade_view(tmp_path):
+    ledger = EventLedger(tmp_path / "ledger.sqlite3")
+    trade_path = tmp_path / "trades.json"
+    trade = _trade()
+
+    ledger.record_order_submitted(trade, source_path=trade_path)
+    ledger.record_fill(
+        {
+            "timestamp": trade["timestamp"],
+            "ticker": trade["ticker"],
+            "order_id": trade["order_id"],
+            "fill_price_cents": 48,
+            "fill_count": 1,
+            "source_bot": trade["source_bot"],
+        },
+        source_path=trade_path,
+    )
+    ledger.record_fill(
+        {
+            "timestamp": "2026-03-14T10:00:05+00:00",
+            "ticker": trade["ticker"],
+            "order_id": trade["order_id"],
+            "fill_price_cents": 50,
+            "fill_count": 1,
+            "source_bot": trade["source_bot"],
+        },
+        source_path=trade_path,
+    )
+
+    fill_rows = ledger._fetch_event_payloads(EVENT_TYPE_FILL, source_path=trade_path)
+    rows = ledger.get_trade_records(trade_path)
+
+    assert len(fill_rows) == 2
+    assert len(rows) == 1
+    assert rows[0]["fill_count"] == 2
+    assert rows[0]["fill_price_cents"] == 49
+
+
+def test_event_ledger_preserves_order_update_history(tmp_path):
+    ledger = EventLedger(tmp_path / "ledger.sqlite3")
+    trade_path = tmp_path / "trades.json"
+    resting = _trade(timestamp="2026-03-14T10:00:00+00:00")
+    filled = _trade(timestamp="2026-03-14T10:00:05+00:00")
+    filled["status"] = "filled"
+
+    ledger.record_order_submitted(resting, source_path=trade_path)
+    ledger.record_order_submitted(filled, source_path=trade_path)
+
+    updates = ledger._fetch_event_payloads(EVENT_TYPE_ORDER_UPDATE, source_path=trade_path)
+
+    assert [row["status"] for row in updates] == ["resting", "filled"]
+
+
 def test_event_ledger_parity_report_matches_legacy_files(tmp_path):
     ledger = EventLedger(tmp_path / "ledger.sqlite3")
     trade_path = tmp_path / "trades.json"
@@ -128,6 +181,23 @@ def test_event_ledger_trade_parity_uses_overlap_window(tmp_path):
     assert row["legacy_count"] == 1
     assert row["ledger_count"] == 1
     assert row["hash_match"] is True
+
+
+def test_event_ledger_trade_parity_reports_no_overlap_for_pre_coverage_legacy_file(tmp_path):
+    ledger = EventLedger(tmp_path / "ledger.sqlite3")
+    stale_trade_path = tmp_path / "stale-trades.json"
+    active_trade_path = tmp_path / "active-trades.json"
+    stale_trade = _trade(order_id="order-stale", timestamp="2026-03-10T10:00:00+00:00")
+    active_trade = _trade(order_id="order-active", timestamp="2026-03-14T10:00:00+00:00")
+
+    stale_trade_path.write_text(json.dumps([stale_trade]))
+    ledger.record_order_submitted(active_trade, source_path=active_trade_path)
+
+    report = ledger.build_parity_report(trade_specs=[{"path": stale_trade_path}])
+    row = report["trade_logs"][0]
+
+    assert row["comparison_status"] == "no_overlap"
+    assert row["pre_coverage"] is True
 
 
 def test_event_ledger_trade_parity_reports_ledger_superset(tmp_path):

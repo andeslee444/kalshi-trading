@@ -6,7 +6,8 @@ queries GET /markets/{ticker} for each unsettled trade, which works even when th
 portfolio settlements endpoint doesn't return a match.
 
 Also produces a summary report: win rate, P&L, average edge on wins vs losses,
-and edge calibration.
+and edge calibration. settlement_revenue_cents is stored as gross payout
+(100c per winning contract, 0 for losses).
 
 Idempotent: skips records that already have settlement_result set.
 
@@ -36,6 +37,29 @@ log = setup_logging("backfill")
 
 # Use canonical trade file list from trade_files module
 TRADE_FILES = ALL_TRADE_PATHS
+
+
+def _settlement_contract_count(trade):
+    count = trade.get("fill_count")
+    if count in (None, ""):
+        count = trade.get("count", 1)
+    try:
+        return int(count or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _gross_settlement_revenue_cents(trade):
+    return 100 * _settlement_contract_count(trade) if trade.get("settlement_result") == "won" else 0
+
+
+def _trade_pnl_cents(trade):
+    cost = trade.get("cost_cents", 0) or 0
+    if trade.get("settlement_result") == "won":
+        return (100 * _settlement_contract_count(trade)) - cost
+    if trade.get("settlement_result") == "lost":
+        return -cost
+    return 0
 
 
 def _sync_settled_trades_to_ledger(trade_file, trades, ledger):
@@ -169,16 +193,10 @@ def backfill(dry_run=False):
             else:
                 trade["settlement_result"] = "won" if not yes_won else "lost"
 
-            # Compute revenue: won = 100 - price, lost = -price
-            # price_cents is per-contract; cost_cents is total (price * count), don't use it
             price = trade.get("price_cents")
             if price is None:
                 price = 50
-            count = trade.get("count", 1)
-            if trade["settlement_result"] == "won":
-                trade["settlement_revenue_cents"] = (100 - price) * count
-            else:
-                trade["settlement_revenue_cents"] = -price * count
+            trade["settlement_revenue_cents"] = _gross_settlement_revenue_cents(trade)
 
             # Compute realized edge (in P(YES) frame to match model_prob convention)
             if trade.get("model_prob") is not None:
@@ -225,7 +243,7 @@ def summary_report():
     losses = [t for t in settled if t["settlement_result"] == "lost"]
 
     # P&L
-    total_pnl = sum(t.get("settlement_revenue_cents", 0) or 0 for t in settled)
+    total_pnl = sum(_trade_pnl_cents(t) for t in settled)
 
     # Average edge on wins vs losses
     win_edges = [t["model_prob"] - (t.get("price_cents", 50) or 50) / 100.0
@@ -279,7 +297,7 @@ def summary_report():
             by_bot[bot]["wins"] += 1
         else:
             by_bot[bot]["losses"] += 1
-        by_bot[bot]["pnl"] += t.get("settlement_revenue_cents", 0) or 0
+        by_bot[bot]["pnl"] += _trade_pnl_cents(t)
 
     if by_bot:
         print(f"\n  Per-Bot Breakdown:")

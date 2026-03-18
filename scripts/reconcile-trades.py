@@ -3,7 +3,8 @@
 
 Walks all trade log files, matches each trade to API settlement data and fill info,
 and writes settlement_result, settlement_revenue_cents, fill_price_cents, and
-realized_edge back into the trade record.
+realized_edge back into the trade record. settlement_revenue_cents is stored as
+gross settlement payout (100c per winning contract, 0 for losses).
 
 Idempotent: skips records that already have settlement_result set.
 Writes go through TradeStore so file format stays unchanged.
@@ -134,7 +135,12 @@ def _annotate_trade(trade, settlements, fills):
         else:
             trade["settlement_result"] = "won" if not yes_won else "lost"
 
-        trade["settlement_revenue_cents"] = s["revenue_cents"]
+        filled_count = trade.get("count", 1) or 1
+        if order_id and order_id in fills:
+            api_fill_count = fills[order_id].get("fill_count")
+            if api_fill_count:
+                filled_count = api_fill_count
+        trade["settlement_revenue_cents"] = 100 * filled_count if trade["settlement_result"] == "won" else 0
         modified = True
 
     # Match fill price
@@ -188,12 +194,13 @@ def reconcile_all(dry_run=False):
             if _annotate_trade(trade, settlements, fills):
                 try:
                     if trade.get("order_id") and trade.get("fill_price_cents") is not None:
+                        fill = fills.get(trade.get("order_id"), {})
                         ledger.record_fill({
                             "timestamp": trade.get("timestamp"),
                             "ticker": trade.get("ticker"),
                             "order_id": trade.get("order_id"),
-                            "fill_price_cents": trade.get("fill_price_cents"),
-                            "fill_count": trade.get("count"),
+                            "fill_price_cents": fill.get("fill_price_cents", trade.get("fill_price_cents")),
+                            "fill_count": fill.get("fill_count"),
                             "source_bot": trade.get("source_bot"),
                         }, source_path=trade_file)
                     if trade.get("settlement_result") is not None:

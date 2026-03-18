@@ -49,8 +49,10 @@ def _overall_ok(report):
     for row in rows:
         if not row:
             continue
-        if row.get("comparison_status") == "no_overlap":
+        if row.get("comparison_status") == "no_overlap" and row.get("pre_coverage"):
             continue
+        if row.get("comparison_status") == "no_overlap":
+            return False
         if "count_match" in row and not row["count_match"]:
             return False
         if "hash_match" in row and not row["hash_match"]:

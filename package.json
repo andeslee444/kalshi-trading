@@ -59,6 +59,10 @@
     "backfill": "python3 scripts/backfill-settlements.py",
     "skip-audit": "python3 scripts/skip-audit.py",
     "daily": "bash scripts/daily-automation.sh",
+    "ops-loop": "python3 scripts/daily-ops-loop.py",
+    "ops-loop:dry": "python3 scripts/daily-ops-loop.py --dry-run",
+    "ops-loop:json": "python3 scripts/daily-ops-loop.py --json",
+    "ops-loop:skip": "python3 scripts/daily-ops-loop.py --skip-refresh",
     "test": "pytest tests/ -v"
   },
   "dependencies": {},
