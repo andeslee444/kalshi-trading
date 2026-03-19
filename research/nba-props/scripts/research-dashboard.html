@@ -55,6 +55,7 @@
       <button class="tab-btn tab-active py-3 text-sm font-medium" data-tab="overview">Overview</button>
       <button class="tab-btn tab-inactive py-3 text-sm font-medium" data-tab="experiments">Experiments</button>
       <button class="tab-btn tab-inactive py-3 text-sm font-medium" data-tab="sensitivity">Sensitivity</button>
+      <button class="tab-btn tab-inactive py-3 text-sm font-medium" data-tab="agent-log">Agent Log</button>
       <button class="tab-btn tab-inactive py-3 text-sm font-medium" data-tab="controls">Controls</button>
       <button class="tab-btn tab-inactive py-3 text-sm font-medium" data-tab="data">Data</button>
     </div>
@@ -170,6 +171,24 @@
     <div id="tab-sensitivity" class="tab-content hidden">
       <div id="sensitivity-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         <div class="card text-center text-zinc-500 col-span-full">Loading sensitivity data...</div>
+      </div>
+    </div>
+
+    <!-- Tab: Agent Log -->
+    <div id="tab-agent-log" class="tab-content hidden">
+      <div class="card">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="text-sm font-semibold text-zinc-300">Agent Thoughts &amp; Actions</h3>
+          <div class="flex items-center gap-3">
+            <label class="flex items-center gap-1.5 text-xs text-zinc-500 cursor-pointer">
+              <input type="checkbox" id="log-autoscroll" checked class="rounded"> Auto-scroll
+            </label>
+            <span id="log-size" class="text-xs text-zinc-600 mono"></span>
+          </div>
+        </div>
+        <div id="agent-log-container" class="bg-zinc-950 rounded border border-zinc-800 p-3 overflow-y-auto mono text-xs text-zinc-400 whitespace-pre-wrap" style="height: 600px; max-height: 80vh;">
+          <span class="text-zinc-600">Waiting for agent output...</span>
+        </div>
       </div>
     </div>
 
@@ -945,6 +964,72 @@
     setInterval(updateCountdown, 1000);
     // Fetch orchestrator state every 30 seconds
     setInterval(fetchOrchestratorStatus, 30000);
+    // ── Agent Log ─────────────────────────────────────────────────────
+    var _logOffset = 0;
+    var _logContainer = document.getElementById('agent-log-container');
+    var _logAutoScroll = document.getElementById('log-autoscroll');
+    var _logInitialized = false;
+
+    function colorizeLogLine(line) {
+      var span = document.createElement('span');
+      if (/^\[THINKING\]/.test(line)) {
+        span.className = 'text-zinc-500 italic';
+        span.textContent = line.replace('[THINKING] ', '');
+        var wrapper = document.createElement('span');
+        var label = document.createElement('span');
+        label.className = 'text-purple-400/70 not-italic';
+        label.textContent = '\u{1F4AD} ';
+        wrapper.appendChild(label);
+        wrapper.appendChild(span);
+        return wrapper;
+      } else if (/^\[TOOL\] (Edit|Write):/.test(line)) {
+        span.className = 'text-yellow-400 font-medium';
+      } else if (/^\[TOOL\] Bash:/.test(line)) {
+        span.className = 'text-blue-400';
+      } else if (/^\[TOOL\] (Read|Glob|Grep):/.test(line)) {
+        span.className = 'text-cyan-400/70';
+      } else if (/^\[TOOL\]/.test(line)) {
+        span.className = 'text-blue-400';
+      } else if (/^\[RESULT\]/.test(line)) {
+        span.className = 'text-zinc-600 text-[0.7rem]';
+      } else if (/^\[ERROR\]/.test(line)) {
+        span.className = 'text-red-400 font-medium';
+      } else if (/^(brier_score:|calibration_error:|expected_profit|sample_size:|hit_rate:)/i.test(line.trim())) {
+        span.className = 'text-green-400';
+      } else if (/^(CRASH|ERROR|Traceback|Exception)/i.test(line.trim())) {
+        span.className = 'text-red-400';
+      } else if (/git (commit|reset|checkout)/i.test(line)) {
+        span.className = 'text-purple-400';
+      }
+      span.textContent = line;
+      return span;
+    }
+
+    function appendLogLines(lines) {
+      if (!lines || !lines.length) return;
+      if (!_logInitialized) { _logContainer.textContent = ''; _logInitialized = true; }
+      lines.forEach(function(line) {
+        _logContainer.appendChild(colorizeLogLine(line));
+        _logContainer.appendChild(document.createTextNode('\n'));
+      });
+      while (_logContainer.childNodes.length > 4000) { _logContainer.removeChild(_logContainer.childNodes[0]); }
+      if (_logAutoScroll.checked) { _logContainer.scrollTop = _logContainer.scrollHeight; }
+    }
+
+    function fetchAgentLog() {
+      var url = '/api/agent-log?lines=200';
+      if (_logOffset > 0) url += '&offset=' + _logOffset;
+      return api(url).then(function(data) {
+        if (!data) return;
+        _logOffset = data.offset || 0;
+        var sizeEl = document.getElementById('log-size');
+        if (data.size) { sizeEl.textContent = (data.size / 1024).toFixed(1) + ' KB'; }
+        if (data.lines && data.lines.length > 0) { appendLogLines(data.lines); }
+      });
+    }
+
+    fetchAgentLog();
+    setInterval(fetchAgentLog, 3000);
   </script>
 </body>
 </html>

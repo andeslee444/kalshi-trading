@@ -23,7 +23,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-DEFAULT_OUTPUT = "../kalshi-trading/config/oracle-calibration.json"
+DEFAULT_OUTPUT = "../../config/oracle-calibration.json"
 
 BOOK_B_PARAMS = [
     "MATCHUP_MULTIPLIER",

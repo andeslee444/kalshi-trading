@@ -19,6 +19,7 @@
     "collect:full": "python3 -m collect.batch_collector --min-minutes 20 --max-players 100 --games 30",
     "export": "python3 -m export.export_calibration",
     "export:dry": "python3 -m export.export_calibration --dry-run",
+    "collect:prices": "python3 scripts/collect_pregame_prices.py --all",
     "test": "python3 -m pytest tests/ -v"
   }
 }

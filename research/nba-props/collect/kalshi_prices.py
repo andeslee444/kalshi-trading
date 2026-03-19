@@ -30,7 +30,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 # Import Kalshi client from sibling repo
-KALSHI_TRADING_ROOT = _PROJECT_ROOT.parent / "kalshi-trading"
+KALSHI_TRADING_ROOT = _PROJECT_ROOT.parent.parent
 if str(KALSHI_TRADING_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(KALSHI_TRADING_ROOT / "src"))
 
@@ -87,7 +87,7 @@ def collect_kalshi_prices(
 ) -> dict:
     """Collect settled NBA prop markets and their price history from Kalshi."""
     from dotenv import load_dotenv
-    load_dotenv(str(KALSHI_TRADING_ROOT / ".env"))
+    load_dotenv(str(_PROJECT_ROOT.parent.parent / ".env"))
 
     from kalshi.infra.kalshi_client import KalshiClient
     client = KalshiClient()

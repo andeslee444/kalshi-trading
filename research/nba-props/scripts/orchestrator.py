@@ -51,7 +51,7 @@ RESEARCH_PROGRAM = PROJECT_ROOT / "research_program.md"
 EXPORT_HISTORY = DATA_DIR / "export-history.json"
 ORCHESTRATOR_STATE = DATA_DIR / "orchestrator-state.json"
 HINTS_FILE = DATA_DIR / "director-hints.txt"
-EXPORT_OUTPUT = PROJECT_ROOT / ".." / "kalshi-trading" / "config" / "oracle-calibration.json"
+EXPORT_OUTPUT = PROJECT_ROOT.parent.parent / "config" / "oracle-calibration.json"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -85,7 +85,7 @@ def start_dashboard() -> threading.Thread:
         )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        uvicorn.run(mod.app, host="0.0.0.0", port=3457, log_level="warning")
+        uvicorn.run(mod.app, host="127.0.0.1", port=3457, log_level="warning")
 
     t = threading.Thread(target=_run, daemon=True, name="dashboard")
     t.start()
@@ -120,8 +120,9 @@ def start_agent() -> subprocess.Popen | None:
     try:
         proc = subprocess.Popen(
             [
-                "claude", "--print",
+                "claude", "--print", "--verbose",
                 "-p", prompt,
+                "--output-format", "stream-json",
                 "--allowedTools", "Edit,Bash,Read,Glob,Grep",
             ],
             stdout=_agent_log_file,
@@ -752,12 +753,10 @@ def _show_new_log_lines(log_path: Path, old_size: int, new_size: int) -> None:
 
 
 def _handle_signal(signum, frame):
-    """Handle Ctrl+C gracefully."""
+    """Handle Ctrl+C — only sets shutdown flag. Cleanup happens in main()'s finally block."""
     print()
     _print_status("Shutdown", "received interrupt, cleaning up...", _YELLOW)
     _shutdown.set()
-    stop_agent("shutdown")
-    sys.exit(0)
 
 
 # ── Main ─────────────────────────────────────────────────────────────

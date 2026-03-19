@@ -24,7 +24,7 @@ from statistics import correlation as _corr
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 # ── Paths ────────────────────────────────────────────────────────────
 
@@ -564,6 +564,100 @@ async def get_orchestrator_status():
     })
 
 
+# ── Agent log ────────────────────────────────────────────────────
+
+AGENT_LOG = PROJECT_ROOT / "run.log"
+
+
+def _parse_stream_json_line(line: str) -> str | None:
+    """Parse a stream-json line into a readable string."""
+    line = line.strip()
+    if not line:
+        return None
+    if not line.startswith("{"):
+        return line
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return line
+
+    etype = event.get("type", "")
+    if etype == "assistant":
+        msg = event.get("message", {})
+        content = msg.get("content", [])
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                btype = block.get("type", "")
+                if btype == "thinking":
+                    text = block.get("thinking", "")
+                    if text:
+                        parts.append(f"[THINKING] {text}")
+                elif btype == "text":
+                    text = block.get("text", "")
+                    if text:
+                        parts.append(text)
+                elif btype == "tool_use":
+                    name = block.get("name", "?")
+                    inp = block.get("input", {})
+                    if name in ("Read", "Glob", "Grep"):
+                        target = inp.get("file_path") or inp.get("pattern") or inp.get("path", "")
+                        parts.append(f"[TOOL] {name}: {target}")
+                    elif name == "Edit":
+                        parts.append(f"[TOOL] Edit: {inp.get('file_path', '')}")
+                    elif name == "Bash":
+                        parts.append(f"[TOOL] Bash: {inp.get('command', '')[:200]}")
+                    else:
+                        parts.append(f"[TOOL] {name}")
+        return "\n".join(parts) if parts else None
+    elif etype == "result":
+        result = event.get("result", "")
+        subtype = event.get("subtype", "")
+        if subtype == "success" and result:
+            return f"[RESULT] {str(result)[:300]}"
+        elif subtype == "error":
+            return f"[ERROR] {result}"
+        return None
+    elif etype == "system":
+        return None
+    return None
+
+
+@app.get("/api/agent-log")
+async def get_agent_log(lines: int = 200, offset: int = 0):
+    """Return parsed agent log lines from run.log."""
+    if not AGENT_LOG.exists():
+        return JSONResponse(content={"lines": [], "offset": 0, "size": 0})
+    try:
+        size = AGENT_LOG.stat().st_size
+        if offset > 0:
+            if offset >= size:
+                return JSONResponse(content={"lines": [], "offset": size, "size": size, "incremental": True})
+            with open(AGENT_LOG, "r", errors="replace") as f:
+                f.seek(offset)
+                new_text = f.read()
+            raw_lines = new_text.rstrip("\n").split("\n") if new_text.strip() else []
+            parsed = []
+            for raw in raw_lines:
+                result = _parse_stream_json_line(raw)
+                if result:
+                    parsed.extend(result.split("\n"))
+            return JSONResponse(content={"lines": parsed, "offset": size, "size": size, "incremental": True})
+        with open(AGENT_LOG, "r", errors="replace") as f:
+            all_lines = f.readlines()
+        raw_tail = [l.rstrip("\n") for l in all_lines[-lines:]]
+        parsed = []
+        for raw in raw_tail:
+            result = _parse_stream_json_line(raw)
+            if result:
+                parsed.extend(result.split("\n"))
+        return JSONResponse(content={"lines": parsed[-lines:], "offset": size, "size": size, "incremental": False})
+    except OSError as e:
+        return JSONResponse(content={"lines": [], "offset": 0, "error": str(e)})
+
+
 # ── Main ─────────────────────────────────────────────────────────────
 
 
@@ -571,7 +665,7 @@ def main():
     print(f"Starting Sport Autoresearch Dashboard on http://localhost:3457")
     print(f"Project root: {PROJECT_ROOT}")
     print(f"Results TSV:  {RESULTS_TSV}")
-    uvicorn.run(app, host="0.0.0.0", port=3457, log_level="info")
+    uvicorn.run(app, host="127.0.0.1", port=3457, log_level="info")
 
 
 if __name__ == "__main__":

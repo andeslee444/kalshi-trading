@@ -515,7 +515,7 @@ async def _async_main(args: argparse.Namespace) -> None:
         env_loaded = False
         for env_path in [
             _PROJECT_ROOT / ".env",
-            Path.home() / "Documents" / "cursor-projects" / "kalshi-trading" / ".env",
+            _PROJECT_ROOT.parent.parent / ".env",
         ]:
             if env_path.exists():
                 load_dotenv(env_path)
