@@ -139,6 +139,23 @@ If run.log has no `---` markers, the run crashed before producing metrics.
 | `RECENCY_WEIGHT_SEASON` | 1.0 | 0.5 – 2.0 | Weight for games 11+ |
 | `USE_STAT_SPACE` | False | True/False | Shift stats vs shift probabilities |
 | `BOOK_B_MIN_EDGE` | 0.10 | 0.03 – 0.20 | Min edge to trigger trade |
+| `KDE_MODE` | False | True/False | Kernel density estimator vs binary hit rate |
+| `FALLBACK_SIGMA` | 0.15 | 0.5 – 2.0 | KDE bandwidth multiplier on Silverman's rule. Only matters when KDE_MODE=True |
+| `BAYESIAN_PRIOR_STRENGTH` | 0.0 | 1.0 – 8.0 | Shrink hit-rate toward 0.5 for small samples (0 = disabled) |
+| `MINUTES_WEIGHT_FACTOR` | 0.0 | 0.2 – 1.0 | Down-weight low-minutes games in hit rate (0 = disabled) |
+| `MINUTES_CV_SHRINK` | 0.0 | 0.1 – 0.5 | Shrink predictions for inconsistent-minutes players (0 = disabled) |
+| `REST_BOOST` | 0.0 | 0.0 – 0.05 | Probability boost for 3+ days rest (0 = disabled) |
+
+### Per-Stat Parameter Overrides
+
+Any adjustment param can have a stat-specific version by appending `_STATNAME`:
+```python
+MATCHUP_MULTIPLIER = 0.05          # default for all stats
+MATCHUP_MULTIPLIER_POINTS = 0.10   # override for points only
+VENUE_MULTIPLIER_BLOCKS = 0.0      # disable venue for blocks
+```
+Stat suffixes: `POINTS`, `REBOUNDS`, `ASSISTS`, `THREE_POINTERS`, `STEALS`,
+`BLOCKS`, `TURNOVERS`, `POINTS_REBOUNDS_ASSISTS`, `REBOUNDS_ASSISTS`.
 
 ### Book C (not yet testable — needs live game data)
 
@@ -169,14 +186,48 @@ BOOK_B_MIN_EDGE:    0.03, 0.05, 0.08, 0.12, 0.15, 0.20
 Take the best value from each sensitive parameter.
 Combine them and test. Then fine-tune around the combined optimum.
 
-### Phase 3: Fundamentally Different Approaches
+### Phase 3: New Model Features (PRIORITY — try these first)
+
+These change the base probability estimation, not just adjustments:
+
+1. **Bayesian shrinkage** (most impactful):
+   `BAYESIAN_PRIOR_STRENGTH = 3.0` — prevents extreme probabilities from small samples.
+   Try 2.0, 3.0, 5.0. Tested: prior=3.0 gives brier=0.1925 (breaks 0.1928 plateau).
+
+2. **Minutes-adjusted weighting**:
+   `MINUTES_WEIGHT_FACTOR = 0.5` — garbage-time 3-minute games get 0.3x weight.
+   Try 0.3, 0.5, 0.8, 1.0.
+
+3. **Minutes CV shrinkage**:
+   `MINUTES_CV_SHRINK = 0.3` — players with volatile minutes get predictions
+   pulled toward 0.5. Try 0.1, 0.2, 0.3, 0.5.
+
+4. **KDE mode** (smooth probabilities):
+   `KDE_MODE = True, FALLBACK_SIGMA = 1.0` — Gaussian kernel density instead of
+   binary hit rate. Sigma is multiplier on Silverman's bandwidth. Try 0.5, 0.8, 1.0, 1.5.
+
+5. **Extended rest boost**:
+   `REST_BOOST = 0.02` — 3+ days rest gets a small nudge. Try 0.01, 0.02, 0.03.
+
+6. **Combine best**:
+   `BAYESIAN_PRIOR_STRENGTH=3.0, MINUTES_CV_SHRINK=0.2` then re-optimize adjustments.
+
+### Phase 4: Per-Stat Tuning
+
+Use `--verbose` to see per-stat breakdown, then add per-stat overrides:
+```python
+MATCHUP_MULTIPLIER_POINTS = 0.10   # points needs more matchup sensitivity
+VENUE_MULTIPLIER_BLOCKS = 0.0      # disable venue for low-variance stats
+```
+
+### Phase 5: Fundamentally Different Approaches
 
 - `USE_STAT_SPACE = True` — re-optimize all multipliers for stat-space
 - All recency weights equal (1.0) — maybe recency weighting hurts
-- Remove caps entirely (set to 1.0) — maybe clamping loses information
 - Very aggressive recency (LAST5 = 5.0, others = 0.5) — recent form only
+- KDE + per-stat sigma: try different FALLBACK_SIGMA per stat type
 
-### Phase 4: Fine-Tuning
+### Phase 6: Fine-Tuning
 
 Binary search around the best values found so far.
 Try perturbations of +-10% around the optimum.
