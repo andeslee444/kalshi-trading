@@ -1,0 +1,950 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sport Autoresearch Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <style>
+    body { font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+    .tab-active { border-bottom: 2px solid #22c55e; color: #22c55e; }
+    .tab-inactive { border-bottom: 2px solid transparent; color: #a1a1aa; }
+    .tab-inactive:hover { color: #d4d4d8; }
+    .row-best { background: rgba(34,197,94,0.12); }
+    .row-run { background: rgba(34,197,94,0.05); }
+    .row-crash { background: rgba(239,68,68,0.12); }
+    .badge-continue { background: #166534; color: #4ade80; }
+    .badge-collect { background: #854d0e; color: #fbbf24; }
+    .badge-alert { background: #991b1b; color: #fca5a5; }
+    .badge-converged { background: #1e3a5f; color: #60a5fa; }
+    table { border-collapse: collapse; }
+    th { cursor: pointer; user-select: none; }
+    th:hover { color: #22c55e; }
+    .sort-asc::after { content: ' \25B2'; font-size: 0.7em; }
+    .sort-desc::after { content: ' \25BC'; font-size: 0.7em; }
+    .card { background: #27272a; border: 1px solid #3f3f46; border-radius: 0.5rem; padding: 1.25rem; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #18181b; }
+    ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
+    .expand-row { display: none; }
+    .expand-row.open { display: table-row; }
+    .mono { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.8rem; }
+  </style>
+</head>
+<body class="bg-zinc-900 text-zinc-100 min-h-screen">
+
+  <!-- Header -->
+  <header class="border-b border-zinc-800 px-6 py-4">
+    <div class="flex items-center justify-between max-w-screen-2xl mx-auto">
+      <div>
+        <h1 class="text-xl font-semibold text-zinc-100">Sport Autoresearch</h1>
+        <p class="text-xs text-zinc-500 mt-0.5">Research Dashboard &mdash; port 3457</p>
+      </div>
+      <div class="flex items-center gap-4">
+        <span id="countdown-display" class="text-xs px-2 py-1 rounded font-mono bg-zinc-800 text-zinc-400 border border-zinc-700">--:--</span>
+        <span id="research-badge" class="text-xs px-2 py-1 rounded font-medium bg-zinc-700 text-zinc-400">Checking...</span>
+        <span id="refresh-ts" class="text-xs text-zinc-600"></span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Tabs -->
+  <nav class="border-b border-zinc-800 px-6">
+    <div class="flex gap-6 max-w-screen-2xl mx-auto">
+      <button class="tab-btn tab-active py-3 text-sm font-medium" data-tab="overview">Overview</button>
+      <button class="tab-btn tab-inactive py-3 text-sm font-medium" data-tab="experiments">Experiments</button>
+      <button class="tab-btn tab-inactive py-3 text-sm font-medium" data-tab="sensitivity">Sensitivity</button>
+      <button class="tab-btn tab-inactive py-3 text-sm font-medium" data-tab="controls">Controls</button>
+      <button class="tab-btn tab-inactive py-3 text-sm font-medium" data-tab="data">Data</button>
+    </div>
+  </nav>
+
+  <!-- Content -->
+  <main class="px-6 py-6 max-w-screen-2xl mx-auto">
+
+    <!-- Tab: Overview -->
+    <div id="tab-overview" class="tab-content">
+      <!-- Best vs Baseline -->
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+        <div class="card">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-sm font-semibold text-green-400">Current Best</h3>
+            <span id="best-commit" class="mono text-zinc-500"></span>
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div><p class="text-xs text-zinc-500">Brier Score</p><p id="best-brier" class="text-2xl font-bold text-green-400 mono">--</p></div>
+            <div><p class="text-xs text-zinc-500">Cal Error</p><p id="best-cal" class="text-lg font-semibold text-zinc-300 mono">--</p></div>
+            <div><p class="text-xs text-zinc-500">Expected Profit</p><p id="best-profit" class="text-lg font-semibold text-zinc-300 mono">--</p></div>
+            <div><p class="text-xs text-zinc-500">Sample Size</p><p id="best-samples" class="text-lg font-semibold text-zinc-300 mono">--</p></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-sm font-semibold text-zinc-400">Baseline</h3>
+            <span id="baseline-commit" class="mono text-zinc-500"></span>
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div><p class="text-xs text-zinc-500">Brier Score</p><p id="baseline-brier" class="text-2xl font-bold text-zinc-400 mono">--</p></div>
+            <div><p class="text-xs text-zinc-500">Cal Error</p><p id="baseline-cal" class="text-lg font-semibold text-zinc-400 mono">--</p></div>
+            <div><p class="text-xs text-zinc-500">Expected Profit</p><p id="baseline-profit" class="text-lg font-semibold text-zinc-400 mono">--</p></div>
+            <div><p class="text-xs text-zinc-500">Sample Size</p><p id="baseline-samples" class="text-lg font-semibold text-zinc-400 mono">--</p></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Director recommendation -->
+      <div class="card mb-6">
+        <div class="flex items-center gap-3 mb-2">
+          <h3 class="text-sm font-semibold text-zinc-300">Director Recommendation</h3>
+          <span id="director-badge" class="text-xs px-2 py-0.5 rounded font-medium badge-continue">--</span>
+        </div>
+        <p id="director-reason" class="text-sm text-zinc-400">Loading...</p>
+        <p id="director-detail" class="text-xs text-zinc-500 mt-1"></p>
+      </div>
+
+      <!-- Stats row -->
+      <div class="grid grid-cols-2 md:grid-cols-6 gap-4 mb-6">
+        <div class="card text-center">
+          <p class="text-xs text-zinc-500">Total Experiments</p>
+          <p id="stat-total" class="text-2xl font-bold text-zinc-100 mono">--</p>
+        </div>
+        <div class="card text-center">
+          <p class="text-xs text-zinc-500">Kept (run)</p>
+          <p id="stat-kept" class="text-2xl font-bold text-green-400 mono">--</p>
+        </div>
+        <div class="card text-center">
+          <p class="text-xs text-zinc-500">Crashed</p>
+          <p id="stat-crashed" class="text-2xl font-bold text-red-400 mono">--</p>
+        </div>
+        <div class="card text-center">
+          <p class="text-xs text-zinc-500">Players</p>
+          <p id="stat-players" class="text-2xl font-bold text-blue-400 mono">--</p>
+        </div>
+        <div class="card text-center">
+          <p class="text-xs text-zinc-500">Games</p>
+          <p id="stat-games" class="text-2xl font-bold text-blue-400 mono">--</p>
+        </div>
+        <div class="card text-center">
+          <p class="text-xs text-zinc-500">Last Collection</p>
+          <p id="stat-freshness" class="text-sm font-semibold text-zinc-400 mt-1">--</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tab: Experiments -->
+    <div id="tab-experiments" class="tab-content hidden">
+      <!-- Brier chart -->
+      <div class="card mb-6">
+        <h3 class="text-sm font-semibold text-zinc-300 mb-3">Brier Score Over Experiments</h3>
+        <div style="height: 280px; position: relative;">
+          <canvas id="brier-chart"></canvas>
+        </div>
+      </div>
+
+      <!-- Results table -->
+      <div class="card overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="text-left text-xs text-zinc-500 border-b border-zinc-700">
+              <th class="px-2 py-2" data-col="index">#</th>
+              <th class="px-2 py-2" data-col="timestamp">Time</th>
+              <th class="px-2 py-2" data-col="commit">Commit</th>
+              <th class="px-2 py-2" data-col="brier_score">Brier</th>
+              <th class="px-2 py-2" data-col="calibration_error">Cal Err</th>
+              <th class="px-2 py-2" data-col="expected_profit_pct">Profit%</th>
+              <th class="px-2 py-2" data-col="hit_rate">Hit Rate</th>
+              <th class="px-2 py-2" data-col="sample_size">Samples</th>
+              <th class="px-2 py-2" data-col="trades_taken">Trades</th>
+              <th class="px-2 py-2">CI</th>
+              <th class="px-2 py-2" data-col="status">Status</th>
+              <th class="px-2 py-2">Description</th>
+            </tr>
+          </thead>
+          <tbody id="results-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Tab: Sensitivity -->
+    <div id="tab-sensitivity" class="tab-content hidden">
+      <div id="sensitivity-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        <div class="card text-center text-zinc-500 col-span-full">Loading sensitivity data...</div>
+      </div>
+    </div>
+
+    <!-- Tab: Controls -->
+    <div id="tab-controls" class="tab-content hidden">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <!-- Research Agent -->
+        <div class="card">
+          <h3 class="text-sm font-semibold text-zinc-300 mb-4">Research Agent</h3>
+          <div class="flex items-center gap-3 mb-4">
+            <span class="text-xs text-zinc-500">Status:</span>
+            <span id="ctrl-research-status" class="text-sm font-medium text-zinc-400">Checking...</span>
+          </div>
+          <div class="flex gap-3">
+            <button id="btn-start-research" class="px-4 py-2 bg-green-700 hover:bg-green-600 text-white text-sm rounded font-medium transition">Start Research</button>
+            <button id="btn-stop-research" class="px-4 py-2 bg-red-700 hover:bg-red-600 text-white text-sm rounded font-medium transition">Stop Research</button>
+          </div>
+        </div>
+
+        <!-- Director -->
+        <div class="card">
+          <h3 class="text-sm font-semibold text-zinc-300 mb-4">Director Check</h3>
+          <p class="text-xs text-zinc-500 mb-4">Run the statistical director analysis (convergence, CI overlap, metric gaming).</p>
+          <button id="btn-director" class="px-4 py-2 bg-blue-700 hover:bg-blue-600 text-white text-sm rounded font-medium transition">Run Director Check</button>
+          <div id="director-result" class="mt-3 text-xs text-zinc-500"></div>
+        </div>
+
+        <!-- Baseline -->
+        <div class="card">
+          <h3 class="text-sm font-semibold text-zinc-300 mb-4">Baseline</h3>
+          <p class="text-xs text-zinc-500 mb-4">Run experiment with default params (not logged to results.tsv).</p>
+          <button id="btn-baseline" class="px-4 py-2 bg-zinc-700 hover:bg-zinc-600 text-white text-sm rounded font-medium transition">Run Baseline</button>
+          <div id="baseline-result" class="mt-3 text-xs text-zinc-500"></div>
+        </div>
+
+        <!-- Collect Data -->
+        <div class="card">
+          <h3 class="text-sm font-semibold text-zinc-300 mb-4">Collect Data</h3>
+          <p class="text-xs text-zinc-500 mb-4">Launch batch collector (NBA player gamelogs).</p>
+          <button id="btn-collect" class="px-4 py-2 bg-purple-700 hover:bg-purple-600 text-white text-sm rounded font-medium transition">Collect Data</button>
+          <div id="collect-result" class="mt-3 text-xs text-zinc-500"></div>
+        </div>
+      </div>
+
+      <!-- Git log -->
+      <div class="card mt-6">
+        <h3 class="text-sm font-semibold text-zinc-300 mb-3">Recent Git Log</h3>
+        <div id="git-log" class="mono text-xs text-zinc-400 space-y-1 max-h-64 overflow-y-auto"></div>
+      </div>
+    </div>
+
+    <!-- Tab: Data -->
+    <div id="tab-data" class="tab-content hidden">
+      <div class="card mb-4">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="text-sm font-semibold text-zinc-300">Data Status</h3>
+          <span id="data-freshness" class="text-xs text-zinc-500"></span>
+        </div>
+        <div class="grid grid-cols-3 gap-4 mb-4">
+          <div><p class="text-xs text-zinc-500">Players</p><p id="data-players" class="text-xl font-bold text-blue-400 mono">--</p></div>
+          <div><p class="text-xs text-zinc-500">Total Games</p><p id="data-games" class="text-xl font-bold text-blue-400 mono">--</p></div>
+          <div><p class="text-xs text-zinc-500">Collection Summary</p><p id="data-collection-ts" class="text-sm text-zinc-400">--</p></div>
+        </div>
+      </div>
+
+      <!-- Player Roster -->
+      <div class="card overflow-x-auto">
+        <h3 class="text-sm font-semibold text-zinc-300 mb-3">Player Roster</h3>
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="text-left text-xs text-zinc-500 border-b border-zinc-700">
+              <th class="px-2 py-2">Player</th>
+              <th class="px-2 py-2">Team</th>
+              <th class="px-2 py-2">Games</th>
+              <th class="px-2 py-2">Avg Pts</th>
+              <th class="px-2 py-2">Avg Reb</th>
+              <th class="px-2 py-2">Avg Ast</th>
+            </tr>
+          </thead>
+          <tbody id="roster-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </main>
+
+  <script>
+    // ── State ──────────────────────────────────────────────────────────
+
+    var resultsData = [];
+    var sortCol = null;
+    var sortAsc = true;
+    var brierChart = null;
+    var sensitivityCharts = [];
+
+    // ── Utility: safe text escaping ────────────────────────────────────
+
+    function esc(s) {
+      if (!s) return '';
+      var d = document.createElement('div');
+      d.textContent = String(s);
+      return d.innerHTML;
+    }
+
+    // ── DOM builders (safe — all data goes through esc()) ──────────────
+
+    function buildResultRow(r, bestBrier) {
+      var cls = '';
+      if (r.status === 'crash') cls = 'row-crash';
+      else if (r.brier_score === bestBrier && r.brier_score > 0) cls = 'row-best';
+      else if (r.status === 'run') cls = 'row-run';
+
+      var profitCls = r.expected_profit_pct >= 0 ? 'text-green-400' : 'text-red-400';
+      var brierCls = (r.brier_score === bestBrier && r.brier_score > 0) ? 'text-green-400' : '';
+      var statusCls = r.status === 'crash' ? 'bg-red-900/50 text-red-400' : 'bg-green-900/50 text-green-400';
+
+      var tr = document.createElement('tr');
+      tr.className = cls + ' border-b border-zinc-800/50 hover:bg-zinc-800/30 cursor-pointer';
+      tr.setAttribute('data-index', r.index);
+      tr.addEventListener('click', function() { toggleExpand(r.index); });
+
+      // Format timestamp: "3:45 PM" or "Mar 18 3:45 PM"
+      var tsDisplay = '';
+      if (r.timestamp) {
+        var d = new Date(r.timestamp);
+        if (!isNaN(d.getTime())) {
+          var now = new Date();
+          if (d.toDateString() === now.toDateString()) {
+            tsDisplay = d.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'});
+          } else {
+            tsDisplay = d.toLocaleDateString([], {month: 'short', day: 'numeric'}) + ' ' +
+                        d.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'});
+          }
+        }
+      }
+
+      var cells = [
+        { text: r.index, cls: 'mono text-zinc-500' },
+        { text: tsDisplay, cls: 'mono text-zinc-500 text-xs whitespace-nowrap' },
+        { text: r.commit || '', cls: 'mono text-zinc-400' },
+        { text: r.brier_score > 0 ? r.brier_score.toFixed(4) : '--', cls: 'mono font-medium ' + brierCls },
+        { text: r.calibration_error >= 0 ? r.calibration_error.toFixed(4) : '--', cls: 'mono' },
+        { text: r.expected_profit_pct.toFixed(1) + '%', cls: 'mono ' + profitCls },
+        { text: r.hit_rate > 0 ? r.hit_rate.toFixed(3) : '--', cls: 'mono' },
+        { text: r.sample_size || '--', cls: 'mono' },
+        { text: r.trades_taken || '--', cls: 'mono' },
+        { text: r.brier_95ci || '', cls: 'mono text-zinc-500' },
+      ];
+
+      cells.forEach(function(c) {
+        var td = document.createElement('td');
+        td.className = 'px-2 py-1.5 ' + (c.cls || '');
+        td.textContent = c.text;
+        tr.appendChild(td);
+      });
+
+      // Status badge cell
+      var tdStatus = document.createElement('td');
+      tdStatus.className = 'px-2 py-1.5';
+      var badge = document.createElement('span');
+      badge.className = 'text-xs px-1.5 py-0.5 rounded ' + statusCls;
+      badge.textContent = r.status || '--';
+      tdStatus.appendChild(badge);
+      tr.appendChild(tdStatus);
+
+      // Description cell
+      var tdDesc = document.createElement('td');
+      tdDesc.className = 'px-2 py-1.5 text-zinc-400 text-xs max-w-xs truncate';
+      tdDesc.textContent = r.description || '';
+      tr.appendChild(tdDesc);
+
+      // Expand row
+      var trExpand = document.createElement('tr');
+      trExpand.className = 'expand-row';
+      trExpand.id = 'expand-' + r.index;
+      var tdExpand = document.createElement('td');
+      tdExpand.colSpan = 11;
+      tdExpand.className = 'px-4 py-3 bg-zinc-800/50';
+      var detail = document.createElement('div');
+      detail.className = 'mono text-xs text-zinc-400';
+      var lines = [
+        'Commit: ' + (r.commit || 'N/A'),
+        'Description: ' + (r.description || 'N/A'),
+        'Brier 95% CI: ' + (r.brier_95ci || 'N/A'),
+        'Calibration Error: ' + (r.calibration_error >= 0 ? r.calibration_error.toFixed(4) : 'N/A'),
+        'Expected Profit: ' + r.expected_profit_pct.toFixed(1) + '%',
+        'Hit Rate: ' + (r.hit_rate > 0 ? r.hit_rate.toFixed(3) : 'N/A'),
+        'Sample Size: ' + r.sample_size + '  Trades: ' + r.trades_taken,
+      ];
+      lines.forEach(function(l) {
+        var p = document.createElement('p');
+        p.textContent = l;
+        detail.appendChild(p);
+      });
+      tdExpand.appendChild(detail);
+      trExpand.appendChild(tdExpand);
+
+      return { main: tr, expand: trExpand };
+    }
+
+    // ── Tab switching ──────────────────────────────────────────────────
+
+    function switchTab(tab) {
+      document.querySelectorAll('.tab-content').forEach(function(el) { el.classList.add('hidden'); });
+      document.querySelectorAll('.tab-btn').forEach(function(btn) {
+        btn.classList.remove('tab-active');
+        btn.classList.add('tab-inactive');
+      });
+      var panel = document.getElementById('tab-' + tab);
+      if (panel) panel.classList.remove('hidden');
+      var btn = document.querySelector('.tab-btn[data-tab="' + tab + '"]');
+      if (btn) { btn.classList.remove('tab-inactive'); btn.classList.add('tab-active'); }
+      window.location.hash = tab;
+    }
+
+    document.querySelectorAll('.tab-btn').forEach(function(btn) {
+      btn.addEventListener('click', function() { switchTab(btn.dataset.tab); });
+    });
+
+    // Init tab from hash
+    var initTab = window.location.hash.slice(1) || 'overview';
+    switchTab(initTab);
+
+    // ── API helpers ────────────────────────────────────────────────────
+
+    function api(url, opts) {
+      opts = opts || {};
+      return fetch(url, opts).then(function(res) { return res.json(); }).catch(function(e) {
+        console.error('API error:', url, e);
+        return null;
+      });
+    }
+
+    // ── Overview ───────────────────────────────────────────────────────
+
+    function updateOverview(results) {
+      var valid = results.filter(function(r) { return r.brier_score > 0 && r.status !== 'crash'; });
+      if (!valid.length) return;
+
+      // Filter to v2-era: most recent contiguous run with same sample_size
+      var latestSize = valid[valid.length - 1].sample_size;
+      var v2Start = valid.length - 1;
+      for (var i = valid.length - 2; i >= 0; i--) {
+        if (valid[i].sample_size === latestSize) v2Start = i;
+        else break;
+      }
+      var v2 = valid.slice(v2Start);
+
+      // Find best from v2 experiments only
+      var best = v2.reduce(function(a, b) { return a.brier_score < b.brier_score ? a : b; });
+      document.getElementById('best-brier').textContent = best.brier_score.toFixed(4);
+      document.getElementById('best-cal').textContent = best.calibration_error.toFixed(4);
+      document.getElementById('best-profit').textContent = best.expected_profit_pct.toFixed(1) + '%';
+      document.getElementById('best-samples').textContent = best.sample_size.toLocaleString();
+      document.getElementById('best-commit').textContent = best.commit || '';
+
+      // Find baseline
+      var baseline = valid.find(function(r) { return (r.description || '').toLowerCase().indexOf('baseline') >= 0; }) || valid[0];
+      document.getElementById('baseline-brier').textContent = baseline.brier_score.toFixed(4);
+      document.getElementById('baseline-cal').textContent = baseline.calibration_error.toFixed(4);
+      document.getElementById('baseline-profit').textContent = baseline.expected_profit_pct.toFixed(1) + '%';
+      document.getElementById('baseline-samples').textContent = baseline.sample_size.toLocaleString();
+      document.getElementById('baseline-commit').textContent = baseline.commit || '';
+
+      // Stats
+      document.getElementById('stat-total').textContent = results.length;
+      document.getElementById('stat-kept').textContent = valid.length;
+      document.getElementById('stat-crashed').textContent = results.filter(function(r) { return r.status === 'crash'; }).length;
+    }
+
+    function updateDirector() {
+      return api('/api/director').then(function(state) {
+        if (!state || state.status === 'no_data') {
+          document.getElementById('director-badge').textContent = 'NO DATA';
+          document.getElementById('director-reason').textContent = 'Run a director check first.';
+          return;
+        }
+        var rec = state.recommendation || {};
+        var action = rec.action || 'UNKNOWN';
+        var badge = document.getElementById('director-badge');
+        badge.textContent = action;
+        badge.className = 'text-xs px-2 py-0.5 rounded font-medium ';
+        if (action === 'CONTINUE') badge.className += 'badge-continue';
+        else if (action === 'COLLECT_DATA') badge.className += 'badge-collect';
+        else if (action.indexOf('ALERT') >= 0) badge.className += 'badge-alert';
+        else if (action.indexOf('CONVERGED') >= 0) badge.className += 'badge-converged';
+        else badge.className += 'bg-zinc-700 text-zinc-400';
+
+        document.getElementById('director-reason').textContent = rec.reason || '';
+        document.getElementById('director-detail').textContent = rec.detail || '';
+      });
+    }
+
+    function updateDataStatus() {
+      return api('/api/data-status').then(function(data) {
+        if (!data) return;
+        document.getElementById('stat-players').textContent = data.n_players;
+        document.getElementById('stat-games').textContent = data.n_games.toLocaleString();
+        var freshness = data.latest_collection || 'Never';
+        document.getElementById('stat-freshness').textContent = freshness === 'Never' ? freshness : freshness.split('T')[0];
+        // Data tab
+        document.getElementById('data-players').textContent = data.n_players;
+        document.getElementById('data-games').textContent = data.n_games.toLocaleString();
+        document.getElementById('data-freshness').textContent = data.latest_collection ? 'Last: ' + data.latest_collection : '';
+        document.getElementById('data-collection-ts').textContent = data.collection_summary_ts || 'N/A';
+        // Roster
+        renderRoster(data.player_roster || []);
+      });
+    }
+
+    function renderRoster(roster) {
+      var tbody = document.getElementById('roster-tbody');
+      tbody.textContent = '';
+      if (!roster.length) {
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.colSpan = 6;
+        td.className = 'px-2 py-4 text-center text-zinc-500';
+        td.textContent = 'No player data collected';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+      }
+      roster.forEach(function(p) {
+        var tr = document.createElement('tr');
+        tr.className = 'border-b border-zinc-800 hover:bg-zinc-800/50';
+        var cells = [
+          { text: p.player_name, cls: 'font-medium' },
+          { text: p.team, cls: 'text-zinc-400' },
+          { text: p.game_count, cls: 'mono' },
+          { text: p.avg_points, cls: 'mono' },
+          { text: p.avg_rebounds, cls: 'mono' },
+          { text: p.avg_assists, cls: 'mono' },
+        ];
+        cells.forEach(function(c) {
+          var td = document.createElement('td');
+          td.className = 'px-2 py-1.5 ' + (c.cls || '');
+          td.textContent = c.text;
+          tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+      });
+    }
+
+    // ── Experiments Tab ────────────────────────────────────────────────
+
+    function renderResultsTable(results) {
+      var tbody = document.getElementById('results-tbody');
+      tbody.textContent = '';
+
+      if (!results.length) {
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.colSpan = 12;
+        td.className = 'px-2 py-8 text-center text-zinc-500';
+        td.textContent = 'No experiments yet';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+      }
+
+      var valid = results.filter(function(r) { return r.brier_score > 0 && r.status !== 'crash'; });
+      var bestBrier = valid.length ? Math.min.apply(null, valid.map(function(r) { return r.brier_score; })) : 999;
+
+      var sorted = results.slice();
+      if (sortCol) {
+        sorted.sort(function(a, b) {
+          var va = a[sortCol], vb = b[sortCol];
+          if (typeof va === 'number' && typeof vb === 'number') return sortAsc ? va - vb : vb - va;
+          return sortAsc ? String(va).localeCompare(String(vb)) : String(vb).localeCompare(String(va));
+        });
+      }
+
+      sorted.forEach(function(r) {
+        var rowPair = buildResultRow(r, bestBrier);
+        tbody.appendChild(rowPair.main);
+        tbody.appendChild(rowPair.expand);
+      });
+    }
+
+    function toggleExpand(idx) {
+      var row = document.getElementById('expand-' + idx);
+      if (row) row.classList.toggle('open');
+    }
+
+    // Sort on header click
+    document.querySelectorAll('#tab-experiments th[data-col]').forEach(function(th) {
+      th.addEventListener('click', function() {
+        var col = th.dataset.col;
+        if (sortCol === col) sortAsc = !sortAsc;
+        else { sortCol = col; sortAsc = true; }
+        document.querySelectorAll('#tab-experiments th').forEach(function(h) {
+          h.classList.remove('sort-asc', 'sort-desc');
+        });
+        th.classList.add(sortAsc ? 'sort-asc' : 'sort-desc');
+        renderResultsTable(resultsData);
+      });
+    });
+
+    // ── Brier Chart ────────────────────────────────────────────────────
+
+    function renderBrierChart(results) {
+      var valid = results.filter(function(r) { return r.brier_score > 0; });
+      if (!valid.length) return;
+
+      var baseline = valid.find(function(r) { return (r.description || '').toLowerCase().indexOf('baseline') >= 0; });
+      var baselineBrier = baseline ? baseline.brier_score : null;
+      var minBrier = Math.min.apply(null, valid.map(function(r) { return r.brier_score; }));
+
+      var ctx = document.getElementById('brier-chart').getContext('2d');
+      if (brierChart) brierChart.destroy();
+
+      var colors = valid.map(function(r) {
+        if (r.status === 'crash') return '#ef4444';
+        if (r.brier_score === minBrier) return '#22c55e';
+        return '#60a5fa';
+      });
+
+      var datasets = [{
+        label: 'Brier Score',
+        data: valid.map(function(r) { return { x: r.index, y: r.brier_score }; }),
+        pointBackgroundColor: colors,
+        pointBorderColor: colors,
+        borderColor: '#3f3f46',
+        borderWidth: 1,
+        pointRadius: 4,
+        pointHoverRadius: 6,
+        fill: false,
+        tension: 0.1,
+      }];
+
+      if (baselineBrier !== null) {
+        datasets.push({
+          label: 'Baseline',
+          data: valid.map(function(r) { return { x: r.index, y: baselineBrier }; }),
+          borderColor: '#a1a1aa',
+          borderDash: [6, 3],
+          borderWidth: 1,
+          pointRadius: 0,
+          fill: false,
+        });
+      }
+
+      brierChart = new Chart(ctx, {
+        type: 'line',
+        data: { datasets: datasets },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            x: { type: 'linear', title: { display: true, text: 'Experiment #', color: '#71717a' },
+                 grid: { color: '#27272a' }, ticks: { color: '#71717a' } },
+            y: { title: { display: true, text: 'Brier Score', color: '#71717a' },
+                 grid: { color: '#27272a' }, ticks: { color: '#71717a' } },
+          },
+          plugins: {
+            legend: { labels: { color: '#a1a1aa' } },
+            tooltip: {
+              callbacks: {
+                label: function(ctx) {
+                  var r = valid[ctx.dataIndex];
+                  if (!r) return ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(4);
+                  return '#' + r.index + ' ' + r.commit + ': ' + r.brier_score.toFixed(4) + ' (' + (r.description || '') + ')';
+                }
+              }
+            }
+          }
+        }
+      });
+    }
+
+    // ── Sensitivity Tab ────────────────────────────────────────────────
+
+    function updateSensitivity() {
+      return api('/api/sensitivity').then(function(data) {
+        if (!data || !data.params) return;
+
+        var grid = document.getElementById('sensitivity-grid');
+        sensitivityCharts.forEach(function(c) { c.destroy(); });
+        sensitivityCharts = [];
+        grid.textContent = '';
+
+        if (!data.params.length) {
+          var card = document.createElement('div');
+          card.className = 'card text-center text-zinc-500 col-span-full';
+          card.textContent = 'Not enough varied experiments for sensitivity analysis';
+          grid.appendChild(card);
+          return;
+        }
+
+        data.params.forEach(function(p, i) {
+          var card = document.createElement('div');
+          card.className = 'card';
+
+          // Header row
+          var header = document.createElement('div');
+          header.className = 'flex items-center justify-between mb-2';
+          var title = document.createElement('h4');
+          title.className = 'text-sm font-medium ' + (p.sensitive ? 'text-orange-400' : 'text-zinc-400');
+          title.textContent = p.param;
+          var corr = document.createElement('span');
+          corr.className = 'mono text-xs ' + (Math.abs(p.correlation) > 0.3 ? 'text-orange-400' : 'text-zinc-500');
+          corr.textContent = 'r=' + p.correlation.toFixed(3);
+          header.appendChild(title);
+          header.appendChild(corr);
+          card.appendChild(header);
+
+          // Info line
+          var info = document.createElement('div');
+          info.className = 'text-xs text-zinc-500 mb-2';
+          info.textContent = p.n_points + ' points \u00B7 range [' + p.value_range[0] + ', ' + p.value_range[1] + '] \u00B7 ' + (p.sensitive ? 'SENSITIVE' : 'noise');
+          card.appendChild(info);
+
+          // Canvas wrapper
+          var canvasWrap = document.createElement('div');
+          canvasWrap.style.height = '160px';
+          canvasWrap.style.position = 'relative';
+          var canvas = document.createElement('canvas');
+          canvas.id = 'sens-chart-' + i;
+          canvasWrap.appendChild(canvas);
+          card.appendChild(canvasWrap);
+
+          grid.appendChild(card);
+        });
+
+        // Render scatter charts after DOM update
+        requestAnimationFrame(function() {
+          data.params.forEach(function(p, i) {
+            var canvas = document.getElementById('sens-chart-' + i);
+            if (!canvas) return;
+            var chart = new Chart(canvas.getContext('2d'), {
+              type: 'scatter',
+              data: {
+                datasets: [{
+                  data: p.scatter,
+                  pointBackgroundColor: p.sensitive ? '#f97316' : '#60a5fa',
+                  pointBorderColor: p.sensitive ? '#f97316' : '#60a5fa',
+                  pointRadius: 4,
+                }]
+              },
+              options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { display: false } },
+                scales: {
+                  x: { title: { display: true, text: p.param, color: '#52525b', font: { size: 10 } },
+                       grid: { color: '#27272a' }, ticks: { color: '#52525b', font: { size: 9 } } },
+                  y: { title: { display: true, text: 'Brier', color: '#52525b', font: { size: 10 } },
+                       grid: { color: '#27272a' }, ticks: { color: '#52525b', font: { size: 9 } } },
+                }
+              }
+            });
+            sensitivityCharts.push(chart);
+          });
+        });
+      });
+    }
+
+    // ── Controls Tab ───────────────────────────────────────────────────
+
+    function updateResearchStatus() {
+      return api('/api/research/status').then(function(data) {
+        if (!data) return;
+        var el = document.getElementById('ctrl-research-status');
+        var badge = document.getElementById('research-badge');
+        if (data.running) {
+          el.textContent = '';
+          var s1 = document.createElement('span');
+          s1.className = 'text-green-400';
+          s1.textContent = 'Running';
+          var s2 = document.createElement('span');
+          s2.className = 'text-zinc-500';
+          s2.textContent = ' (PID ' + data.pid + ')';
+          el.appendChild(s1);
+          el.appendChild(s2);
+          badge.textContent = 'Agent Running';
+          badge.className = 'text-xs px-2 py-1 rounded font-medium bg-green-900/50 text-green-400';
+        } else {
+          el.textContent = 'Stopped';
+          el.className = 'text-sm font-medium text-zinc-500';
+          badge.textContent = 'Agent Stopped';
+          badge.className = 'text-xs px-2 py-1 rounded font-medium bg-zinc-700 text-zinc-400';
+        }
+      });
+    }
+
+    document.getElementById('btn-start-research').addEventListener('click', function() {
+      var btn = this;
+      btn.disabled = true;
+      btn.textContent = 'Starting...';
+      api('/api/research/start', { method: 'POST' }).then(function(data) {
+        if (data && data.status === 'started') btn.textContent = 'Started!';
+        else if (data && data.status === 'already_running') btn.textContent = 'Already Running';
+        else btn.textContent = 'Error';
+        setTimeout(function() { btn.disabled = false; btn.textContent = 'Start Research'; updateResearchStatus(); }, 2000);
+      });
+    });
+
+    document.getElementById('btn-stop-research').addEventListener('click', function() {
+      var btn = this;
+      btn.disabled = true;
+      btn.textContent = 'Stopping...';
+      api('/api/research/stop', { method: 'POST' }).then(function(data) {
+        btn.textContent = (data && data.status === 'stopped') ? 'Stopped!' : 'Done';
+        setTimeout(function() { btn.disabled = false; btn.textContent = 'Stop Research'; updateResearchStatus(); }, 2000);
+      });
+    });
+
+    document.getElementById('btn-director').addEventListener('click', function() {
+      var btn = this;
+      var result = document.getElementById('director-result');
+      btn.disabled = true;
+      btn.textContent = 'Running...';
+      result.textContent = '';
+      api('/api/director/check', { method: 'POST' }).then(function(data) {
+        if (data && data.recommendation) {
+          result.textContent = data.recommendation.action + ': ' + data.recommendation.reason;
+          updateDirector();
+        } else {
+          result.textContent = 'Error running check';
+        }
+        btn.disabled = false;
+        btn.textContent = 'Run Director Check';
+      });
+    });
+
+    document.getElementById('btn-baseline').addEventListener('click', function() {
+      var btn = this;
+      var result = document.getElementById('baseline-result');
+      btn.disabled = true;
+      btn.textContent = 'Running...';
+      result.textContent = 'Running baseline experiment (may take a minute)...';
+      api('/api/baseline').then(function(data) {
+        if (data && data.status === 'ok' && data.metrics) {
+          var m = data.metrics;
+          result.textContent = 'Brier: ' + (m.brier_score || '--') + ' | Cal: ' + (m.calibration_error || '--') + ' | Profit: ' + (m.expected_profit_pct || '--') + '%';
+        } else {
+          result.textContent = 'Error: ' + ((data && data.message) || (data && data.stderr) || 'unknown');
+        }
+        btn.disabled = false;
+        btn.textContent = 'Run Baseline';
+      });
+    });
+
+    document.getElementById('btn-collect').addEventListener('click', function() {
+      var btn = this;
+      var result = document.getElementById('collect-result');
+      btn.disabled = true;
+      btn.textContent = 'Launching...';
+      api('/api/collect', { method: 'POST' }).then(function(data) {
+        if (data && data.status === 'started') {
+          result.textContent = 'Collector started (PID ' + data.pid + ')';
+        } else {
+          result.textContent = 'Error starting collector';
+        }
+        btn.disabled = false;
+        btn.textContent = 'Collect Data';
+      });
+    });
+
+    function updateGitLog() {
+      return api('/api/git-log').then(function(data) {
+        if (!data || !data.entries) return;
+        var el = document.getElementById('git-log');
+        el.textContent = '';
+        data.entries.forEach(function(e) {
+          var div = document.createElement('div');
+          var commitSpan = document.createElement('span');
+          commitSpan.className = 'text-green-400';
+          commitSpan.textContent = e.commit;
+          div.appendChild(commitSpan);
+          div.appendChild(document.createTextNode(' ' + e.message));
+          el.appendChild(div);
+        });
+      });
+    }
+
+    // ── Refresh loop ───────────────────────────────────────────────────
+
+    function refresh() {
+      return api('/api/results').then(function(results) {
+        if (results) {
+          resultsData = results;
+          updateOverview(results);
+          renderResultsTable(results);
+          renderBrierChart(results);
+        }
+        return Promise.all([
+          updateDirector(),
+          updateDataStatus(),
+          updateResearchStatus(),
+        ]);
+      }).then(function() {
+        document.getElementById('refresh-ts').textContent = 'Updated ' + new Date().toLocaleTimeString();
+      });
+    }
+
+    function fullRefresh() {
+      return refresh().then(function() {
+        return Promise.all([
+          updateSensitivity(),
+          updateGitLog(),
+        ]);
+      });
+    }
+
+    // ── Countdown timer ─────────────────────────────────────────────
+
+    var _nextCheckAt = null;
+    var _avgExpSeconds = 0;
+    var _lastExpCount = 0;
+    var _lastExpTime = Date.now();
+
+    function updateCountdown() {
+      var el = document.getElementById('countdown-display');
+      if (!_nextCheckAt) {
+        el.textContent = '--:--';
+        return;
+      }
+      var now = new Date();
+      var target = new Date(_nextCheckAt);
+      var diff = Math.max(0, Math.floor((target - now) / 1000));
+      var mm = Math.floor(diff / 60);
+      var ss = diff % 60;
+
+      var parts = [];
+      parts.push('Director ' + mm + ':' + (ss < 10 ? '0' : '') + ss);
+
+      // Experiment ETA
+      if (_avgExpSeconds > 0 && _lastExpTime) {
+        var sinceLast = (Date.now() - _lastExpTime) / 1000;
+        var expEta = Math.max(0, Math.floor(_avgExpSeconds - sinceLast));
+        if (expEta > 0) parts.push('Exp ~' + expEta + 's');
+        else parts.push('Exp due');
+      }
+
+      el.textContent = parts.join('  |  ');
+    }
+
+    function fetchOrchestratorStatus() {
+      return api('/api/orchestrator/status').then(function(data) {
+        if (!data) return;
+        if (data.next_check_at) _nextCheckAt = data.next_check_at;
+        if (data.avg_experiment_seconds) _avgExpSeconds = data.avg_experiment_seconds;
+      });
+    }
+
+    // Track experiment count for timing
+    function trackExperiments(results) {
+      if (!results) return;
+      if (results.length > _lastExpCount && _lastExpCount > 0) {
+        _lastExpTime = Date.now();
+      }
+      _lastExpCount = results.length;
+    }
+
+    // Initial load
+    fullRefresh();
+    fetchOrchestratorStatus();
+
+    // Auto-refresh every 15 seconds (faster for live feel)
+    setInterval(function() {
+      refresh().then(function() {
+        trackExperiments(resultsData);
+      });
+    }, 15000);
+    // Full refresh (including sensitivity + git + orchestrator) every 2 minutes
+    setInterval(function() {
+      fullRefresh();
+      fetchOrchestratorStatus();
+    }, 120000);
+    // Countdown ticks every second
+    setInterval(updateCountdown, 1000);
+    // Fetch orchestrator state every 30 seconds
+    setInterval(fetchOrchestratorStatus, 30000);
+  </script>
+</body>
+</html>

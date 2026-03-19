@@ -1,0 +1,24 @@
+{
+  "name": "sport-autoresearch",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Autonomous sports research pipeline for Oracle NBA prop calibration",
+  "scripts": {
+    "dev": "PYTHONUNBUFFERED=1 python3 scripts/orchestrator.py",
+    "dev:no-agent": "python3 scripts/orchestrator.py --no-agent",
+    "dev:collect-first": "python3 scripts/orchestrator.py --collect-first",
+    "dev:fast": "python3 scripts/orchestrator.py --check-interval 60",
+    "dashboard": "python3 scripts/research-dashboard.py",
+    "baseline": "python3 run_experiment.py --baseline",
+    "experiment": "python3 run_experiment.py",
+    "experiment:verbose": "python3 run_experiment.py --verbose",
+    "director": "python3 scripts/director_checks.py",
+    "director:json": "python3 scripts/director_checks.py --json",
+    "collect": "python3 -m collect.batch_collector --min-minutes 20 --max-players 50",
+    "collect:dry": "python3 -m collect.batch_collector --min-minutes 20 --max-players 50 --dry-run",
+    "collect:full": "python3 -m collect.batch_collector --min-minutes 20 --max-players 100 --games 30",
+    "export": "python3 -m export.export_calibration",
+    "export:dry": "python3 -m export.export_calibration --dry-run",
+    "test": "python3 -m pytest tests/ -v"
+  }
+}

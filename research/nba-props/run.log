@@ -1,19 +1,13 @@
 ---
-brier_score:         0.1925
-brier_95ci:          0.1914-0.1938
-calibration_error:   0.0188
-expected_profit_pct: -0.8
-hit_rate:            0.691
+brier_score:         0.1936
+brier_95ci:          0.1924-0.1948
+calibration_error:   0.0215
+expected_profit_pct: -24.1
+hit_rate:            0.688
 sample_size:         93313
-trades_taken:        217
-elapsed_seconds:     3.5
-commit:              d61c8e0
+trades_taken:        233
+elapsed_seconds:     3.2
+commit:              8dd18b4
 use_stat_space:      False
-params_changed:      MATCHUP_MULTIPLIER, MATCHUP_CAP, VENUE_MULTIPLIER, VENUE_CAP, B2B_PENALTY, RECENCY_WEIGHT_LAST5, RECENCY_WEIGHT_LAST10, RECENCY_WEIGHT_SEASON, BOOK_B_MIN_EDGE
+params_changed:      MATCHUP_MULTIPLIER, VENUE_MULTIPLIER, B2B_PENALTY, RECENCY_WEIGHT_LAST5, RECENCY_WEIGHT_LAST10, BOOK_B_MIN_EDGE
 ---
-{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_011TPacKXxRRAACdffYYUDav","type":"tool_result","content":"[autoresearch/20260319 d61c8e0] exp: very high matchup mm=0.50/0.03 tight cap\n 1 file changed, 2 insertions(+), 2 deletions(-)\nbrier_score:         0.1925\nbrier_95ci:          0.1914-0.1938\ncalibration_error:   0.0188\nexpected_profit_pct: -0.8","is_error":false}]},"parent_tool_use_id":null,"session_id":"7e3591ee-cb04-46f3-9eeb-030f3b3ead3a","uuid":"fecfd553-f9f0-48b9-b476-6697a8ba6da9","timestamp":"2026-03-19T04:16:21.896Z","tool_use_result":{"stdout":"[autoresearch/20260319 d61c8e0] exp: very high matchup mm=0.50/0.03 tight cap\n 1 file changed, 2 insertions(+), 2 deletions(-)\nbrier_score:         0.1925\nbrier_95ci:          0.1914-0.1938\ncalibration_error:   0.0188\nexpected_profit_pct: -0.8","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false}}
-{"type":"assistant","message":{"model":"claude-opus-4-6","id":"msg_018CChSoXseeHScBBNLmJ2mf","type":"message","role":"assistant","content":[{"type":"thinking","thinking":"0.1925 vs 0.1924. Slightly worse. Revert.","signature":"EtEBCkYICxgCKkBDWm/cRtv+8mSyvUezR+SsyY1yFSqO07scDQsI0Gcm+wa9vcbfI0ukZfJ/heppvfBHNBIIBlH9DKMznVxKXP3KEgyTSx0gnLmHHEsN6+waDEvgFY4otptyYP9lLSIwkglqocOcjqLZY7/ESJG0SVt8n4OuSx+mYwdb2MLlnCjbsPltx9QVvWWLwjvWI13VKjk8mR6DNbDieR+LBjkmg6n+zWI3EGbzPJ+k1H5ZwrPzptCv0QdzBWjpkTY8t6+veSR3/6OUDZv7C1IYAQ=="}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"cache_creation_input_tokens":311,"cache_read_input_tokens":94841,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":311},"output_tokens":8,"service_tier":"standard","inference_geo":"not_available"},"context_management":null},"parent_tool_use_id":null,"session_id":"7e3591ee-cb04-46f3-9eeb-030f3b3ead3a","uuid":"a2dcb2fd-63ce-430f-859c-da219258e085"}
-{"type":"assistant","message":{"model":"claude-opus-4-6","id":"msg_018CChSoXseeHScBBNLmJ2mf","type":"message","role":"assistant","content":[{"type":"text","text":"Slight regression (0.1925 vs 0.1924). Reverting."}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"cache_creation_input_tokens":311,"cache_read_input_tokens":94841,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":311},"output_tokens":8,"service_tier":"standard","inference_geo":"not_available"},"context_management":null},"parent_tool_use_id":null,"session_id":"7e3591ee-cb04-46f3-9eeb-030f3b3ead3a","uuid":"0819152f-dc39-4da9-a483-8b087eef13f9"}
-{"type":"assistant","message":{"model":"claude-opus-4-6","id":"msg_018CChSoXseeHScBBNLmJ2mf","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01Jo7NHoB39PZxgfH6A8c2Li","name":"Bash","input":{"command":"git reset --hard HEAD~1","description":"Revert"},"caller":{"type":"direct"}}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"cache_creation_input_tokens":311,"cache_read_input_tokens":94841,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":311},"output_tokens":8,"service_tier":"standard","inference_geo":"not_available"},"context_management":null},"parent_tool_use_id":null,"session_id":"7e3591ee-cb04-46f3-9eeb-030f3b3ead3a","uuid":"fa4a7c31-e17f-4535-b10e-5164b838f697"}
-{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01Jo7NHoB39PZxgfH6A8c2Li","type":"tool_result","content":"HEAD is now at ab082b9 exp: mm=0.20/0.04 vm=0.05/0.03 (higher matchup mult)","is_error":false}]},"parent_tool_use_id":null,"session_id":"7e3591ee-cb04-46f3-9eeb-030f3b3ead3a","uuid":"9bcedf4a-a8ed-4e34-b929-38591628bc94","timestamp":"2026-03-19T04:16:26.163Z","tool_use_result":{"stdout":"HEAD is now at ab082b9 exp: mm=0.20/0.04 vm=0.05/0.03 (higher matchup mult)","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false}}
-{"type":"assistant","message":{"model":"claude-opus-4-6","id":"msg_01VXB3HLqhyfNJWS6QLadTik","type":"message","role":"assistant","content":[{"type":"text","text":"**Experiment 4: Mild B2B penalty with current best config**"}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"cache_creation_input_tokens":551,"cache_read_input_tokens":95152,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":551},"output_tokens":1,"service_tier":"standard","inference_geo":"not_available"},"context_management":null},"parent_tool_use_id":null,"session_id":"7e3591ee-cb04-46f3-9eeb-030f3b3ead3a","uuid":"6140b1d5-f4b5-4415-aa66-1631163b9bd1"}

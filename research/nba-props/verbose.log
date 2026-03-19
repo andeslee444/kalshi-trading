@@ -1,26 +1,26 @@
 ---
-brier_score:         0.1928
-brier_95ci:          0.1916-0.1940
-calibration_error:   0.0180
-expected_profit_pct: 7.0
-hit_rate:            0.691
-sample_size:         93313
-trades_taken:        1972
-elapsed_seconds:     3.2
-commit:              85a4447
+brier_score:         0.2027
+brier_95ci:          0.1985-0.2070
+calibration_error:   0.0512
+expected_profit_pct: 0.0
+hit_rate:            0.666
+sample_size:         8276
+trades_taken:        0
+elapsed_seconds:     0.1
+commit:              060047a
 use_stat_space:      False
-params_changed:      MATCHUP_MULTIPLIER, VENUE_MULTIPLIER, B2B_PENALTY, RECENCY_WEIGHT_LAST5, RECENCY_WEIGHT_LAST10, BOOK_B_MIN_EDGE
+params_changed:      MATCHUP_MULTIPLIER, VENUE_MULTIPLIER, VENUE_CAP, B2B_PENALTY, RECENCY_WEIGHT_LAST5, RECENCY_WEIGHT_LAST10
 ---
 
 Per-stat breakdown:
                        stat    brier    hit   profit%      n
   -------------------------  -------  -----  --------  -----
-                    assists  0.1832  0.724     -2.2%  10743
-                     blocks  0.1232  0.814     -3.6%   6775
-                     points  0.2428  0.578     11.9%  12618
-    points+rebounds+assists  0.2484  0.550      9.6%  12618
-                   rebounds  0.2006  0.703     15.0%  12372
-           rebounds+assists  0.2245  0.642     15.9%  12599
-                     steals  0.1305  0.802      8.4%   8237
-             three_pointers  0.1564  0.767      5.9%   7875
-                  turnovers  0.1450  0.790     23.9%   9476
+                    assists  0.2090  0.666      0.0%   1010
+                     blocks  0.1174  0.826      0.0%    582
+                     points  0.2532  0.534      0.0%   1074
+    points+rebounds+assists  0.2520  0.531      0.0%   1074
+                   rebounds  0.2093  0.686      0.0%   1063
+           rebounds+assists  0.2398  0.617      0.0%   1074
+                     steals  0.1439  0.755      0.0%    703
+             three_pointers  0.1649  0.757      0.0%    787
+                  turnovers  0.1593  0.770      0.0%    909
