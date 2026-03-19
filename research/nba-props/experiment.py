@@ -10,7 +10,7 @@ in backtester.py and cannot be changed by the agent.
 
 # ── Book B: Probability Adjustments ──────────────────────────────
 
-MATCHUP_MULTIPLIER = 0.12
+MATCHUP_MULTIPLIER = 0.20
 MATCHUP_CAP = 0.04
 VENUE_MULTIPLIER = 0.05
 VENUE_CAP = 0.03
