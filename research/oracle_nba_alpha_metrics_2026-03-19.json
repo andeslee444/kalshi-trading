@@ -1,0 +1,133 @@
+{
+  "date": "2026-03-19",
+  "repo_findings": {
+    "oracle_live_enabled": false,
+    "oracle_scans_placeholder": true,
+    "real_nba_prop_ticker_parser_broken": true,
+    "exported_calibration_stale": true,
+    "backtester_uses_proxy_prices": true,
+    "kalshi_backtest_uses_synthetic_fill_price": true
+  },
+  "locked_experiment_rerun": {
+    "baseline": {
+      "brier_score": 0.1941,
+      "calibration_error": 0.0261,
+      "expected_profit_pct": 5.8,
+      "sample_size": 93313,
+      "trades_taken": 8030
+    },
+    "current_params": {
+      "brier_score": 0.1936,
+      "calibration_error": 0.0215,
+      "expected_profit_pct": -24.1,
+      "sample_size": 93313,
+      "trades_taken": 233
+    }
+  },
+  "matched_kalshi_backtest": {
+    "total_settled": 971,
+    "matched": 679,
+    "brier_score": 0.194,
+    "calibration_error": 0.092,
+    "directional_accuracy": 0.718,
+    "per_stat": {
+      "assists": {
+        "count": 150,
+        "brier": 0.1677,
+        "accuracy": 0.753
+      },
+      "points": {
+        "count": 168,
+        "brier": 0.1961,
+        "accuracy": 0.725
+      },
+      "rebounds": {
+        "count": 175,
+        "brier": 0.2069,
+        "accuracy": 0.68
+      },
+      "steals": {
+        "count": 126,
+        "brier": 0.2067,
+        "accuracy": 0.722
+      },
+      "blocks": {
+        "count": 60,
+        "brier": 0.1892,
+        "accuracy": 0.717
+      }
+    }
+  },
+  "scored_signal_run_20260318_212834": {
+    "trades": 38,
+    "win_rate": 0.158,
+    "model_accuracy": 0.447,
+    "roi_pct": -58.8,
+    "yes_side": {
+      "trades": 6,
+      "win_rate": 1.0,
+      "roi_pct": 61.1
+    },
+    "no_side": {
+      "trades": 32,
+      "win_rate": 0.0,
+      "roi_pct": -100.0
+    }
+  },
+  "book_c_dataset": {
+    "games": 201,
+    "median_key_snapshots_per_game": 29,
+    "games_with_clutch_moment": 124,
+    "games_with_blowout_moment": 73,
+    "games_with_technical_foul": 129
+  },
+  "orderbook_snapshot_20260318_193041": {
+    "markets_total": 956,
+    "markets_with_depth": 955,
+    "median_spread": 0.05,
+    "median_displayed_depth": 1000,
+    "tight_spreads_lte_0_05": 537,
+    "tight_spreads_lte_0_10": 656,
+    "tradeable_lt_0_50_from_index": 765,
+    "stat_microstructure": {
+      "points": {
+        "markets": 266,
+        "median_spread": 0.04
+      },
+      "rebounds": {
+        "markets": 240,
+        "median_spread": 0.03
+      },
+      "assists": {
+        "markets": 190,
+        "median_spread": 0.04
+      },
+      "3PT": {
+        "markets": 119,
+        "median_spread": 0.05
+      },
+      "steals": {
+        "markets": 78,
+        "median_spread": 0.185
+      },
+      "blocks": {
+        "markets": 63,
+        "median_spread": 0.62
+      }
+    },
+    "ladder_checks": {
+      "adjacent_pairs_checked": 731,
+      "midpoint_monotonicity_violations": 102,
+      "midpoint_violation_rate": 0.14,
+      "non_0_50_style_midpoint_violations": 15,
+      "true_bid_ask_cross_violations": 9
+    }
+  },
+  "ranked_alpha_threads": [
+    "Real App live event latency edge versus Kalshi repricing",
+    "Real App crowd/game price divergence versus Kalshi",
+    "Price-aware pregame props in assists, points, rebounds, and 3PT",
+    "Pregame lineup, injury, and officials timing edge",
+    "Kalshi execution and queue-quality edge"
+  ]
+}

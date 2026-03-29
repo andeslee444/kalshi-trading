@@ -54,7 +54,7 @@ CALIBRATION_SECTIONS = ["weather", "nws", "album_sales", "box_office", "ensemble
 STAGES_CORE = [
     ("reconcile", SCRIPTS_DIR / "reconcile-trades.py", [], 120),
     ("backfill",  SCRIPTS_DIR / "backfill-settlements.py", [], 180),
-    ("backtest",  SCRIPTS_DIR / "backtest.py", ["--save"], 120),
+    ("backtest",  SCRIPTS_DIR / "backtest.py", ["--save", "--allow-canonical-save"], 120),
 ]
 
 # Calibration stages run independently -- if one fails, others still proceed.

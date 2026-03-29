@@ -76,7 +76,7 @@ load_dotenv(PROJECT_DIR / ".env")
 DEFAULT_KEY_PATH = PROJECT_DIR / "config" / "keys" / "kalshi-demo.pem"
 
 DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
-PROD_BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
+PROD_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 1.0  # seconds
@@ -199,11 +199,12 @@ def setup_signal_handlers():
 class KalshiClient(InfraKalshiClient):
     """Compatibility wrapper over the extracted infra.kalshi_client module."""
 
-    def __init__(self, api_key=None, key_path=None, mode=None):
+    def __init__(self, api_key=None, key_path=None, mode=None, confirm_production=None):
         super().__init__(
             api_key=api_key,
             key_path=key_path,
             mode=mode,
+            confirm_production=confirm_production,
             project_dir=PROJECT_DIR,
             default_key_path=DEFAULT_KEY_PATH,
             demo_base_url=DEMO_BASE_URL,

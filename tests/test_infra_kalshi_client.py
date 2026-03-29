@@ -7,6 +7,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from infra.kalshi_client import (
+    PROD_BASE_URL,
+    _normalize_base_url,
+    _normalize_mode,
     KalshiClient,
     normalize_market,
     read_market_cache,
@@ -96,3 +99,30 @@ def test_get_market_normalizes_success_response():
     assert result["yes_bid"] == 86
     assert result["yes_ask"] == 87
     assert result["volume"] == 100
+
+
+def test_get_orderbook_fetches_expected_path():
+    client = MagicMock()
+    client.get.return_value = {"orderbook": {"yes": [[61, 9]], "no": [[37, 11]]}}
+
+    result = KalshiClient.get_orderbook(client, "KXNBA-18MAR26-LALHOU-LAL")
+
+    client.get.assert_called_once_with("/markets/KXNBA-18MAR26-LALHOU-LAL/orderbook")
+    assert result["orderbook"]["yes"][0] == [61, 9]
+
+
+def test_normalize_mode_accepts_demo_and_production_aliases():
+    assert _normalize_mode("demo") == "demo"
+    assert _normalize_mode("paper") == "demo"
+    assert _normalize_mode("prod") == "production"
+    assert _normalize_mode("live") == "production"
+
+
+def test_normalize_mode_rejects_unknown_values():
+    with pytest.raises(ValueError, match="Unsupported Kalshi mode"):
+        _normalize_mode("staging")
+
+
+def test_normalize_base_url_appends_trade_api_suffix():
+    assert _normalize_base_url("https://demo-api.kalshi.co") == "https://demo-api.kalshi.co/trade-api/v2"
+    assert _normalize_base_url(PROD_BASE_URL) == PROD_BASE_URL

@@ -208,13 +208,64 @@ class TestTradeFilesImport:
         """Verify the module imports TRADE_FILES from trade_files module."""
         # The module should have TRADE_FILES imported from trade_files
         tf = calibrate_sigma.TRADE_FILES
-        # Should be the canonical 10-file list
-        assert len(tf) == 10
+        # Should track the current canonical trade file registry.
+        assert len(tf) == len(import_module("trade_files").TRADE_FILES)
+        assert len(tf) >= 10
         # Check that it has the expected structure (label, bot, filename keys)
         for entry in tf:
             assert "label" in entry
             assert "bot" in entry
             assert "filename" in entry
+
+
+class TestCalibrationSavePaths:
+
+    def test_shadow_output_skips_live_side_effects(self, tmp_path, monkeypatch):
+        calls = []
+
+        monkeypatch.setattr(calibrate_sigma, "_backup_calibration", lambda: calls.append("backup"))
+        monkeypatch.setattr(
+            calibrate_sigma,
+            "_sync_runtime_weather_config",
+            lambda *_args, **_kwargs: calls.append("sync"),
+        )
+
+        shadow_path = tmp_path / "shadow" / "weather-calibration.json"
+        payload = {"generated_at": "2026-03-22T00:00:00", "ensemble": {"weights": {"gfs": 1.0}}}
+
+        saved_path, is_canonical = calibrate_sigma._save_calibration_output(
+            payload,
+            output_path=shadow_path,
+        )
+
+        assert saved_path == shadow_path
+        assert is_canonical is False
+        assert shadow_path.exists()
+        assert calls == []
+
+    def test_canonical_output_runs_live_side_effects(self, tmp_path, monkeypatch):
+        calls = []
+        canonical_path = tmp_path / "config" / "calibration.json"
+
+        monkeypatch.setattr(calibrate_sigma, "CALIBRATION_PATH", canonical_path)
+        monkeypatch.setattr(calibrate_sigma, "_backup_calibration", lambda: calls.append("backup"))
+        monkeypatch.setattr(
+            calibrate_sigma,
+            "_sync_runtime_weather_config",
+            lambda *_args, **_kwargs: calls.append("sync"),
+        )
+
+        payload = {"generated_at": "2026-03-22T00:00:00", "ensemble": {"weights": {"gfs": 1.0}}}
+
+        saved_path, is_canonical = calibrate_sigma._save_calibration_output(
+            payload,
+            output_path=canonical_path,
+        )
+
+        assert saved_path == canonical_path
+        assert is_canonical is True
+        assert canonical_path.exists()
+        assert calls == ["backup", "sync"]
 
 
 class TestEdgeThresholdSweep:

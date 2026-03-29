@@ -1277,7 +1277,7 @@ async def api_backtest():
     """Return full backtest results (Brier scores + calibration curves)."""
     data = load_json_safe(BACKTEST_RESULTS_PATH)
     if data is None:
-        return {"error": "No backtest results found. Run: python3 scripts/backtest.py --save"}
+        return {"error": "No backtest results found. Run: python3 scripts/backtest.py --save --allow-canonical-save"}
     return data
 
 
@@ -1286,7 +1286,7 @@ async def api_calibration_curve():
     """Return just the calibration curves section from backtest results."""
     data = load_json_safe(BACKTEST_RESULTS_PATH)
     if data is None:
-        return {"error": "No backtest results found. Run: python3 scripts/backtest.py --save"}
+        return {"error": "No backtest results found. Run: python3 scripts/backtest.py --save --allow-canonical-save"}
     curves = data.get("calibration_curves", {})
     return {"calibration_curves": curves, "timestamp": data.get("timestamp", data.get("generated_at"))}
 

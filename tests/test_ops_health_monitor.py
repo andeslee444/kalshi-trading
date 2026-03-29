@@ -32,6 +32,31 @@ def test_record_bot_heartbeat_persists_state(tmp_path):
     assert data["bots"]["weather"]["last_heartbeat"]
 
 
+def test_record_bot_heartbeat_preserves_existing_bot_state(tmp_path):
+    monitor, _ = _make_monitor(tmp_path)
+    monitor._state["bots"]["oracle"] = {
+        "last_heartbeat": "2026-03-22T00:00:00+00:00",
+        "scan_metrics": {
+            "kalshi_markets": 12,
+            "signals_a": 1,
+            "signals_b": 0,
+            "signals_c": 0,
+            "total_signals": 1,
+            "trades_executed": 0,
+            "open_positions": 0,
+            "daily_pnl_cents": 0,
+        },
+        "zero_signal_streak": 2,
+    }
+
+    monitor.record_bot_heartbeat("oracle")
+
+    data = json.loads((tmp_path / "health-state.json").read_text())
+    assert data["bots"]["oracle"]["scan_metrics"]["kalshi_markets"] == 12
+    assert data["bots"]["oracle"]["zero_signal_streak"] == 2
+    assert data["bots"]["oracle"]["last_heartbeat"] != "2026-03-22T00:00:00+00:00"
+
+
 def test_record_source_error_opens_breaker_and_notifies(tmp_path):
     monitor, notifications = _make_monitor(tmp_path, source_breaker_threshold=3)
 
@@ -88,3 +113,62 @@ def test_check_per_bot_halts_creates_and_removes_halt_file(tmp_path):
 
     assert status["weather"] == "recovered"
     assert not halt_path.exists()
+
+
+def test_record_source_warning_notifies_and_marks_summary_warning(tmp_path):
+    monitor, notifications = _make_monitor(tmp_path)
+
+    monitor.record_source_warning("oracle-book-c-zero-signals", "3 scans without a live signal")
+
+    assert monitor._state["sources"]["oracle-book-c-zero-signals"]["error_count"] == 1
+    summary = monitor.get_summary()
+    assert summary["sources"]["oracle-book-c-zero-signals"]["status"] == "warning"
+    assert any(item[0] == "webhook" for item in notifications)
+    assert any(item[0] == "imessage" for item in notifications)
+
+
+def test_record_source_warning_rearms_after_success(tmp_path):
+    monitor, notifications = _make_monitor(tmp_path)
+
+    monitor.record_source_warning("oracle-book-c-zero-signals", "first")
+    monitor.record_source_success("oracle-book-c-zero-signals")
+    monitor.record_source_warning("oracle-book-c-zero-signals", "second")
+
+    webhook_count = sum(1 for kind, *_ in notifications if kind == "webhook")
+    imessage_count = sum(1 for kind, *_ in notifications if kind == "imessage")
+    assert webhook_count == 2
+    assert imessage_count == 2
+
+
+def test_update_bot_state_persists_scan_metrics(tmp_path):
+    monitor, _ = _make_monitor(tmp_path)
+
+    monitor.update_bot_state(
+        "oracle",
+        scan_metrics={
+            "kalshi_markets": 12,
+            "signals_a": 0,
+            "signals_b": 0,
+            "signals_c": 1,
+            "total_signals": 1,
+            "book_c": {"live_games": 2},
+        },
+    )
+
+    data = json.loads((tmp_path / "health-state.json").read_text())
+    assert data["bots"]["oracle"]["scan_metrics"]["total_signals"] == 1
+    assert data["bots"]["oracle"]["scan_metrics"]["book_c"]["live_games"] == 2
+
+
+def test_summary_includes_ignored_bot_when_scan_metrics_exist(tmp_path):
+    monitor, _ = _make_monitor(tmp_path, ignored_bot_names={"oracle"})
+
+    monitor.update_bot_state(
+        "oracle",
+        last_heartbeat=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        scan_metrics={"total_signals": 0, "book_c": {"live_games": 1}},
+    )
+
+    summary = monitor.get_summary()
+    assert "oracle" in summary["bots"]
+    assert summary["bots"]["oracle"]["scan_metrics"]["book_c"]["live_games"] == 1

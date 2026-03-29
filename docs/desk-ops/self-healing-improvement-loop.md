@@ -373,6 +373,10 @@ After the parity observation window closes cleanly, consider:
 - allocator-limit recommendation automation
 - experiment promotion suggestion automation
 - execution-policy suggestion automation
+- ledger hot/cold storage split:
+  - keep recent operational events in hot SQLite
+  - archive older high-volume history to local Parquet
+  - keep bot runtime contracts and weather verification artifacts unchanged
 
 Do not skip directly from shadow to autonomous config changes.
 

@@ -8,6 +8,21 @@
 
 **Tech Stack:** Python 3, Open-Meteo API, math.erf
 
+Observation-window follow-up:
+
+- During the Phase 4 parity observation window, use the safe-now worklist at
+  [2026-03-22-weather-observation-window-worklist.md](./2026-03-22-weather-observation-window-worklist.md).
+- Use `python3 scripts/weather-shadow-refresh.py` as the preferred shadow-only bundle refresh entry point during that window.
+- If you need a stale-prior comparison during the window, use `python3 scripts/weather-shadow-refresh.py --refresh-shadow-prior` and keep the outputs under `data/shadow/**` only.
+- Use the ranked post-window promotion list at
+  [2026-03-22-weather-april1-promotion-list.md](./2026-03-22-weather-april1-promotion-list.md)
+  when preparing April 2026 weather changes.
+- Use the bias-correction design at
+  [../superpowers/specs/2026-03-11-weather-bias-correction-design.md](../superpowers/specs/2026-03-11-weather-bias-correction-design.md)
+  as the conceptual model for why the live verifier, stale prior refresh, and post-window recalibration sequence matter.
+- Do not apply live calibration, sizing, or schema changes from this plan until
+  after the observation window closes cleanly.
+
 ---
 
 ## 1. Data Acquisition

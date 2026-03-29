@@ -22,13 +22,16 @@ from storage import atomic_write_json as storage_atomic_write_json
 PROJECT_DIR = Path(__file__).resolve().parents[3]
 DEFAULT_KEY_PATH = PROJECT_DIR / "config" / "keys" / "kalshi-demo.pem"
 DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
-PROD_BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
+PROD_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 1.0
 MARKET_CACHE_PATH = PROJECT_DIR / "data" / "market-cache.json"
 MARKET_CACHE_TTL = 60
 
 _log = logging.getLogger("kalshi-client")
+
+_DEMO_MODES = {"demo", "paper", "sandbox"}
+_PRODUCTION_MODES = {"production", "prod", "live"}
 
 
 def _safe_close_response(response):
@@ -58,6 +61,24 @@ def _round_half_up(value):
 
 def _dollars_to_cents(value):
     return _round_half_up(float(value) * 100)
+
+
+def _normalize_mode(value):
+    mode = str(value or "demo").strip().lower()
+    if mode in _DEMO_MODES:
+        return "demo"
+    if mode in _PRODUCTION_MODES:
+        return "production"
+    raise ValueError(
+        f"Unsupported Kalshi mode {value!r}. Use one of: demo, production."
+    )
+
+
+def _normalize_base_url(value):
+    base = str(value).rstrip("/")
+    if base.endswith("/trade-api/v2"):
+        return base
+    return f"{base}/trade-api/v2"
 
 
 _MARKET_FIELD_MAP = [
@@ -146,6 +167,7 @@ class KalshiClient:
         api_key=None,
         key_path=None,
         mode=None,
+        confirm_production=None,
         *,
         project_dir=PROJECT_DIR,
         default_key_path=DEFAULT_KEY_PATH,
@@ -187,7 +209,8 @@ class KalshiClient:
         except Exception as exc:
             raise ValueError(f"Failed to load RSA private key from {key_path_obj}: {exc}")
 
-        self.mode = mode or os.environ.get("KALSHI_MODE", "demo")
+        requested_mode = mode or os.environ.get("KALSHI_MODE", "demo")
+        self.mode = _normalize_mode(requested_mode)
         self._log = logger or _log
         self.log = self._log
         self.max_retries = max_retries
@@ -203,8 +226,14 @@ class KalshiClient:
         self._time_module = time_module
         self._market_cache = {}
 
-        if self.mode == "production":
-            if os.environ.get("KALSHI_CONFIRM_PRODUCTION") != "yes":
+        base_url_override = os.environ.get("KALSHI_BASE_URL")
+        if base_url_override:
+            self.base_url = _normalize_base_url(base_url_override)
+        elif self.mode == "production":
+            production_confirmed = confirm_production
+            if production_confirmed is None:
+                production_confirmed = os.environ.get("KALSHI_CONFIRM_PRODUCTION") == "yes"
+            if not production_confirmed:
                 raise ValueError(
                     "Production mode requires KALSHI_CONFIRM_PRODUCTION=yes env var. "
                     "Set this explicitly to confirm you intend to trade with real money."
@@ -421,6 +450,10 @@ class KalshiClient:
             log.warning("get_market(%s) failed: %s", ticker, exc)
             return None
 
+    def get_orderbook(self, ticker):
+        """Fetch a market orderbook by ticker."""
+        return self.get(f"/markets/{ticker}/orderbook")
+
     def get_balance(self):
         """Get portfolio balance. Returns (balance_cents, available_cents)."""
         data = self.get("/portfolio/balance")
@@ -437,6 +470,8 @@ __all__ = [
     "MAX_RETRIES",
     "PROD_BASE_URL",
     "RETRY_BACKOFF_BASE",
+    "_normalize_base_url",
+    "_normalize_mode",
     "normalize_market",
     "normalize_markets",
     "read_market_cache",

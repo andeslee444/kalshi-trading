@@ -1,0 +1,61 @@
+{
+  "observed_at_utc": "2026-03-20T01:50:00Z",
+  "context": {
+    "repo_date": "2026-03-19",
+    "timezone": "America/New_York",
+    "credentials": "repo .env",
+    "note": "Live endpoint checks run after sourcing .env with unrestricted network"
+  },
+  "real": {
+    "game_markets_nba_count": 0,
+    "home_latest_day": "2026-03-19",
+    "home_latest_day_games_count": 8,
+    "home_latest_day_first_game": {
+      "id": 23474,
+      "status": "final",
+      "homeMoneyline": 750,
+      "awayMoneyline": -1200,
+      "pointSpread": "14.5",
+      "overUnder": "229.5"
+    },
+    "schedule_days_len": 14,
+    "schedule_day_2026_03_20_count": 6,
+    "stattrackers_2026_03_19_count": 0,
+    "stattrackers_2026_03_20_count": 0,
+    "search_players_count": 50,
+    "search_players_sample": {
+      "id": 20002662,
+      "nbaId": 1630567,
+      "firstName": "Scottie",
+      "lastName": "Barnes",
+      "teamId": 10,
+      "injuryStatus": "Active"
+    },
+    "game_detail_23474": {
+      "hasMarket": true,
+      "market": null,
+      "hasPlays": true
+    }
+  },
+  "kalshi": {
+    "kxnba_open_count": 2571,
+    "kxnba_game_market_count": 30,
+    "kxnba_game_market_sample": {
+      "ticker": "KXNBA-26-WAS",
+      "yes_bid": 1,
+      "yes_ask": 100,
+      "status": "active"
+    }
+  },
+  "decisions": {
+    "scheduled_game_universe_primary": "real_schedule",
+    "same_day_context_primary": "real_home_next",
+    "crowd_price_primary": "real_game_markets",
+    "player_lookup_primary": "real_player_search",
+    "player_history_primary": "real_player_season_feed",
+    "prop_universe_primary": "kalshi_open_prop_markets",
+    "live_trigger_primary": "real_websocket",
+    "live_state_backfill_primary": "real_game_detail_feed",
+    "execution_price_primary": "kalshi_orderbook"
+  }
+}

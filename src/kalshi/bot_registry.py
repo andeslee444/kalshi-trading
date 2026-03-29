@@ -142,6 +142,18 @@ BOT_DEFINITIONS: tuple[BotDefinition, ...] = (
         trade_filename="kalshi-strategy-trades.json",
     ),
     BotDefinition(
+        bot_id="oracle",
+        display_name="Oracle NBA",
+        command=("python3", "src/kalshi/oracle-bot.py"),
+        process_kind="daemon",
+        config_key="oracle",
+        health_key="oracle",
+        log_name="oracle",
+        default_scan_interval_min=1,
+        trade_label="Oracle NBA",
+        trade_filename="kalshi-oracle-trades.json",
+    ),
+    BotDefinition(
         bot_id="hdd",
         display_name="Data Scraper",
         command=("python3", "src/kalshi/hdd-scraper.py"),

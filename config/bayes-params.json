@@ -35,7 +35,7 @@
         },
         "6-10": {
           "wins": 2680,
-          "losses": 1263
+          "losses": 1265
         },
         "11-15": {
           "wins": 0,
@@ -56,16 +56,16 @@
     "crypto": {
       "buckets": {
         "1-5": {
-          "wins": 15,
-          "losses": 2
+          "wins": 30,
+          "losses": 3
         },
         "6-10": {
-          "wins": 0,
-          "losses": 0
+          "wins": 6,
+          "losses": 4
         },
         "11-15": {
-          "wins": 0,
-          "losses": 0
+          "wins": 3,
+          "losses": 1
         },
         "16-20": {
           "wins": 0,
@@ -76,17 +76,17 @@
           "losses": 0
         }
       },
-      "empirical_alpha": null,
-      "empirical_delta": null
+      "empirical_alpha": 0.1,
+      "empirical_delta": 0.3
     },
     "weather": {
       "buckets": {
         "1-5": {
-          "wins": 0,
+          "wins": 3,
           "losses": 0
         },
         "6-10": {
-          "wins": 0,
+          "wins": 2,
           "losses": 0
         },
         "11-15": {
@@ -102,14 +102,14 @@
           "losses": 0
         }
       },
-      "empirical_alpha": null,
-      "empirical_delta": null
+      "empirical_alpha": 0.9,
+      "empirical_delta": 0.05
     },
     "economics": {
       "buckets": {
         "1-5": {
-          "wins": 0,
-          "losses": 0
+          "wins": 1,
+          "losses": 2
         },
         "6-10": {
           "wins": 0,

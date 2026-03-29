@@ -246,6 +246,27 @@ Acceptance gate:
 - Dashboard can read either source behind a feature flag
 - Reconciliation and attribution run off the ledger with identical outputs
 
+Post-observation follow-up:
+
+- After the Phase 4 parity window closes cleanly, keep the ledger architecture but split storage into:
+  - hot SQLite for recent/high-value operational events
+  - local Parquet archive for older/high-volume history
+  - DuckDB or equivalent read path for research across hot + cold storage
+- First retention targets should be the highest-volume append-only event types:
+  - `trade_decision`
+  - `forecast_snapshot`
+  - `market_snapshot`
+  - `source_observation`
+- Keep the low-volume, audit-critical event types hot:
+  - `order_submitted`
+  - `order_update`
+  - `fill`
+  - `settlement`
+  - `verification_result`
+  - `post_trade_attribution`
+- Reference plan:
+  - `docs/plans/2026-03-22-ledger-storage-retention-plan.md`
+
 Estimated size:
 
 - 6 to 10 PRs

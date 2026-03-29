@@ -185,6 +185,7 @@ def main():
         return
 
     db_path = str((PROJECT_DIR / args.db_path).resolve()) if not Path(args.db_path).is_absolute() else args.db_path
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     store = TrainingStore(db_path=db_path)
     total_pairs = 0
     today = datetime.date.today()
@@ -255,6 +256,8 @@ def main():
     print(f"\nBackfill complete: {total_pairs} total pairs in {db_path}")
     print(f"Total rows in DB: {store.count()}")
     store.close()
+    if total_pairs <= 0:
+        raise SystemExit("Backfill produced zero training pairs")
 
 
 if __name__ == "__main__":

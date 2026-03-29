@@ -1,21 +1,26 @@
 """Tests for per-bot kill switches with auto-recovery."""
 
+import importlib
 import json
 import time
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import kalshi_auth
 from kalshi_auth import (
     per_bot_halt_path,
     PER_BOT_HALT_PREFIX,
     BOT_SOURCE_MAP,
     TradeManager,
-    HealthCheckMonitor,
     check_kill_switch,
     KILL_SWITCH_PATH,
     PROJECT_DIR,
 )
+
+
+def _kalshi_auth():
+    return importlib.import_module("kalshi_auth")
 
 
 # ===================================================================
@@ -128,7 +133,7 @@ class TestCheckPerBotHalts:
     def _make_monitor(self, tmp_path, cooldown=0):
         """Create HealthCheckMonitor with tmp state path."""
         state_path = tmp_path / "health-state.json"
-        monitor = HealthCheckMonitor(
+        monitor = _kalshi_auth().HealthCheckMonitor(
             state_path=state_path,
             auto_halt=True,
             per_bot_halt_cooldown_seconds=cooldown,

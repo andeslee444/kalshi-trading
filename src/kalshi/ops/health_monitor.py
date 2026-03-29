@@ -26,6 +26,7 @@ BOT_SOURCE_MAP = {
     "crypto": ["coinbase", "deribit"],
     "economics": ["cleveland-fed", "gdpnow", "cme-fedwatch"],
     "entertainment": ["hdd", "boxoffice"],
+    "oracle": ["real-sports", "kalshi"],
     "source-monitor": ["hdd", "boxoffice", "nws"],
     "beatrelease": ["beatrelease"],
 }
@@ -145,6 +146,25 @@ class HealthCheckMonitor:
         except Exception as exc:
             self.log.warning("Failed to save health state: %s", exc)
 
+    def _bot_state(self, bot):
+        bot_state = self._state["bots"].get(bot)
+        if not isinstance(bot_state, dict):
+            bot_state = {}
+            self._state["bots"][bot] = bot_state
+        return bot_state
+
+    def _source_state(self, source):
+        source_state = self._state["sources"].get(source)
+        if not isinstance(source_state, dict):
+            source_state = {
+                "last_success": None,
+                "last_error": None,
+                "last_error_message": None,
+                "error_count": 0,
+            }
+            self._state["sources"][source] = source_state
+        return source_state
+
     @staticmethod
     def _parse_state_time(value):
         if not value:
@@ -176,29 +196,35 @@ class HealthCheckMonitor:
         return (now - last_error).total_seconds() <= active_window
 
     def record_source_success(self, source):
-        if source not in self._state["sources"]:
-            self._state["sources"][source] = {
-                "last_success": None,
-                "last_error": None,
-                "last_error_message": None,
-                "error_count": 0,
-            }
-        self._state["sources"][source]["last_success"] = self._utc_now_iso()
-        self._state["sources"][source]["error_count"] = 0
-        self._state["sources"][source]["opened_at"] = None
-        self._state["sources"][source]["last_error_message"] = None
+        source_state = self._source_state(source)
+        source_state["last_success"] = self._utc_now_iso()
+        source_state["error_count"] = 0
+        source_state["opened_at"] = None
+        source_state["last_error_message"] = None
+        self._alerts_sent.pop(f"source_warning:{source}", None)
+        self._dirty_sources.add(source)
+        self._save()
+
+    def record_source_warning(self, source, msg=""):
+        source_state = self._source_state(source)
+        source_state["last_error"] = self._utc_now_iso()
+        source_state["last_error_message"] = str(msg) if msg else None
+        source_state["error_count"] = 1
+        source_state["opened_at"] = None
+        alert_key = f"source_warning:{source}"
+        if self.should_send_alert(alert_key):
+            alert_msg = f"Source warning: {source}"
+            if msg:
+                alert_msg = f"{alert_msg} ({msg})"
+            self.log.warning(alert_msg)
+            self._notify_webhook(alert_msg, level="warning", logger=self.log)
+            self._notify_imessage(alert_msg, logger=self.log)
+            self.record_alert_sent(alert_key)
         self._dirty_sources.add(source)
         self._save()
 
     def record_source_error(self, source, msg=""):
-        if source not in self._state["sources"]:
-            self._state["sources"][source] = {
-                "last_success": None,
-                "last_error": None,
-                "last_error_message": None,
-                "error_count": 0,
-            }
-        data = self._state["sources"][source]
+        data = self._source_state(source)
         data["last_error"] = self._utc_now_iso()
         data["last_error_message"] = str(msg) if msg else None
         data["error_count"] = data.get("error_count", 0) + 1
@@ -251,10 +277,15 @@ class HealthCheckMonitor:
             return False
         return True
 
-    def record_bot_heartbeat(self, bot):
-        self._state["bots"][bot] = {"last_heartbeat": self._utc_now_iso()}
+    def update_bot_state(self, bot, **fields):
+        bot_state = self._bot_state(bot)
+        bot_state.update(fields)
         self._dirty_bots.add(bot)
         self._save()
+        return dict(bot_state)
+
+    def record_bot_heartbeat(self, bot):
+        self.update_bot_state(bot, last_heartbeat=self._utc_now_iso())
 
     def should_send_alert(self, alert_key):
         if alert_key not in self._alerts_sent:
@@ -264,6 +295,10 @@ class HealthCheckMonitor:
 
     def record_alert_sent(self, alert_key):
         self._alerts_sent[alert_key] = datetime.datetime.now(datetime.timezone.utc)
+
+    @staticmethod
+    def _should_include_ignored_bot_summary(data):
+        return isinstance(data, dict) and isinstance(data.get("scan_metrics"), dict)
 
     def get_summary(self):
         summary = {"sources": {}, "bots": {}, "overall": "healthy"}
@@ -286,7 +321,7 @@ class HealthCheckMonitor:
             }
 
         for bot, data in self._state.get("bots", {}).items():
-            if bot in self._ignored_bot_names:
+            if bot in self._ignored_bot_names and not self._should_include_ignored_bot_summary(data):
                 continue
             last_hb = data.get("last_heartbeat")
             stale = False
@@ -302,10 +337,14 @@ class HealthCheckMonitor:
             status = "stale" if stale else "ok"
             if stale:
                 issues += 1
-            summary["bots"][bot] = {
+            bot_summary = {
                 "status": status,
                 "last_heartbeat": last_hb,
             }
+            for key, value in data.items():
+                if key not in bot_summary:
+                    bot_summary[key] = value
+            summary["bots"][bot] = bot_summary
 
         if issues >= 2:
             summary["overall"] = "critical"

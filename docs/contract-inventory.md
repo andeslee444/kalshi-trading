@@ -1,7 +1,7 @@
 # Contract Inventory
 
-Generated: 2026-03-14
-Status: Phase 0 frozen
+Generated: 2026-03-22
+Status: Phase 0 frozen; Phase 4 weather shadow-bundle guidance added
 
 This document records the current persisted contracts that multiple bots,
 analytics jobs, and operator tools depend on.
@@ -75,6 +75,9 @@ State metadata convention:
 | `data/pids/supervisor-state.json` | `scripts/supervisor.py` | `scripts/dashboard.py` |
 | `data/regime-state.json` | allocator / crypto bot | `scripts/dashboard.py`, `scripts/daily-attribution.py` |
 | `data/correlation-state.json` | allocator / correlation engine | `scripts/dashboard.py`, allocator |
+| `data/weather-observation-pack.json` | `scripts/weather-observation-pack.py` | operator/manual review only | derived non-canonical weather observation summary; top-level copy only when explicitly requested |
+| `data/shadow/weather-refresh/*` | `scripts/weather-shadow-refresh.py` | operator/manual review only | preferred Phase 4 shadow-only weather observation, audit, backtest, calibration, shadow-prior, and promotion bundle |
+| `data/weather-promotion-candidates.json` | `scripts/weather-promotion-candidates.py` | operator/manual review only | derived non-canonical weather promotion ranking; top-level copy only when explicitly requested |
 
 ## Additional Persisted Artifacts In Scope
 

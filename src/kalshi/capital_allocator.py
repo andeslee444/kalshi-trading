@@ -62,6 +62,7 @@ BOT_PRIORITY = {
     "position-monitor": 0.9,  # exits free capital, not consuming allocation
     "economics": 0.9,         # nowcast-based: high edge quality (like info-arb)
     "entertainment": 0.8,     # info-arb: high edge quality
+    "oracle": 0.6,            # live sports + market microstructure: medium-high quality
     "weather": 0.5,           # model-based: moderate edge quality
     "crypto": 0.4,            # model-based: high vol, lower confidence
     "strategy": 0.3,          # statistical: lower per-trade edge
@@ -175,6 +176,7 @@ MODEL_QUALITY_FACTOR = {
     "source-monitor": 1.0,    # direct data observation
     "economics": 0.9,         # nowcast-based
     "entertainment": 0.8,     # info-arb from HDD/box office
+    "oracle": 0.6,            # sports data + market structure
     "weather": 0.5,           # model-based forecasting
     "crypto": 0.4,            # high-vol model
     "strategy": 0.3,          # statistical bias

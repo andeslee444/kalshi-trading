@@ -7,7 +7,10 @@ minimize Brier score (primary) with realized P&L as tiebreaker.
 
 Usage:
     python3 scripts/calibrate-sigma.py              # Display calibration report
-    python3 scripts/calibrate-sigma.py --save       # Save to config/calibration.json
+    python3 scripts/calibrate-sigma.py --save --allow-canonical-save
+                                                   # Save to config/calibration.json
+    python3 scripts/calibrate-sigma.py --save --output data/shadow/calibration.json
+                                                   # Save to a shadow path instead
     python3 scripts/calibrate-sigma.py --json       # JSON output
     python3 scripts/calibrate-sigma.py --no-api     # Local-only (skip settlement fetch)
     python3 scripts/calibrate-sigma.py --dry-run    # Report data availability without modifying anything
@@ -27,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 from probability import _norm_cdf, _student_t_cdf, half_kelly
+from kalshi_auth import _atomic_write_json
 from trade_files import TRADE_FILES, ALL_TRADE_PATHS
 from ticker_utils import parse_weather_ticker as _parse_weather_ticker_shared
 
@@ -236,6 +240,36 @@ def _sync_runtime_weather_config(ensemble_cal):
     config_data.setdefault("ensemble", {})
     config_data["ensemble"]["weights"] = ensemble_cal["weights"]
     WEATHER_CONFIG_PATH.write_text(json.dumps(config_data, indent=2) + "\n")
+
+
+def _resolve_output_path(output_path=None):
+    """Resolve a requested calibration output path."""
+    if output_path is None:
+        return CALIBRATION_PATH
+
+    resolved = Path(output_path)
+    if not resolved.is_absolute():
+        resolved = PROJECT_DIR / resolved
+    return resolved
+
+
+def _is_canonical_calibration_path(path):
+    """Return True when the output path is the live calibration file."""
+    return Path(path).resolve() == CALIBRATION_PATH.resolve()
+
+
+def _save_calibration_output(calibration, output_path=None):
+    """Write calibration output and apply live-only side effects when canonical."""
+    save_path = _resolve_output_path(output_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    if _is_canonical_calibration_path(save_path):
+        _backup_calibration()
+        _atomic_write_json(save_path, calibration)
+        _sync_runtime_weather_config(calibration.get("ensemble", {}))
+        return save_path, True
+
+    _atomic_write_json(save_path, calibration)
+    return save_path, False
 
 
 def _print_diff(old_cal, new_cal):
@@ -765,11 +799,24 @@ def main():
         description="Calibrate sigma parameters from historical trade settlements."
     )
     parser.add_argument("--save", action="store_true", help="Save calibration to config/calibration.json")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Optional output path for saved calibration JSON (defaults to config/calibration.json)",
+    )
+    parser.add_argument(
+        "--allow-canonical-save",
+        action="store_true",
+        help="Permit --no-api --save to overwrite the canonical calibration artifact",
+    )
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--no-api", action="store_true", help="Skip Kalshi API calls (local data only)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Report data availability without modifying anything")
     args = parser.parse_args()
+    save_path = _resolve_output_path(args.output)
+    if args.save and _is_canonical_calibration_path(save_path) and not args.allow_canonical_save:
+        parser.error("--save to config/calibration.json requires --allow-canonical-save")
 
     # Load all trade logs from canonical TRADE_FILES
     DATA_DIR = PROJECT_DIR / "data"
@@ -885,28 +932,26 @@ def main():
         else:
             # Backup existing calibration before overwriting
             old_cal = {}
-            if CALIBRATION_PATH.exists():
+            save_path = _resolve_output_path(args.output)
+            if _is_canonical_calibration_path(save_path) and CALIBRATION_PATH.exists():
                 try:
                     old_cal = json.loads(CALIBRATION_PATH.read_text())
                 except (json.JSONDecodeError, OSError):
                     old_cal = {}
-                _backup_calibration()
 
-            CALIBRATION_PATH.parent.mkdir(parents=True, exist_ok=True)
-            CALIBRATION_PATH.write_text(json.dumps(calibration, indent=2) + "\n")
-            _sync_runtime_weather_config(ensemble_cal)
+            saved_path, is_canonical = _save_calibration_output(calibration, args.output)
 
             # Print diff summary
-            if old_cal:
+            if old_cal and is_canonical:
                 _print_diff(old_cal, calibration)
 
     if args.json:
         print(json.dumps(calibration, indent=2))
     else:
-        _print_report(calibration, args.save and has_data)
+        _print_report(calibration, args.save and has_data, saved_path if args.save and has_data else None)
 
 
-def _print_report(cal, saved):
+def _print_report(cal, saved, saved_path=None):
     """Print human-readable calibration report."""
     print("=" * 60)
     print("SIGMA CALIBRATION REPORT")
@@ -970,7 +1015,7 @@ def _print_report(cal, saved):
         print("  No trades with ensemble_forecasts data.")
 
     if saved:
-        print(f"\nCalibration saved to {CALIBRATION_PATH}")
+        print(f"\nCalibration saved to {saved_path or CALIBRATION_PATH}")
     else:
         print("\nRun with --save to write config/calibration.json")
 

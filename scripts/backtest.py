@@ -276,13 +276,15 @@ def _determine_outcome(trade, settlement_revenue, side):
 
     API revenue is 0 for positions exited before settlement (by position-monitor),
     which the old logic incorrectly treated as losses. The local settlement_result
-    field (set by reconcile-trades.py) is authoritative.
+    field (set by reconcile-trades.py) is authoritative, but it is expressed in
+    trade-win space rather than YES-event-outcome space.
     """
     local_result = trade.get("settlement_result")
-    if local_result == "won":
-        return 1
-    if local_result == "lost":
-        return 0
+    if local_result in ("won", "lost"):
+        if side == "yes":
+            return 1 if local_result == "won" else 0
+        if side == "no":
+            return 0 if local_result == "won" else 1
     # Fallback: API revenue (unreliable for pre-exit trades)
     if side == "yes":
         return 1 if settlement_revenue > 0 else 0
@@ -423,8 +425,8 @@ def sizing_comparison(evaluated_trades):
     kelly_pnl = 0
 
     for t in evaluated_trades:
-        revenue = t.get("revenue", 0)
-        actual_pnl += revenue
+        revenue = t.get("revenue")
+        actual_pnl += int(revenue or 0)
 
         # Flat: 1 contract per trade
         price = t.get("price", 0)
@@ -469,7 +471,7 @@ def threshold_sweep(evaluated_trades, thresholds=None):
             continue
 
         wins = sum(1 for t in filtered if t["actual"] == 1)
-        pnl = sum(t["revenue"] for t in filtered)
+        pnl = sum(int(t.get("revenue") or 0) for t in filtered)
         results.append({
             "threshold": thresh,
             "trades": len(filtered),
@@ -480,6 +482,18 @@ def threshold_sweep(evaluated_trades, thresholds=None):
     return results
 
 
+def _resolve_output_path(output_path):
+    """Resolve a requested output path relative to the project root."""
+    path = Path(output_path)
+    if not path.is_absolute():
+        path = PROJECT_DIR / path
+    return path
+
+
+def _is_canonical_output_path(path):
+    return Path(path).resolve() == (DATA_DIR / "backtest-results.json").resolve()
+
+
 # ─── Main ───
 
 def main():
@@ -487,8 +501,25 @@ def main():
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--bot", type=str, help="Filter by bot (weather, strategy, crypto, beatrelease)")
     parser.add_argument("--no-api", action="store_true", help="Skip Kalshi API calls")
-    parser.add_argument("--save", action="store_true", help="Save results to data/backtest-results.json")
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Save results to the requested output path (default: data/backtest-results.json)",
+    )
+    parser.add_argument(
+        "--output",
+        default=str(DATA_DIR / "backtest-results.json"),
+        help="Output path for saved results (default: data/backtest-results.json)",
+    )
+    parser.add_argument(
+        "--allow-canonical-save",
+        action="store_true",
+        help="Permit --no-api --save to overwrite the canonical backtest artifact",
+    )
     args = parser.parse_args()
+    save_path = _resolve_output_path(args.output)
+    if args.save and _is_canonical_output_path(save_path) and not args.allow_canonical_save:
+        parser.error("--save to data/backtest-results.json requires --allow-canonical-save")
 
     # Load trades
     trades_by_bot = {}
@@ -528,7 +559,7 @@ def main():
         for t in trades:
             ticker = t.get("ticker", "")
             revenue = settlement_map.get(ticker)
-            if revenue is None:
+            if revenue is None and t.get("settlement_result") not in ("won", "lost"):
                 continue
 
             if bot_label == "weather":
@@ -626,7 +657,6 @@ def main():
     }
 
     if args.save:
-        save_path = PROJECT_DIR / "data" / "backtest-results.json"
         save_path.parent.mkdir(parents=True, exist_ok=True)
         _atomic_write_json(save_path, report)
         print(f"Results saved to {save_path}", file=sys.stderr)

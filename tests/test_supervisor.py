@@ -28,9 +28,14 @@ mock_auth = MagicMock()
 mock_auth.setup_logging = MagicMock(return_value=MagicMock())
 mock_auth.check_kill_switch = MagicMock(return_value=False)
 mock_auth.notify_webhook = MagicMock()
+_orig_kalshi_auth = sys.modules.get("kalshi_auth")
 sys.modules.setdefault("kalshi_auth", mock_auth)
 
 spec.loader.exec_module(supervisor)
+if _orig_kalshi_auth is None:
+    sys.modules.pop("kalshi_auth", None)
+else:
+    sys.modules["kalshi_auth"] = _orig_kalshi_auth
 BotProcess = supervisor.BotProcess
 Supervisor = supervisor.Supervisor
 HEARTBEAT_NAMES = supervisor.HEARTBEAT_NAMES

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Daily backtest runner with drift detection and alerting.
 
-Runs backtest.py --save, compares Brier scores to previous results,
+Runs backtest.py --save --allow-canonical-save, compares Brier scores to previous results,
 and sends a WhatsApp alert if model quality degrades >10%.
 
 Usage:
@@ -97,7 +97,7 @@ def main():
     # Run backtest
     log.info("Running backtest...")
     result = subprocess.run(
-        [sys.executable, str(BACKTEST_SCRIPT), "--save"],
+        [sys.executable, str(BACKTEST_SCRIPT), "--save", "--allow-canonical-save"],
         capture_output=True, text=True, timeout=120,
     )
     if result.returncode != 0:

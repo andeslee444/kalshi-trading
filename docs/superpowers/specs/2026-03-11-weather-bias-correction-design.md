@@ -6,6 +6,24 @@ Historical forecast calibration (14,177 forecast-actual pairs across 20 cities, 
 
 This bias is the dominant source of forecast error. With current sigma=4.7F, a +10F bias means forecasts are systematically off by 2+ sigma, producing probability estimates that are directionally wrong. Correcting this bias is the single highest-impact improvement available.
 
+## Current Implementation Note
+
+This document captures the original bias-correction design direction.
+The current runtime has evolved in one important way:
+
+- the live weather bot now prefers `config/weather-live-bias.json` as the calibration prior
+- that artifact is built from `data/weather-training.db` via `scripts/backfill-weather-data.py` and `scripts/calibrate-weather-bias.py`
+- the bot requires the loaded bias artifact to be marked lead-time matched
+- `config/historical-calibration.json` remains useful as a broader historical reference, but it is no longer the preferred live prior when the lead-time-matched artifact is available
+
+Read the rest of this spec as the conceptual model, with the lead-time-matched prior replacing the older assumption that `historical-calibration.json` is the main live bias source.
+
+Operational follow-up documents:
+
+- [../../plans/2026-03-06-plan2-weather-bot.md](../../plans/2026-03-06-plan2-weather-bot.md)
+- [../../plans/2026-03-22-weather-observation-window-worklist.md](../../plans/2026-03-22-weather-observation-window-worklist.md)
+- [../../plans/2026-03-22-weather-april1-promotion-list.md](../../plans/2026-03-22-weather-april1-promotion-list.md)
+
 ### Root Cause
 
 NWP models operate on grid cells (9-25km resolution). The model's surface elevation for a grid cell is smoothed topography, not the actual station elevation. For cities near complex terrain (Denver at 5,431 ft on the Front Range, Austin/OKC/SATX on the Edwards Plateau/Great Plains), the model grid cell is at lower elevation than the ASOS station, producing systematically warmer temperature predictions. Coastal/flat cities (SEA, MIA, HOU) have smaller biases because terrain smoothing matters less.

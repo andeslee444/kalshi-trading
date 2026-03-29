@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "source": "sportsmarket/autoresearch",
+  "exported_at": "2026-03-18T15:18:04",
+  "book_b": {
+    "MATCHUP_MULTIPLIER": 0.0,
+    "MATCHUP_CAP": 0.1,
+    "VENUE_MULTIPLIER": 0.3,
+    "VENUE_CAP": 0.03,
+    "B2B_PENALTY": -0.04,
+    "RECENCY_WEIGHT_LAST5": 1.0,
+    "RECENCY_WEIGHT_LAST10": 1.0,
+    "RECENCY_WEIGHT_SEASON": 1.0,
+    "FALLBACK_SIGMA": 0.15,
+    "USE_STAT_SPACE": false
+  },
+  "book_c": {
+    "FOUL_TROUBLE_PROB": 0.25,
+    "FOUL_TROUBLE_MINUTES_REDUCTION": 0.7,
+    "BLOWOUT_PROB": 0.15,
+    "BLOWOUT_MINUTES_THRESHOLD": 10.0,
+    "BLOWOUT_MINUTES_REDUCTION": 0.5,
+    "OT_MINUTES": 5.0,
+    "OT_MARGIN_FACTOR_TIED": 1.0,
+    "OT_MARGIN_FACTOR_CLOSE": 0.55,
+    "OT_CLOCK_DECAY": 200.0,
+    "OT_BASE_MULTIPLIER": 0.8,
+    "OT_MAX_PROB": 0.85,
+    "OT_OVER_PROB_BASE": 0.5,
+    "OT_OVER_PROB_MULTIPLIER": 2.0,
+    "OT_OVER_PROB_MIN": 0.4,
+    "OT_OVER_PROB_MAX": 0.9,
+    "OT_NO_OT_PROB_BASE": 0.3,
+    "OT_NO_OT_PROB_MULTIPLIER": 2.0,
+    "OT_NO_OT_PROB_MIN": 0.1,
+    "OT_NO_OT_PROB_MAX": 0.8,
+    "OT_SAFETY_MARGIN": 1.05,
+    "OT_GAP_THRESHOLD": 0.3
+  },
+  "edge_thresholds": {
+    "BOOK_A_MIN_EDGE": 0.15,
+    "BOOK_B_MIN_EDGE": 0.06,
+    "BOOK_C_MIN_EDGE": 0.12
+  },
+  "sizing": {
+    "BOOK_A_SIZE_PCT": 0.02,
+    "BOOK_B_SIZE_PCT": 0.015,
+    "BOOK_C_SIZE_PCT": 0.01
+  },
+  "backtest_metrics": {
+    "brier_score": 0.094,
+    "calibration_error": 0.0235,
+    "expected_profit_pct": 141.5,
+    "sample_size": 7685,
+    "timestamp": ""
+  }
+}

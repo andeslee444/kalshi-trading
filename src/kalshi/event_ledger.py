@@ -514,7 +514,7 @@ class EventLedger:
             legacy_key=event_id,
         )
 
-    def _fetch_event_payloads(self, event_type, *, source_path=None):
+    def _fetch_event_payloads(self, event_type, *, source_path=None, start=None, end=None):
         self.ensure_schema()
         query = """
             SELECT payload_json, event_time, source_path
@@ -525,10 +525,65 @@ class EventLedger:
         if source_path is not None:
             query += " AND source_path = ?"
             params.append(_safe_path(source_path))
+        if start is not None:
+            query += " AND event_time >= ?"
+            params.append(_iso_or_none(start) if not isinstance(start, str) else start)
+        if end is not None:
+            query += " AND event_time <= ?"
+            params.append(_iso_or_none(end) if not isinstance(end, str) else end)
         query += " ORDER BY event_time ASC, event_id ASC"
         with self._connection() as conn:
             rows = conn.execute(query, params).fetchall()
         return [json.loads(row["payload_json"]) for row in rows]
+
+    def _count_events(self, event_type, *, source_path=None, start=None, end=None):
+        self.ensure_schema()
+        query = """
+            SELECT COUNT(*) AS count
+            FROM events
+            WHERE event_type = ?
+        """
+        params = [event_type]
+        if source_path is not None:
+            query += " AND source_path = ?"
+            params.append(_safe_path(source_path))
+        if start is not None:
+            query += " AND event_time >= ?"
+            params.append(_iso_or_none(start) if not isinstance(start, str) else start)
+        if end is not None:
+            query += " AND event_time <= ?"
+            params.append(_iso_or_none(end) if not isinstance(end, str) else end)
+        with self._connection() as conn:
+            row = conn.execute(query, params).fetchone()
+        return int(row["count"] or 0)
+
+    def _summarize_events_by_source(self, event_type, source_paths):
+        self.ensure_schema()
+        normalized_paths = [_safe_path(path) for path in source_paths if path is not None]
+        if not normalized_paths:
+            return {}
+        placeholders = ",".join("?" for _ in normalized_paths)
+        query = f"""
+            SELECT source_path,
+                   COUNT(*) AS count,
+                   MIN(event_time) AS min_event_time,
+                   MAX(event_time) AS max_event_time
+            FROM events
+            WHERE event_type = ?
+              AND source_path IN ({placeholders})
+            GROUP BY source_path
+        """
+        params = [event_type, *normalized_paths]
+        with self._connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        summary = {}
+        for row in rows:
+            summary[row["source_path"]] = {
+                "count": int(row["count"] or 0),
+                "min_event_time": _parse_timestamp(row["min_event_time"]),
+                "max_event_time": _parse_timestamp(row["max_event_time"]),
+            }
+        return summary
 
     def _fetch_event_window(self, event_type, *, source_path=None):
         self.ensure_schema()
@@ -602,16 +657,30 @@ class EventLedger:
                 for key in (
                     "settlement_result",
                     "settlement_revenue_cents",
+                    "fee_cents",
+                    "fees_cents",
+                    "close_price_cents",
+                    "settlement_price_cents",
+                    "close_price",
+                    "settlement_price",
                     "fill_price_cents",
+                    "fill_count",
                     "realized_edge",
+                    "settled_at",
+                    "verified_at",
                 ):
                     if key in settle:
                         merged[key] = settle.get(key)
             result.append(merged)
         return result
 
-    def get_decision_records(self, source_path=None):
-        return self._fetch_event_payloads(EVENT_TYPE_TRADE_DECISION, source_path=source_path)
+    def get_decision_records(self, source_path=None, *, start=None, end=None):
+        return self._fetch_event_payloads(
+            EVENT_TYPE_TRADE_DECISION,
+            source_path=source_path,
+            start=start,
+            end=end,
+        )
 
     def get_source_observation_records(self, source_name=None):
         records = self._fetch_event_payloads(EVENT_TYPE_SOURCE_OBSERVATION)
@@ -770,6 +839,10 @@ class EventLedger:
         verification_specs = verification_specs or []
         trade_coverage_start, trade_coverage_end = self._fetch_event_window(EVENT_TYPE_ORDER_SUBMITTED)
         decision_coverage_start, decision_coverage_end = self._fetch_event_window(EVENT_TYPE_TRADE_DECISION)
+        decision_summaries = self._summarize_events_by_source(
+            EVENT_TYPE_TRADE_DECISION,
+            [spec["path"] for spec in decision_specs],
+        )
 
         for spec in trade_specs:
             path = Path(spec["path"])
@@ -788,12 +861,21 @@ class EventLedger:
         for spec in decision_specs:
             path = Path(spec["path"])
             legacy = self._load_json_list(path)
-            ledger = self.get_decision_records(path)
+            legacy_window_start, legacy_window_end = self._window_bounds(legacy, ("timestamp",))
+            ledger = self.get_decision_records(
+                path,
+                start=legacy_window_start,
+                end=legacy_window_end,
+            )
+            summary = decision_summaries.get(str(path), {})
             report["decision_logs"].append(
                 self._compare_decision_records(
                     path,
                     legacy,
                     ledger,
+                    ledger_total_count=summary.get("count", 0),
+                    ledger_window_start=summary.get("min_event_time"),
+                    ledger_window_end=summary.get("max_event_time"),
                     coverage_start=decision_coverage_start,
                     coverage_end=decision_coverage_end,
                 )
@@ -1107,9 +1189,23 @@ class EventLedger:
         return cls._annotate_ledger_superset(row, comparable_legacy, comparable_ledger)
 
     @classmethod
-    def _compare_decision_records(cls, path, legacy, ledger, *, coverage_start=None, coverage_end=None):
+    def _compare_decision_records(
+        cls,
+        path,
+        legacy,
+        ledger,
+        *,
+        ledger_total_count=None,
+        ledger_window_start=None,
+        ledger_window_end=None,
+        coverage_start=None,
+        coverage_end=None,
+    ):
         legacy_window_start, legacy_window_end = cls._window_bounds(legacy, ("timestamp",))
-        ledger_window_start, ledger_window_end = cls._window_bounds(ledger, ("timestamp",))
+        if ledger_window_start is None or ledger_window_end is None:
+            ledger_window_start, ledger_window_end = cls._window_bounds(ledger, ("timestamp",))
+        if ledger_total_count is None:
+            ledger_total_count = len(ledger)
         if (
             not ledger and
             legacy_window_end is not None and
@@ -1161,7 +1257,7 @@ class EventLedger:
             "comparison_mode": "latest_suffix",
             "comparison_status": status,
             "legacy_total_count": len(legacy),
-            "ledger_total_count": len(ledger),
+            "ledger_total_count": ledger_total_count,
             "legacy_count": len(comparable_legacy),
             "ledger_count": len(comparable_ledger),
             "count_match": count_match,

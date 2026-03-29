@@ -86,6 +86,57 @@
       "takeProfitFraction": 0.50
     }
   },
+  "oracle": {
+    "enabled": false,
+    "maxTradeAmount": 25,
+    "maxDailyTrades": 30,
+    "maxDailyLoss": 100,
+    "maxDailyLossPct": 0.10,
+    "scanIntervalMinutes": 1,
+    "edgeThreshold": 0.10,
+    "risk": {
+      "maxTotalExposurePct": 0.18,
+      "maxSimultaneousPositions": 10,
+      "dailyStopLossPct": 0.05,
+      "maxDrawdownPct": 0.15,
+      "maxPropsPerPlayer": 2,
+      "maxPropsPerGame": 4,
+      "noOppositeSidesOnSpread": true
+    },
+    "books": {
+      "A": {
+        "enabled": true,
+        "minEdge": 0.15,
+        "maxPositions": 4,
+        "maxExposurePct": 0.08,
+        "maxPerGamePct": 0.04
+      },
+      "B": {
+        "enabled": true,
+        "minEdge": 0.10,
+        "maxPositions": 4,
+        "maxExposurePct": 0.06
+      },
+      "C": {
+        "enabled": true,
+        "minEdge": 0.12,
+        "maxPositions": 2,
+        "maxExposurePct": 0.04,
+        "fillTimeoutSeconds": 15,
+        "maxReprices": 2,
+        "slippageDisableThresholdCents": 3,
+        "slippageDisableMinTrades": 20
+      }
+    },
+    "killSwitches": {
+      "consecutiveOrderFailures": 3,
+      "singleBookDrawdownPct": 0.10
+    },
+    "realSports": {
+      "baseUrl": "https://web.realapp.com",
+      "wsUrl": "https://web.realsports.io"
+    }
+  },
   "crypto": {
     "maxTradeAmount": 25,
     "maxTradeAmountPct": 0.05,
@@ -170,6 +221,7 @@
       "weather": 200,
       "economics": 300,
       "crypto": 150,
+      "oracle": 150,
       "strategy": 150,
       "monitor": 100,
       "entertainment": 50,

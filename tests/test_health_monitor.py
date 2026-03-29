@@ -4,6 +4,7 @@ Fix 5C: Validates the health monitoring infrastructure.
 """
 
 import datetime
+import importlib
 import json
 import tempfile
 import time
@@ -11,14 +12,19 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import kalshi_auth
 from artifact_contracts import (
     HEALTH_STATE_ARTIFACT,
     HEALTH_SUMMARY_BOT_FIELDS,
     HEALTH_SUMMARY_REQUIRED_FIELDS,
     HEALTH_SUMMARY_SOURCE_FIELDS,
 )
+
+
+def _kalshi_auth():
+    return importlib.import_module("kalshi_auth")
 from kalshi_auth import (
-    HealthCheckMonitor, KILL_SWITCH_PATH, BOT_SOURCE_MAP,
+    KILL_SWITCH_PATH, BOT_SOURCE_MAP,
     notify_imessage, _reset_imessage_rate_limiter,
 )
 
@@ -28,7 +34,7 @@ class TestBotHeartbeat:
 
     def _make_monitor(self, tmp_path, **kwargs):
         state_path = tmp_path / "health-state.json"
-        return HealthCheckMonitor(state_path=str(state_path), **kwargs)
+        return _kalshi_auth().HealthCheckMonitor(state_path=str(state_path), **kwargs)
 
     def test_record_heartbeat(self, tmp_path):
         hm = self._make_monitor(tmp_path)
@@ -38,16 +44,16 @@ class TestBotHeartbeat:
 
     def test_heartbeat_persisted(self, tmp_path):
         state_path = tmp_path / "health-state.json"
-        hm = HealthCheckMonitor(state_path=str(state_path))
+        hm = _kalshi_auth().HealthCheckMonitor(state_path=str(state_path))
         hm.record_bot_heartbeat("crypto")
 
         # Load a new instance from the same state file
-        hm2 = HealthCheckMonitor(state_path=str(state_path))
+        hm2 = _kalshi_auth().HealthCheckMonitor(state_path=str(state_path))
         assert "crypto" in hm2._state["bots"]
 
     def test_health_state_includes_schema_metadata(self, tmp_path):
         state_path = tmp_path / "health-state.json"
-        hm = HealthCheckMonitor(state_path=str(state_path))
+        hm = _kalshi_auth().HealthCheckMonitor(state_path=str(state_path))
         hm.record_bot_heartbeat("weather")
 
         data = json.loads(state_path.read_text())
@@ -102,7 +108,7 @@ class TestSourceTracking:
 
     def _make_monitor(self, tmp_path, **kwargs):
         state_path = tmp_path / "health-state.json"
-        return HealthCheckMonitor(state_path=str(state_path), **kwargs)
+        return _kalshi_auth().HealthCheckMonitor(state_path=str(state_path), **kwargs)
 
     def test_record_source_success(self, tmp_path):
         hm = self._make_monitor(tmp_path)
@@ -206,7 +212,7 @@ class TestAutoHalt:
 
     def _make_monitor(self, tmp_path, **kwargs):
         state_path = tmp_path / "health-state.json"
-        return HealthCheckMonitor(state_path=str(state_path), **kwargs)
+        return _kalshi_auth().HealthCheckMonitor(state_path=str(state_path), **kwargs)
 
     def test_auto_halt_disabled_by_default(self, tmp_path):
         hm = self._make_monitor(tmp_path)
@@ -278,19 +284,19 @@ class TestHealthStateLoad:
 
     def test_missing_state_file(self, tmp_path):
         state_path = tmp_path / "nonexistent.json"
-        hm = HealthCheckMonitor(state_path=str(state_path))
+        hm = _kalshi_auth().HealthCheckMonitor(state_path=str(state_path))
         assert hm._state["sources"] == {}
         assert hm._state["bots"] == {}
 
     def test_corrupt_state_file(self, tmp_path):
         state_path = tmp_path / "corrupt.json"
         state_path.write_text("not valid json{{{")
-        hm = HealthCheckMonitor(state_path=str(state_path))
+        hm = _kalshi_auth().HealthCheckMonitor(state_path=str(state_path))
         assert hm._state["sources"] == {}
         assert hm._state["bots"] == {}
 
     def test_custom_staleness_minutes(self, tmp_path):
-        hm = HealthCheckMonitor(
+        hm = _kalshi_auth().HealthCheckMonitor(
             state_path=str(tmp_path / "h.json"),
             staleness_minutes=120,
         )
@@ -302,7 +308,7 @@ class TestAlertDeduplication:
 
     def _make_monitor(self, tmp_path, **kwargs):
         state_path = tmp_path / "health-state.json"
-        return HealthCheckMonitor(state_path=str(state_path), **kwargs)
+        return _kalshi_auth().HealthCheckMonitor(state_path=str(state_path), **kwargs)
 
     def test_first_alert_not_suppressed(self, tmp_path):
         mon = self._make_monitor(tmp_path)
@@ -325,7 +331,7 @@ class TestHealthSummary:
 
     def _make_monitor(self, tmp_path, **kwargs):
         state_path = tmp_path / "health-state.json"
-        return HealthCheckMonitor(state_path=str(state_path), **kwargs)
+        return _kalshi_auth().HealthCheckMonitor(state_path=str(state_path), **kwargs)
 
     def test_summary_includes_all_sources(self, tmp_path):
         mon = self._make_monitor(tmp_path)
@@ -379,7 +385,7 @@ class TestIsSourceOpen:
 
     def _make_monitor(self, tmp_path, **kwargs):
         state_path = tmp_path / "health-state.json"
-        return HealthCheckMonitor(state_path=str(state_path), **kwargs)
+        return _kalshi_auth().HealthCheckMonitor(state_path=str(state_path), **kwargs)
 
     def test_below_threshold_returns_false(self, tmp_path):
         mon = self._make_monitor(tmp_path, source_breaker_threshold=5)
@@ -416,13 +422,13 @@ class TestIsSourceOpen:
 
     def test_opened_at_persists_in_state(self, tmp_path):
         state_path = tmp_path / "health-state.json"
-        mon = HealthCheckMonitor(state_path=str(state_path), source_breaker_threshold=3)
+        mon = _kalshi_auth().HealthCheckMonitor(state_path=str(state_path), source_breaker_threshold=3)
         for _ in range(3):
             mon.record_source_error("hdd", "err")
         assert mon._state["sources"]["hdd"].get("opened_at") is not None
 
         # Reload from disk
-        mon2 = HealthCheckMonitor(state_path=str(state_path), source_breaker_threshold=3)
+        mon2 = _kalshi_auth().HealthCheckMonitor(state_path=str(state_path), source_breaker_threshold=3)
         assert mon2._state["sources"]["hdd"].get("opened_at") is not None
         assert mon2.is_source_open("hdd") is True
 
@@ -435,17 +441,17 @@ class TestNotifyImessage:
     """Test iMessage notification via BlueBubbles API."""
 
     def setup_method(self):
-        _reset_imessage_rate_limiter()
+        _kalshi_auth()._reset_imessage_rate_limiter()
 
     def test_returns_false_when_env_vars_missing(self):
         with patch.dict("os.environ", {}, clear=True):
-            assert notify_imessage("test message") is False
+            assert _kalshi_auth().notify_imessage("test message") is False
 
     def _dispatch_and_join(self, message):
         """Call notify_imessage and join the background thread so assertions are safe."""
         import threading
         before = set(threading.enumerate())
-        result = notify_imessage(message)
+        result = _kalshi_auth().notify_imessage(message)
         after = set(threading.enumerate())
         for t in after - before:
             t.join(timeout=5)
@@ -481,7 +487,7 @@ class TestNotifyImessage:
                 mock_post.return_value = MagicMock(status_code=200)
                 mock_post.return_value.raise_for_status = MagicMock()
                 assert self._dispatch_and_join("duplicate msg") is True
-                assert notify_imessage("duplicate msg") is False
+                assert _kalshi_auth().notify_imessage("duplicate msg") is False
                 assert mock_post.call_count == 1
 
     def test_http_error_does_not_crash(self):
