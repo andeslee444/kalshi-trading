@@ -208,6 +208,8 @@ Current per-bot attribution basis:
   - `local_buy_orders_joined_to_api_fills_and_settlement_outcomes`
 - `strategy`:
   - `local_buy_orders_joined_to_api_fills_and_settlement_outcomes`
+- `demo-weather-history`:
+  - `kalshi_api_settlements`
 - `unattributed-weather`:
   - `kalshi_api_settlements`
 - most other bots:
@@ -233,6 +235,8 @@ Weather-family attribution state:
   - `90384` cents
 - weather-family realized leader:
   - `source_monitor_nws`
+- known demo-weather historical context:
+  - currently `0` cents on the refreshed live settlement set
 - unattributed historical weather context:
   - `2000` cents
   - intentionally excluded from canonical forecast-weather and combined weather-family realized totals
@@ -257,9 +261,11 @@ This means both source-monitor NWS and forecast-weather now use local joined fil
 Manager-facing reporting state:
 
 - `weather-observation-pack.json` now includes:
+  - `demo_weather_history`
   - `unattributed_weather`
   - `weather_family.realized` excluding that bucket
 - `daily-imessage-report.py` now prints bot basis labels and isolates `unattributed-weather history`
+- `daily-imessage-report.py` also supports `demo-weather history` when that bucket is non-empty
 - `daily-ops-loop.py` now prefers `financial_snapshot.by_bot` over attribution-only bot totals
 
 Live city controls applied:
@@ -283,7 +289,7 @@ Shadow weather refresh state:
 
 ## Remaining Work
 
-- classify the remaining orphan historical `KXHIGH` API-only settlements into a narrower manual/demo sub-bucket if cleaner manager reporting is needed beyond `unattributed-weather`
+- investigate the still-unexplained `unattributed-weather` residue if you want to fully eliminate orphan historical weather noise from manager reporting
 - monitor the live effect of the new city tighten controls:
   - forecast-weather: `CHI`, `HOU`, `NY`
   - source-monitor NWS: `CHI`, `LAX`
@@ -300,6 +306,7 @@ The outage-recovery objective is met:
 - source-monitor NWS realized P&L is now attributable inside the weather-family reporting stack
 - forecast-weather realized P&L is now also on the local joined canonical basis
 - old API-only `KXHIGH` history is no longer silently counted as forecast-weather; it is surfaced as `unattributed-weather`
+- known demo-weather history now has its own separate reporting bucket when present; on the current live settlement set it resolves to zero, which means the remaining orphan weather residue is still unexplained rather than known demo traffic
 - the main manager-facing report paths now honor the repaired hybrid per-bot basis
 - the current live weather tighten set is implemented in config and active after supervised restart
 - the shadow weather bundle is refreshed against the repaired live state

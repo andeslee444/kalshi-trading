@@ -32,6 +32,7 @@ from pnl_snapshot import (
     _build_balance_check,
     _infer_bot,
     _infer_unmatched_api_bot,
+    _load_demo_weather_refs,
     _is_buy_action,
     _select_canonical_by_bot,
     _safe_int,
@@ -376,6 +377,60 @@ class TestComputeRealizedPnlByBotLocal:
         assert result["by_bot_reconciliation"]["weather"]["api_fills_without_local_order"] == 0
         assert result["by_bot_reconciliation"]["unattributed-weather"]["api_fills_without_local_order"] == 1
         assert result["by_bot_reconciliation"]["weather"]["eligible_local_join_basis"] is True
+
+    def test_demo_weather_fill_is_split_from_unknown_unattributed_bucket(self):
+        local_trades = [
+            _make_local_trade(
+                ticker="KXHIGHDEN-26MAR04-T60",
+                source_bot="weather",
+                side="yes",
+                order_id="ord-live",
+                cost_cents=80,
+                count=2,
+            ),
+        ]
+        fills = [
+            _make_fill(
+                ticker="KXHIGHDEN-26MAR04-T60",
+                order_id="ord-live",
+                side="yes",
+                yes_price=40,
+                count=2,
+            ),
+            _make_fill(
+                ticker="KXHIGHMIA-26FEB16-B79.5",
+                order_id="demo-ord",
+                side="yes",
+                yes_price=20,
+                count=1,
+            ),
+            _make_fill(
+                ticker="KXHIGHMIA-26MAR04-B79.5",
+                order_id="unknown-ord",
+                side="no",
+                no_price=33,
+                count=2,
+            ),
+        ]
+        settlements = [
+            _make_settlement(
+                ticker="KXHIGHDEN-26MAR04-T60",
+                revenue=200,
+                yes_total_cost=80,
+                no_total_cost=0,
+                market_result="yes",
+            ),
+        ]
+
+        result = compute_realized_pnl_by_bot_local(
+            local_trades,
+            fills,
+            settlements,
+            demo_weather_refs={"tickers": {"KXHIGHMIA-26FEB16-B79.5"}, "order_ids": {"demo-ord"}},
+        )
+
+        assert result["by_bot_reconciliation"]["demo-weather-history"]["api_fills_without_local_order"] == 1
+        assert result["by_bot_reconciliation"]["unattributed-weather"]["api_fills_without_local_order"] == 1
 
     def test_orphan_api_fill_still_blocks_non_weather_local_basis(self):
         local_trades = [
@@ -892,11 +947,76 @@ class TestBuildSnapshot:
         assert snapshot["realized_pnl"]["by_bot"]["unattributed-weather"]["pnl_cents"] == 60
         assert snapshot["realized_pnl"]["by_bot_basis_map"]["unattributed-weather"] == "kalshi_api_settlements"
 
+    def test_demo_weather_api_settlement_is_split_from_unknown_unattributed_weather(self):
+        settlements = [
+            _make_settlement(
+                ticker="KXHIGHLAX-26FEB15-B66.5",
+                revenue=100,
+                yes_total_cost=67,
+                no_total_cost=0,
+                market_result="yes",
+            ),
+            _make_settlement(
+                ticker="KXHIGHMIA-26MAR04-T80",
+                revenue=200,
+                yes_total_cost=140,
+                no_total_cost=0,
+                market_result="yes",
+            ),
+        ]
+
+        snapshot = build_snapshot(
+            balance_cents=0,
+            portfolio_value_cents=0,
+            settlements=settlements,
+            fills=[],
+            positions=[],
+            local_trades=[],
+            deposits_path=None,
+            demo_weather_refs={"tickers": {"KXHIGHLAX-26FEB15-B66.5"}, "order_ids": {"demo-order"}},
+        )
+
+        assert snapshot["realized_pnl"]["by_bot"]["demo-weather-history"]["pnl_cents"] == 33
+        assert snapshot["realized_pnl"]["by_bot"]["unattributed-weather"]["pnl_cents"] == 60
+        assert snapshot["realized_pnl"]["by_bot_basis_map"]["demo-weather-history"] == "kalshi_api_settlements"
+
 
 class TestUnmatchedApiInference:
     def test_unmatched_kxhigh_rows_are_not_attributed_to_weather(self):
         assert _infer_unmatched_api_bot("KXHIGHMIA-26MAR04-T80") == "unattributed-weather"
         assert _infer_unmatched_api_bot("KXBTC-26MAR04-T90000") == "crypto"
+
+    def test_demo_weather_rows_use_demo_history_bucket(self):
+        refs = {"tickers": {"KXHIGHMIA-26FEB16-B79.5"}, "order_ids": {"demo-order"}}
+        assert _infer_unmatched_api_bot(
+            "KXHIGHMIA-26FEB16-B79.5",
+            demo_weather_refs=refs,
+        ) == "demo-weather-history"
+        assert _infer_unmatched_api_bot(
+            "KXHIGHXXX-26MAR04-T80",
+            order_id="demo-order",
+            demo_weather_refs=refs,
+        ) == "demo-weather-history"
+
+
+class TestDemoWeatherRefs:
+    def test_load_demo_weather_refs_extracts_only_kxhigh_rows(self, tmp_path, monkeypatch):
+        payload = {
+            "timestamp": "2026-02-16T00:00:00Z",
+            "trades": [
+                {"ticker": "KXHIGHLAX-26FEB15-B66.5", "order_id": "demo-weather"},
+                {"ticker": "KXUSDJPY-26FEB1610-B155.125", "order_id": "non-weather"},
+            ],
+        }
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "demo-trades-log.json").write_text(__import__("json").dumps(payload))
+        monkeypatch.setattr(_mod, "DATA_DIR", data_dir)
+
+        refs = _load_demo_weather_refs()
+
+        assert refs["tickers"] == {"KXHIGHLAX-26FEB15-B66.5"}
+        assert refs["order_ids"] == {"demo-weather"}
 
     def test_roi_uses_nav_based_total_pnl(self, tmp_path):
         """ROI = (NAV - deposits) / deposits, NOT realized / deposits."""

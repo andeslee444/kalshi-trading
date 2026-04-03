@@ -56,6 +56,8 @@ def _basis_label(basis: str | None) -> str:
 
 
 def _bot_display_name(bot: str) -> str:
+    if bot == "demo-weather-history":
+        return "demo-weather history"
     if bot == "unattributed-weather":
         return "unattributed-weather history"
     return bot
@@ -128,7 +130,7 @@ def build_report(snap: dict) -> str:
                 f"  {bot_name}: {format_dollars(pnl)} | {wins}W/{losses}L "
                 f"({wr * 100:.0f}%) | fees ${fees / 100:.2f} | basis={basis}"
             )
-            if bot == "unattributed-weather":
+            if bot in {"demo-weather-history", "unattributed-weather"}:
                 line += " | excludes canonical weather-family bots"
             lines.append(line)
 

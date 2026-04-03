@@ -473,11 +473,13 @@ def test_observation_pack_surfaces_unattributed_weather_without_counting_it_in_f
                 "by_bot": {
                     "weather": {"pnl_cents": 1250, "wins": 1, "losses": 0, "win_rate": 1.0},
                     "source-monitor": {"pnl_cents": 1700, "wins": 3, "losses": 1, "win_rate": 0.75},
+                    "demo-weather-history": {"pnl_cents": 400, "wins": 1, "losses": 0, "win_rate": 1.0},
                     "unattributed-weather": {"pnl_cents": 900, "wins": 2, "losses": 1, "win_rate": 0.667},
                 },
                 "by_bot_api_settlements": {
                     "weather": {"pnl_cents": 1250, "wins": 1, "losses": 0, "win_rate": 1.0},
                     "source-monitor": {"pnl_cents": 1700, "wins": 3, "losses": 1, "win_rate": 0.75},
+                    "demo-weather-history": {"pnl_cents": 400, "wins": 1, "losses": 0, "win_rate": 1.0},
                     "unattributed-weather": {"pnl_cents": 900, "wins": 2, "losses": 1, "win_rate": 0.667},
                 },
                 "by_bot_local_joined_fills": {
@@ -486,6 +488,7 @@ def test_observation_pack_surfaces_unattributed_weather_without_counting_it_in_f
                 "by_bot_basis_map": {
                     "weather": "kalshi_api_settlements",
                     "source-monitor": "local_buy_orders_joined_to_api_fills_and_settlement_outcomes",
+                    "demo-weather-history": "kalshi_api_settlements",
                     "unattributed-weather": "kalshi_api_settlements",
                 },
                 "by_bot_local_reconciliation": {
@@ -548,6 +551,8 @@ def test_observation_pack_surfaces_unattributed_weather_without_counting_it_in_f
     monkeypatch.setattr("weather_observation_pack._load_json", fake_load_json)
     pack = build_observation_pack(source_lookback_days=(7,), lookback_days=7, top_cities=3, now=datetime(2026, 3, 22, tzinfo=timezone.utc))
 
+    assert pack["demo_weather_history"]["realized"]["pnl_cents"] == 400
+    assert pack["demo_weather_history"]["basis"] == "kalshi_api_settlements"
     assert pack["unattributed_weather"]["realized"]["pnl_cents"] == 900
     assert pack["unattributed_weather"]["basis"] == "kalshi_api_settlements"
     assert pack["weather_family"]["realized"]["pnl_cents"] == 2950

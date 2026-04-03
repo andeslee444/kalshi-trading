@@ -28,10 +28,12 @@ def test_build_report_includes_basis_and_unattributed_weather_label():
             "by_day": {"2026-04-02": 300},
             "by_bot": {
                 "weather": {"pnl_cents": 16876, "wins": 99, "losses": 69, "win_rate": 0.589, "fees_cents": 146},
+                "demo-weather-history": {"pnl_cents": 3300, "wins": 1, "losses": 0, "win_rate": 1.0, "fees_cents": 0},
                 "unattributed-weather": {"pnl_cents": 9000, "wins": 2, "losses": 1, "win_rate": 0.667, "fees_cents": 0},
             },
             "by_bot_basis_map": {
                 "weather": "local_buy_orders_joined_to_api_fills_and_settlement_outcomes",
+                "demo-weather-history": "kalshi_api_settlements",
                 "unattributed-weather": "kalshi_api_settlements",
             },
         },
@@ -43,6 +45,7 @@ def test_build_report_includes_basis_and_unattributed_weather_label():
 
     assert "weather: +$168.76" in report
     assert "basis=local" in report
+    assert "demo-weather history: +$33.00" in report
     assert "unattributed-weather history: +$90.00" in report
     assert "basis=api" in report
     assert "excludes canonical weather-family bots" in report

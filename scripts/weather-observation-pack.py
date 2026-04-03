@@ -726,6 +726,10 @@ def build_observation_pack(
         )
         realized_weather = by_bot.get("weather") or by_bot_api.get("weather")
         realized_source_monitor = by_bot.get("source-monitor") or by_bot_api.get("source-monitor")
+        realized_demo_weather = (
+            by_bot.get("demo-weather-history")
+            or by_bot_api.get("demo-weather-history")
+        )
         realized_unattributed_weather = (
             by_bot.get("unattributed-weather")
             or by_bot_api.get("unattributed-weather")
@@ -735,15 +739,18 @@ def build_observation_pack(
         realized_source_monitor_local = by_bot_local.get("source-monitor")
         realized_source_monitor_basis = by_bot_basis_map.get("source-monitor")
         realized_source_monitor_local_reconciliation = by_bot_local_reconciliation.get("source-monitor")
+        realized_demo_weather_basis = by_bot_basis_map.get("demo-weather-history")
         realized_unattributed_weather_basis = by_bot_basis_map.get("unattributed-weather")
     else:
         realized_source_monitor = None
+        realized_demo_weather = None
         realized_unattributed_weather = None
         realized_weather_api = None
         realized_source_monitor_api = None
         realized_source_monitor_local = None
         realized_source_monitor_basis = None
         realized_source_monitor_local_reconciliation = None
+        realized_demo_weather_basis = None
         realized_unattributed_weather_basis = None
 
     verification_rows = verification.get("verified", []) if isinstance(verification, dict) else []
@@ -802,6 +809,15 @@ def build_observation_pack(
             "realized": realized_weather,
             "realized_api_settlements": realized_weather_api,
             "financial_snapshot": _freshness_from(financial_snapshot_path, financial_snapshot, now=now),
+        },
+        "demo_weather_history": {
+            "realized": realized_demo_weather,
+            "basis": realized_demo_weather_basis,
+            "financial_snapshot": _freshness_from(financial_snapshot_path, financial_snapshot, now=now),
+            "reporting_note": (
+                "Known demo-trader weather activity matched from data/demo-trades-log.json; keep visible as "
+                "historical context but exclude from attributable forecast-weather and combined weather-family realized P&L"
+            ) if realized_demo_weather else None,
         },
         "unattributed_weather": {
             "realized": realized_unattributed_weather,
@@ -873,8 +889,22 @@ def _print_human(pack):
             f"({source_monitor.get('wins', 0)}W/{source_monitor.get('losses', 0)}L, "
             f"win_rate={source_monitor.get('win_rate')})"
         )
+    demo_weather = pack.get("demo_weather_history", {}).get("realized") or {}
+    if demo_weather and (
+        demo_weather.get("pnl_cents", 0) != 0
+        or demo_weather.get("wins", 0)
+        or demo_weather.get("losses", 0)
+    ):
+        print(
+            f"Demo weather history: {demo_weather.get('pnl_cents', 0)} cents "
+            f"({demo_weather.get('wins', 0)}W/{demo_weather.get('losses', 0)}L)"
+        )
     unattributed = pack.get("unattributed_weather", {}).get("realized") or {}
-    if unattributed:
+    if unattributed and (
+        unattributed.get("pnl_cents", 0) != 0
+        or unattributed.get("wins", 0)
+        or unattributed.get("losses", 0)
+    ):
         print(
             f"Unattributed weather history: {unattributed.get('pnl_cents', 0)} cents "
             f"({unattributed.get('wins', 0)}W/{unattributed.get('losses', 0)}L)"

@@ -29,6 +29,7 @@ DATA_DIR = PROJECT_DIR / "data"
 DEPOSITS_PATH = DATA_DIR / "deposits.json"
 SNAPSHOT_PATH = DATA_DIR / "financial-snapshot.json"
 UNATTRIBUTED_WEATHER_BOT = "unattributed-weather"
+DEMO_WEATHER_HISTORY_BOT = "demo-weather-history"
 
 
 # ─── Pure computation functions (no I/O, fully testable) ───
@@ -221,7 +222,7 @@ def _finalize_local_reconciliation_stats(group):
         stats["eligible_local_join_basis"] = strict_local_basis or relaxed_weather_family_basis
 
 
-def compute_realized_pnl_by_bot_api(settlements, local_trades):
+def compute_realized_pnl_by_bot_api(settlements, local_trades, demo_weather_refs=None):
     """Legacy per-bot attribution from API settlements + local ticker mapping."""
     ticker_to_bot = {}
     for trade in local_trades:
@@ -237,7 +238,10 @@ def compute_realized_pnl_by_bot_api(settlements, local_trades):
         cost = _safe_int(settlement.get("yes_total_cost", 0)) + _safe_int(settlement.get("no_total_cost", 0))
         profit = revenue - cost
         fee = _safe_api_fee_cents(settlement.get("fee_cost"))
-        bot = ticker_to_bot.get(ticker, _infer_unmatched_api_bot(ticker))
+        bot = ticker_to_bot.get(
+            ticker,
+            _infer_unmatched_api_bot(ticker, demo_weather_refs=demo_weather_refs),
+        )
         _accumulate_rollup(by_bot[bot], profit, fee)
 
     result = dict(by_bot)
@@ -245,7 +249,7 @@ def compute_realized_pnl_by_bot_api(settlements, local_trades):
     return result
 
 
-def compute_realized_pnl_by_bot_local(local_trades, fills, settlements):
+def compute_realized_pnl_by_bot_local(local_trades, fills, settlements, demo_weather_refs=None):
     """Per-bot realized P&L from local buy orders joined to fills and outcomes."""
     settlement_result_by_ticker = {}
     for settlement in settlements:
@@ -340,7 +344,11 @@ def compute_realized_pnl_by_bot_local(local_trades, fills, settlements):
         local = local_orders.get(order_id)
         if not local:
             unmatched_fills_without_local_trade += 1
-            bot = _infer_unmatched_api_bot(fill_row.get("ticker", ""))
+            bot = _infer_unmatched_api_bot(
+                fill_row.get("ticker", ""),
+                order_id=order_id,
+                demo_weather_refs=demo_weather_refs,
+            )
             by_bot_reconciliation[bot]["api_fills_without_local_order"] += 1
             continue
 
@@ -607,14 +615,23 @@ def load_deposits(deposits_path):
 
 
 def build_snapshot(balance_cents, portfolio_value_cents, settlements, fills,
-                   positions, local_trades, deposits_path):
+                   positions, local_trades, deposits_path, demo_weather_refs=None):
     """Assemble the complete financial snapshot from all data sources."""
     realized = compute_realized_pnl(settlements)
     unrealized = compute_unrealized_pnl(positions, fills)
     verification = verify_settlements(settlements, local_trades)
     deposits = load_deposits(deposits_path)
-    by_bot_api = compute_realized_pnl_by_bot_api(settlements, local_trades)
-    by_bot_local = compute_realized_pnl_by_bot_local(local_trades, fills, settlements)
+    by_bot_api = compute_realized_pnl_by_bot_api(
+        settlements,
+        local_trades,
+        demo_weather_refs=demo_weather_refs,
+    )
+    by_bot_local = compute_realized_pnl_by_bot_local(
+        local_trades,
+        fills,
+        settlements,
+        demo_weather_refs=demo_weather_refs,
+    )
     local_by_bot_total_cents = sum(
         stats.get("pnl_cents", 0)
         for stats in by_bot_local["by_bot"].values()
@@ -727,10 +744,15 @@ def _infer_bot(ticker):
     return "other"
 
 
-def _infer_unmatched_api_bot(ticker):
+def _infer_unmatched_api_bot(ticker, *, order_id=None, demo_weather_refs=None):
     """Attribute API-only rows conservatively when no local order exists."""
     t = (ticker or "").upper()
     if t.startswith("KXHIGH"):
+        refs = demo_weather_refs or {}
+        demo_tickers = refs.get("tickers", set())
+        demo_order_ids = refs.get("order_ids", set())
+        if t in demo_tickers or (order_id and str(order_id) in demo_order_ids):
+            return DEMO_WEATHER_HISTORY_BOT
         return UNATTRIBUTED_WEATHER_BOT
     return _infer_bot(ticker)
 
@@ -765,6 +787,38 @@ def _load_local_trades():
         except (json.JSONDecodeError, ValueError, OSError):
             continue
     return all_trades
+
+
+def _load_demo_weather_refs():
+    """Load known demo weather rows so API-only weather history can be split."""
+    path = DATA_DIR / "demo-trades-log.json"
+    if not path.exists():
+        return {"tickers": set(), "order_ids": set()}
+    try:
+        payload = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError, ValueError):
+        return {"tickers": set(), "order_ids": set()}
+
+    if isinstance(payload, dict):
+        rows = payload.get("trades", [])
+    elif isinstance(payload, list):
+        rows = payload
+    else:
+        rows = []
+
+    tickers = set()
+    order_ids = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ticker = str(row.get("ticker", "")).upper()
+        if not ticker.startswith("KXHIGH"):
+            continue
+        tickers.add(ticker)
+        order_id = row.get("order_id")
+        if order_id:
+            order_ids.add(str(order_id))
+    return {"tickers": tickers, "order_ids": order_ids}
 
 
 def _fetch_api_data():
@@ -853,6 +907,7 @@ def main():
     print("Loading local trade logs...")
     local_trades = _load_local_trades()
     print(f"  {len(local_trades)} local trade records")
+    demo_weather_refs = _load_demo_weather_refs()
 
     deposits_path = DEPOSITS_PATH if DEPOSITS_PATH.exists() else None
 
@@ -864,6 +919,7 @@ def main():
         positions=positions,
         local_trades=local_trades,
         deposits_path=deposits_path,
+        demo_weather_refs=demo_weather_refs,
     )
 
     if args.print_only:
