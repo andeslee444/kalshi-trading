@@ -6,6 +6,7 @@ Provides:
 - NWSForecastFetcher: Fetches NWS 7-day forecast as fallback data source
 - EnsembleCollector: Fetches raw ensemble member temperatures from Open-Meteo
 - HRRRFetcher: Fetches HRRR deterministic forecast data from Open-Meteo
+- IntradayFeatureFetcher: Fetches research-only same-day HRRR 15-minute feature summaries
 - NAMFetcher: Fetches NAM 3km deterministic forecast from Open-Meteo
 - PreviousRunsFetcher: Forecast convergence analysis from previous model runs
 - BiasCorrector: Per-city per-model systematic forecast bias correction
@@ -1039,6 +1040,167 @@ class HRRRFetcher:
             self.last_error = str(e)
             self.log.warning("HRRR API error: %s", e)
             return None
+
+
+class IntradayFeatureFetcher:
+    """Fetch same-day research-only 15-minute HRRR feature summaries.
+
+    This is intentionally separate from the live pricing path. It captures
+    short-horizon atmospheric context that may explain late-day temperature
+    misses without forcing unvalidated feature logic into production trading.
+    """
+
+    FEATURE_FIELDS = (
+        "temperature_2m",
+        "cape",
+        "precipitation",
+        "cloud_cover",
+        "dewpoint_2m",
+    )
+
+    def __init__(self, logger=None, rate_limiter=None):
+        self.log = logger or _log
+        self._rate_limiter = rate_limiter
+        self.last_status_code = None
+        self.last_error = None
+
+    def fetch_same_day_summary(self, lat, lon, *, city_code=None, target_date=None, forecast_hours=24):
+        """Fetch a local-date summary of HRRR 15-minute features.
+
+        Args:
+            lat: latitude
+            lon: longitude
+            city_code: optional Kalshi city code, only used for local-date fallback
+            target_date: optional YYYY-MM-DD local date; defaults to the city's local today
+            forecast_hours: horizon to request from Open-Meteo (default 24)
+
+        Returns:
+            dict summary or None when no usable 15-minute data is available.
+        """
+        if _retry_request is None:
+            self.log.warning("retry_request not available")
+            return None
+        self.last_status_code = None
+        self.last_error = None
+
+        target_date = target_date or self._local_date_for_city(city_code)
+        api_key = os.environ.get("OPEN_METEO_API_KEY", "")
+        model = open_meteo_model_name("hrrr_conus", api_key=api_key)
+        base, request_key = open_meteo_forecast_target(model_name=model, api_key=api_key)
+        params = (
+            f"latitude={lat}&longitude={lon}"
+            f"&minutely_15={','.join(self.FEATURE_FIELDS)}"
+            f"&temperature_unit=fahrenheit"
+            f"&timezone=auto&forecast_hours={forecast_hours}"
+            f"&models={model}"
+        )
+        url = f"{base}?{params}" + (f"&apikey={request_key}" if request_key else "")
+
+        try:
+            if self._rate_limiter is not None:
+                self._rate_limiter()
+            resp = _retry_request("GET", url, timeout=15, max_retries=2)
+            if resp is None or resp.status_code != 200:
+                self.last_status_code = getattr(resp, "status_code", None)
+                self.last_error = f"status={self.last_status_code}"
+                self.log.warning(
+                    "Intraday feature API returned status %s",
+                    getattr(resp, "status_code", "None"),
+                )
+                return None
+
+            data = resp.json()
+            summary = self._summarize_minutely_15(data, target_date=target_date)
+            if summary is None:
+                self.last_error = "no usable minutely_15 rows"
+                self.log.warning("Intraday feature API returned no usable minutely_15 rows")
+                return None
+            return summary
+        except Exception as e:
+            self.last_status_code = getattr(getattr(e, "response", None), "status_code", None)
+            self.last_error = str(e)
+            self.log.warning("Intraday feature API error: %s", e)
+            return None
+
+    def _summarize_minutely_15(self, payload, *, target_date):
+        minutely = payload.get("minutely_15", {})
+        units = payload.get("minutely_15_units", {})
+        times = minutely.get("time", [])
+        if not times:
+            return None
+
+        date_rows = []
+        for idx, ts in enumerate(times):
+            if not str(ts).startswith(f"{target_date}T"):
+                continue
+            date_rows.append((idx, ts))
+
+        if not date_rows:
+            return None
+
+        def _series(name):
+            values = minutely.get(name, [])
+            return [values[idx] if idx < len(values) else None for idx, _ in date_rows]
+
+        def _valid(values):
+            return [value for value in values if isinstance(value, (int, float))]
+
+        temps = _series("temperature_2m")
+        capes = _series("cape")
+        precip = _series("precipitation")
+        clouds = _series("cloud_cover")
+        dewpoints = _series("dewpoint_2m")
+
+        valid_temps = _valid(temps)
+        valid_capes = _valid(capes)
+        valid_precip = _valid(precip)
+        valid_clouds = _valid(clouds)
+        valid_dewpoints = _valid(dewpoints)
+        if not any((valid_temps, valid_capes, valid_precip, valid_clouds, valid_dewpoints)):
+            return None
+
+        peak_temp_time = None
+        if valid_temps:
+            peak_temp = max(valid_temps)
+            for idx, ts in date_rows:
+                value = minutely.get("temperature_2m", [None])[idx]
+                if value == peak_temp:
+                    peak_temp_time = ts
+                    break
+
+        return {
+            "date": target_date,
+            "samples": len(date_rows),
+            "time_window": {
+                "start": date_rows[0][1],
+                "end": date_rows[-1][1],
+            },
+            "source": "open_meteo_hrrr_minutely_15",
+            "model": "hrrr",
+            "temperature_max_f": round(max(valid_temps), 3) if valid_temps else None,
+            "temperature_min_f": round(min(valid_temps), 3) if valid_temps else None,
+            "temperature_latest_f": round(valid_temps[-1], 3) if valid_temps else None,
+            "temperature_peak_time": peak_temp_time,
+            "cape_max_jkg": round(max(valid_capes), 3) if valid_capes else None,
+            "precipitation_total": round(sum(valid_precip), 4) if valid_precip else None,
+            "cloud_cover_mean_pct": round(sum(valid_clouds) / len(valid_clouds), 3) if valid_clouds else None,
+            "cloud_cover_max_pct": round(max(valid_clouds), 3) if valid_clouds else None,
+            "dewpoint_max_f": round(max(valid_dewpoints), 3) if valid_dewpoints else None,
+            "units": {
+                "temperature_2m": units.get("temperature_2m"),
+                "cape": units.get("cape"),
+                "precipitation": units.get("precipitation"),
+                "cloud_cover": units.get("cloud_cover"),
+                "dewpoint_2m": units.get("dewpoint_2m"),
+            },
+        }
+
+    def _local_date_for_city(self, city_code):
+        try:
+            tz = ZoneInfo(_city_timezone_name(city_code=city_code))
+            return datetime.datetime.now(tz).date().isoformat()
+        except Exception:
+            return datetime.date.today().isoformat()
 
 
 class NAMFetcher:

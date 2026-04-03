@@ -54,6 +54,10 @@ Observation-window follow-up:
   - [2026-03-29-weather-family-calibration-audit.md](./2026-03-29-weather-family-calibration-audit.md)
 - Weather-family April 2 outage-recovery audit note:
   - [2026-04-02-weather-outage-recovery-audit.md](./2026-04-02-weather-outage-recovery-audit.md)
+- Weather-family April 3 Open-Meteo follow-on:
+  - NBM promoted into the live forecast-weather prior
+  - AIFS explicitly held back after zero usable training pairs in end-to-end tests
+  - `python3 scripts/weather-intraday-feature-audit.py` added as a research-only same-day HRRR 15-minute regime surface
 - Event-ledger post-Phase-4 storage retention plan:
   - [2026-03-22-ledger-storage-retention-plan.md](./2026-03-22-ledger-storage-retention-plan.md)
 

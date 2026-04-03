@@ -153,6 +153,8 @@ MODEL_MAP = {
     "ecmwf": "ecmwf_ifs025",
     "icon": "icon_seamless",
     "gem": "gem_global",
+    "nbm": "nbm_conus",
+    "aifs": "ecmwf_aifs025",
     "graphcast": "gfs_graphcast025",
 }
 
@@ -164,8 +166,11 @@ def main():
     parser.add_argument(
         "--models",
         type=str,
-        default="gfs,ecmwf",
-        help="Comma-separated model list from: gfs, ecmwf, icon, gem, graphcast (default: gfs,ecmwf)",
+        default="gfs,ecmwf,icon,gem,graphcast,nbm",
+        help=(
+            "Comma-separated model list from: gfs, ecmwf, icon, gem, graphcast, nbm, aifs "
+            "(default: gfs,ecmwf,icon,gem,graphcast,nbm)"
+        ),
     )
     parser.add_argument(
         "--db-path",

@@ -4,7 +4,7 @@
 
 **Goal:** Optimize the forecast-weather track from +$112.18 realized (62 settled, 63% WR, 27% ROI) to target +$50-80/day with improved model quality and execution.
 
-**Architecture:** Forecast-weather ensemble model (GFS/ECMWF/ICON via Open-Meteo) trading KXHIGH temperature markets. CDF-based probability with per-city sigma calibration.
+**Architecture:** Forecast-weather ensemble model (GFS/ECMWF/ICON/GraphCast/NBM via Open-Meteo, with AIFS held back until it returns usable data) trading KXHIGH temperature markets. CDF-based probability with per-city sigma calibration.
 
 **Tech Stack:** Python 3, Open-Meteo API, math.erf
 
@@ -24,6 +24,7 @@ Observation-window follow-up for the forecast-weather track:
   [2026-03-29-weather-family-calibration-audit.md](./2026-03-29-weather-family-calibration-audit.md).
 - For the April 2 outage-recovery and live supervisor cutover trail, use
   [2026-04-02-weather-outage-recovery-audit.md](./2026-04-02-weather-outage-recovery-audit.md).
+- The April 3 follow-on refresh promoted `nbm` into the live historical prior, explicitly held back `aifs` after an end-to-end zero-pair probe, and added a research-only `python3 scripts/weather-intraday-feature-audit.py` path for HRRR 15-minute regime analysis.
 - For the separate NWS observed-weather track, use [2026-03-06-plan6-source-monitor.md](./2026-03-06-plan6-source-monitor.md).
 - The March 29 live calibration refresh is already captured in the audit note above.
 - Do not apply additional live forecast-weather prior, sizing, or schema changes from this plan until

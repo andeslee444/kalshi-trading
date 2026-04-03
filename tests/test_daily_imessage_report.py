@@ -36,6 +36,10 @@ def test_build_report_includes_basis_and_unattributed_weather_label():
                 "demo-weather-history": "kalshi_api_settlements",
                 "unattributed-weather": "kalshi_api_settlements",
             },
+            "by_bot_display_map": {
+                "demo-weather-history": "demo-weather history",
+                "unattributed-weather": "legacy automated weather history",
+            },
         },
         "unrealized_pnl": {"positions": []},
         "verification": {"status": "ok"},
@@ -46,6 +50,6 @@ def test_build_report_includes_basis_and_unattributed_weather_label():
     assert "weather: +$168.76" in report
     assert "basis=local" in report
     assert "demo-weather history: +$33.00" in report
-    assert "unattributed-weather history: +$90.00" in report
+    assert "legacy automated weather history: +$90.00" in report
     assert "basis=api" in report
     assert "excludes canonical weather-family bots" in report

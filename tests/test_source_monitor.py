@@ -189,6 +189,37 @@ class TestNwsSigma:
         assert sm._nws_min_edge(81, 80, 17, False) == 0.15
 
 
+class TestNwsExecutionGuards:
+    def test_daily_loss_override_requires_late_high_confidence_threshold(self, monkeypatch):
+        sm = _load_source_monitor()
+        monkeypatch.setattr(
+            sm,
+            "config",
+            {
+                "maxDailyLoss": 50,
+                "sources": {
+                    "nws": {
+                        "highConfidenceDailyLossBufferPct": 0.5,
+                        "highConfidenceDailyLossMinEdge": 0.18,
+                        "highConfidenceDailyLossMinConfidence": 0.85,
+                        "highConfidenceDailyLossMinHour": 17,
+                    }
+                },
+            },
+        )
+        monkeypatch.setattr(
+            sm,
+            "trade_manager",
+            type("FakeTradeManager", (), {"_effective_max_daily_loss_cents": lambda self: 5000})(),
+        )
+
+        assert sm._nws_daily_loss_limit_override_cents(0.22, 0.91, 18, False) == 7500
+        assert sm._nws_daily_loss_limit_override_cents(0.17, 0.91, 18, False) is None
+        assert sm._nws_daily_loss_limit_override_cents(0.22, 0.80, 18, False) is None
+        assert sm._nws_daily_loss_limit_override_cents(0.22, 0.91, 16, False) is None
+        assert sm._nws_daily_loss_limit_override_cents(0.22, 0.91, 18, True) is None
+
+
 # === Integration tests using source-monitor module import ===
 
 

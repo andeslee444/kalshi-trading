@@ -51,6 +51,14 @@ def fake_runner(tmp_path):
         if script == "weather-execution-audit.py":
             payload = {"overall": {"trades": 1}, "per_city": {"PHIL": {"trades": 1}}}
             return _result(stdout=json.dumps(payload))
+        if script == "weather-intraday-feature-audit.py":
+            payload = {
+                "artifact_type": "weather_intraday_feature_audit",
+                "schema_version": 1,
+                "summary": {"convective_risk_cities": ["MIA"]},
+                "per_city": {"MIA": {"risk_flags": ["convective_risk"]}},
+            }
+            return _result(stdout=json.dumps(payload))
         if script == "backtest.py":
             output_index = command.index("--output") + 1
             output_path = Path(command[output_index])
@@ -123,6 +131,7 @@ def test_refresh_writes_shadow_bundle_without_shadow_prior(tmp_path, fake_runner
     assert summary["status"] == "ok"
     assert (output_dir / "weather-observation-pack.json").exists()
     assert (output_dir / "weather-city-audit.json").exists()
+    assert (output_dir / "weather-intraday-feature-audit.json").exists()
     assert (output_dir / "weather-backtest-results.json").exists()
     assert (output_dir / "weather-calibration.json").exists()
     assert (output_dir / "weather-promotion-candidates.json").exists()
@@ -157,6 +166,8 @@ def test_refresh_can_include_shadow_prior(tmp_path, fake_runner, monkeypatch):
     assert (output_dir / "weather-live-bias.json").exists()
     assert any(Path(cmd[1]).name == "backfill-weather-data.py" for cmd in calls)
     assert any(Path(cmd[1]).name == "calibrate-weather-bias.py" for cmd in calls)
+    backfill_cmd = next(cmd for cmd in calls if Path(cmd[1]).name == "backfill-weather-data.py")
+    assert "gfs,ecmwf,icon,gem,graphcast,nbm" in backfill_cmd
     obs_cmd = next(cmd for cmd in calls if Path(cmd[1]).name == "weather-observation-pack.py")
     assert "--weather-bias-path" in obs_cmd
 
@@ -186,6 +197,13 @@ def test_empty_shadow_prior_db_fails(tmp_path, monkeypatch):
             return _result(stdout=json.dumps({"overall": {"n": 0}, "per_city": {}, "per_days_out": {}}))
         if script == "weather-execution-audit.py":
             return _result(stdout=json.dumps({"overall": {"trades": 0}, "per_city": {}}))
+        if script == "weather-intraday-feature-audit.py":
+            return _result(stdout=json.dumps({
+                "artifact_type": "weather_intraday_feature_audit",
+                "schema_version": 1,
+                "summary": {"convective_risk_cities": []},
+                "per_city": {},
+            }))
         if script == "backtest.py":
             output_path = Path(command[command.index("--output") + 1])
             payload = {"generated_at": "2026-03-23T00:00:00", "n_evaluated": 1, "per_bot": {"weather": {"n_evaluated": 1}}}

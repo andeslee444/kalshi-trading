@@ -543,6 +543,11 @@ class TradeManager:
             self.log.info("Cost cap: %dx → %dx on %s (max $%.2f)", original_count, count, ticker, max_cost_cents / 100)
 
         max_loss_cents = self._effective_max_daily_loss_cents()
+        override_limit_cents = extra_fields.get("daily_loss_limit_override_cents")
+        if isinstance(override_limit_cents, (int, float)) and override_limit_cents > max_loss_cents:
+            max_loss_cents = min(50000, int(override_limit_cents))
+            extra_fields["daily_loss_limit_applied_cents"] = max_loss_cents
+            caps_applied.append("daily_loss_override")
         risk_cents = price_cents * count
         if self._daily_spend_cents + risk_cents > max_loss_cents:
             self.log.warning(

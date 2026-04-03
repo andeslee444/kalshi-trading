@@ -141,6 +141,25 @@ def _city_weather_edge_threshold(city_code, base_threshold=None):
     return threshold
 
 
+def _yield_same_day_to_observed_weather():
+    return bool(config.get("yieldSameDayToObservedWeather", True))
+
+
+def _should_yield_same_day_weather_market(parsed, days_out):
+    if not _yield_same_day_to_observed_weather():
+        return False
+    city_code = parsed.get("city")
+    date_str = parsed.get("date")
+    if not city_code or not date_str:
+        return False
+    if isinstance(days_out, int):
+        return days_out <= 0
+    try:
+        return datetime.date.fromisoformat(date_str) <= _city_today(city_code)
+    except Exception:
+        return False
+
+
 def _resolve_optional_project_path(path_str, project_dir=None):
     if not path_str:
         return None
@@ -411,6 +430,15 @@ def get_batch_ensemble_forecasts(cities_dict):
     lats = ",".join(str(cities_dict[c]["lat"]) for c in codes)
     lons = ",".join(str(cities_dict[c]["lon"]) for c in codes)
 
+    def _non_null_daily_map(daily):
+        dates = daily.get("time", [])
+        temps = daily.get("temperature_2m_max", [])
+        return {
+            date_str: temp
+            for date_str, temp in zip(dates, temps)
+            if temp is not None
+        }
+
     def _fetch_single_model_forecasts(model_name):
         """Fallback for model endpoints that reject multi-location requests."""
         city_forecasts = {}
@@ -427,8 +455,9 @@ def get_batch_ensemble_forecasts(cities_dict):
             r = _cached_request(url, timeout=30)
             data = r.json()
             d = data.get("daily", {})
-            if d and "time" in d and "temperature_2m_max" in d:
-                city_forecasts[code] = dict(zip(d["time"], d["temperature_2m_max"]))
+            parsed = _non_null_daily_map(d)
+            if parsed:
+                city_forecasts[code] = parsed
         return city_forecasts
 
     # Fetch each model in a single batch request
@@ -457,15 +486,25 @@ def get_batch_ensemble_forecasts(cities_dict):
                     if i >= len(codes):
                         break
                     d = city_data.get("daily", {})
-                    if d and "time" in d and "temperature_2m_max" in d:
-                        city_forecasts[codes[i]] = dict(zip(d["time"], d["temperature_2m_max"]))
+                    parsed = _non_null_daily_map(d)
+                    if parsed:
+                        city_forecasts[codes[i]] = parsed
             else:
                 d = data.get("daily", {})
-                if d and "time" in d and "temperature_2m_max" in d:
-                    city_forecasts[codes[0]] = dict(zip(d["time"], d["temperature_2m_max"]))
+                parsed = _non_null_daily_map(d)
+                if parsed:
+                    city_forecasts[codes[0]] = parsed
 
-            model_results[model_key] = city_forecasts
-            health.record_source_success(f"open-meteo-{model_key}")
+            if city_forecasts:
+                model_results[model_key] = city_forecasts
+                health.record_source_success(f"open-meteo-{model_key}")
+            else:
+                _record_source_failure(
+                    f"open-meteo-{model_key}",
+                    "all returned temperature_2m_max values were null",
+                    status_code=getattr(r, "status_code", None),
+                    immediate_on_bad_request=False,
+                )
         except Exception as e:
             status_code = getattr(getattr(e, "response", None), "status_code", None)
             if status_code == 400 and len(codes) > 1:
@@ -586,7 +625,21 @@ def get_ensemble_forecast(lat, lon):
             continue
         try:
             d = response.json()["daily"]
-            model_forecasts[model_key] = dict(zip(d["time"], d["temperature_2m_max"]))
+            parsed = {
+                date_str: temp
+                for date_str, temp in zip(d.get("time", []), d.get("temperature_2m_max", []))
+                if temp is not None
+            }
+            if not parsed:
+                _record_source_failure(
+                    f"open-meteo-{model_key}",
+                    "all returned temperature_2m_max values were null",
+                    status_code=getattr(response, "status_code", None),
+                    immediate_on_bad_request=False,
+                )
+                failed_models.append(model_key)
+                continue
+            model_forecasts[model_key] = parsed
             health.record_source_success(f"open-meteo-{model_key}")
         except (KeyError, ValueError) as e:
             log.warning(f"Ensemble model {model_key} parse error: {e}")
@@ -680,6 +733,11 @@ def _maker_execution_config():
         "maxJoinUpliftCents": int(raw.get("maxJoinUpliftCents", 18)),
         "pricePriorityEdgeBuffer": float(raw.get("pricePriorityEdgeBuffer", 0.02)),
         "maxPriceCents": int(raw.get("maxPriceCents", 95)),
+        "takerEscalationNearCloseMinutes": int(raw.get("takerEscalationNearCloseMinutes", 180)),
+        "takerEscalationMaxDaysOut": int(raw.get("takerEscalationMaxDaysOut", 0)),
+        "takerEscalationMinDisplayedEdge": float(raw.get("takerEscalationMinDisplayedEdge", 0.12)),
+        "takerEscalationMinConfidence": float(raw.get("takerEscalationMinConfidence", 0.90)),
+        "takerEscalationMaxMakerEdgeAdvantage": float(raw.get("takerEscalationMaxMakerEdgeAdvantage", 0.08)),
     }
 
 
@@ -779,6 +837,41 @@ def _select_weather_execution_plan(displayed_plan, maker_plan, market_liquid, ma
         if maker_plan["edge"] >= displayed_plan["edge"] + cfg["pricePriorityEdgeBuffer"]:
             return maker_plan
     return displayed_plan
+
+
+def _time_to_close_minutes(close_time):
+    if not close_time:
+        return None
+    try:
+        close_dt = datetime.datetime.fromisoformat(str(close_time).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return max(0, int((close_dt - now).total_seconds() / 60))
+
+
+def _should_taker_escalate_weather(displayed_plan, maker_plan, market, side_prob,
+                                   days_out, effective_edge_threshold, maker_cfg=None):
+    cfg = maker_cfg or _maker_execution_config()
+    if not displayed_plan or not maker_plan:
+        return False
+    max_days_out = int(cfg.get("takerEscalationMaxDaysOut", 0))
+    if days_out is None or days_out > max_days_out:
+        return False
+    close_minutes = _time_to_close_minutes(market.get("close_time"))
+    if close_minutes is None or close_minutes > cfg["takerEscalationNearCloseMinutes"]:
+        return False
+    if side_prob < cfg["takerEscalationMinConfidence"]:
+        return False
+    min_displayed_edge = max(
+        float(effective_edge_threshold or 0.0),
+        cfg["takerEscalationMinDisplayedEdge"],
+    )
+    if displayed_plan["edge"] + 1e-9 < min_displayed_edge:
+        return False
+    if maker_plan["edge"] > displayed_plan["edge"] + cfg["takerEscalationMaxMakerEdgeAdvantage"]:
+        return False
+    return True
 
 
 def _weather_bias_trade_fields(bias_applied=None, hist_bias=None, live_bias=None,
@@ -1815,6 +1908,20 @@ def scan_and_trade():
             bias_fields=bias_fields,
         )
 
+        if _should_yield_same_day_weather_market(parsed, days_out):
+            ss.skip("shared_track_yield")
+            _log_weather_decision(
+                ticker,
+                "yes" if our_prob > 0.5 else "no",
+                "skipped",
+                "yield_same_day_to_source_monitor",
+                forecast=forecast_temp,
+                threshold=parsed["threshold"],
+                days_out=days_out,
+                **research_fields,
+            )
+            continue
+
         # Skip near-threshold coinflips — dynamic based on calibrated sigma
         # With sigma=4.7F (global), min_distance=2.35F. For NY day-0 (sigma=3.1F), 1.55F.
         # Floor of 1.0F prevents degenerate cases.
@@ -1858,7 +1965,30 @@ def scan_and_trade():
         side_prob = our_prob if side == "yes" else (1 - our_prob)
         displayed_plan = _build_displayed_entry_plan(m, side, side_prob, liquid)
         maker_plan = _build_maker_entry_plan(m, side, side_prob, days_out, maker_cfg=maker_cfg)
+
+        # Adjust edge threshold for high ensemble spread or disagreement (defense in depth)
+        effective_edge_threshold = city_edge_threshold
+        disagree_mult = VERIFICATION_CONFIG.get("disagreement_edge_multiplier", 2.0)
+        if disagreement_score > 0.3:
+            effective_edge_threshold = city_edge_threshold * disagree_mult
+        elif spread_mult > 1.5:
+            effective_edge_threshold = city_edge_threshold * 2
+        elif verification_confidence and verification_confidence < 0.6:
+            effective_edge_threshold *= 1.0 + ((0.6 - verification_confidence) * 0.5)
+
         entry_plan = _select_weather_execution_plan(displayed_plan, maker_plan, liquid, maker_cfg=maker_cfg)
+        taker_escalated = False
+        if _should_taker_escalate_weather(
+            displayed_plan,
+            maker_plan,
+            m,
+            side_prob,
+            days_out,
+            effective_edge_threshold,
+            maker_cfg=maker_cfg,
+        ):
+            entry_plan = displayed_plan
+            taker_escalated = True
 
         if entry_plan is None:
             displayed_edge = displayed_plan["edge"] if displayed_plan else None
@@ -1896,16 +2026,6 @@ def scan_and_trade():
             )
             continue
 
-        # Adjust edge threshold for high ensemble spread or disagreement (defense in depth)
-        effective_edge_threshold = city_edge_threshold
-        disagree_mult = VERIFICATION_CONFIG.get("disagreement_edge_multiplier", 2.0)
-        if disagreement_score > 0.3:
-            effective_edge_threshold = city_edge_threshold * disagree_mult
-        elif spread_mult > 1.5:
-            effective_edge_threshold = city_edge_threshold * 2
-        elif verification_confidence and verification_confidence < 0.6:
-            effective_edge_threshold *= 1.0 + ((0.6 - verification_confidence) * 0.5)
-
         if edge_yes >= effective_edge_threshold:
             if parsed["direction"] == "B" and edge_yes < city_edge_threshold * 2:
                 ss.skip("bracket_low_edge")
@@ -1939,6 +2059,7 @@ def scan_and_trade():
                 "verification_confidence": verification_confidence,
                 "effective_edge_threshold": effective_edge_threshold,
                 "execution_mode": entry_plan["execution_mode"],
+                "taker_escalated": taker_escalated,
                 "entry_price": entry_plan["price"],
                 "maker_plan": maker_plan,
                 "research_fields": dict(
@@ -2048,6 +2169,7 @@ def scan_and_trade():
         # Edge is always positive (computed against the price we'd actually quote/pay)
         side = opp["side"]
         execution_mode = opp.get("execution_mode", "taker")
+        taker_escalated = bool(opp.get("taker_escalated"))
         price = opp.get("entry_price")
 
         # Phase 3: Order book depth gating — skip thin books, improve limit pricing
@@ -2147,7 +2269,8 @@ def scan_and_trade():
                 order_type, price = choose_order_type(yes_bid, yes_ask, "yes", edge, opp["our_prob"], depth_data)
                 if not price or price <= 0:
                     price = yes_ask
-                reasoning = f"{city_name} forecast: {forecast}F, {ticker} YES at {price}c ({order_type}) -> our prob {opp['our_prob']*100:.0f}%, edge +{edge*100:.1f}%, buying YES"
+                escalation_note = " late taker escalation," if taker_escalated else ""
+                reasoning = f"{city_name} forecast: {forecast}F, {ticker} YES at {price}c ({order_type}) -> our prob {opp['our_prob']*100:.0f}%, edge +{edge*100:.1f}%,{escalation_note} buying YES"
         elif side == "no" and (no_ask and no_ask < 99 or execution_mode == "maker"):
             if execution_mode == "maker":
                 order_type = "maker-limit"
@@ -2167,12 +2290,13 @@ def scan_and_trade():
                 order_type, price = choose_order_type(yes_bid, yes_ask, "no", edge, opp["our_prob"], depth_data)
                 if not price or price <= 0:
                     price = no_ask
-                reasoning = f"{city_name} forecast: {forecast}F, {ticker} NO at {price}c ({order_type}) -> our prob {(1-opp['our_prob'])*100:.0f}%, edge +{edge*100:.1f}%, buying NO"
+                escalation_note = " late taker escalation," if taker_escalated else ""
+                reasoning = f"{city_name} forecast: {forecast}F, {ticker} NO at {price}c ({order_type}) -> our prob {(1-opp['our_prob'])*100:.0f}%, edge +{edge*100:.1f}%,{escalation_note} buying NO"
         else:
             continue
 
         # Request budget from portfolio allocator (includes Rec 6 dedup via global ticker check)
-        budget = allocator.request_budget("weather", ticker, edge=edge)
+        budget = allocator.request_budget("weather", ticker, edge=edge, source_type="forecast_weather")
         if not budget.approved:
             log.info(f"  Allocator denied {ticker}: {budget.reason}")
             ss.skip("allocator_denied")
@@ -2305,7 +2429,8 @@ def scan_and_trade():
             per_model_probs=opp.get("per_model_probs"),
             weights_used=opp.get("weights_used"),
             verification_confidence=round(opp.get("verification_confidence", 0.0), 4),
-            execution_style=execution_mode,
+            execution_style="taker_escalated" if taker_escalated and execution_mode != "maker" else execution_mode,
+            taker_escalated=taker_escalated,
             bias_applied_f=opp.get("bias_applied_f"),
             bias_hist_f=opp.get("bias_hist_f"),
             bias_live_f=opp.get("bias_live_f"),
@@ -2318,7 +2443,7 @@ def scan_and_trade():
         )
         if result:
             ss.trades_placed += 1
-            allocator.record_trade("weather", ticker, result.get("cost_cents", risk), edge=edge)
+            allocator.record_trade("weather", ticker, result.get("cost_cents", risk), edge=edge, source_type="forecast_weather")
             record_local_trade(ticker)
 
     log.info(f"Market analysis + trading ({time.time()-t_analysis:.1f}s)")

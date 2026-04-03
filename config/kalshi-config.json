@@ -7,6 +7,7 @@
   "maxDailyLossPct": 0.07,
   "scanIntervalMinutes": 30,
   "edgeThreshold": 0.06,
+  "yieldSameDayToObservedWeather": true,
   "cityEdgeThresholds": {
     "CHI": 0.12,
     "HOU": 0.12,
@@ -188,7 +189,12 @@
     "maxJoinUpliftCents": 18,
     "pricePriorityEdgeBuffer": 0.02,
     "maxPriceCents": 95,
-    "maxRestingSeconds": 300
+    "maxRestingSeconds": 300,
+    "takerEscalationNearCloseMinutes": 180,
+    "takerEscalationMaxDaysOut": 0,
+    "takerEscalationMinDisplayedEdge": 0.12,
+    "takerEscalationMinConfidence": 0.9,
+    "takerEscalationMaxMakerEdgeAdvantage": 0.04
   },
   "opportunitySelection": {
     "enabled": true,

@@ -59,7 +59,7 @@ def _bot_display_name(bot: str) -> str:
     if bot == "demo-weather-history":
         return "demo-weather history"
     if bot == "unattributed-weather":
-        return "unattributed-weather history"
+        return "legacy automated weather history"
     return bot
 
 
@@ -110,6 +110,7 @@ def build_report(snap: dict) -> str:
     # Per-bot performance
     by_bot = rp.get("by_bot", {})
     by_bot_basis_map = rp.get("by_bot_basis_map", {})
+    by_bot_display_map = rp.get("by_bot_display_map", {})
     active_bots = {k: v for k, v in by_bot.items()
                    if v.get("wins", 0) + v.get("losses", 0) > 0 or v.get("pnl_cents", 0) != 0}
 
@@ -125,7 +126,7 @@ def build_report(snap: dict) -> str:
             pnl = d.get("pnl_cents", 0)
             fees = d.get("fees_cents", 0)
             basis = _basis_label(by_bot_basis_map.get(bot))
-            bot_name = _bot_display_name(bot)
+            bot_name = by_bot_display_map.get(bot) or _bot_display_name(bot)
             line = (
                 f"  {bot_name}: {format_dollars(pnl)} | {wins}W/{losses}L "
                 f"({wr * 100:.0f}%) | fees ${fees / 100:.2f} | basis={basis}"

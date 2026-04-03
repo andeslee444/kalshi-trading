@@ -721,6 +721,7 @@ def build_observation_pack(
         by_bot_api = realized_pnl.get("by_bot_api_settlements", {}) if isinstance(realized_pnl, dict) else {}
         by_bot_local = realized_pnl.get("by_bot_local_joined_fills", {}) if isinstance(realized_pnl, dict) else {}
         by_bot_basis_map = realized_pnl.get("by_bot_basis_map", {}) if isinstance(realized_pnl, dict) else {}
+        by_bot_reporting_notes = realized_pnl.get("by_bot_reporting_notes", {}) if isinstance(realized_pnl, dict) else {}
         by_bot_local_reconciliation = (
             realized_pnl.get("by_bot_local_reconciliation", {}) if isinstance(realized_pnl, dict) else {}
         )
@@ -741,6 +742,8 @@ def build_observation_pack(
         realized_source_monitor_local_reconciliation = by_bot_local_reconciliation.get("source-monitor")
         realized_demo_weather_basis = by_bot_basis_map.get("demo-weather-history")
         realized_unattributed_weather_basis = by_bot_basis_map.get("unattributed-weather")
+        realized_demo_weather_note = by_bot_reporting_notes.get("demo-weather-history")
+        realized_unattributed_weather_note = by_bot_reporting_notes.get("unattributed-weather")
     else:
         realized_source_monitor = None
         realized_demo_weather = None
@@ -752,6 +755,8 @@ def build_observation_pack(
         realized_source_monitor_local_reconciliation = None
         realized_demo_weather_basis = None
         realized_unattributed_weather_basis = None
+        realized_demo_weather_note = None
+        realized_unattributed_weather_note = None
 
     verification_rows = verification.get("verified", []) if isinstance(verification, dict) else []
     verification_source_mix = [
@@ -814,7 +819,7 @@ def build_observation_pack(
             "realized": realized_demo_weather,
             "basis": realized_demo_weather_basis,
             "financial_snapshot": _freshness_from(financial_snapshot_path, financial_snapshot, now=now),
-            "reporting_note": (
+            "reporting_note": realized_demo_weather_note or (
                 "Known demo-trader weather activity matched from data/demo-trades-log.json; keep visible as "
                 "historical context but exclude from attributable forecast-weather and combined weather-family realized P&L"
             ) if realized_demo_weather else None,
@@ -823,7 +828,7 @@ def build_observation_pack(
             "realized": realized_unattributed_weather,
             "basis": realized_unattributed_weather_basis,
             "financial_snapshot": _freshness_from(financial_snapshot_path, financial_snapshot, now=now),
-            "reporting_note": (
+            "reporting_note": realized_unattributed_weather_note or (
                 "API-only KXHIGH settlements/fills with no canonical local order match; keep visible as historical "
                 "weather context but exclude from attributable forecast-weather and combined weather-family realized P&L"
             ) if realized_unattributed_weather else None,

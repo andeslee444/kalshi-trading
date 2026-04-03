@@ -491,6 +491,10 @@ def test_observation_pack_surfaces_unattributed_weather_without_counting_it_in_f
                     "demo-weather-history": "kalshi_api_settlements",
                     "unattributed-weather": "kalshi_api_settlements",
                 },
+                "by_bot_reporting_notes": {
+                    "demo-weather-history": "Known demo-trader weather activity matched from data/demo-trades-log.json; exclude from canonical weather-family bot P&L.",
+                    "unattributed-weather": "API-only KXHIGH settlements/fills with no canonical local-order match. Current evidence suggests this is older automated weather activity outside today's canonical weather trade logs, not manual trading.",
+                },
                 "by_bot_local_reconciliation": {
                     "source-monitor": {"eligible_local_join_basis": True},
                 },
@@ -553,8 +557,10 @@ def test_observation_pack_surfaces_unattributed_weather_without_counting_it_in_f
 
     assert pack["demo_weather_history"]["realized"]["pnl_cents"] == 400
     assert pack["demo_weather_history"]["basis"] == "kalshi_api_settlements"
+    assert "demo-trader weather activity" in pack["demo_weather_history"]["reporting_note"]
     assert pack["unattributed_weather"]["realized"]["pnl_cents"] == 900
     assert pack["unattributed_weather"]["basis"] == "kalshi_api_settlements"
+    assert "older automated weather activity" in pack["unattributed_weather"]["reporting_note"]
     assert pack["weather_family"]["realized"]["pnl_cents"] == 2950
 
 

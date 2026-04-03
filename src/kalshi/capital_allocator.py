@@ -186,14 +186,19 @@ MODEL_QUALITY_FACTOR = {
     "trade-cycle": 0.2,       # one-shot
 }
 
+SOURCE_QUALITY_FACTOR = {
+    "nws": 1.1,               # observed same-day weather
+    "forecast_weather": 0.45, # forecast-weather, slightly below generic weather
+}
 
-def compute_signal_quality(bot_name, edge):
+
+def compute_signal_quality(bot_name, edge, source_type=None):
     """Compute a signal quality score for dedup/supersede decisions.
 
     Returns edge * quality_factor, so a 20% edge from source-monitor (1.0)
     beats a 20% edge from weather (0.5).
     """
-    factor = MODEL_QUALITY_FACTOR.get(bot_name, 0.2)
+    factor = SOURCE_QUALITY_FACTOR.get(source_type, MODEL_QUALITY_FACTOR.get(bot_name, 0.2))
     return abs(edge) * factor
 
 
@@ -633,7 +638,7 @@ class PortfolioAllocator:
         self._reset_daily_if_needed()
         return ticker in self._traded_tickers
 
-    def record_trade(self, bot_name, ticker, risk_cents, edge=0.0):
+    def record_trade(self, bot_name, ticker, risk_cents, edge=0.0, source_type=None):
         """Record that a trade was executed.
 
         Uses exclusive file lock to prevent TOCTOU race where two bots
@@ -654,24 +659,25 @@ class PortfolioAllocator:
                 try:
                     self._load_state()  # refresh from disk
                     self._correlation_engine.load_state()  # refresh cluster risk from disk
-                    self._record_trade_inner(bot_name, ticker, risk_cents, edge)
+                    self._record_trade_inner(bot_name, ticker, risk_cents, edge, source_type=source_type)
                     self._save_state()
                 finally:
                     self._holding_lock = False
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
         else:
-            self._record_trade_inner(bot_name, ticker, risk_cents, edge)
+            self._record_trade_inner(bot_name, ticker, risk_cents, edge, source_type=source_type)
 
-    def _record_trade_inner(self, bot_name, ticker, risk_cents, edge):
+    def _record_trade_inner(self, bot_name, ticker, risk_cents, edge, source_type=None):
         """Inner record_trade logic (call under lock)."""
         self._reset_daily_if_needed_inner()
-        quality = compute_signal_quality(bot_name, edge)
+        quality = compute_signal_quality(bot_name, edge, source_type=source_type)
         self._traded_tickers[ticker] = {
             "bot": bot_name,
             "timestamp": _local_now_iso(),
             "signal_quality": round(quality, 4),
             "edge": round(abs(edge), 4),
             "risk_cents": risk_cents,
+            "source_type": source_type,
         }
         self._bot_spend[bot_name] = self._bot_spend.get(bot_name, 0) + risk_cents
         # Track city-level and region-level exposure for weather tickers
@@ -904,7 +910,7 @@ class PortfolioAllocator:
         if ticker in self._traded_tickers:
             existing = self._traded_tickers[ticker]
             existing_quality = existing.get("signal_quality", 0.0)
-            new_quality = compute_signal_quality(bot_name, edge)
+            new_quality = compute_signal_quality(bot_name, edge, source_type=source_type)
             # Only supersede if new signal is 1.5x better
             if new_quality > existing_quality * 1.5 and new_quality > 0:
                 self.log.info(

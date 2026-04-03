@@ -364,6 +364,52 @@ def _nws_threshold_no_liquidity_override(liquidity_status, *, market, direction,
         return False
     return True
 
+
+def _nws_daily_loss_limit_override_cents(edge, confidence, hour, is_bracket):
+    """Return a narrow late-day NWS risk override for the best threshold setups.
+
+    This does not raise global bot risk limits. It only allows a modest
+    extension of source-monitor's daily loss limit for late same-day observed
+    temperature opportunities that already cleared the NWS-specific edge gate.
+    """
+    if is_bracket:
+        return None
+    nws_cfg = (((config or {}).get("sources") or {}).get("nws") or {})
+    buffer_pct = nws_cfg.get("highConfidenceDailyLossBufferPct")
+    min_edge = nws_cfg.get("highConfidenceDailyLossMinEdge")
+    min_confidence = nws_cfg.get("highConfidenceDailyLossMinConfidence")
+    min_hour = nws_cfg.get("highConfidenceDailyLossMinHour")
+    if not isinstance(buffer_pct, (int, float)) or buffer_pct <= 0:
+        return None
+    if not isinstance(min_edge, (int, float)):
+        min_edge = 0.18
+    if not isinstance(min_confidence, (int, float)):
+        min_confidence = 0.85
+    if not isinstance(min_hour, int):
+        min_hour = 17
+    if hour is None or hour < min_hour:
+        return None
+    if edge < float(min_edge) or confidence < float(min_confidence):
+        return None
+
+    base_limit_cents = None
+    manager = trade_manager
+    if manager is not None:
+        try:
+            base_limit_cents = int(manager._effective_max_daily_loss_cents())
+        except Exception:
+            base_limit_cents = None
+    if base_limit_cents is None or base_limit_cents <= 0:
+        try:
+            base_limit_cents = int(float((config or {}).get("maxDailyLoss", 0)) * 100)
+        except Exception:
+            base_limit_cents = 0
+    if base_limit_cents <= 0:
+        return None
+
+    override_cents = int(round(base_limit_cents * (1.0 + min(float(buffer_pct), 2.0))))
+    return min(50000, max(base_limit_cents, override_cents))
+
 # === Kalshi Market Helpers ===
 def get_markets_by_prefix(prefix, status="open"):
     """Get all open markets matching a ticker prefix."""
@@ -1375,6 +1421,12 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     fee = kalshi_fee_cents(price)
                     kelly_fn, sizing_label = _nws_sizing_plan(running_high, threshold, city_hour, is_bracket)
                     count, risk, kelly_details = kelly_fn(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+                    daily_loss_limit_override_cents = _nws_daily_loss_limit_override_cents(
+                        edge,
+                        prob,
+                        city_hour,
+                        is_bracket,
+                    )
                     if count <= 0:
                         if ss:
                             ss.skip("kelly_zero")
@@ -1401,6 +1453,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                                                         hour_of_day=city_hour,
                                                         city=city, direction=direction, threshold=threshold,
                                                         source_type="nws",
+                                                        daily_loss_limit_override_cents=daily_loss_limit_override_cents,
                                                         execution_style="standard",
                                                         **research_fields)
                     if result:
@@ -1414,7 +1467,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             execution_style="standard",
                             **research_fields,
                         )
-                        allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)
+                        allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge, source_type="nws")
 
                 elif prob <= 0.5 and no_ask and no_ask < 99:
                     # Buy NO (raw edge, fees handled in Kelly)
@@ -1470,6 +1523,12 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     fee = kalshi_fee_cents(price)
                     kelly_fn, sizing_label = _nws_sizing_plan(running_high, threshold, city_hour, is_bracket)
                     count, risk, kelly_details = kelly_fn(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+                    daily_loss_limit_override_cents = _nws_daily_loss_limit_override_cents(
+                        edge,
+                        no_prob,
+                        city_hour,
+                        is_bracket,
+                    )
                     if count <= 0:
                         if ss:
                             ss.skip("kelly_zero")
@@ -1496,6 +1555,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                                                         hour_of_day=city_hour,
                                                         city=city, direction=direction, threshold=threshold,
                                                         source_type="nws",
+                                                        daily_loss_limit_override_cents=daily_loss_limit_override_cents,
                                                         execution_style=execution_style,
                                                         liquidity_status=liquidity_status,
                                                         **research_fields)
@@ -1511,7 +1571,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             liquidity_status=liquidity_status,
                             **research_fields,
                         )
-                        allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)
+                        allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge, source_type="nws")
 
     except Exception as e:
         log.error("  NWS market matching failed: %s", e, exc_info=True)

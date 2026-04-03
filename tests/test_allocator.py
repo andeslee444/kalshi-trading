@@ -43,6 +43,11 @@ class TestSignalQuality:
         q = compute_signal_quality("unknown-bot", 0.10)
         assert q == 0.10 * 0.2  # default factor is 0.2
 
+    def test_source_type_override_beats_generic_weather(self):
+        q_forecast = compute_signal_quality("weather", 0.10, source_type="forecast_weather")
+        q_nws = compute_signal_quality("weather", 0.10, source_type="nws")
+        assert q_nws > q_forecast
+
     def test_all_known_bots_have_factors(self):
         for bot in ["source-monitor", "economics", "entertainment",
                      "weather", "crypto", "strategy", "beatrelease"]:

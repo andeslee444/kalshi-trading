@@ -46,6 +46,7 @@ Notes:
 | `data/weather-verification.json` | weather bot / `ForecastVerifier` | dashboard, audits, calibration | forecast verification and source mix |
 | `data/weather-nws-cross-check.json` | weather bot / `NWSCrossCheckVerifier` | dashboard, weather audit scripts | Open-Meteo vs NWS comparison history |
 | `data/financial-snapshot.json` | `scripts/pnl-snapshot.py` | sync validation, reports | portfolio snapshot for audit/sync |
+| `data/weather-intraday-feature-audit.json` | `scripts/weather-intraday-feature-audit.py` | operator/manual review only | derived non-canonical HRRR 15-minute weather regime audit |
 | `data/pids/supervisor-state.json` | supervisor | dashboard | restart counts and process metadata |
 | `data/regime-state.json` | `PortfolioAllocator`, crypto bot | dashboard, daily attribution | regime detector beliefs |
 | `data/correlation-state.json` | `CorrelationEngine` via allocator | dashboard, allocator | cluster risk state |
@@ -76,6 +77,7 @@ State metadata convention:
 | `data/regime-state.json` | allocator / crypto bot | `scripts/dashboard.py`, `scripts/daily-attribution.py` |
 | `data/correlation-state.json` | allocator / correlation engine | `scripts/dashboard.py`, allocator |
 | `data/weather-observation-pack.json` | `scripts/weather-observation-pack.py` | operator/manual review only | derived non-canonical weather observation summary; top-level copy only when explicitly requested |
+| `data/weather-intraday-feature-audit.json` | `scripts/weather-intraday-feature-audit.py` | operator/manual review only | derived non-canonical same-day HRRR 15-minute summary; top-level copy only when explicitly requested |
 | `data/shadow/weather-refresh/*` | `scripts/weather-shadow-refresh.py` | operator/manual review only | preferred Phase 4 shadow-only weather observation, audit, backtest, calibration, shadow-prior, and promotion bundle |
 | `data/weather-promotion-candidates.json` | `scripts/weather-promotion-candidates.py` | operator/manual review only | derived non-canonical weather promotion ranking; top-level copy only when explicitly requested |
 

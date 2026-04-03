@@ -946,6 +946,8 @@ class TestBuildSnapshot:
         assert snapshot["realized_pnl"]["by_bot"]["weather"]["pnl_cents"] == 120
         assert snapshot["realized_pnl"]["by_bot"]["unattributed-weather"]["pnl_cents"] == 60
         assert snapshot["realized_pnl"]["by_bot_basis_map"]["unattributed-weather"] == "kalshi_api_settlements"
+        assert snapshot["realized_pnl"]["by_bot_display_map"]["unattributed-weather"] == "legacy automated weather history"
+        assert "older automated weather activity" in snapshot["realized_pnl"]["by_bot_reporting_notes"]["unattributed-weather"]
 
     def test_demo_weather_api_settlement_is_split_from_unknown_unattributed_weather(self):
         settlements = [
@@ -979,6 +981,7 @@ class TestBuildSnapshot:
         assert snapshot["realized_pnl"]["by_bot"]["demo-weather-history"]["pnl_cents"] == 33
         assert snapshot["realized_pnl"]["by_bot"]["unattributed-weather"]["pnl_cents"] == 60
         assert snapshot["realized_pnl"]["by_bot_basis_map"]["demo-weather-history"] == "kalshi_api_settlements"
+        assert snapshot["realized_pnl"]["by_bot_display_map"]["demo-weather-history"] == "demo-weather history"
 
 
 class TestUnmatchedApiInference:

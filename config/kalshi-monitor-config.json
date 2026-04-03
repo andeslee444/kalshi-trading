@@ -26,6 +26,10 @@
         "CHI": 0.05,
         "LAX": 0.05
       },
+      "highConfidenceDailyLossBufferPct": 0.5,
+      "highConfidenceDailyLossMinEdge": 0.18,
+      "highConfidenceDailyLossMinConfidence": 0.85,
+      "highConfidenceDailyLossMinHour": 17,
       "stations": {
         "MIA": "KMIA",
         "LAX": "KLAX",

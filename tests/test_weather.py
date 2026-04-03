@@ -1,5 +1,6 @@
 """Tests for parse_ticker() and compute_probability() in weather-bot.py."""
 
+import datetime
 import json
 import sys
 import pytest
@@ -179,6 +180,18 @@ class TestWeatherCalibrationPathResolution:
         assert _mod._city_weather_edge_threshold("CHI", 0.10) == 0.12
         assert _mod._city_weather_edge_threshold("DEN", 0.10) == 0.10
 
+    def test_same_day_weather_yields_to_observed_track(self, monkeypatch):
+        monkeypatch.setattr(_mod, "config", {"yieldSameDayToObservedWeather": True})
+        monkeypatch.setattr(_mod, "_city_today", lambda city_code: "2026-04-02")
+        parsed = {"city": "CHI", "date": "2026-04-02"}
+        assert _mod._should_yield_same_day_weather_market(parsed, 0) is True
+
+    def test_same_day_weather_yield_can_be_disabled(self, monkeypatch):
+        monkeypatch.setattr(_mod, "config", {"yieldSameDayToObservedWeather": False})
+        monkeypatch.setattr(_mod, "_city_today", lambda city_code: "2026-04-02")
+        parsed = {"city": "CHI", "date": "2026-04-02"}
+        assert _mod._should_yield_same_day_weather_market(parsed, 0) is False
+
 
 class TestWeatherExecutionPlanning:
     """Thin-book weather markets should still produce passive entry plans."""
@@ -209,6 +222,48 @@ class TestWeatherExecutionPlanning:
         maker = {"execution_mode": "maker", "price": 67, "edge": 0.17}
         chosen = _mod._select_weather_execution_plan(displayed, maker, market_liquid=False)
         assert chosen == maker
+
+    def test_should_taker_escalate_near_close_same_day(self):
+        displayed = {"execution_mode": "taker", "price": 61, "edge": 0.15}
+        maker = {"execution_mode": "maker", "price": 58, "edge": 0.18}
+        close_time = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=45)).isoformat()
+        market = {"close_time": close_time}
+        assert _mod._should_taker_escalate_weather(
+            displayed,
+            maker,
+            market,
+            side_prob=0.93,
+            days_out=0,
+            effective_edge_threshold=0.12,
+            maker_cfg={
+                "takerEscalationNearCloseMinutes": 180,
+                "takerEscalationMaxDaysOut": 0,
+                "takerEscalationMinDisplayedEdge": 0.12,
+                "takerEscalationMinConfidence": 0.90,
+                "takerEscalationMaxMakerEdgeAdvantage": 0.04,
+            },
+        ) is True
+
+    def test_should_not_taker_escalate_when_maker_gap_too_large(self):
+        displayed = {"execution_mode": "taker", "price": 61, "edge": 0.13}
+        maker = {"execution_mode": "maker", "price": 50, "edge": 0.20}
+        close_time = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=45)).isoformat()
+        market = {"close_time": close_time}
+        assert _mod._should_taker_escalate_weather(
+            displayed,
+            maker,
+            market,
+            side_prob=0.95,
+            days_out=0,
+            effective_edge_threshold=0.12,
+            maker_cfg={
+                "takerEscalationNearCloseMinutes": 180,
+                "takerEscalationMaxDaysOut": 0,
+                "takerEscalationMinDisplayedEdge": 0.12,
+                "takerEscalationMinConfidence": 0.90,
+                "takerEscalationMaxMakerEdgeAdvantage": 0.04,
+            },
+        ) is False
 
 
 class TestWeatherOpportunitySelection:
@@ -474,6 +529,49 @@ class TestEnsembleModels:
         assert forecasts["MIA"]["2026-03-14"]["nbm"] == 85.0
         assert forecasts["NY"]["2026-03-14"]["nbm"] == 52.0
         record_source_success.assert_called_once_with("open-meteo-nbm")
+
+    def test_batch_ensemble_skips_all_null_model_payloads(self, monkeypatch):
+        class _Resp:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        cities = {
+            "MIA": {"lat": 25.8, "lon": -80.3},
+            "NY": {"lat": 40.8, "lon": -74.0},
+        }
+
+        def fake_cached_request(url, timeout=30, max_retries=2):
+            if "models=ecmwf_aifs025" in url:
+                return _Resp([
+                    {"daily": {"time": ["2026-03-14"], "temperature_2m_max": [None]}},
+                    {"daily": {"time": ["2026-03-14"], "temperature_2m_max": [None]}},
+                ])
+            if "models=ncep_nbm_conus" in url:
+                return _Resp([
+                    {"daily": {"time": ["2026-03-14"], "temperature_2m_max": [85.0]}},
+                    {"daily": {"time": ["2026-03-14"], "temperature_2m_max": [52.0]}},
+                ])
+            raise AssertionError(f"unexpected url {url}")
+
+        monkeypatch.setattr(_mod, "ENSEMBLE_MODELS", {"aifs": "ecmwf_aifs025", "nbm": "nbm_conus"})
+        monkeypatch.setattr(_mod, "_OPEN_METEO_API_KEY", "premium-key")
+        monkeypatch.setattr(_mod.health, "is_source_open", lambda source: False)
+        record_source_success = MagicMock()
+        monkeypatch.setattr(_mod.health, "record_source_success", record_source_success)
+        record_source_failure = MagicMock()
+        monkeypatch.setattr(_mod, "_record_source_failure", record_source_failure)
+        monkeypatch.setattr(_mod, "_cached_request", fake_cached_request)
+
+        forecasts = _mod.get_batch_ensemble_forecasts(cities)
+
+        assert "aifs" not in forecasts["MIA"]["2026-03-14"]
+        assert forecasts["MIA"]["2026-03-14"]["nbm"] == 85.0
+        assert forecasts["NY"]["2026-03-14"]["nbm"] == 52.0
+        record_source_success.assert_called_once_with("open-meteo-nbm")
+        assert record_source_failure.call_args_list[0][0][0] == "open-meteo-aifs"
 
 
 def test_bias_corrector_imported():

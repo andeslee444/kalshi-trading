@@ -30,6 +30,21 @@ DEPOSITS_PATH = DATA_DIR / "deposits.json"
 SNAPSHOT_PATH = DATA_DIR / "financial-snapshot.json"
 UNATTRIBUTED_WEATHER_BOT = "unattributed-weather"
 DEMO_WEATHER_HISTORY_BOT = "demo-weather-history"
+BOT_DISPLAY_MAP = {
+    DEMO_WEATHER_HISTORY_BOT: "demo-weather history",
+    UNATTRIBUTED_WEATHER_BOT: "legacy automated weather history",
+}
+BOT_REPORTING_NOTES = {
+    DEMO_WEATHER_HISTORY_BOT: (
+        "Known demo-trader weather activity matched from data/demo-trades-log.json; "
+        "exclude from canonical weather-family bot P&L."
+    ),
+    UNATTRIBUTED_WEATHER_BOT: (
+        "API-only KXHIGH settlements/fills with no canonical local-order match. "
+        "Current evidence suggests this is older automated weather activity outside "
+        "today's canonical weather trade logs, not manual trading."
+    ),
+}
 
 
 # ─── Pure computation functions (no I/O, fully testable) ───
@@ -660,6 +675,16 @@ def build_snapshot(balance_cents, portfolio_value_cents, settlements, fills,
     realized["by_bot"] = canonical_by_bot
     realized["by_bot_basis"] = canonical_basis
     realized["by_bot_basis_map"] = canonical_basis_map
+    realized["by_bot_display_map"] = {
+        bot: BOT_DISPLAY_MAP[bot]
+        for bot in BOT_DISPLAY_MAP
+        if bot in canonical_by_bot or bot in by_bot_api
+    }
+    realized["by_bot_reporting_notes"] = {
+        bot: BOT_REPORTING_NOTES[bot]
+        for bot in BOT_REPORTING_NOTES
+        if bot in canonical_by_bot or bot in by_bot_api
+    }
     realized["by_bot_api_settlements"] = by_bot_api
     realized["by_bot_local_joined_fills"] = by_bot_local["by_bot"]
     realized["by_bot_local_reconciliation"] = by_bot_local.get("by_bot_reconciliation", {})

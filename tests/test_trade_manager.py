@@ -353,6 +353,22 @@ class TestTradeManager:
         result = mgr.place_order("T2", "yes", 50, 1, "r2")
         assert result is None
 
+    def test_daily_loss_override_allows_scoped_extra_risk(self, tmp_path):
+        mgr, _, _ = _make_manager(tmp_path, {"maxTradeAmount": 5, "maxDailyTrades": 100, "maxDailyLoss": 1})
+        mgr.place_order("T1", "yes", 90, 1, "r1")
+        result = mgr.place_order(
+            "T2",
+            "yes",
+            40,
+            1,
+            "r2",
+            daily_loss_limit_override_cents=150,
+        )
+        assert result is not None
+        trades = load_trades(mgr.trades_path)
+        assert trades[-1]["daily_loss_limit_applied_cents"] == 150
+        assert "daily_loss_override" in trades[-1]["caps_applied"]
+
     def test_cost_cap_adjustment(self, tmp_path):
         mgr, client, _ = _make_manager(tmp_path, {"maxTradeAmount": 1, "maxDailyTrades": 100, "maxDailyLoss": 100})
         # maxTradeAmount=1 dollar = 100 cents. 50c * 5 = 250c > 100c, so count should be adjusted to 2

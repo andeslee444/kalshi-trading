@@ -198,7 +198,7 @@ def refresh_weather_shadow_artifacts(
     *,
     refresh_shadow_prior=False,
     backfill_days=14,
-    backfill_models="gfs,ecmwf,icon,gem,graphcast",
+    backfill_models="gfs,ecmwf,icon,gem,graphcast,nbm",
     runner=subprocess.run,
 ):
     output_dir = _resolve_output_dir(output_dir)
@@ -210,6 +210,7 @@ def refresh_weather_shadow_artifacts(
     city_audit_path = output_dir / "weather-city-audit.json"
     nws_crosscheck_path = output_dir / "weather-nws-crosscheck-audit.json"
     execution_audit_path = output_dir / "weather-execution-audit.json"
+    intraday_audit_path = output_dir / "weather-intraday-feature-audit.json"
     backtest_path = output_dir / "weather-backtest-results.json"
     calibration_path = output_dir / "weather-calibration.json"
     promotion_candidates_path = output_dir / "weather-promotion-candidates.json"
@@ -256,6 +257,17 @@ def refresh_weather_shadow_artifacts(
         "execution_audit",
         [sys.executable, str(SCRIPTS_DIR / "weather-execution-audit.py"), "--json"],
         execution_audit_path,
+        runner=runner,
+        persist_output=True,
+    ))
+    steps.append(_run_json_step(
+        "intraday_feature_audit",
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "weather-intraday-feature-audit.py"),
+            "--json",
+        ],
+        intraday_audit_path,
         runner=runner,
         persist_output=True,
     ))
@@ -416,8 +428,11 @@ def main(argv=None):
     )
     parser.add_argument(
         "--backfill-models",
-        default="gfs,ecmwf,icon,gem,graphcast",
-        help="Comma-separated models for shadow prior backfill (default: gfs,ecmwf,icon,gem,graphcast)",
+        default="gfs,ecmwf,icon,gem,graphcast,nbm",
+        help=(
+            "Comma-separated models for shadow prior backfill "
+            "(default: gfs,ecmwf,icon,gem,graphcast,nbm)"
+        ),
     )
     parser.add_argument("--json", action="store_true", help="Print the refresh summary as JSON")
     parser.add_argument("--dry-run", action="store_true", help="Describe the refresh without running it")

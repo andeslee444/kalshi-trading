@@ -138,4 +138,6 @@ class TestBackfillWeatherDataEnhancements:
         assert backfill_mod.MODEL_MAP["ecmwf"] == "ecmwf_ifs025"
         assert backfill_mod.MODEL_MAP["icon"] == "icon_seamless"
         assert backfill_mod.MODEL_MAP["gem"] == "gem_global"
+        assert backfill_mod.MODEL_MAP["nbm"] == "nbm_conus"
+        assert backfill_mod.MODEL_MAP["aifs"] == "ecmwf_aifs025"
         assert backfill_mod.MODEL_MAP["graphcast"] == "gfs_graphcast025"

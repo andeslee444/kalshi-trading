@@ -21,6 +21,10 @@ calibrate_mod = _load_script("calibrate-historical.py", "calibrate_historical")
 
 
 class TestBackfillWeatherDataScript:
+    def test_model_map_includes_nbm_and_aifs(self):
+        assert backfill_mod.MODEL_MAP["nbm"] == "nbm_conus"
+        assert backfill_mod.MODEL_MAP["aifs"] == "ecmwf_aifs025"
+
     def test_parse_previous_runs_daily_extracts_current_and_previous_day(self):
         payload = {
             "hourly": {
