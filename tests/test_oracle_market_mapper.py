@@ -5,6 +5,7 @@ import datetime
 from domain.oracle.market_mapper import (
     normalize_team,
     make_player_code,
+    make_live_player_token,
     match_game_markets,
     match_prop_markets,
     real_game_to_game_id,
@@ -46,6 +47,12 @@ def test_make_player_code():
 
 def test_make_player_code_single_name():
     assert make_player_code("Nene") == "NENE"
+
+
+def test_make_live_player_token():
+    assert make_live_player_token("Brook Lopez") == "BLOPEZ"
+    assert make_live_player_token("Derrick Jones Jr.") == "DJONES"
+    assert make_live_player_token("AJ Green") == "AGREEN"
 
 
 def test_match_game_markets():
@@ -107,6 +114,19 @@ def test_match_prop_markets_wrong_stat():
     date = datetime.date(2026, 3, 18)
     matches = match_prop_markets("LeBron James", "LAL", "points", date, markets)
     assert len(matches) == 0
+
+
+def test_match_live_prop_markets():
+    markets = [
+        {"ticker": "KXNBAPTS-26MAR29LACMIL-LACBLOPEZ11-10"},
+        {"ticker": "KXNBAREB-26MAR29LACMIL-LACBLOPEZ11-6"},
+        {"ticker": "KXNBAPTS-26MAR29MIAIND-MIABADEBAYO13-25"},
+    ]
+    date = datetime.date(2026, 3, 29)
+
+    matches = match_prop_markets("Brook Lopez", "LAC", "points", date, markets)
+    assert len(matches) == 1
+    assert matches[0]["ticker"] == "KXNBAPTS-26MAR29LACMIL-LACBLOPEZ11-10"
 
 
 def test_real_game_to_game_id():

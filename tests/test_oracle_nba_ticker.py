@@ -71,6 +71,21 @@ def test_parse_prop_ticker_three_pointers():
     assert result["team"] == "GSW"
 
 
+def test_parse_live_prop_ticker_points():
+    result = parse_nba_ticker("KXNBAPTS-26MAR29LACMIL-LACBLOPEZ11-10")
+    assert result is not None
+    assert result["type"] == "prop"
+    assert result["stat"] == "points"
+    assert result["date"] == "2026-03-29"
+    assert result["away"] == "LAC"
+    assert result["home"] == "MIL"
+    assert result["team"] == "LAC"
+    assert result["player_code"] == "BLOPEZ11"
+    assert result["player_token"] == "BLOPEZ"
+    assert result["jersey_number"] == 11
+    assert result["line"] == 10.0
+
+
 def test_parse_invalid_ticker():
     assert parse_nba_ticker("NOTAVALIDTICKER") is None
     assert parse_nba_ticker("") is None

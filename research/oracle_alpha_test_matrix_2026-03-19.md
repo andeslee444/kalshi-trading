@@ -17,8 +17,24 @@ This is the standard I would use before claiming Oracle can compete with strong 
 
 ## Status Update
 
-Status as of 2026-03-22:
+Status as of 2026-03-29:
 
+- The Real live websocket capture path was repaired to mirror the browser Engine.IO v3 websocket semantics, so H1 source-event collection is no longer stuck at zero.
+- Real live game-detail feeds do not currently expose usable `playerBoxScores` during active NBA games; the H1 collector now falls back to recent `plays` participant objects to build live player contexts.
+- H1 live collection now maps Kalshi player prop markets alongside game markets:
+  - open Kalshi prop series are fetched for `KXNBAPTS`, `KXNBAREB`, `KXNBAAST`, `KXNBA3PM`, `KXNBASTL`, `KXNBABLK`, and `KXNBATO`
+  - Real player contexts are extracted from per-game detail feeds and used to map live player-driven events to affected prop tickers
+  - player-driven source rows now persist `mapped_prop_tickers` in addition to `mapped_game_tickers`
+- Kalshi's live NBA prop parser now understands the production daily ticker format like `KXNBAPTS-26MAR29LACMIL-LACBLOPEZ11-10`, which was previously failing the prop mapping path even after player contexts were available.
+- H1 runtime health now fails loudly if live mapped games exist but Oracle extracts zero player contexts or zero mapped prop tickers, instead of silently looking healthy on game markets alone.
+- H1 now records partial prop-mapping diagnostics for the remaining unmapped live player contexts, with reason buckets for:
+  - `no_open_kalshi_market`
+  - `player_token_mismatch`
+  - `team_mismatch`
+  - `date_mismatch`
+- `oracle-latency-report.py` now breaks out event-driven H1 capture by market type, so game-market and prop-market source/quote coverage can be audited separately instead of only looking at aggregate quote counts.
+- H1 live-event classification now includes `injury_player_out`, so the event-class list in the matrix is fully represented in code.
+- H1 execution reconciliation and reporting now use Oracle-linked rows only; unrelated generic ledger trades are excluded from Oracle fill-rate / EV summaries.
 - H1 live collection is now running read-only against Real plus Kalshi production under `launchd`.
 - Oracle shadow collection now also runs under a separate `launchd` service in `--demo` mode, so Stage 2 shadow rows can accumulate without opening a terminal.
 - Shadow Book C scans now persist detailed zero-signal diagnostics into health state, and prolonged zero-signal live-opportunity runs emit a non-fatal health warning instead of failing silently.

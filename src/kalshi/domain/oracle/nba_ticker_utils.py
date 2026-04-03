@@ -62,6 +62,12 @@ _LIVE_GAME_RE = re.compile(
     r"^(KXNBAGAME)-(\d{2})([A-Z]{3})(\d{2})([A-Z]{3})([A-Z]{3})-([A-Z]{3})$"
 )
 
+# Current Kalshi daily NBA prop pattern:
+#   KXNBAPTS-YYMMMDDAWAYHOME-TEAMPLAYERJERSEY-LINE
+_LIVE_PROP_RE = re.compile(
+    r"^(KXNBA[A-Z0-9]+)-(\d{2})([A-Z]{3})(\d{2})([A-Z]{3})([A-Z]{3})-([A-Z]{3})([A-Z]+)(\d+)-(\d+(?:\.\d+)?)$"
+)
+
 # Player prop tail: TEAMLASTNAMEINITIAL-O/U<line>
 _PROP_RE = re.compile(
     r"^([A-Z]{3})([A-Z]+[A-Z])-([OU])(\d+(?:\.\d+)?)$"
@@ -82,6 +88,34 @@ def parse_nba_ticker(ticker: str) -> Optional[dict]:
              "player_code": ..., "direction": "over"|"under", "line": float}
       None if parsing fails.
     """
+    live_prop = _LIVE_PROP_RE.match(ticker)
+    if live_prop:
+        prefix, year_str, mon_str, day_str, away, home, team, player_token, jersey_number, line_str = live_prop.groups()
+        month = MONTHS.get(mon_str)
+        stat_type = STAT_PREFIXES.get(prefix)
+        if month is None or stat_type is None:
+            return None
+        try:
+            date = _dt.date(2000 + int(year_str), month, int(day_str))
+        except ValueError:
+            return None
+        if away not in NBA_TEAMS or home not in NBA_TEAMS or team not in NBA_TEAMS:
+            return None
+        return {
+            "type": "prop",
+            "prefix": prefix,
+            "date": date.isoformat(),
+            "stat": stat_type,
+            "team": team,
+            "away": away,
+            "home": home,
+            "player_code": f"{player_token}{jersey_number}",
+            "player_token": player_token,
+            "jersey_number": int(jersey_number),
+            "direction": "over",
+            "line": float(line_str),
+        }
+
     live_game = _LIVE_GAME_RE.match(ticker)
     if live_game:
         prefix, year_str, mon_str, day_str, away, home, pick = live_game.groups()

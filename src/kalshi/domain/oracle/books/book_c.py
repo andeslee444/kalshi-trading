@@ -305,6 +305,40 @@ def detect_blowout(
     )
 
 
+# Empirical trailing-team win rates from 200 stored game feeds (H3 analysis, 2026-04-02).
+# Keyed by (time_bucket, margin_bucket) -> trailing_team_win_probability.
+# Time buckets: "late" = 30-120s, "final" = 10-30s.
+# Margin buckets: 1, 2, 3-5, 6-8.
+_EMPIRICAL_TRAILING_WIN_RATE = {
+    ("late", 1): 0.385,
+    ("late", 2): 0.352,
+    ("late", 3): 0.327,  # represents 3-5 margin
+    ("late", 4): 0.327,
+    ("late", 5): 0.327,
+    ("late", 6): 0.227,  # represents 6-8 margin
+    ("final", 1): 0.402,
+    ("final", 2): 0.344,
+    ("final", 3): 0.311,
+    ("final", 4): 0.311,
+    ("final", 5): 0.311,
+    ("final", 6): 0.200,
+}
+
+
+def _empirical_trailing_prob(margin: int, clock_seconds: int) -> float:
+    """Look up empirical trailing-team win probability from H3 research.
+
+    Falls back to interpolation for margins 7-8 and edge cases.
+    """
+    time_bucket = "final" if clock_seconds <= 30 else "late"
+    abs_margin = min(abs(margin), 6)
+    prob = _EMPIRICAL_TRAILING_WIN_RATE.get((time_bucket, abs_margin))
+    if prob is not None:
+        return prob
+    # Fallback: linear interpolation between margin 6 (22%) and 8 (15% est.)
+    return _clamp(0.22 - 0.035 * (abs_margin - 6), 0.05, 0.45)
+
+
 def detect_clutch_comeback(
     margin: int,
     period: str,
@@ -316,16 +350,15 @@ def detect_clutch_comeback(
     game_id: Optional[str] = None,
     min_edge: float = 0.08,
 ) -> Optional[LiveSignal]:
-    """Detect late-game comeback overpricing on the trailing team.
+    """Detect late-game mispricing on the trailing team.
 
-    BUY NO on the trailing team if:
-    - Q4 with 10s-120s remaining
-    - margin is 1-6 points
-    - displayed trailing-team price overstates the empirical/heuristic comeback odds
+    Uses empirical trailing-team win rates (from H3 analysis of 200 games)
+    to detect when Kalshi misprices the comeback probability. Trades both
+    directions:
+    - BUY YES on trailing team if Kalshi underprices (trailing_price < empirical)
+    - BUY NO on trailing team if Kalshi overprices (trailing_price > empirical)
 
-    This is intentionally game-market oriented, unlike the player-prop Book C
-    signals above. The model is conservative and meant for ranking / shadow use
-    until H3 is validated with real Kalshi late-game quotes.
+    Filters: Q4, 10-120s remaining, margin 1-6, price not extreme.
     """
     if period != "Q4":
         return None
@@ -339,38 +372,68 @@ def detect_clutch_comeback(
     if trailing_team_price_cents <= 5 or trailing_team_price_cents >= 95:
         return None
 
-    # Conservative trailing-team win model:
-    # tighter margin and more time left increase comeback probability, but it
-    # still falls quickly late in regulation.
-    time_factor = _clamp(clock_seconds / 120.0, 0.0, 1.0)
-    model_prob_trailing = _clamp(0.08 + (0.42 * time_factor) - (0.075 * abs_margin), 0.01, 0.45)
+    model_prob_trailing = _empirical_trailing_prob(abs_margin, clock_seconds)
     model_prob_leading = 1.0 - model_prob_trailing
 
     kalshi_trailing_implied = trailing_team_price_cents / 100.0
-    edge = kalshi_trailing_implied - model_prob_trailing
-    if edge < min_edge:
-        return None
 
-    return LiveSignal(
-        signal_type="clutch_comeback",
-        ticker=ticker,
-        side="no",  # fade trailing-team enthusiasm
-        edge=edge,
-        model_prob=model_prob_leading,
-        kalshi_price_cents=100 - trailing_team_price_cents,
-        player_name=trailing_team,
-        game_id=game_id,
-        metadata={
-            "margin": abs_margin,
-            "period": period,
-            "clock_seconds": clock_seconds,
-            "trailing_team": trailing_team,
-            "leading_team": leading_team,
-            "trailing_team_model_prob": round(model_prob_trailing, 3),
-            "leading_team_model_prob": round(model_prob_leading, 3),
-            "trailing_team_market_prob": round(kalshi_trailing_implied, 3),
-        },
-    )
+    # Detect mispricing in EITHER direction:
+    # If Kalshi overprices trailing team -> fade (buy NO)
+    # If Kalshi underprices trailing team -> buy YES on trailing
+    overpricing = kalshi_trailing_implied - model_prob_trailing  # positive = overpriced
+    underpricing = model_prob_trailing - kalshi_trailing_implied  # positive = underpriced
+
+    if overpricing >= min_edge:
+        # Trailing team overpriced: fade (buy NO on trailing = buy YES on leader)
+        return LiveSignal(
+            signal_type="clutch_comeback",
+            ticker=ticker,
+            side="no",
+            edge=overpricing,
+            model_prob=model_prob_leading,
+            kalshi_price_cents=100 - trailing_team_price_cents,
+            player_name=trailing_team,
+            game_id=game_id,
+            metadata={
+                "margin": abs_margin,
+                "period": period,
+                "clock_seconds": clock_seconds,
+                "trailing_team": trailing_team,
+                "leading_team": leading_team,
+                "trailing_team_model_prob": round(model_prob_trailing, 3),
+                "leading_team_model_prob": round(model_prob_leading, 3),
+                "trailing_team_market_prob": round(kalshi_trailing_implied, 3),
+                "direction": "fade_trailing",
+                "model_source": "empirical_h3_200games",
+            },
+        )
+
+    if underpricing >= min_edge:
+        # Trailing team underpriced: buy YES on trailing team
+        return LiveSignal(
+            signal_type="clutch_comeback",
+            ticker=ticker,
+            side="yes",
+            edge=underpricing,
+            model_prob=model_prob_trailing,
+            kalshi_price_cents=trailing_team_price_cents,
+            player_name=trailing_team,
+            game_id=game_id,
+            metadata={
+                "margin": abs_margin,
+                "period": period,
+                "clock_seconds": clock_seconds,
+                "trailing_team": trailing_team,
+                "leading_team": leading_team,
+                "trailing_team_model_prob": round(model_prob_trailing, 3),
+                "leading_team_model_prob": round(model_prob_leading, 3),
+                "trailing_team_market_prob": round(kalshi_trailing_implied, 3),
+                "direction": "buy_trailing",
+                "model_source": "empirical_h3_200games",
+            },
+        )
+
+    return None
 
 
 def should_cancel_signal(

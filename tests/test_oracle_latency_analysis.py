@@ -62,6 +62,70 @@ def test_classify_live_event_technical_foul_from_play_text():
     assert classified["derived_event_class"] == "technical_foul"
 
 
+def test_classify_live_event_injury_player_out_from_play_text():
+    event = LiveEvent(
+        event_type="LiveFeedSocketPlaysAdded",
+        game_id=23454,
+        player_id=77,
+        data={
+            "description": "LeBron James left the game and will not return due to injury",
+            "period": "Q4",
+            "clock": "2:10",
+        },
+    )
+
+    classified = classify_live_event(event)
+
+    assert classified["derived_event_class"] == "injury_player_out"
+
+
+def test_classify_live_event_injury_player_out_from_status_field():
+    event = LiveEvent(
+        event_type="PlayerBoxScoreUpdated",
+        game_id=23454,
+        player_id=77,
+        data={"injuryStatus": "Out", "period": "Q3", "clock": "5:00"},
+    )
+
+    classified = classify_live_event(event)
+
+    assert classified["derived_event_class"] == "injury_player_out"
+
+
+def test_classify_live_event_reads_real_play_payload_shape():
+    event = LiveEvent(
+        event_type="LiveFeedSocketPlaysUpdated",
+        game_id=23547,
+        player_id=20002880,
+        data={
+            "sport": "nba",
+            "period": 4,
+            "homeTeamScore": 102,
+            "awayTeamScore": 100,
+            "timeRemainingMinutes": 0,
+            "timeRemainingSeconds": 45,
+            "type": "FieldGoalMade",
+        },
+    )
+
+    classified = classify_live_event(
+        event,
+        previous_game_state={
+            "game_state": "competitive",
+            "home_score": 98,
+            "away_score": 97,
+            "period": "Q4",
+            "clock_seconds": 75,
+        },
+    )
+
+    assert classified["derived_event_class"] == "ot_likely_entry"
+    assert classified["home_score"] == 102
+    assert classified["away_score"] == 100
+    assert classified["clock_seconds"] == 45
+    assert classified["period"] == "Q4"
+
+
 def test_summarize_latency_capture_groups_by_derived_event_class():
     source_rows = [
         {
@@ -231,6 +295,67 @@ def test_summarize_latency_capture_pairs_followup_markouts_by_horizon():
         "stage2_shadow_trade_target_met_proxy": False,
         "bootstrap_mean_best_markout_ci_above_zero": True,
     }
+
+
+def test_summarize_latency_capture_tracks_game_vs_prop_event_capture():
+    source_rows = [
+        {
+            "record_kind": "source_event",
+            "hypothesis_id": "H1_real_to_kalshi_latency",
+            "event_id": "source-1",
+            "derived_event_class": "foul_trouble_entry",
+            "game_id": 23454,
+            "player_id": 30,
+            "mapped_game_tickers": ["KXNBAGAME-26MAR21GSWATL-ATL"],
+            "mapped_prop_tickers": ["KXNBAPTS-26MAR21GSWATL-GSWCURRY30-30"],
+        },
+    ]
+    quote_rows = [
+        {
+            "record_kind": "quote_snapshot",
+            "hypothesis_id": "H1_real_to_kalshi_latency",
+            "source_event_id": "source-1",
+            "ticker": "KXNBAGAME-26MAR21GSWATL-ATL",
+            "capture_mode": "event_immediate",
+            "horizon_seconds": 0.0,
+        },
+        {
+            "record_kind": "quote_snapshot",
+            "hypothesis_id": "H1_real_to_kalshi_latency",
+            "source_event_id": "source-1",
+            "ticker": "KXNBAPTS-26MAR21GSWATL-GSWCURRY30-30",
+            "capture_mode": "event_immediate",
+            "horizon_seconds": 0.0,
+        },
+        {
+            "record_kind": "quote_snapshot",
+            "hypothesis_id": "H1_real_to_kalshi_latency",
+            "source_event_id": "source-1",
+            "ticker": "KXNBAPTS-26MAR21GSWATL-GSWCURRY30-30",
+            "capture_mode": "event_followup",
+            "horizon_seconds": 3.0,
+        },
+    ]
+
+    summary = summarize_latency_capture(
+        source_rows,
+        quote_rows,
+        hypothesis_id="H1_real_to_kalshi_latency",
+    )
+
+    game_capture = summary["by_market_type"]["game"]
+    prop_capture = summary["by_market_type"]["prop"]
+
+    assert game_capture["source_events"] == 1
+    assert game_capture["quoted_source_events"] == 1
+    assert game_capture["quote_snapshots"] == 1
+    assert game_capture["event_immediate_quote_snapshots"] == 1
+    assert game_capture["event_followup_quote_snapshots"] == 0
+    assert prop_capture["source_events"] == 1
+    assert prop_capture["quoted_source_events"] == 1
+    assert prop_capture["quote_snapshots"] == 2
+    assert prop_capture["event_immediate_quote_snapshots"] == 1
+    assert prop_capture["event_followup_quote_snapshots"] == 1
 
 
 def test_summarize_latency_capture_proof_checks_reflect_sample_and_ci_strength():
@@ -682,6 +807,125 @@ def test_summarize_alpha_execution_capture_includes_settlement_summary_and_missi
     assert clutch["pass_fail_status"] == "insufficient_fee_data"
 
 
+def test_summarize_alpha_execution_capture_can_ignore_unlinked_execution_rows():
+    signal_rows = [
+        {
+            "record_kind": "signal",
+            "hypothesis_id": "H1_real_to_kalshi_latency",
+            "signal_id": "signal-1",
+            "signal_timestamp_utc": "2026-03-19T12:00:00+00:00",
+            "book": "C",
+            "signal_type": "clutch_comeback",
+            "market_ticker": "KXNBA-18MAR26-LALHOU-LAL",
+            "side": "yes",
+            "model_prob": 0.63,
+            "market_prob": 0.54,
+            "entry_price": 0.61,
+        }
+    ]
+    order_rows = [
+        {
+            "record_kind": "order_submission",
+            "hypothesis_id": "H1_real_to_kalshi_latency",
+            "signal_id": "signal-1",
+            "order_id": "order-1",
+            "timestamp": "2026-03-19T12:00:02+00:00",
+            "order_timestamp_utc": "2026-03-19T12:00:02+00:00",
+            "book": "C",
+            "signal_type": "clutch_comeback",
+            "ticker": "KXNBA-18MAR26-LALHOU-LAL",
+            "side": "yes",
+            "price_cents": 61,
+            "count": 2,
+        },
+        {
+            "record_kind": "order_submission",
+            "hypothesis_id": "H1_real_to_kalshi_latency",
+            "signal_id": None,
+            "order_id": "order-2",
+            "timestamp": "2026-03-19T12:10:02+00:00",
+            "order_timestamp_utc": "2026-03-19T12:10:02+00:00",
+            "book": "C",
+            "signal_type": "unclassified",
+            "ticker": "KXNBA-18MAR26-LALHOU-LAL",
+            "side": "yes",
+            "price_cents": 60,
+            "count": 1,
+        },
+    ]
+    fill_rows = [
+        {
+            "record_kind": "fill",
+            "hypothesis_id": "H1_real_to_kalshi_latency",
+            "signal_id": "signal-1",
+            "order_id": "order-1",
+            "fill_timestamp_utc": "2026-03-19T12:00:08+00:00",
+            "timestamp": "2026-03-19T12:00:08+00:00",
+            "market_ticker": "KXNBA-18MAR26-LALHOU-LAL",
+            "side": "yes",
+            "fill_price_cents": 62,
+            "fill_count": 2,
+        },
+        {
+            "record_kind": "fill",
+            "hypothesis_id": "H1_real_to_kalshi_latency",
+            "signal_id": None,
+            "order_id": "order-2",
+            "fill_timestamp_utc": "2026-03-19T12:10:10+00:00",
+            "timestamp": "2026-03-19T12:10:10+00:00",
+            "market_ticker": "KXNBA-18MAR26-LALHOU-LAL",
+            "side": "yes",
+            "fill_price_cents": 60,
+            "fill_count": 1,
+        },
+    ]
+    settlement_rows = [
+        {
+            "record_kind": "settlement",
+            "hypothesis_id": "H1_real_to_kalshi_latency",
+            "signal_id": "signal-1",
+            "order_id": "order-1",
+            "ticker": "KXNBA-18MAR26-LALHOU-LAL",
+            "side": "yes",
+            "fill_price_cents": 62,
+            "fill_count": 2,
+            "settlement_revenue_cents": 200,
+            "fee_cents": 5,
+            "close_price_cents": 100,
+            "settlement_result": "win",
+        },
+        {
+            "record_kind": "settlement",
+            "hypothesis_id": "H1_real_to_kalshi_latency",
+            "signal_id": None,
+            "order_id": "order-2",
+            "ticker": "KXNBA-18MAR26-LALHOU-LAL",
+            "side": "yes",
+            "fill_price_cents": 60,
+            "fill_count": 1,
+            "settlement_revenue_cents": 0,
+            "fee_cents": 2,
+            "close_price_cents": 0,
+            "settlement_result": "loss",
+        },
+    ]
+
+    summary = summarize_alpha_execution_capture(
+        signal_rows,
+        order_rows,
+        fill_rows,
+        settlement_rows=settlement_rows,
+        hypothesis_id="H1_real_to_kalshi_latency",
+        require_signal_link=True,
+    )
+
+    assert summary["signal_rows"] == 1
+    assert summary["order_rows"] == 1
+    assert summary["fill_rows"] == 1
+    assert summary["execution_summary"]["settlement_rows"] == 1
+    assert summary["execution_summary"]["realized_net_pnl_cents"] == 71
+
+
 def test_summarize_alpha_execution_capture_handles_multiple_orders_per_signal():
     signal_rows = [
         {
@@ -884,6 +1128,34 @@ def test_summarize_h1_daily_activity_uses_oracle_payload_timestamps_and_realized
     assert summary["rows"][1]["date"] == "2026-03-20"
     assert summary["rows"][1]["realized_net_pnl_cents"] == -72
     assert summary["rows"][1]["realized_clv_cents"] == -70
+
+
+def test_summarize_h1_daily_activity_excludes_source_failures_from_source_event_counts():
+    summary = summarize_h1_daily_activity(
+        source_rows=[
+            {
+                "record_kind": "source_event",
+                "hypothesis_id": "H1_real_to_kalshi_latency",
+                "observed_at": "2026-03-29T12:00:00+00:00",
+            },
+            {
+                "record_kind": "source_failure",
+                "hypothesis_id": "H1_real_to_kalshi_latency",
+                "observed_at": "2026-03-29T12:00:30+00:00",
+                "failure_code": "empty_crowd_price_response",
+            },
+        ],
+        quote_rows=[],
+        signal_rows=[],
+        order_rows=[],
+        fill_rows=[],
+        settlement_rows=[],
+        hypothesis_id="H1_real_to_kalshi_latency",
+    )
+
+    assert summary["days"] == 1
+    assert summary["rows"][0]["date"] == "2026-03-29"
+    assert summary["rows"][0]["source_events"] == 1
 
 
 def test_summarize_h1_decision_reports_pass_when_required_gates_are_met():

@@ -11,9 +11,31 @@ from typing import Iterable
 from domain.oracle.alpha_capture import DEFAULT_HYPOTHESIS_ID, OracleAlphaCapture
 from domain.oracle.latency_analysis import classify_live_event
 from domain.oracle.execution.quote_check import quote_from_orderbook
-from domain.oracle.market_mapper import match_game_markets
+from domain.oracle.market_mapper import (
+    make_live_player_token,
+    make_player_code,
+    match_game_markets,
+    match_prop_markets,
+    normalize_team,
+)
+from domain.oracle.nba_ticker_utils import parse_nba_ticker
 
 _log = logging.getLogger("oracle.latency_probe")
+_PROP_STATS = (
+    "points",
+    "rebounds",
+    "assists",
+    "three_pointers",
+    "steals",
+    "blocks",
+    "turnovers",
+)
+_PLAYER_PROP_MAPPING_REASONS = (
+    "no_open_kalshi_market",
+    "player_token_mismatch",
+    "team_mismatch",
+    "date_mismatch",
+)
 
 
 def _parse_game_date(start_time: str) -> dt.date | None:
@@ -30,6 +52,7 @@ class OracleLatencyProbe:
 
     DEFAULT_EVENT_TYPES = frozenset({
         "LiveFeedSocketPlaysAdded",
+        "LiveFeedSocketPlaysUpdated",
         "LiveFeedSocketPlayersUpdated",
         "PlayerBoxScoreUpdated",
         "GameUpdated",
@@ -68,6 +91,8 @@ class OracleLatencyProbe:
         self._fetch_quote = fetch_quote_func or self._default_fetch_quote
         self._has_external_quote_source = fetch_quote_func is not None
         self._game_market_index: dict[str, list[str]] = {}
+        self._player_prop_market_index: dict[str, list[str]] = {}
+        self._player_prop_mapping_diagnostics: dict[str, object] = {}
         self._game_state_index: dict[str, dict] = {}
         self._player_foul_index: dict[str, int] = {}
         self._quote_index: dict[str, dict] = {}
@@ -100,13 +125,186 @@ class OracleLatencyProbe:
                 index[str(game_id)] = sorted(set(tickers))
         return index
 
+    @classmethod
+    def analyze_player_prop_market_index(
+        cls,
+        player_contexts: list[dict],
+        kalshi_markets: list[dict],
+    ) -> tuple[dict[str, list[str]], dict[str, object]]:
+        """Map Real game/player ids to matching Kalshi player-prop tickers and diagnostics."""
+        index: dict[str, list[str]] = {}
+        parsed_markets = []
+        for market in kalshi_markets:
+            ticker = str(market.get("ticker") or "").strip()
+            if not ticker:
+                continue
+            parsed = parse_nba_ticker(ticker)
+            if not parsed or parsed.get("type") != "prop":
+                continue
+            parsed_markets.append((market, parsed))
+
+        reason_counts = {reason: 0 for reason in _PLAYER_PROP_MAPPING_REASONS}
+        examples = {reason: [] for reason in _PLAYER_PROP_MAPPING_REASONS}
+        for context in player_contexts:
+            game_id = context.get("game_id")
+            player_id = context.get("player_id")
+            player_name = context.get("player_name", "")
+            team_name = context.get("team", "")
+            player_key = cls._player_index_key(game_id, player_id)
+            if player_key is None or not player_name or not team_name:
+                continue
+            game_date = _parse_game_date(context.get("scheduled_day") or context.get("start_time", ""))
+            if game_date is None:
+                continue
+            tickers = set()
+            for stat_type in _PROP_STATS:
+                for market in match_prop_markets(
+                    player_name,
+                    team_name,
+                    stat_type,
+                    game_date,
+                    kalshi_markets,
+                ):
+                    ticker = market.get("ticker", "")
+                    if ticker:
+                        tickers.add(ticker)
+            if tickers:
+                index[player_key] = sorted(tickers)
+                continue
+
+            reason, sample_tickers = cls._diagnose_unmapped_player_context(context, parsed_markets)
+            reason_counts[reason] += 1
+            if len(examples[reason]) < 5:
+                examples[reason].append(
+                    {
+                        "game_id": game_id,
+                        "player_id": player_id,
+                        "player_name": player_name,
+                        "team": team_name,
+                        "scheduled_day": context.get("scheduled_day"),
+                        "sample_tickers": sample_tickers,
+                    }
+                )
+
+        diagnostics = {
+            "player_contexts": len(player_contexts),
+            "mapped_players": len(index),
+            "unmapped_players": max(0, len(player_contexts) - len(index)),
+            "mapped_tickers": sum(len(tickers) for tickers in index.values()),
+            "reason_counts": {reason: count for reason, count in reason_counts.items() if count},
+            "examples": {reason: rows for reason, rows in examples.items() if rows},
+        }
+        return index, diagnostics
+
+    @classmethod
+    def build_player_prop_market_index(
+        cls,
+        player_contexts: list[dict],
+        kalshi_markets: list[dict],
+    ) -> dict[str, list[str]]:
+        index, _ = cls.analyze_player_prop_market_index(player_contexts, kalshi_markets)
+        return index
+
+    @classmethod
+    def _diagnose_unmapped_player_context(
+        cls,
+        context: dict,
+        parsed_markets: list[tuple[dict, dict]],
+    ) -> tuple[str, list[str]]:
+        game_date = _parse_game_date(context.get("scheduled_day") or context.get("start_time", ""))
+        team_code = normalize_team(str(context.get("team") or ""))
+        player_name = str(context.get("player_name") or "").strip()
+        live_token = make_live_player_token(player_name).upper()
+        legacy_code = make_player_code(player_name).upper()
+        token_candidates = {token for token in (live_token, legacy_code) if token}
+
+        if game_date is None or not team_code or not token_candidates:
+            return "no_open_kalshi_market", []
+
+        date_iso = game_date.isoformat()
+
+        def parsed_token(parsed: dict) -> str:
+            raw = str(parsed.get("player_token") or parsed.get("player_code") or "").upper()
+            return raw.rstrip("0123456789")
+
+        same_date_token_other_team = [
+            market.get("ticker", "")
+            for market, parsed in parsed_markets
+            if parsed.get("date") == date_iso
+            and parsed_token(parsed) in token_candidates
+            and parsed.get("team") != team_code
+        ]
+        if same_date_token_other_team:
+            return "team_mismatch", same_date_token_other_team[:5]
+
+        same_token_other_date = [
+            market.get("ticker", "")
+            for market, parsed in parsed_markets
+            if parsed_token(parsed) in token_candidates
+            and parsed.get("date") != date_iso
+        ]
+        if same_token_other_date:
+            return "date_mismatch", same_token_other_date[:5]
+
+        team_date_markets = [
+            market.get("ticker", "")
+            for market, parsed in parsed_markets
+            if parsed.get("date") == date_iso and parsed.get("team") == team_code
+        ]
+        if not team_date_markets:
+            return "no_open_kalshi_market", []
+
+        return "player_token_mismatch", team_date_markets[:5]
+
     def refresh_game_market_index(self, real_markets: list[dict], kalshi_markets: list[dict]) -> dict[str, list[str]]:
         self._game_market_index = self.build_game_market_index(real_markets, kalshi_markets)
         return dict(self._game_market_index)
 
+    def refresh_player_prop_market_index(self, player_contexts: list[dict], kalshi_markets: list[dict]) -> dict[str, list[str]]:
+        (
+            self._player_prop_market_index,
+            self._player_prop_mapping_diagnostics,
+        ) = self.analyze_player_prop_market_index(player_contexts, kalshi_markets)
+        return dict(self._player_prop_market_index)
+
+    def refresh_market_indexes(
+        self,
+        real_markets: list[dict],
+        kalshi_game_markets: list[dict],
+        player_contexts: list[dict] | None = None,
+        kalshi_prop_markets: list[dict] | None = None,
+    ) -> dict[str, list[str]]:
+        self.refresh_game_market_index(real_markets, kalshi_game_markets)
+        self.refresh_player_prop_market_index(player_contexts or [], kalshi_prop_markets or [])
+        return self.market_index
+
     @property
     def game_market_index(self) -> dict[str, list[str]]:
         return dict(self._game_market_index)
+
+    @property
+    def player_prop_market_index(self) -> dict[str, list[str]]:
+        return dict(self._player_prop_market_index)
+
+    @property
+    def player_prop_mapping_diagnostics(self) -> dict[str, object]:
+        return dict(self._player_prop_mapping_diagnostics)
+
+    @property
+    def market_index(self) -> dict[str, list[str]]:
+        combined: dict[str, set[str]] = {}
+        for game_id, tickers in self._game_market_index.items():
+            combined.setdefault(str(game_id), set()).update(tickers)
+        for player_key, tickers in self._player_prop_market_index.items():
+            game_id, _, _ = str(player_key).partition(":")
+            if not game_id:
+                continue
+            combined.setdefault(game_id, set()).update(tickers)
+        return {game_id: sorted(tickers) for game_id, tickers in combined.items() if tickers}
+
+    @property
+    def mapped_tickers(self) -> list[str]:
+        return sorted({ticker for tickers in self.market_index.values() for ticker in tickers})
 
     @property
     def source_event_count(self) -> int:
@@ -154,6 +352,14 @@ class OracleLatencyProbe:
             extra["home_score"] = classification.get("home_score")
             extra["away_score"] = classification.get("away_score")
         return extra
+
+    def _event_tickers(self, game_id, player_id) -> tuple[list[str], list[str], list[str]]:
+        game_key = str(game_id) if game_id not in (None, "") else None
+        player_key = self._player_index_key(game_id, player_id)
+        game_tickers = list(self._game_market_index.get(game_key, [])) if game_key else []
+        prop_tickers = list(self._player_prop_market_index.get(player_key, [])) if player_key else []
+        all_tickers = sorted(set(game_tickers) | set(prop_tickers))
+        return all_tickers, sorted(set(game_tickers)), sorted(set(prop_tickers))
 
     def _update_state_indices(self, event, classification: dict) -> None:
         if event.game_id not in (None, ""):
@@ -282,14 +488,17 @@ class OracleLatencyProbe:
 
     async def capture_market_index_snapshot(self, *, extra: dict | None = None) -> list[dict]:
         """Persist a baseline mapping snapshot and current quotes for mapped markets."""
-        tickers = sorted({ticker for values in self._game_market_index.values() for ticker in values})
+        tickers = self.mapped_tickers
         source_record = self._capture.record_probe_snapshot(
             snapshot_name="market_index_snapshot",
             hypothesis_id=self._hypothesis_id,
             payload={
-                "mapped_games": len(self._game_market_index),
+                "mapped_games": len(self.market_index),
                 "mapped_tickers": tickers,
+                "market_index": self.market_index,
                 "game_market_index": self.game_market_index,
+                "player_prop_market_index": self.player_prop_market_index,
+                "player_prop_mapping_diagnostics": self.player_prop_mapping_diagnostics,
                 **(extra or {}),
             },
         )
@@ -323,6 +532,11 @@ class OracleLatencyProbe:
         """Persist the source event and snapshot mapped Kalshi quotes."""
         if event.event_type not in self._capture_event_types:
             return []
+        sport = ""
+        if isinstance(getattr(event, "data", None), dict):
+            sport = str(event.data.get("sport") or "").strip().lower()
+        if sport and sport != "nba":
+            return []
 
         observed_at = time.time()
         game_key = str(event.game_id) if event.game_id not in (None, "") else None
@@ -333,13 +547,15 @@ class OracleLatencyProbe:
             previous_player_fouls=self._player_foul_index.get(player_key) if player_key else None,
         )
         self._update_state_indices(event, classification)
-        tickers = self._game_market_index.get(str(event.game_id), [])
+        tickers, game_tickers, prop_tickers = self._event_tickers(event.game_id, event.player_id)
         source_record = self._capture.record_source_event(
             event,
             hypothesis_id=self._hypothesis_id,
             observed_at=observed_at,
             extra={
                 "mapped_tickers": tickers,
+                "mapped_game_tickers": game_tickers,
+                "mapped_prop_tickers": prop_tickers,
                 **self._classification_extra(classification, include_scores=True),
             },
         )

@@ -201,7 +201,7 @@ def test_execute_signal_records_order_metadata_without_false_fill(monkeypatch):
     assert len(fake_capture.orders) == 1
     record = fake_capture.signals[0]
     assert record["triggered"] is True
-    assert record["reason"] == "executed"
+    assert record["reason"].startswith("executed")
     assert record["mode"] == "live"
     assert record["order_id"] == "ord_1"
     assert record["order_status"] == "resting"
@@ -213,6 +213,51 @@ def test_execute_signal_records_order_metadata_without_false_fill(monkeypatch):
     assert order["status"] == "resting"
     assert order["mode"] == "live"
     assert fake_capture.fills == []
+
+
+def test_passive_execution_price_resolution(monkeypatch):
+    """Passive mode should use bid (YES) or 100-ask (NO) instead of ask."""
+    monkeypatch.setattr(oracle_bot, "oracle_config", {
+        "books": {"C": {"passiveExecution": True}},
+    })
+
+    # YES side: should use bid (40c) instead of ask (42c)
+    yes_signal = Signal(
+        book=Book.C, ticker="T1", side="yes", edge=0.10,
+        model_prob=0.55, kalshi_price=0.42,
+        metadata={"kalshi_yes_bid": 40, "kalshi_yes_ask": 42},
+    )
+    price, mode = oracle_bot._resolve_execution_price(yes_signal)
+    assert mode == "passive"
+    assert price == 40  # bid, not ask
+
+    # NO side: should use 100 - ask (58c) instead of signal price
+    no_signal = Signal(
+        book=Book.C, ticker="T2", side="no", edge=0.10,
+        model_prob=0.55, kalshi_price=0.60,
+        metadata={"kalshi_yes_bid": 40, "kalshi_yes_ask": 42},
+    )
+    price, mode = oracle_bot._resolve_execution_price(no_signal)
+    assert mode == "passive"
+    assert price == 58  # 100 - 42
+
+    # Non-Book-C: should always be taker
+    book_a_signal = Signal(
+        book=Book.A, ticker="T3", side="yes", edge=0.15,
+        model_prob=0.60, kalshi_price=0.45,
+        metadata={"kalshi_yes_bid": 43, "kalshi_yes_ask": 45},
+    )
+    price, mode = oracle_bot._resolve_execution_price(book_a_signal)
+    assert mode == "taker"
+    assert price == 45  # ask
+
+    # Passive disabled: should be taker
+    monkeypatch.setattr(oracle_bot, "oracle_config", {
+        "books": {"C": {"passiveExecution": False}},
+    })
+    price, mode = oracle_bot._resolve_execution_price(yes_signal)
+    assert mode == "taker"
+    assert price == 42  # ask
 
 
 def test_limit_check_passes_fresh_ledger(tmp_path):
@@ -450,9 +495,11 @@ def test_oracle_config_structure():
     assert "A" in books
     assert "B" in books
     assert "C" in books
-    assert books["A"]["minEdge"] == 0.15
-    assert books["B"]["minEdge"] == 0.10
-    assert books["C"]["minEdge"] == 0.12
+    assert books["A"]["enabled"] is False
+    assert books["B"]["enabled"] is False
+    assert books["C"]["enabled"] is True
+    assert books["C"]["maxSpreadCents"] == 6
+    assert books["C"]["minDepthContracts"] == 10
 
     # Kill switches
     ks = oracle["killSwitches"]
@@ -686,6 +733,8 @@ def test_scan_book_c_generates_clutch_comeback_signal(tmp_path, monkeypatch):
     }
     monkeypatch.setattr(oracle_bot, "real_client", _FakeRealClient(home_feed, game_details))
 
+    # Trailing team price 50c -> empirical trailing prob 35.2% (margin=2, 75s)
+    # Overpricing = 50% - 35.2% = 14.8% > min_edge 8%
     trailing_ticker = "KXNBAGAME-26MAR22GSWATL-GSW"
     monkeypatch.setattr(
         oracle_bot,
@@ -694,8 +743,8 @@ def test_scan_book_c_generates_clutch_comeback_signal(tmp_path, monkeypatch):
             {
                 trailing_ticker: {
                     "orderbook_fp": {
-                        "yes_dollars": [["0.4000", "12.00"]],
-                        "no_dollars": [["0.5900", "15.00"]],
+                        "yes_dollars": [["0.5000", "12.00"]],
+                        "no_dollars": [["0.4900", "15.00"]],
                     },
                 },
             }
@@ -712,14 +761,15 @@ def test_scan_book_c_generates_clutch_comeback_signal(tmp_path, monkeypatch):
     signal = signals[0]
     assert signal.book == Book.C
     assert signal.ticker == trailing_ticker
-    assert signal.side == "no"
+    assert signal.side == "no"  # fade overpriced trailing team
     assert signal.metadata["signal_type"] == "clutch_comeback"
     assert signal.metadata["trailing_team"] == "Golden State Warriors"
     assert signal.metadata["leading_team"] == "Atlanta Hawks"
     assert signal.metadata["game_id"] == "ATL-GSW-20260322"
-    assert signal.metadata["kalshi_yes_bid"] == 40
-    assert signal.metadata["kalshi_yes_ask"] == 41
-    assert signal.metadata["kalshi_price_cents"] == 60
+    assert signal.metadata["direction"] == "fade_trailing"
+    assert signal.metadata["kalshi_yes_bid"] == 50
+    assert signal.metadata["kalshi_yes_ask"] == 51
+    assert signal.metadata["kalshi_price_cents"] == 50
 
 
 def test_scan_book_c_rejects_wide_spread_quote(tmp_path, monkeypatch):
@@ -803,6 +853,7 @@ def test_scan_book_c_records_zero_signal_warning_and_recovers(tmp_path, monkeypa
             },
         },
     }
+    # Set trailing price at 35c (close to empirical 35.2%) so edge is < 8%
     trailing_ticker = "KXNBAGAME-26MAR22GSWATL-GSW"
     _configure_book_c_runtime(
         monkeypatch,
@@ -812,8 +863,8 @@ def test_scan_book_c_records_zero_signal_warning_and_recovers(tmp_path, monkeypa
         orderbooks={
             trailing_ticker: {
                 "orderbook_fp": {
-                    "yes_dollars": [["0.2000", "12.00"]],
-                    "no_dollars": [["0.7900", "15.00"]],
+                    "yes_dollars": [["0.3500", "12.00"]],
+                    "no_dollars": [["0.6400", "15.00"]],
                 },
             },
         },
@@ -840,10 +891,11 @@ def test_scan_book_c_records_zero_signal_warning_and_recovers(tmp_path, monkeypa
     ]
     assert oracle_bot.health.source_errors == []
 
+    # Recovery: price 50c trailing -> overpricing 50% - 35.2% = 14.8% > 8%
     oracle_bot.client._orderbooks[trailing_ticker] = {
         "orderbook_fp": {
-            "yes_dollars": [["0.4000", "12.00"]],
-            "no_dollars": [["0.5900", "15.00"]],
+            "yes_dollars": [["0.5000", "12.00"]],
+            "no_dollars": [["0.4900", "15.00"]],
         },
     }
     signals = asyncio.run(oracle_bot.scan_book_c(kalshi_markets))

@@ -1,12 +1,15 @@
 """Tests for Oracle Real Sports client (async with respx mocks)."""
 
+import asyncio
 import pytest
 import json
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 from domain.oracle.real_sports_client import (
     RealSportsConfig,
     RealSportsClient,
+    RealSportsWebSocket,
     parse_game_market_response,
     parse_home_game_response,
     parse_player_splits,
@@ -207,11 +210,115 @@ def test_auth_headers_format():
     assert headers["origin"] == "https://www.realapp.com"
 
 
+def test_real_ws_url_matches_browser_query_shape():
+    cfg = RealSportsConfig(
+        ws_url="https://web.realsports.io",
+        user_id="k3LkNN1v",
+        token="3293b82e-1fd8-4e87-b6c2-6cd7363dcc70",
+        device_id="39bQYPRE",
+    )
+    ws = RealSportsWebSocket(cfg)
+    with patch("domain.oracle.real_sports_client._generate_request_token", return_value="tok-123"), patch(
+        "domain.oracle.real_sports_client.uuid.uuid4",
+        return_value="generated-uuid",
+    ):
+        url = ws._build_ws_url()
+
+    parsed = urlsplit(url)
+    qs = parse_qs(parsed.query)
+
+    assert parsed.scheme == "wss"
+    assert parsed.netloc == "web.realsports.io"
+    assert parsed.path == "/socket.io/"
+    assert qs["socketType"] == ["LiveFeed"]
+    assert qs["sport"] == ["all"]
+    assert qs["deviceType"] == ["desktop_web"]
+    assert qs["deviceVersion"] == ["undefined"]
+    assert qs["realVersion"] == ["28"]
+    assert qs["realRequestToken"] == ["tok-123"]
+    assert qs["auth"] == ["k3LkNN1v!39bQYPRE!3293b82e-1fd8-4e87-b6c2-6cd7363dcc70"]
+    assert qs["deviceUuid"] == ["generated-uuid"]
+    assert qs["EIO"] == ["3"]
+    assert qs["transport"] == ["websocket"]
+
+
+def test_real_ws_dispatch_unwraps_play_lists():
+    cfg = RealSportsConfig(
+        user_id="k3LkNN1v",
+        token="tok",
+        device_id="dev",
+        device_uuid="uuid",
+    )
+    ws = RealSportsWebSocket(cfg)
+    seen = []
+
+    async def handler(event):
+        seen.append(event)
+
+    ws.on("LiveFeedSocketPlaysAdded", handler)
+    asyncio.run(
+        ws._dispatch_event(
+            "LiveFeedSocketPlaysAdded",
+            {
+                "plays": [
+                    {"gameId": 23547, "playerId": 20001835, "type": "FieldGoalMade"},
+                    {"gameId": 23547, "playerId": 20002270, "type": "Assist"},
+                ]
+            },
+        )
+    )
+
+    assert [event.game_id for event in seen] == [23547, 23547]
+    assert [event.player_id for event in seen] == [20001835, 20002270]
+    assert [event.data["type"] for event in seen] == ["FieldGoalMade", "Assist"]
+
+
 # ── Async client tests (using respx if available, otherwise skip) ──
 
 try:
     import respx
     import httpx
+
+    @pytest.mark.asyncio
+    async def test_login_matches_browser_request_shape():
+        config = RealSportsConfig(
+            base_url="https://mock.api.com",
+            email="andes@example.com",
+            password="secret",
+        )
+        client = RealSportsClient(config)
+
+        with patch("domain.oracle.real_sports_client._generate_request_token", return_value="tok-123"), patch(
+            "domain.oracle.real_sports_client.uuid.uuid4",
+            return_value="generated-uuid",
+        ), respx.mock:
+            route = respx.post("https://mock.api.com/login").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "user": {"id": "k3LkNN1v"},
+                        "token": "fresh-token",
+                        "deviceId": "39bQYPRE",
+                    },
+                )
+            )
+            ok = await client.login()
+
+        assert ok is True
+        request = route.calls.last.request
+        assert request.headers["real-request-token"] == "tok-123"
+        assert request.headers["real-device-type"] == "desktop_web"
+        assert request.headers["real-device-uuid"] == "generated-uuid"
+        assert request.headers["referer"] == "https://www.realapp.com/"
+        assert json.loads(request.read().decode()) == {
+            "login": "andes@example.com",
+            "password": "secret",
+            "tfaAuthCode": "",
+        }
+        assert config.user_id == "k3LkNN1v"
+        assert config.token == "fresh-token"
+        assert config.device_id == "39bQYPRE"
+        assert config.device_uuid == "generated-uuid"
 
     @pytest.mark.asyncio
     async def test_get_game_markets():

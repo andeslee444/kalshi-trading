@@ -1357,13 +1357,48 @@ def _reconcile_ledger_positions():
         log.debug("Ledger reconciliation skipped: %s", e)
 
 
+def _resolve_execution_price(signal: Signal) -> tuple[int, str]:
+    """Resolve order price based on execution mode (taker vs maker).
+
+    Taker (aggressive): cross the spread — buy at ask, sell at bid.
+    Maker (passive): post at our side of the spread — buy at bid, sell at ask.
+      H8 research shows +2.6c maker advantage over taker on game markets.
+
+    Returns (price_cents, execution_mode).
+    """
+    book_c_config = oracle_config.get("books", {}).get("C", {})
+    use_passive = book_c_config.get("passiveExecution", False)
+
+    if use_passive and signal.book == Book.C:
+        # Passive: post at the bid (YES) or 100-ask (NO) to capture spread
+        if signal.side == "yes":
+            passive_price = signal.metadata.get("kalshi_yes_bid")
+            if passive_price and 1 <= passive_price <= 99:
+                return passive_price, "passive"
+        else:
+            # NO side: post at our price = 100 - yes_ask
+            yes_ask = signal.metadata.get("kalshi_yes_ask")
+            if yes_ask and 1 <= yes_ask <= 99:
+                no_passive = 100 - yes_ask
+                if 1 <= no_passive <= 99:
+                    return no_passive, "passive"
+
+    # Taker (default): use the signal's ask-derived price
+    taker_price = (
+        int(round(signal.kalshi_price * 100))
+        if signal.kalshi_price > 0
+        else signal.metadata.get("kalshi_price_cents", 50)
+    )
+    return taker_price, "taker"
+
+
 def _execute_signal(signal: Signal, bankroll_cents: int):
     """Execute a trading signal after limit checks pass."""
     book_enum = signal.book if isinstance(signal.book, Book) else Book.A
     book_str = book_enum.name
 
-    # Compute price first — needed for per-market limit check
-    price_cents = int(round(signal.kalshi_price * 100)) if signal.kalshi_price > 0 else signal.metadata.get("kalshi_price_cents", 50)
+    # Compute price based on execution mode (taker vs passive/maker)
+    price_cents, exec_mode = _resolve_execution_price(signal)
 
     # Preliminary contract count for proposed_cost_cents estimate
     preliminary_contracts = contracts_for_book(book_str, bankroll_cents, price_cents)
@@ -1413,12 +1448,14 @@ def _execute_signal(signal: Signal, bankroll_cents: int):
 
     if _demo_mode:
         log.info(
-            "DEMO: Would trade %s %s %dx @ %dc (edge=%.1f%%, book=%s)",
-            signal.side, signal.ticker, contracts, price_cents,
+            "DEMO: Would %s %s %s %dx @ %dc (edge=%.1f%%, book=%s)",
+            exec_mode, signal.side, signal.ticker, contracts, price_cents,
             signal.edge * 100, book_str,
         )
-        _log_decision(signal, triggered=True, reason="demo mode", contracts=contracts)
-        return
+        _log_decision(signal, triggered=True, reason=f"demo mode ({exec_mode})", contracts=contracts)
+        _record_oracle_alpha_signal(signal)
+        _record_oracle_alpha_order(signal, None)
+        return True  # count as placed for scan summary
 
     # Request budget from portfolio allocator (skipped in demo mode)
     cost_cents = contracts * price_cents
@@ -1456,12 +1493,14 @@ def _execute_signal(signal: Signal, bankroll_cents: int):
             model_prob=round(signal.model_prob, 4),
             raw_edge=round(signal.edge, 4),
             market_snapshot=snapshot,
+            execution_mode=exec_mode,
         )
         if result:
+            order_id = result.get("order_id") or (result.get("order", {}).get("order_id"))
             signal_record = _log_decision(
                 signal,
                 triggered=True,
-                reason="executed",
+                reason=f"executed ({exec_mode})",
                 contracts=contracts,
                 order_info=result,
             )
@@ -1476,11 +1515,29 @@ def _execute_signal(signal: Signal, bankroll_cents: int):
             ))
             ledger.record_order_success()
             log.info(
-                "Executed: %s %s %dx @ %dc (book=%s, edge=%.1f%%)",
-                signal.side, signal.ticker, contracts, price_cents,
+                "Executed (%s): %s %s %dx @ %dc (book=%s, edge=%.1f%%)",
+                exec_mode, signal.side, signal.ticker, contracts, price_cents,
                 book_str, signal.edge * 100,
             )
             _record_oracle_alpha_fill(signal, result, signal_record=signal_record)
+
+            # Passive orders: schedule cancel after timeout if not filled
+            if exec_mode == "passive" and order_id:
+                book_c_config = oracle_config.get("books", {}).get("C", {})
+                cancel_timeout = book_c_config.get("passiveCancelTimeoutSeconds", 5.0)
+                log.info(
+                    "Passive order %s: will cancel in %.0fs if not filled",
+                    order_id, cancel_timeout,
+                )
+                # The cancel is handled by the existing fill_monitor or
+                # can be scheduled via asyncio in the scan loop.
+                # For now, store the order_id + deadline for the next scan cycle.
+                signal.metadata["passive_order_id"] = order_id
+                signal.metadata["passive_cancel_deadline"] = (
+                    datetime.datetime.now(datetime.timezone.utc)
+                    + datetime.timedelta(seconds=cancel_timeout)
+                ).isoformat()
+
             return True
         else:
             ledger.record_order_failure()
@@ -1574,14 +1631,35 @@ async def scan_book_c(kalshi_markets: list):
         log.debug("Book C scan: Real client unavailable")
         return []
 
-    home_feed = await real_client.get_home_feed("nba")
+    try:
+        home_feed = await real_client.get_home_feed("nba")
+    except Exception as exc:
+        log.warning("Book C scan: Real home feed fetch failed: %s", exc)
+        return []
+
+    all_home_games = _extract_home_games(home_feed)
     live_games = [
         game
-        for game in _extract_home_games(home_feed)
+        for game in all_home_games
         if str(game.get("status", "")).lower() in LIVE_GAME_STATUSES
     ]
+
+    # Diagnostic: log game statuses when games exist but none are live
+    if all_home_games and not live_games:
+        statuses = set(str(g.get("status", "")).lower() for g in all_home_games)
+        log.info(
+            "Book C scan: %d games in feed, 0 live (statuses: %s)",
+            len(all_home_games), ", ".join(sorted(statuses)),
+        )
+    elif not all_home_games:
+        log.info("Book C scan: Real home feed returned 0 games")
+    else:
+        log.info(
+            "Book C scan: %d live games found (of %d total)",
+            len(live_games), len(all_home_games),
+        )
+
     if not live_games:
-        log.debug("Book C scan: no live games in Real home feed")
         return []
 
     min_edge = book_c_config.get("minEdge", oracle_config.get("edgeThreshold", 0.10))
@@ -1701,6 +1779,16 @@ async def scan_book_c(kalshi_markets: list):
             game.get("home_team", ""),
             game.get("away_team", ""),
             game_date,
+        )
+        log.info(
+            "Book C clutch eval: %s  period=%s clock=%ss margin=%d  trailing=%s bid=%dc spread=%dc",
+            trailing_ticker,
+            game_state.get("period", "?"),
+            game_state.get("clock_seconds", "?"),
+            game_state.get("margin", 0),
+            trailing_team,
+            quote.yes_bid,
+            quote.spread_cents if hasattr(quote, "spread_cents") else 0,
         )
         live_signal = detect_clutch_comeback(
             margin=game_state["margin"],

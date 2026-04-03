@@ -19,7 +19,6 @@ from domain.oracle.latency_analysis import (
 )
 from event_ledger import (
     EVENT_TYPE_MARKET_SNAPSHOT,
-    EVENT_TYPE_SETTLEMENT,
     EVENT_TYPE_SOURCE_OBSERVATION,
     EventLedger,
 )
@@ -141,6 +140,20 @@ def _render_h1_decision(summary: dict) -> str:
     )
 
 
+def _render_market_type_capture(summary: dict, market_type: str) -> str:
+    row = summary.get("by_market_type", {}).get(market_type, {})
+    return (
+        f"{market_type}_capture: "
+        f"source_events={row.get('source_events', 0)} "
+        f"quoted_source_events={row.get('quoted_source_events', 0)} "
+        f"capture_rate={_render_ratio(row.get('capture_rate'))} "
+        f"quote_snapshots={row.get('quote_snapshots', 0)} "
+        f"event_immediate={row.get('event_immediate_quote_snapshots', 0)} "
+        f"event_followup={row.get('event_followup_quote_snapshots', 0)} "
+        f"paired_fillable_opportunities={row.get('paired_fillable_opportunities', 0)}"
+    )
+
+
 def _daily_table_rows(summary: dict, limit: int) -> list[str]:
     rows = [
         "date        src  quote  sig  ord  fill  setl  net_pnl  clv  cap%  fill%",
@@ -234,9 +247,13 @@ def main() -> int:
     args = parser.parse_args()
 
     ledger = EventLedger(args.ledger_path)
+    alpha_capture = OracleAlphaCapture(path=args.ledger_path)
     source_rows = ledger._fetch_event_payloads(EVENT_TYPE_SOURCE_OBSERVATION)
     quote_rows = ledger._fetch_event_payloads(EVENT_TYPE_MARKET_SNAPSHOT)
-    settlement_rows = ledger._fetch_event_payloads(EVENT_TYPE_SETTLEMENT)
+    signal_rows = alpha_capture.load_signal_rows(hypothesis_id=args.hypothesis_id)
+    order_rows = alpha_capture.load_order_rows(hypothesis_id=args.hypothesis_id)
+    fill_rows = alpha_capture.load_fill_rows(hypothesis_id=args.hypothesis_id)
+    settlement_rows = alpha_capture.load_settlement_rows(hypothesis_id=args.hypothesis_id)
     summary = summarize_latency_capture(
         source_rows,
         quote_rows,
@@ -244,22 +261,23 @@ def main() -> int:
         max_spread_cents=args.max_spread_cents,
         min_depth_contracts=args.min_depth_contracts,
     )
-    alpha_capture = OracleAlphaCapture(path=args.ledger_path)
     shadow_summary = summarize_alpha_execution_capture(
-        alpha_capture.load_signal_rows(hypothesis_id=args.hypothesis_id),
-        alpha_capture.load_order_rows(hypothesis_id=args.hypothesis_id),
-        alpha_capture.load_fill_rows(hypothesis_id=args.hypothesis_id),
+        signal_rows,
+        order_rows,
+        fill_rows,
         hypothesis_id=args.hypothesis_id,
         settlement_rows=settlement_rows,
+        require_signal_link=True,
     )
     daily_summary = summarize_h1_daily_activity(
         source_rows,
         quote_rows,
-        alpha_capture.load_signal_rows(hypothesis_id=args.hypothesis_id),
-        alpha_capture.load_order_rows(hypothesis_id=args.hypothesis_id),
-        alpha_capture.load_fill_rows(hypothesis_id=args.hypothesis_id),
+        signal_rows,
+        order_rows,
+        fill_rows,
         settlement_rows,
         hypothesis_id=args.hypothesis_id,
+        require_signal_link=True,
     )
     h1_decision = summarize_h1_decision(summary, shadow_summary, daily_summary)
 
@@ -303,6 +321,8 @@ def main() -> int:
         f"proof_flags={_render_proof_flags(summary.get('proof_checks'))}"
     )
     print("proof_flags: S=source_events>=200 F=fillable_pairs>=100 E=bootstrap_mean_best_markout_ci_above_zero")
+    print(_render_market_type_capture(summary, "game"))
+    print(_render_market_type_capture(summary, "prop"))
     print(
         "shadow_signal_rows="
         f"{shadow_summary['signal_rows']} "

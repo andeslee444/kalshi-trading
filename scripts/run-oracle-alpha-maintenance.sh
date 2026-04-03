@@ -30,7 +30,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-python3.13 src/kalshi/oracle-alpha-reconcile.py --format json > "$tmp_reconcile_json"
+python3.13 src/kalshi/oracle-alpha-reconcile.py --linked-only --format json > "$tmp_reconcile_json"
 mv "$tmp_reconcile_json" "$REPORT_DIR/oracle-alpha-reconcile-latest.json"
 
 python3.13 src/kalshi/oracle-latency-report.py --format json --limit "$LIMIT" > "$tmp_report_json"

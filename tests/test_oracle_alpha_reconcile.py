@@ -149,6 +149,39 @@ def test_reconcile_alpha_ledger_preserves_unlinked_orders_without_inventing_fill
     assert len(fills) == 0
 
 
+def test_reconcile_alpha_ledger_linked_only_skips_unlinked_orders(tmp_path):
+    source_path = tmp_path / "event-ledger.sqlite3"
+    ledger = EventLedger(source_path)
+    ledger.record_order_submitted(
+        {
+            "ticker": "KXNBA-18MAR26-LALHOU-LAL",
+            "action": "buy",
+            "side": "no",
+            "count": 1,
+            "price_cents": 43,
+            "order_id": "order-2",
+            "timestamp": "2026-03-19T12:05:00+00:00",
+            "source_bot": "oracle",
+            "status": "resting",
+        },
+        source_path=source_path,
+    )
+    capture = OracleAlphaCapture(path=tmp_path / "oracle-alpha.sqlite3")
+
+    summary = oracle_alpha_reconcile.reconcile_alpha_ledger(
+        source_ledger_path=source_path,
+        alpha_ledger_path=capture.path,
+        linked_only=True,
+        dry_run=False,
+    )
+
+    assert summary["source_trade_rows"] == 1
+    assert summary["eligible_trade_rows"] == 0
+    assert summary["skipped_unlinked_rows"] == 1
+    assert summary["order_rows"] == 0
+    assert capture.load_order_rows() == []
+
+
 def test_oracle_alpha_reconcile_main_json_output(tmp_path, monkeypatch, capsys):
     source_path = _seed_source_ledger(tmp_path / "event-ledger.sqlite3")
     capture = _seed_alpha_signal(tmp_path / "oracle-alpha.sqlite3")

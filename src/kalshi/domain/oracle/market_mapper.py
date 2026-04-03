@@ -109,6 +109,29 @@ def make_player_code(name: str) -> str:
     return f"{last.upper()}{first[0].upper()}"
 
 
+def make_live_player_token(name: str) -> str:
+    """Convert player name to Kalshi live prop token.
+
+    Current live prop tickers use FIRST_INITIAL + LAST_NAME, with punctuation
+    stripped and common suffixes omitted, followed by jersey digits.
+    """
+    suffixes = {"JR", "SR", "II", "III", "IV", "V"}
+    parts = [part for part in re.split(r"\s+", str(name).strip()) if part]
+    if not parts:
+        return ""
+    normalized_parts = [re.sub(r"[^A-Za-z]", "", part).upper() for part in parts]
+    normalized_parts = [part for part in normalized_parts if part]
+    if not normalized_parts:
+        return ""
+    while len(normalized_parts) > 1 and normalized_parts[-1] in suffixes:
+        normalized_parts.pop()
+    first = normalized_parts[0]
+    last = normalized_parts[-1]
+    if len(normalized_parts) == 1:
+        return last
+    return f"{first[0]}{last}"
+
+
 def match_game_markets(
     real_home: str, real_away: str, game_date: _dt.date,
     kalshi_markets: list[dict],
@@ -147,7 +170,8 @@ def match_prop_markets(
     team_code = normalize_team(team)
     if not team_code:
         return []
-    player_code = make_player_code(player_name)
+    legacy_player_code = make_player_code(player_name).upper()
+    live_player_token = make_live_player_token(player_name).upper()
 
     matches = []
     for market in kalshi_markets:
@@ -161,8 +185,15 @@ def match_prop_markets(
             continue
         if parsed["team"] != team_code:
             continue
-        # Fuzzy match on player code (case-insensitive)
-        if parsed["player_code"].upper() == player_code.upper():
+        parsed_code = str(parsed.get("player_code") or "").upper()
+        parsed_token = str(parsed.get("player_token") or "").upper()
+        if parsed_code == legacy_player_code:
+            matches.append(market)
+            continue
+        if parsed_token == live_player_token:
+            matches.append(market)
+            continue
+        if parsed_code and parsed_code.rstrip("0123456789") == live_player_token:
             matches.append(market)
     return matches
 

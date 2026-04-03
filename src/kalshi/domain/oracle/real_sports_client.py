@@ -19,11 +19,15 @@ All Real Sports interaction is isolated in this file for easy adaptation.
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
 import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
+from urllib.parse import urlencode
 
 import asyncio
 
@@ -76,6 +80,13 @@ def _generate_request_token() -> str:
     """
     h = _get_request_token_hashids()
     return h.encode(int(time.time() * 1000))
+
+
+def _ensure_real_device_uuid(config: "RealSportsConfig") -> str:
+    """Ensure a stable device UUID exists for websocket and login flows."""
+    if not config.device_uuid:
+        config.device_uuid = str(uuid.uuid4())
+    return config.device_uuid
 
 
 @dataclass
@@ -184,28 +195,31 @@ class RealSportsClient:
             ) as login_client:
                 resp = await login_client.post(
                     "/login",
-                    json={"email": cfg.email, "password": cfg.password},
+                    json={"login": cfg.email, "password": cfg.password, "tfaAuthCode": ""},
                     headers={
                         "content-type": "application/json",
                         "real-device-type": "desktop_web",
                         "real-device-name": _DEVICE_NAME,
+                        "real-device-uuid": _ensure_real_device_uuid(cfg),
                         "real-version": _REAL_VERSION,
                         "real-request-token": _generate_request_token(),
-                        "origin": "https://www.realapp.com",
                         "referer": "https://www.realapp.com/",
                     },
                 )
                 resp.raise_for_status()
                 data = resp.json()
 
-            # Extract auth info from response
+            # Real has returned at least two shapes in practice:
+            # 1. {"authInfo": {"userId", "token", "deviceId"}}
+            # 2. {"user": {"id"}, "token", "deviceId", ...}
             auth_info = data.get("authInfo", data)
-            new_user_id = auth_info.get("userId", "")
-            new_token = auth_info.get("token", "")
-            new_device_id = auth_info.get("deviceId", "")
+            nested_user = data.get("user", {}) if isinstance(data.get("user"), dict) else {}
+            new_user_id = auth_info.get("userId") or nested_user.get("id") or data.get("userId", "")
+            new_token = auth_info.get("token") or data.get("token", "")
+            new_device_id = auth_info.get("deviceId") or data.get("deviceId", "")
 
             if not new_user_id or not new_token:
-                _log.error("Login response missing userId/token: %s", list(auth_info.keys()))
+                _log.error("Login response missing userId/token: %s", list(data.keys()))
                 return False
 
             # Update config with fresh credentials
@@ -338,11 +352,15 @@ class RealSportsClient:
         """Get all active prediction markets for a sport.
 
         Returns list of market dicts with game info, prices, volume.
+        The API returns {"gameMarkets": [...]}, each with outcomes, probabilities,
+        probabilityHistory, volumeDisplay, isLocked, isSettled.
         """
         data = await self._get(f"/predictions/gamemarkets/{sport}")
         if isinstance(data, list):
             return data
-        return data.get("markets", []) if isinstance(data, dict) else []
+        if isinstance(data, dict):
+            return data.get("gameMarkets", data.get("markets", []))
+        return []
 
     async def get_game_detail(self, game_id: int, sport: str = "nba") -> dict:
         """Get detailed game data including play-by-play."""
@@ -482,159 +500,268 @@ class LiveEvent:
 
 
 class RealSportsWebSocket:
-    """Socket.io WebSocket client for live game events.
+    """Real Sports live-feed websocket client.
 
-    Connects to Real Sports' Socket.io server and dispatches events to handlers.
+    Real's browser client uses an Engine.IO v3 websocket on `/socket.io/`
+    with auth and device fields carried in the query string. The generic
+    python-socketio client was connecting at the transport layer but not
+    receiving room data, so this client mirrors the browser protocol directly.
     """
 
     # Heartbeat watchdog: if no data received for this many seconds,
     # mark the connection as STALE (spec Section 12)
     STALE_THRESHOLD_SECONDS = 30.0
     MAX_RECONNECT_FAILURES = 3
+    SOCKET_TYPE = "LiveFeed"
+    SOCKET_SPORT = "all"
+    DEVICE_VERSION = "undefined"
 
     def __init__(self, config: RealSportsConfig):
         self._config = config
-        self._sio = None
+        self._session = None
+        self._ws = None
+        self._runner_task: Optional[asyncio.Task] = None
+        self._startup_future: Optional[asyncio.Future] = None
+        self._stop_requested = False
         self._connected = False
         self._reconnecting = False
         self._reconnect_count = 0
         self._reconnect_failures = 0
         self._last_data_time: float = 0.0
         self._stale = False
+        self._ping_interval_seconds = 25.0
+        self._ping_timeout_seconds = 5.0
         self._handlers: dict[str, list[Callable]] = {}
 
     def on(self, event: str, handler: Callable) -> None:
-        """Register a handler for a Socket.io event."""
+        """Register a handler for a live event."""
         self._handlers.setdefault(event, []).append(handler)
 
     async def connect(self) -> None:
-        """Connect to the Real Sports Socket.io server."""
+        """Connect to the Real Sports live websocket."""
         try:
-            import socketio
+            import aiohttp
         except ImportError:
-            _log.error("python-socketio not installed")
+            _log.error("aiohttp not installed")
             return
 
-        self._sio = socketio.AsyncClient(
-            reconnection=True,
-            reconnection_delay=1,
-            reconnection_delay_max=30,
-        )
+        if self._runner_task and not self._runner_task.done():
+            return
 
-        @self._sio.event
-        async def connect():
-            self._connected = True
-            self._reconnecting = False
-            _log.info("Connected to Real Sports WebSocket")
+        self._stop_requested = False
+        self._startup_future = asyncio.get_running_loop().create_future()
+        self._runner_task = asyncio.create_task(self._run_forever(aiohttp), name="real-live-ws")
+        await self._startup_future
 
-        @self._sio.event
-        async def disconnect():
-            self._connected = False
-            self._reconnecting = True
-            _log.info("Disconnected from Real Sports WebSocket")
+    def _ensure_device_uuid(self) -> str:
+        generated = not bool(self._config.device_uuid)
+        device_uuid = _ensure_real_device_uuid(self._config)
+        if generated:
+            _log.info("Generated Real Sports device UUID for websocket session")
+        return device_uuid
 
-        @self._sio.on("reconnect")
-        async def on_reconnect(attempt_number):
-            self._connected = True
-            self._reconnecting = False
-            self._reconnect_count += 1
-            _log.info("Reconnected to Real Sports WebSocket (attempt %s, total reconnects: %d)",
-                       attempt_number, self._reconnect_count)
-
-        @self._sio.on("reconnect_error")
-        async def on_reconnect_error(data):
-            _log.warning("Real Sports WebSocket reconnection error: %s", data)
-
-        @self._sio.on("reconnect_failed")
-        async def on_reconnect_failed():
-            self._reconnecting = False
-            self._reconnect_failures += 1
-            if self._reconnect_failures >= self.MAX_RECONNECT_FAILURES:
-                _log.error(
-                    "Real Sports WebSocket reconnection failed %d times — "
-                    "Book C disabled, REST-only mode",
-                    self._reconnect_failures,
-                )
-            else:
-                _log.warning(
-                    "Real Sports WebSocket reconnection failed (%d/%d)",
-                    self._reconnect_failures, self.MAX_RECONNECT_FAILURES,
-                )
-
-        # Register event handlers for live data
-        for event_name in [
-            "LiveFeedSocketPlaysAdded",
-            "LiveFeedSocketPlayersUpdated",
-            "PlayerBoxScoreUpdated",
-            "GameUpdated",
-            "GameMarketUpdated",
-        ]:
-            self._register_event(event_name)
-
-        # Build auth headers matching the REST client format
+    def _auth_query_value(self) -> str:
         cfg = self._config
-        headers = {
-            "real-device-name": _DEVICE_NAME,
-            "real-device-type": "desktop_web",
-            "real-version": _REAL_VERSION,
-            "origin": "https://www.realapp.com",
-        }
-        if cfg.user_id and cfg.device_id and cfg.token:
-            headers["real-auth-info"] = f"{cfg.user_id}!{cfg.device_id}!{cfg.token}"
-        if cfg.device_uuid:
-            headers["real-device-uuid"] = cfg.device_uuid
+        return f"{cfg.user_id}!{cfg.device_id}!{cfg.token}"
 
-        # Socket.io query params (required by Real Sports server)
-        socketio_query = {
-            "socketType": "LiveFeed",
+    def _build_ws_url(self) -> str:
+        base_url = self._config.ws_url.rstrip("/")
+        if base_url.startswith("https://"):
+            base_url = "wss://" + base_url[len("https://"):]
+        elif base_url.startswith("http://"):
+            base_url = "ws://" + base_url[len("http://"):]
+        params = {
+            "socketType": self.SOCKET_TYPE,
             "realRequestToken": _generate_request_token(),
             "realVersion": _REAL_VERSION,
+            "sport": self.SOCKET_SPORT,
+            "deviceUuid": self._ensure_device_uuid(),
+            "deviceVersion": self.DEVICE_VERSION,
+            "deviceType": "desktop_web",
+            "auth": self._auth_query_value(),
+            "EIO": "3",
+            "transport": "websocket",
+        }
+        return f"{base_url}/socket.io/?{urlencode(params)}"
+
+    def _build_ws_headers(self) -> dict[str, str]:
+        return {
+            "origin": "https://www.realapp.com",
+            "referer": "https://www.realapp.com/",
+            "user-agent": _DEVICE_NAME,
         }
 
-        # python-socketio passes query params via the URL as query string
-        # or via the `auth` parameter depending on version.
-        # For Socket.io v4+ (which Real Sports uses), query params go in the URL.
-        qs = "&".join(f"{k}={v}" for k, v in socketio_query.items())
-        ws_url = f"{self._config.ws_url}?{qs}" if qs else self._config.ws_url
-
-        await self._sio.connect(
-            ws_url,
-            headers=headers,
-            transports=["websocket"],
+    def _extract_event_ids(self, payload: dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
+        game_id = payload.get("gameId") or payload.get("game_id")
+        player_id = (
+            payload.get("playerId")
+            or payload.get("player_id")
+            or payload.get("primaryPlayerId")
+            or payload.get("primary_player_id")
         )
+        return game_id, player_id
 
-    def _register_event(self, event_name: str) -> None:
-        """Register a Socket.io event to dispatch to handlers."""
-        async def handler(data):
-            # Update heartbeat watchdog on every data event
-            self._last_data_time = time.time()
-            self._stale = False
+    def _iter_payloads(self, payload: Any) -> list[dict[str, Any]]:
+        if isinstance(payload, dict):
+            for key in ("plays", "players", "games", "markets"):
+                items = payload.get(key)
+                if isinstance(items, list) and items:
+                    return [item for item in items if isinstance(item, dict)]
+            return [payload]
+        return [{"raw": payload}]
 
+    async def _dispatch_event(self, event_name: str, payload: Any) -> None:
+        handlers = self._handlers.get(event_name, [])
+        if not handlers:
+            return
+        self._last_data_time = time.time()
+        self._stale = False
+        for item in self._iter_payloads(payload):
+            game_id, player_id = self._extract_event_ids(item)
             event = LiveEvent(
                 event_type=event_name,
-                data=data if isinstance(data, dict) else {"raw": data},
+                game_id=game_id,
+                player_id=player_id,
+                data=item,
             )
-
-            # Extract game_id and player_id if available
-            if isinstance(data, dict):
-                event.game_id = data.get("gameId") or data.get("game_id")
-                event.player_id = data.get("playerId") or data.get("player_id")
-
-            for h in self._handlers.get(event_name, []):
+            for handler in handlers:
                 try:
-                    result = h(event)
+                    result = handler(event)
                     if hasattr(result, "__await__"):
                         await result
                 except Exception:
                     _log.exception("Error in handler for %s", event_name)
 
-        if self._sio:
-            self._sio.on(event_name, handler)
+    def _mark_connected(self, *, reconnected: bool) -> None:
+        self._connected = True
+        self._reconnecting = False
+        self._stale = False
+        self._reconnect_failures = 0
+        self._last_data_time = time.time()
+        if reconnected:
+            self._reconnect_count += 1
+            _log.info(
+                "Reconnected to Real Sports WebSocket (total reconnects: %d)",
+                self._reconnect_count,
+            )
+        else:
+            _log.info("Connected to Real Sports WebSocket")
+
+    async def _handle_engine_packet(self, packet: str) -> None:
+        if not packet:
+            return
+        if packet == "2":
+            if self._ws is not None:
+                await self._ws.send_str("3")
+            return
+        if packet.startswith("0"):
+            try:
+                meta = json.loads(packet[1:])
+            except json.JSONDecodeError:
+                return
+            try:
+                self._ping_interval_seconds = float(meta.get("pingInterval", 25000)) / 1000.0
+            except (TypeError, ValueError):
+                self._ping_interval_seconds = 25.0
+            try:
+                self._ping_timeout_seconds = float(meta.get("pingTimeout", 5000)) / 1000.0
+            except (TypeError, ValueError):
+                self._ping_timeout_seconds = 5.0
+            return
+        if packet.startswith("40"):
+            if not self._connected:
+                self._mark_connected(reconnected=self._reconnecting)
+                if self._startup_future is not None and not self._startup_future.done():
+                    self._startup_future.set_result(None)
+            return
+        if packet.startswith("42"):
+            try:
+                message = json.loads(packet[2:])
+            except json.JSONDecodeError:
+                return
+            if not isinstance(message, list) or not message:
+                return
+            event_name = message[0]
+            payload = message[1] if len(message) > 1 else {}
+            if isinstance(event_name, str):
+                await self._dispatch_event(event_name, payload)
+
+    async def _close_transport(self) -> None:
+        if self._ws is not None:
+            with contextlib.suppress(Exception):
+                await self._ws.close()
+        self._ws = None
+        if self._session is not None:
+            with contextlib.suppress(Exception):
+                await self._session.close()
+        self._session = None
+
+    async def _run_forever(self, aiohttp_module) -> None:
+        initial_attempt = True
+        while not self._stop_requested:
+            try:
+                timeout = aiohttp_module.ClientTimeout(total=None, sock_connect=20, sock_read=None)
+                self._session = aiohttp_module.ClientSession(timeout=timeout)
+                self._ws = await self._session.ws_connect(
+                    self._build_ws_url(),
+                    headers=self._build_ws_headers(),
+                    autoping=False,
+                    heartbeat=None,
+                    max_msg_size=0,
+                )
+                async for message in self._ws:
+                    if message.type == aiohttp_module.WSMsgType.TEXT:
+                        await self._handle_engine_packet(message.data)
+                    elif message.type == aiohttp_module.WSMsgType.CLOSE:
+                        break
+                    elif message.type == aiohttp_module.WSMsgType.ERROR:
+                        raise RuntimeError(f"Real websocket error: {self._ws.exception()}")
+                if initial_attempt and self._startup_future is not None and not self._startup_future.done():
+                    raise RuntimeError("Real websocket closed before connect ack")
+            except Exception as exc:
+                if initial_attempt and self._startup_future is not None and not self._startup_future.done():
+                    self._startup_future.set_exception(exc)
+                    await self._close_transport()
+                    self._runner_task = None
+                    return
+                self._reconnect_failures += 1
+                self._reconnecting = True
+                if self._reconnect_failures >= self.MAX_RECONNECT_FAILURES:
+                    _log.error(
+                        "Real Sports WebSocket reconnection failed %d times — Book C disabled, REST-only mode",
+                        self._reconnect_failures,
+                    )
+                else:
+                    _log.warning(
+                        "Real Sports WebSocket reconnection error (%d/%d): %s",
+                        self._reconnect_failures,
+                        self.MAX_RECONNECT_FAILURES,
+                        exc,
+                    )
+            finally:
+                was_connected = self._connected
+                self._connected = False
+                if was_connected and not self._stop_requested:
+                    self._reconnecting = True
+                    _log.info("Disconnected from Real Sports WebSocket")
+                await self._close_transport()
+
+            initial_attempt = False
+            if self._stop_requested:
+                break
+            await asyncio.sleep(min(30, max(1, self._reconnect_failures or 1)))
+
+        if self._startup_future is not None and not self._startup_future.done():
+            self._startup_future.set_result(None)
+        self._runner_task = None
 
     async def disconnect(self) -> None:
-        if self._sio and self._connected:
-            await self._sio.disconnect()
-            self._connected = False
+        self._stop_requested = True
+        await self._close_transport()
+        if self._runner_task is not None and not self._runner_task.done():
+            await asyncio.gather(self._runner_task, return_exceptions=True)
+        self._connected = False
+        self._reconnecting = False
 
     @property
     def connected(self) -> bool:
@@ -677,8 +804,8 @@ class RealSportsWebSocket:
 
     async def wait(self) -> None:
         """Block until disconnected (for daemon mode)."""
-        if self._sio:
-            await self._sio.wait()
+        if self._runner_task is not None:
+            await asyncio.gather(self._runner_task, return_exceptions=True)
 
 
 def parse_game_market_response(raw: dict) -> dict:

@@ -164,13 +164,15 @@ def test_blowout_q2_not_triggered():
     assert sig is None
 
 
-def test_clutch_comeback_signal_triggers():
-    """Trailing team is overpriced late in a one-possession game."""
+def test_clutch_comeback_signal_triggers_fade():
+    """Trailing team is overpriced late in a one-possession game (fade direction)."""
+    # Empirical: margin=2, 90s -> trailing wins 35.2%
+    # Kalshi trailing price 50c (implied 50%) -> overpricing = 50% - 35.2% = 14.8%
     sig = detect_clutch_comeback(
         margin=2,
         period="Q4",
         clock_seconds=90,
-        trailing_team_price_cents=40,
+        trailing_team_price_cents=50,
         ticker="KXNBAGAME-TEST-TRAIL",
         trailing_team="Pacers",
         leading_team="Bucks",
@@ -182,6 +184,29 @@ def test_clutch_comeback_signal_triggers():
     assert sig.side == "no"
     assert sig.edge > 0.08
     assert sig.metadata["trailing_team"] == "Pacers"
+    assert sig.metadata["direction"] == "fade_trailing"
+
+
+def test_clutch_comeback_signal_triggers_buy_trailing():
+    """Trailing team is underpriced — buy YES on trailing."""
+    # Empirical: margin=1, 20s -> trailing wins 40.2%
+    # Kalshi trailing price 25c (implied 25%) -> underpricing = 40.2% - 25% = 15.2%
+    sig = detect_clutch_comeback(
+        margin=1,
+        period="Q4",
+        clock_seconds=20,
+        trailing_team_price_cents=25,
+        ticker="KXNBAGAME-TEST-TRAIL",
+        trailing_team="Heat",
+        leading_team="Celtics",
+        game_id="G2",
+        min_edge=0.08,
+    )
+    assert sig is not None
+    assert sig.signal_type == "clutch_comeback"
+    assert sig.side == "yes"
+    assert sig.edge > 0.08
+    assert sig.metadata["direction"] == "buy_trailing"
 
 
 def test_clutch_comeback_rejects_tied_game():
@@ -195,11 +220,13 @@ def test_clutch_comeback_rejects_tied_game():
 
 
 def test_clutch_comeback_rejects_low_edge():
+    # Empirical: margin=2, 90s -> trailing wins 35.2%
+    # Kalshi trailing price 35c (implied 35%) -> both edges < 0.08
     sig = detect_clutch_comeback(
-        margin=1,
+        margin=2,
         period="Q4",
-        clock_seconds=110,
-        trailing_team_price_cents=20,
+        clock_seconds=90,
+        trailing_team_price_cents=35,
         min_edge=0.08,
     )
     assert sig is None

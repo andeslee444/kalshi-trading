@@ -10,10 +10,24 @@ import statistics
 from typing import Any
 
 from domain.oracle.models import GameState
+from domain.oracle.nba_ticker_utils import parse_nba_ticker
 
 
 _TECHNICAL_FOUL_RE = re.compile(r"\b(?:technical|double technical|tech)\b", re.IGNORECASE)
 _SCORING_RUN_RE = re.compile(r"(\d+)\s*-\s*(\d+)\s+run", re.IGNORECASE)
+_PLAYER_OUT_RE = re.compile(
+    r"\b(?:injur(?:y|ed)|hurt|left(?: the)? game|will not return|won'?t return|"
+    r"ruled out|out for the game|out\b|inactive|eject(?:ed|ion)?|foul(?:ed)? out|"
+    r"disqualif(?:ied|ication))\b",
+    re.IGNORECASE,
+)
+_PLAYER_OUT_STATUSES = {
+    "OUT",
+    "INACTIVE",
+    "DOUBTFUL",
+    "WILL NOT RETURN",
+    "RULED OUT",
+}
 
 
 def _coerce_int(value: Any) -> int | None:
@@ -98,6 +112,71 @@ def _parse_clock_seconds(value: Any) -> int | None:
     if minutes is None or seconds is None:
         return None
     return max(0, minutes * 60 + seconds)
+
+
+def _parse_clock_from_parts(minutes_value: Any, seconds_value: Any) -> int | None:
+    minutes = _coerce_int(minutes_value)
+    seconds = _coerce_int(seconds_value)
+    if minutes is None or seconds is None:
+        return None
+    return max(0, minutes * 60 + seconds)
+
+
+def _normalize_status_text(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip().upper().replace("_", " ")
+    return " ".join(text.split()) or None
+
+
+def _payload_indicates_player_out(data: dict[str, Any], play_text: str) -> bool:
+    if play_text and _PLAYER_OUT_RE.search(play_text):
+        return True
+
+    injury_status = _normalize_status_text(
+        _deep_find(
+            data,
+            {
+                "injuryStatus",
+                "injury_status",
+                "availabilityStatus",
+                "playerStatus",
+                "participationStatus",
+            },
+        )
+    )
+    if injury_status in _PLAYER_OUT_STATUSES:
+        return True
+
+    bool_checks = {
+        "didNotPlay": True,
+        "did_not_play": True,
+        "isAvailable": False,
+        "is_available": False,
+        "available": False,
+        "active": False,
+        "isActive": False,
+        "is_active": False,
+        "ejected": True,
+        "isEjected": True,
+        "is_ejected": True,
+        "fouledOut": True,
+        "fouled_out": True,
+        "disqualified": True,
+    }
+    for key, target in bool_checks.items():
+        value = _deep_find(data, {key})
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            if value is target:
+                return True
+            continue
+        normalized = _normalize_status_text(value)
+        if normalized in {"TRUE", "FALSE"}:
+            if (normalized == "TRUE") is target:
+                return True
+    return False
 
 
 def _previous_state_parts(previous_game_state: Any) -> tuple[str | None, dict]:
@@ -364,8 +443,8 @@ def classify_live_event(
     data = getattr(event, "data", {}) if isinstance(getattr(event, "data", {}), dict) else {}
     previous_state, previous_context = _previous_state_parts(previous_game_state)
 
-    home_score = _coerce_int(_deep_find(data, {"homeScore", "home_score"}))
-    away_score = _coerce_int(_deep_find(data, {"awayScore", "away_score"}))
+    home_score = _coerce_int(_deep_find(data, {"homeScore", "home_score", "homeTeamScore", "home_team_score"}))
+    away_score = _coerce_int(_deep_find(data, {"awayScore", "away_score", "awayTeamScore", "away_team_score"}))
     if home_score is None:
         home_score = _coerce_int(previous_context.get("home_score"))
     if away_score is None:
@@ -377,6 +456,11 @@ def classify_live_event(
 
     clock_seconds = _parse_clock_seconds(_deep_find(data, {"clock", "gameClock", "timeRemaining"}))
     if clock_seconds is None:
+        clock_seconds = _parse_clock_from_parts(
+            _deep_find(data, {"timeRemainingMinutes", "minutesRemaining"}),
+            _deep_find(data, {"timeRemainingSeconds", "secondsRemaining"}),
+        )
+    if clock_seconds is None:
         clock_seconds = _coerce_int(previous_context.get("clock_seconds"))
 
     margin = None
@@ -386,9 +470,12 @@ def classify_live_event(
     current_state = _state_from_context(margin=margin, period=period, clock_seconds=clock_seconds)
     state_transition = _state_transition(previous_state, current_state)
 
-    play_text = str(
-        _deep_find(data, {"description", "playDescription", "text", "title", "message"}) or ""
-    ).strip()
+    text_parts = [
+        _deep_find(data, {"description", "playDescription", "text", "title", "message", "display", "detail"}),
+        _deep_find(data, {"type"}),
+        _deep_find(data, {"subType", "sub_type"}),
+    ]
+    play_text = " ".join(str(part).strip() for part in text_parts if part not in (None, "")).strip()
 
     player_fouls = _coerce_int(_deep_find(data, {"pf", "personalFouls", "fouls"}))
     if player_fouls is None:
@@ -417,7 +504,9 @@ def classify_live_event(
             scoring_run_for = "away"
             scoring_run_points = away_delta - home_delta
 
-    if play_text and _TECHNICAL_FOUL_RE.search(play_text):
+    if _payload_indicates_player_out(data, play_text):
+        derived_event_class = "injury_player_out"
+    elif play_text and _TECHNICAL_FOUL_RE.search(play_text):
         derived_event_class = "technical_foul"
     elif (
         player_fouls is not None
@@ -482,6 +571,19 @@ def summarize_latency_capture(
     overall_quoted_source_events: set[str] = set()
     overall_fillable_opportunities: dict[str, dict[str, Any]] = {}
 
+    def market_type_bucket() -> dict[str, Any]:
+        return {
+            "source_events": 0,
+            "quote_snapshots": 0,
+            "quoted_source_event_ids": set(),
+            "tickers": set(),
+            "event_immediate_quote_snapshots": 0,
+            "event_followup_quote_snapshots": 0,
+            "paired_fillable_opportunities": 0,
+        }
+
+    overall_market_types: dict[str, dict[str, Any]] = {}
+
     def horizon_bucket() -> dict[str, Any]:
         return {
             "quote_snapshots": 0,
@@ -516,6 +618,7 @@ def summarize_latency_capture(
                 "moved_quote_snapshots": 0,
                 "quoted_source_event_ids": set(),
                 "horizons": {},
+                "by_market_type": {},
             },
         )
 
@@ -527,11 +630,20 @@ def summarize_latency_capture(
             bucket["games"].add(str(row["game_id"]))
         if row.get("player_id") not in (None, ""):
             bucket["players"].add(str(row["player_id"]))
+        if _source_mapped_ticker_count(row, "mapped_game_tickers") > 0:
+            bucket["by_market_type"].setdefault("game", market_type_bucket())["source_events"] += 1
+            overall_market_types.setdefault("game", market_type_bucket())["source_events"] += 1
+        if _source_mapped_ticker_count(row, "mapped_prop_tickers") > 0:
+            bucket["by_market_type"].setdefault("prop", market_type_bucket())["source_events"] += 1
+            overall_market_types.setdefault("prop", market_type_bucket())["source_events"] += 1
 
     for row in event_quotes:
         source_row = source_by_id.get(row.get("source_event_id"), {})
         event_class = row.get("derived_event_class") or source_row.get("derived_event_class") or "unclassified"
         bucket = bucket_for(event_class)
+        market_type = _market_type_for_ticker(row.get("ticker"))
+        market_summary = bucket["by_market_type"].setdefault(market_type, market_type_bucket())
+        overall_market_summary = overall_market_types.setdefault(market_type, market_type_bucket())
         bucket["quote_snapshots"] += 1
         source_event_id = row.get("source_event_id")
         horizon_seconds = _coerce_float(row.get("horizon_seconds"))
@@ -550,6 +662,20 @@ def summarize_latency_capture(
         if source_event_id and horizon_seconds == 0.0:
             bucket["quoted_source_event_ids"].add(source_event_id)
             overall_quoted_source_events.add(source_event_id)
+            market_summary["quoted_source_event_ids"].add(source_event_id)
+            overall_market_summary["quoted_source_event_ids"].add(source_event_id)
+        market_summary["quote_snapshots"] += 1
+        overall_market_summary["quote_snapshots"] += 1
+        if row.get("ticker"):
+            market_summary["tickers"].add(row["ticker"])
+            overall_market_summary["tickers"].add(row["ticker"])
+        capture_mode = str(row.get("capture_mode") or "")
+        if capture_mode == "event_immediate":
+            market_summary["event_immediate_quote_snapshots"] += 1
+            overall_market_summary["event_immediate_quote_snapshots"] += 1
+        elif capture_mode == "event_followup":
+            market_summary["event_followup_quote_snapshots"] += 1
+            overall_market_summary["event_followup_quote_snapshots"] += 1
 
         horizon = bucket["horizons"].setdefault(horizon_seconds, horizon_bucket())
         horizon["quote_snapshots"] += 1
@@ -657,10 +783,35 @@ def summarize_latency_capture(
                 overall_fillable_opportunities[opportunity_id] = opportunity_record
             if best_markout > 0:
                 horizon["positive_best_markouts"] += 1
+            market_type = _market_type_for_ticker(row.get("ticker"))
+            bucket["by_market_type"].setdefault(market_type, market_type_bucket())["paired_fillable_opportunities"] += 1
+            overall_market_types.setdefault(market_type, market_type_bucket())["paired_fillable_opportunities"] += 1
 
     ranked = []
     ranked_horizon_rows = []
     by_event_class = {}
+
+    def summarize_market_type_rows(rows: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        summary_rows: dict[str, dict[str, Any]] = {}
+        for market_type, row in rows.items():
+            quoted_source_events = len(row["quoted_source_event_ids"])
+            source_events_count = max(row["source_events"], quoted_source_events)
+            summary_rows[market_type] = {
+                "source_events": source_events_count,
+                "quoted_source_events": quoted_source_events,
+                "capture_rate": (
+                    round(quoted_source_events / source_events_count, 3)
+                    if source_events_count
+                    else None
+                ),
+                "quote_snapshots": row["quote_snapshots"],
+                "tickers": len(row["tickers"]),
+                "event_immediate_quote_snapshots": row["event_immediate_quote_snapshots"],
+                "event_followup_quote_snapshots": row["event_followup_quote_snapshots"],
+                "paired_fillable_opportunities": row["paired_fillable_opportunities"],
+            }
+        return summary_rows
+
     for event_class, bucket in buckets.items():
         midpoint_abs = [abs(value) for value in bucket["midpoint_changes"]]
         quote_snapshots = bucket["quote_snapshots"]
@@ -758,6 +909,7 @@ def summarize_latency_capture(
             "median_abs_midpoint_change_cents": _median(midpoint_abs),
             "max_abs_midpoint_change_cents": max(midpoint_abs) if midpoint_abs else None,
             "by_horizon": by_horizon,
+            "by_market_type": summarize_market_type_rows(bucket["by_market_type"]),
         }
         by_event_class[event_class] = summary
         ranked.append({"event_class": event_class, **summary})
@@ -807,6 +959,7 @@ def summarize_latency_capture(
             paired_fillable_opportunities=overall_paired_fillable,
             bootstrap_best_markout_ci_low=overall_bootstrap_best_markout["ci_low"],
         ),
+        "by_market_type": summarize_market_type_rows(overall_market_types),
         "by_event_class": by_event_class,
         "ranked_event_classes": ranked,
         "ranked_horizon_rows": ranked_horizon_rows,
@@ -876,6 +1029,24 @@ def _signal_group_label(row: dict) -> str:
 def _row_book_label(row: dict) -> str:
     value = row.get("book")
     return str(value) if value not in (None, "") else "unknown"
+
+
+def _source_mapped_ticker_count(row: dict, key: str) -> int:
+    value = row.get(key)
+    if isinstance(value, list):
+        return len([item for item in value if item not in (None, "")])
+    if value in (None, ""):
+        return 0
+    return 1
+
+
+def _market_type_for_ticker(ticker: Any) -> str:
+    if ticker in (None, ""):
+        return "unknown"
+    parsed = parse_nba_ticker(str(ticker))
+    if parsed and parsed.get("type") in {"game", "prop"}:
+        return str(parsed["type"])
+    return "unknown"
 
 
 def _row_signal_id(row: dict) -> str | None:
@@ -1023,6 +1194,59 @@ def _order_fill_summary(order: dict, fills_by_order_id: dict[str, list[dict]]) -
     }
 
 
+def _filter_execution_rows_for_linked_signals(
+    signal_rows: list[dict],
+    order_rows: list[dict],
+    fill_rows: list[dict],
+    settlement_rows: list[dict],
+) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    signal_ids = {
+        signal_id
+        for row in signal_rows
+        if row.get("record_kind", "signal") == "signal"
+        if (signal_id := _row_signal_id(row)) is not None
+    }
+    if not signal_ids:
+        return signal_rows, [], [], []
+
+    linked_orders = [
+        row
+        for row in order_rows
+        if row.get("record_kind", "order_submission") == "order_submission"
+        and _row_signal_id(row) in signal_ids
+    ]
+    linked_order_ids = {
+        order_id
+        for row in linked_orders
+        if (order_id := _row_order_id(row)) is not None
+    }
+    linked_fills = [
+        row
+        for row in fill_rows
+        if row.get("record_kind", "fill") == "fill"
+        and (
+            _row_signal_id(row) in signal_ids
+            or _row_order_id(row) in linked_order_ids
+        )
+    ]
+    linked_fill_order_ids = {
+        order_id
+        for row in linked_fills
+        if (order_id := _row_order_id(row)) is not None
+    }
+    linked_settlements = [
+        row
+        for row in settlement_rows
+        if row.get("record_kind", "settlement") == "settlement"
+        and (
+            _row_signal_id(row) in signal_ids
+            or _row_order_id(row) in linked_order_ids
+            or _row_order_id(row) in linked_fill_order_ids
+        )
+    ]
+    return signal_rows, linked_orders, linked_fills, linked_settlements
+
+
 def summarize_alpha_execution_capture(
     signal_rows: list[dict],
     order_rows: list[dict],
@@ -1030,6 +1254,7 @@ def summarize_alpha_execution_capture(
     *,
     hypothesis_id: str | None = None,
     settlement_rows: list[dict] | None = None,
+    require_signal_link: bool = False,
 ) -> dict:
     """Summarize alpha-ledger signal/order/fill rows without inventing fills."""
 
@@ -1054,6 +1279,13 @@ def summarize_alpha_execution_capture(
         row for row in (settlement_rows or [])
         if include(row) and row.get("record_kind", "settlement") == "settlement"
     ]
+    if require_signal_link:
+        signals, orders, fills, settlements = _filter_execution_rows_for_linked_signals(
+            signals,
+            orders,
+            fills,
+            settlements,
+        )
 
     signals_by_id = {
         signal_id: signal
@@ -1648,11 +1880,36 @@ def summarize_h1_daily_activity(
     settlement_rows: list[dict],
     *,
     hypothesis_id: str | None = None,
+    require_signal_link: bool = False,
 ) -> dict[str, Any]:
     def include(row: dict) -> bool:
         return not hypothesis_id or row.get("hypothesis_id") == hypothesis_id
 
     daily: dict[str, dict[str, Any]] = {}
+
+    filtered_signals = [
+        row for row in signal_rows
+        if include(row) and row.get("record_kind", "signal") == "signal"
+    ]
+    filtered_orders = [
+        row for row in order_rows
+        if include(row) and row.get("record_kind", "order_submission") == "order_submission"
+    ]
+    filtered_fills = [
+        row for row in fill_rows
+        if include(row) and row.get("record_kind", "fill") == "fill"
+    ]
+    filtered_settlements = [
+        row for row in settlement_rows
+        if include(row) and row.get("record_kind", "settlement") == "settlement"
+    ]
+    if require_signal_link:
+        filtered_signals, filtered_orders, filtered_fills, filtered_settlements = _filter_execution_rows_for_linked_signals(
+            filtered_signals,
+            filtered_orders,
+            filtered_fills,
+            filtered_settlements,
+        )
 
     def ensure_day(day: str) -> dict[str, Any]:
         return daily.setdefault(
@@ -1672,7 +1929,7 @@ def summarize_h1_daily_activity(
         )
 
     for row in source_rows:
-        if not include(row):
+        if not include(row) or row.get("record_kind", "source_event") != "source_event":
             continue
         day = _row_date(row)
         if day is None:
@@ -1687,33 +1944,25 @@ def summarize_h1_daily_activity(
             continue
         ensure_day(day)["quote_snapshots"] += 1
 
-    for row in signal_rows:
-        if not include(row) or row.get("record_kind", "signal") != "signal":
-            continue
+    for row in filtered_signals:
         day = _row_date(row)
         if day is None:
             continue
         ensure_day(day)["signals"] += 1
 
-    for row in order_rows:
-        if not include(row) or row.get("record_kind", "order_submission") != "order_submission":
-            continue
+    for row in filtered_orders:
         day = _row_date(row)
         if day is None:
             continue
         ensure_day(day)["orders"] += 1
 
-    for row in fill_rows:
-        if not include(row) or row.get("record_kind", "fill") != "fill":
-            continue
+    for row in filtered_fills:
         day = _row_date(row)
         if day is None:
             continue
         ensure_day(day)["fills"] += 1
 
-    for row in settlement_rows:
-        if not include(row) or row.get("record_kind", "settlement") != "settlement":
-            continue
+    for row in filtered_settlements:
         day = _row_date(row)
         if day is None:
             continue
