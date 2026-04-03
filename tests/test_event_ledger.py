@@ -1,8 +1,16 @@
+import gzip
 import json
 from pathlib import Path
 from unittest.mock import patch
 
-from event_ledger import EVENT_TYPE_FILL, EVENT_TYPE_ORDER_UPDATE, EventLedger
+import pytest
+
+from event_ledger import (
+    EVENT_TYPE_FILL,
+    EVENT_TYPE_ORDER_UPDATE,
+    EVENT_TYPE_TRADE_DECISION,
+    EventLedger,
+)
 from pnl_attribution import PnLAttributor
 
 
@@ -160,6 +168,123 @@ def test_event_ledger_parity_report_matches_legacy_files(tmp_path):
     assert report["trade_logs"][0]["hash_match"] is True
     assert report["decision_logs"][0]["hash_match"] is True
     assert report["verification"][0]["verified_hash_match"] is True
+
+
+def test_event_ledger_archives_decisions_and_preserves_archive_reads(tmp_path):
+    ledger_path = tmp_path / "ledger.sqlite3"
+    archive_root = tmp_path / "archive"
+    ledger = EventLedger(ledger_path, archive_root=archive_root)
+    decision_path = tmp_path / "decisions.json"
+
+    old_decision = _decision(timestamp="2026-03-01T10:00:00+00:00")
+    new_decision = _decision(timestamp="2026-03-20T10:00:00+00:00", ticker="KXHIGHDEN-26MAR20-T70")
+    ledger.record_trade_decision(old_decision, source_path=decision_path)
+    ledger.record_trade_decision(new_decision, source_path=decision_path)
+
+    summary = ledger.archive_event_type(
+        EVENT_TYPE_TRADE_DECISION,
+        cutoff_time="2026-03-10T00:00:00+00:00",
+    )
+
+    assert summary["candidate_rows"] == 1
+    assert summary["archived_rows"] == 1
+    assert summary["archived_event_dates"] == ["2026-03-01"]
+
+    with ledger._connection() as conn:
+        hot_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM events WHERE event_type = ?",
+            (EVENT_TYPE_TRADE_DECISION,),
+        ).fetchone()["count"]
+    assert hot_count == 1
+
+    records = ledger.get_decision_records(decision_path)
+    assert [row["timestamp"] for row in records] == [
+        "2026-03-01T10:00:00+00:00",
+        "2026-03-20T10:00:00+00:00",
+    ]
+    assert ledger._count_events(EVENT_TYPE_TRADE_DECISION, source_path=decision_path) == 2
+
+    data_path = archive_root / EVENT_TYPE_TRADE_DECISION / "date=2026-03-01" / "events.jsonl.gz"
+    manifest_path = archive_root / EVENT_TYPE_TRADE_DECISION / "date=2026-03-01" / "manifest.json"
+    assert data_path.exists()
+    assert manifest_path.exists()
+
+    with gzip.open(data_path, "rt", encoding="utf-8") as handle:
+        archived_rows = [json.loads(line) for line in handle if line.strip()]
+    assert len(archived_rows) == 1
+    assert archived_rows[0]["event_id"].startswith("decision:")
+
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["record_count"] == 1
+    assert manifest["source_path_summary"][str(decision_path)]["count"] == 1
+
+
+def test_event_ledger_archive_merges_same_day_partitions_without_duplicates(tmp_path):
+    ledger = EventLedger(tmp_path / "ledger.sqlite3", archive_root=tmp_path / "archive")
+    decision_path = tmp_path / "decisions.json"
+
+    morning = _decision(timestamp="2026-03-01T08:00:00+00:00", ticker="KXHIGHCHI-26MAR01-T65")
+    evening = _decision(timestamp="2026-03-01T18:00:00+00:00", ticker="KXHIGHCHI-26MAR01-T68")
+    ledger.record_trade_decision(morning, source_path=decision_path)
+    ledger.record_trade_decision(evening, source_path=decision_path)
+
+    first = ledger.archive_event_type(
+        EVENT_TYPE_TRADE_DECISION,
+        cutoff_time="2026-03-01T12:00:00+00:00",
+    )
+    second = ledger.archive_event_type(
+        EVENT_TYPE_TRADE_DECISION,
+        cutoff_time="2026-03-02T00:00:00+00:00",
+    )
+
+    assert first["archived_rows"] == 1
+    assert second["archived_rows"] == 1
+
+    records = ledger.get_decision_records(decision_path)
+    assert [row["timestamp"] for row in records] == [
+        "2026-03-01T08:00:00+00:00",
+        "2026-03-01T18:00:00+00:00",
+    ]
+
+    manifest_path = tmp_path / "archive" / EVENT_TYPE_TRADE_DECISION / "date=2026-03-01" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["record_count"] == 2
+
+
+def test_event_ledger_archive_overlap_dedupes_when_hot_rows_remain(tmp_path):
+    ledger = EventLedger(tmp_path / "ledger.sqlite3", archive_root=tmp_path / "archive")
+    decision_path = tmp_path / "decisions.json"
+    decision = _decision(timestamp="2026-03-01T08:00:00+00:00", ticker="KXHIGHDEN-26MAR01-T66")
+    ledger.record_trade_decision(decision, source_path=decision_path)
+
+    hot_rows = ledger._fetch_hot_rows(EVENT_TYPE_TRADE_DECISION, source_path=decision_path)
+    ledger._merge_archive_partition(EVENT_TYPE_TRADE_DECISION, "2026-03-01", hot_rows)
+
+    assert ledger._count_events(EVENT_TYPE_TRADE_DECISION, source_path=decision_path) == 1
+    assert ledger.get_decision_records(decision_path) == [decision]
+
+
+def test_event_ledger_raises_on_corrupt_archive_partition(tmp_path):
+    ledger = EventLedger(tmp_path / "ledger.sqlite3", archive_root=tmp_path / "archive")
+    partition_dir = tmp_path / "archive" / EVENT_TYPE_TRADE_DECISION / "date=2026-03-01"
+    partition_dir.mkdir(parents=True, exist_ok=True)
+    (partition_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "event_type": EVENT_TYPE_TRADE_DECISION,
+                "event_date": "2026-03-01",
+                "record_count": 1,
+                "first_event_time": "2026-03-01T00:00:00+00:00",
+                "last_event_time": "2026-03-01T00:00:00+00:00",
+                "record_hash": "x",
+                "source_path_summary": {},
+            }
+        )
+    )
+    (partition_dir / "events.jsonl.gz").write_text("not-gzip")
+
+    with pytest.raises(RuntimeError, match="archive partition"):
+        ledger.get_decision_records()
 
 
 def test_event_ledger_trade_parity_uses_overlap_window(tmp_path):

@@ -1,7 +1,13 @@
 # Event Ledger Storage Retention Plan
 
 Generated: 2026-03-22
-Status: Proposed. Do not implement until the Phase 4 parity observation window closes cleanly.
+Status: Implemented in code on 2026-04-03 for staged rollout. Historical archive/prune on the old 51 GB dev ledger is still an operational follow-up.
+
+Implementation note:
+
+- The implemented cold-store format is `jsonl.gz + manifest.json` under `data/archive/events/<event_type>/date=YYYY-MM-DD/`, not Parquet.
+- Reason: the runtime did not already carry DuckDB/PyArrow, and the first priority was a dependency-light hot/cold path that could ship immediately without weakening live bot safety.
+- Archive-aware reads are implemented inside `src/kalshi/event_ledger.py`, and the maintenance entry point is `python3 scripts/ledger-retention.py`.
 
 ## Goal
 

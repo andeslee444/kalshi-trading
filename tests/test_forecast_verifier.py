@@ -99,10 +99,18 @@ class TestForecastVerifier:
 
     def test_verification_summary_separates_snapshot_mae_from_market_brier(self, tmp_path):
         verifier = ForecastVerifier(tmp_path / "weather-verification.json")
+        today = datetime.date.today()
+        snapshot_date_a = (today - datetime.timedelta(days=10)).isoformat()
+        snapshot_date_b = (today - datetime.timedelta(days=9)).isoformat()
+        pending_date_a = (today - datetime.timedelta(days=8)).isoformat()
+        pending_date_b = (today - datetime.timedelta(days=7)).isoformat()
+        pending_recorded_at = (
+            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=5)
+        ).isoformat()
         verifier.state["verified"] = [
             {
                 "city": "MIA",
-                "date": "2026-03-01",
+                "date": snapshot_date_a,
                 "models": {"gfs": 82.0},
                 "errors": {"gfs": 2.0},
                 "actual_high": 80.0,
@@ -110,7 +118,7 @@ class TestForecastVerifier:
             },
             {
                 "city": "MIA",
-                "date": "2026-03-02",
+                "date": snapshot_date_b,
                 "models": {"gfs": 81.0},
                 "errors": {"gfs": 1.0},
                 "actual_high": 80.0,
@@ -119,7 +127,7 @@ class TestForecastVerifier:
         ] * 5 + [
             {
                 "city": "MIA",
-                "date": "2026-03-01",
+                "date": snapshot_date_a,
                 "models": {"gfs": 82.0},
                 "actual_high": 80.0,
                 "threshold": 79.0,
@@ -129,7 +137,7 @@ class TestForecastVerifier:
             },
             {
                 "city": "MIA",
-                "date": "2026-03-02",
+                "date": snapshot_date_b,
                 "models": {"gfs": 81.0},
                 "actual_high": 80.0,
                 "threshold": 80.0,
@@ -141,17 +149,17 @@ class TestForecastVerifier:
         verifier.state["pending"] = [
             {
                 "city": "MIA",
-                "date": "2026-03-03",
+                "date": pending_date_a,
                 "models": {"gfs": 82.0, "graphcast": 81.0},
                 "record_kind": "market",
-                "recorded_at": "2026-03-13T00:00:00+00:00",
+                "recorded_at": pending_recorded_at,
             },
             {
                 "city": "MIA",
-                "date": "2026-03-04",
+                "date": pending_date_b,
                 "models": {"graphcast": 80.0},
                 "record_kind": "snapshot",
-                "recorded_at": "2026-03-13T00:00:00+00:00",
+                "recorded_at": pending_recorded_at,
             },
         ] * 10
 

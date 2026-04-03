@@ -60,6 +60,8 @@ Observation-window follow-up:
   - `python3 scripts/weather-intraday-feature-audit.py` added as a research-only same-day HRRR 15-minute regime surface
 - Event-ledger post-Phase-4 storage retention plan:
   - [2026-03-22-ledger-storage-retention-plan.md](./2026-03-22-ledger-storage-retention-plan.md)
+- Event-ledger retention implementation audit:
+  - [2026-04-03-ledger-retention-implementation-audit.md](./2026-04-03-ledger-retention-implementation-audit.md)
 
 ## Cross-Cutting Recommendations (A-F)
 
