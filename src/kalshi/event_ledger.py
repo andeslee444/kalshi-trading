@@ -897,11 +897,23 @@ class EventLedger:
                 ).fetchall()
             partition_rows = [self._hot_row_to_archive_record(row) for row in rows]
             manifest = self._merge_archive_partition(event_type, event_date, partition_rows)
-            event_ids = [row["event_id"] for row in partition_rows]
-            placeholders = ",".join("?" for _ in event_ids)
             with self._connection() as conn:
-                conn.execute(f"DELETE FROM events WHERE event_id IN ({placeholders})", event_ids)
+                deleted = conn.execute(
+                    """
+                    DELETE FROM events
+                    WHERE event_type = ?
+                      AND event_time < ?
+                      AND event_date = ?
+                    """,
+                    (event_type, cutoff_time, event_date),
+                ).rowcount
                 conn.commit()
+            if deleted != len(partition_rows):
+                raise RuntimeError(
+                    "Archived partition prune mismatch for "
+                    f"{event_type} {event_date}: archived {len(partition_rows)} rows "
+                    f"but deleted {deleted}"
+                )
             summary["archived_rows"] += len(partition_rows)
             summary["archived_event_dates"].append(event_date)
             summary["partition_manifests"][event_date] = {

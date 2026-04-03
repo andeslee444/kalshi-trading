@@ -1,7 +1,7 @@
 # Ledger Retention Implementation Audit
 
 Generated: 2026-04-03
-Status: Implemented in dev, validated, ready for staged promotion.
+Status: Implemented in dev, validated, first staged dev-ledger rollout completed, ready for staged promotion.
 
 ## Goal
 
@@ -58,11 +58,65 @@ Commands run:
 
 Result:
 
-- `57 passed`
+- `58 passed`
 
 Additional validation:
 
 - The existing demo runtime was cut over to the isolated demo deploy root before this dev implementation, so the dev ledger changes are not attached to the live demo bots until an explicit demo worktree promotion.
+
+## Operational Hardening
+
+The first real dev-ledger maintenance attempt exposed one rollout issue that did not show up in the tmp-path tests:
+
+- the archive write succeeded, but prune was still issuing a giant `DELETE ... WHERE event_id IN (...)` statement for each archived partition
+- on the 54 GB legacy ledger, that prune path was too slow and scaled poorly on large `trade_decision` dates
+
+That was fixed in `src/kalshi/event_ledger.py` before completing the real rollout:
+
+- prune now deletes by archived partition predicate:
+  - `event_type = ?`
+  - `event_time < cutoff_time`
+  - `event_date = ?`
+- the archive/prune step now verifies exact rowcount parity and raises if the archived row count and deleted row count diverge
+
+The focused ledger suite was rerun after this fix and remained green.
+
+## First Real Rollout
+
+Completed on the old dev ledger:
+
+- ledger path: `data/event-ledger.sqlite3`
+- archive root: `data/archive/events`
+- event type: `trade_decision`
+- staged batches:
+  1. `2026-03-14`
+  2. `2026-03-15`
+  3. `2026-03-16`
+
+Real result:
+
+- archived rows: `1,270,254`
+- archived dates: `2026-03-14`, `2026-03-15`, `2026-03-16`
+- cold-store size after first rollout: about `92 MB`
+- hot rows remaining for those dates: `0`
+
+Artifacts written:
+
+- `data/archive/events/trade_decision/date=2026-03-14/events.jsonl.gz`
+- `data/archive/events/trade_decision/date=2026-03-14/manifest.json`
+- `data/archive/events/trade_decision/date=2026-03-15/events.jsonl.gz`
+- `data/archive/events/trade_decision/date=2026-03-15/manifest.json`
+- `data/archive/events/trade_decision/date=2026-03-16/events.jsonl.gz`
+- `data/archive/events/trade_decision/date=2026-03-16/manifest.json`
+- `data/reports/ledger-retention-latest.json`
+
+Logical space reclaimed in hot SQLite:
+
+- `freelist_count = 537,280`
+- `page_size = 4096`
+- reclaimable on next compact: about `2.05 GiB`
+
+The SQLite file itself remains about `54 GB` because no `VACUUM` has been run yet.
 
 ## Important Design Notes
 
@@ -75,8 +129,8 @@ Additional validation:
 
 ## Known Operational Follow-Up
 
-- The old dev-root ledger at `data/event-ledger.sqlite3` is already about 51 GB.
-- The code path is implemented and tested, but a real historical archive/prune run on that legacy ledger is still an operational maintenance job and should be staged by event type / event-date batch.
+- The old dev-root ledger at `data/event-ledger.sqlite3` is now about 54 GB before compaction.
+- The first real staged archive/prune run is complete, but the broader legacy-ledger rollout should still proceed by event type / event-date batch.
 - The first likely rollout order remains:
   1. `trade_decision`
   2. `forecast_snapshot`
@@ -84,3 +138,8 @@ Additional validation:
   4. `source_observation`
   5. `position_snapshot`
   6. `budget_decision`
+- The next three `trade_decision` dates are materially larger:
+  - `2026-03-17`: `1,901,132`
+  - `2026-03-18`: `2,133,122`
+  - `2026-03-19`: `2,275,705`
+- Because of that step-up, the next rollout should remain bounded and should not compact until more hot space has been reclaimed.
