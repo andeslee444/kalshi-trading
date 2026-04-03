@@ -122,6 +122,25 @@ def _effective_weather_edge_threshold():
     return base
 
 
+def _city_weather_edge_threshold(city_code, base_threshold=None):
+    """Return the active weather edge threshold for a city.
+
+    City overrides are explicit absolute thresholds layered on top of the
+    calibrated global baseline. They can tighten or loosen a city relative to
+    the default, but remain opt-in and audit-friendly through config.
+    """
+    threshold = (
+        base_threshold
+        if isinstance(base_threshold, (int, float)) and base_threshold > 0
+        else _effective_weather_edge_threshold()
+    )
+    overrides = config.get("cityEdgeThresholds", {}) or {}
+    override = overrides.get(city_code)
+    if isinstance(override, (int, float)) and override > 0:
+        return float(override)
+    return threshold
+
+
 def _resolve_optional_project_path(path_str, project_dir=None):
     if not path_str:
         return None
@@ -1481,6 +1500,7 @@ def scan_and_trade():
         if city not in CITIES or city not in forecasts:
             ss.skip("no_city")
             continue
+        city_edge_threshold = _city_weather_edge_threshold(city, base_edge_threshold)
 
         date_str = parsed["date"]
         if date_str not in forecasts[city]:
@@ -1877,17 +1897,17 @@ def scan_and_trade():
             continue
 
         # Adjust edge threshold for high ensemble spread or disagreement (defense in depth)
-        effective_edge_threshold = base_edge_threshold
+        effective_edge_threshold = city_edge_threshold
         disagree_mult = VERIFICATION_CONFIG.get("disagreement_edge_multiplier", 2.0)
         if disagreement_score > 0.3:
-            effective_edge_threshold = base_edge_threshold * disagree_mult
+            effective_edge_threshold = city_edge_threshold * disagree_mult
         elif spread_mult > 1.5:
-            effective_edge_threshold = base_edge_threshold * 2
+            effective_edge_threshold = city_edge_threshold * 2
         elif verification_confidence and verification_confidence < 0.6:
             effective_edge_threshold *= 1.0 + ((0.6 - verification_confidence) * 0.5)
 
         if edge_yes >= effective_edge_threshold:
-            if parsed["direction"] == "B" and edge_yes < base_edge_threshold * 2:
+            if parsed["direction"] == "B" and edge_yes < city_edge_threshold * 2:
                 ss.skip("bracket_low_edge")
                 _log_weather_decision(
                     ticker,
@@ -1914,6 +1934,7 @@ def scan_and_trade():
                 "per_model_probs": per_model_probs,
                 "probability_method": probability_method,
                 "sigma_used": sigma,
+                "city_edge_threshold": city_edge_threshold,
                 "weights_used": weights_used,
                 "verification_confidence": verification_confidence,
                 "effective_edge_threshold": effective_edge_threshold,
@@ -2009,8 +2030,9 @@ def scan_and_trade():
             continue
 
         # Rec 1: Brackets require 2x edge threshold (higher model uncertainty)
-        if is_bracket and edge < base_edge_threshold * 2:
-            log.info(f"  Skipping bracket {ticker}: edge {edge*100:.1f}% < {base_edge_threshold*200:.0f}% (2x threshold)")
+        city_edge_threshold = opp.get("city_edge_threshold", base_edge_threshold)
+        if is_bracket and edge < city_edge_threshold * 2:
+            log.info(f"  Skipping bracket {ticker}: edge {edge*100:.1f}% < {city_edge_threshold*200:.0f}% (2x threshold)")
             ss.skip("bracket_low_edge")
             _log_weather_decision(
                 ticker,
@@ -2463,7 +2485,13 @@ def main():
 
     log.info("=" * 60)
     log.info("Kalshi Weather Trading Bot (DEMO)")
-    log.info(f"Mode: {os.environ.get('KALSHI_MODE', 'demo')} | Max: ${config['maxTradeAmount']}/trade | Edge: {_effective_weather_edge_threshold()*100:.0f}%")
+    city_edge_overrides = config.get("cityEdgeThresholds", {}) or {}
+    override_count = len([city for city, value in city_edge_overrides.items() if isinstance(value, (int, float)) and value > 0])
+    log.info(
+        f"Mode: {os.environ.get('KALSHI_MODE', 'demo')} | Max: ${config['maxTradeAmount']}/trade | "
+        f"Edge: {_effective_weather_edge_threshold()*100:.0f}%"
+        + (f" | City edge overrides: {override_count}" if override_count else "")
+    )
     log.info("=" * 60)
 
     # Verify auth

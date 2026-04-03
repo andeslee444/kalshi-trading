@@ -113,7 +113,8 @@ def _annotate_trade(trade, settlements, fills):
     Skips sell (exit) records — settlement belongs to the original buy.
     """
     # Skip sell (exit) records — legacy records without action are assumed buys
-    if trade.get("action", "buy") != "buy":
+    action = trade.get("action")
+    if action not in (None, "", "buy"):
         return False
 
     # Skip already-annotated records

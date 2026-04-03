@@ -22,7 +22,8 @@ def _annotate_trade(trade, settlements, fills):
     Validated against production source by TestAnnotateTradeSourceSync.
     """
     # Skip sell (exit) records — legacy records without action are assumed buys
-    if trade.get("action", "buy") != "buy":
+    action = trade.get("action")
+    if action not in (None, "", "buy"):
         return False
 
     # Skip already-annotated records
@@ -203,6 +204,19 @@ class TestAnnotateTrade:
         assert result is True
         assert trade_old["settlement_result"] == "lost"
         assert trade_old["settlement_revenue_cents"] == 0
+
+    def test_null_action_records_are_annotated(self):
+        trade_old = {
+            "ticker": "TEST-TICKER",
+            "action": None,
+            "side": "yes",
+            "price_cents": 30,
+            "order_id": "order790",
+        }
+        settlements = {"TEST-TICKER": {"yes_won": True, "revenue_cents": 70}}
+        result = _annotate_trade(trade_old, settlements, {})
+        assert result is True
+        assert trade_old["settlement_result"] == "won"
 
     def test_already_annotated_skipped(self):
         """Records with settlement_result already set should be skipped."""

@@ -21,6 +21,8 @@ from weather_observation_pack import (  # noqa: E402
     build_observation_pack,
     compute_historical_city_bias,
     compute_live_city_bias,
+    compute_source_monitor_nws_execution_quality,
+    compute_source_monitor_nws_pnl_from_trades,
     compute_weather_execution_quality,
     compute_verification_source_mix,
     compute_weather_pnl_from_trades,
@@ -40,6 +42,7 @@ def test_weather_pnl_uses_settlement_result_and_cost():
             "ticker": "KXHIGHMIA-26MAR21-T82",
             "city": "MIA",
             "source_bot": "weather",
+            "status": "executed",
             "settlement_result": "won",
             "count": 6,
             "cost_cents": 474,
@@ -48,9 +51,19 @@ def test_weather_pnl_uses_settlement_result_and_cost():
             "ticker": "KXHIGHLAX-26MAR21-T83",
             "city": "LAX",
             "source_bot": "weather",
+            "status": "executed",
             "settlement_result": "lost",
             "count": 6,
             "price_cents": 79,
+        },
+        {
+            "ticker": "KXHIGHMIA-26MAR22-T82",
+            "city": "MIA",
+            "source_bot": "weather",
+            "status": "resting",
+            "settlement_result": "won",
+            "count": 10,
+            "cost_cents": 100,
         },
     ]
     pack = compute_weather_pnl_from_trades(trades)
@@ -58,6 +71,54 @@ def test_weather_pnl_uses_settlement_result_and_cost():
     assert by_city["MIA"]["pnl_cents"] == 126
     assert by_city["LAX"]["pnl_cents"] == -474
     assert pack["overall"]["pnl_cents"] == -348
+
+
+def test_weather_pnl_treats_null_action_as_buy():
+    trades = [
+        {
+            "ticker": "KXHIGHDEN-26MAR21-T82",
+            "city": "DEN",
+            "source_bot": "weather",
+            "action": None,
+            "status": "executed",
+            "settlement_result": "won",
+            "count": 1,
+            "cost_cents": 40,
+        }
+    ]
+
+    pack = compute_weather_pnl_from_trades(trades)
+
+    assert pack["overall"]["settled"] == 1
+    assert pack["overall"]["pnl_cents"] == 60
+
+
+def test_forecast_weather_filter_requires_kxhigh_market():
+    trades = [
+        {
+            "source_bot": "weather",
+            "ticker": "NOTWEATHER",
+            "city": "AUS",
+            "status": "executed",
+            "settlement_result": "won",
+            "count": 1,
+            "cost_cents": 40,
+        },
+        {
+            "source_bot": "weather",
+            "ticker": "KXHIGHAUS-26MAR21-T82",
+            "city": "AUS",
+            "status": "executed",
+            "settlement_result": "won",
+            "count": 1,
+            "cost_cents": 40,
+        },
+    ]
+
+    pack = compute_weather_pnl_from_trades(trades)
+
+    assert pack["overall"]["settled"] == 1
+    assert pack["overall"]["pnl_cents"] == 60
 
 
 def test_verification_source_mix_counts_recent_rows():
@@ -77,6 +138,7 @@ def test_execution_quality_summarizes_weather_trades():
     trades = [
         {
             "source_bot": "weather",
+            "ticker": "KXHIGHAUS-26MAR20-T82",
             "city": "AUS",
             "status": "executed",
             "execution_style": "maker",
@@ -86,7 +148,8 @@ def test_execution_quality_summarizes_weather_trades():
             "bias_capped": False,
         },
         {
-            "source_bot": "weather",
+            "source_bot": None,
+            "ticker": "KXHIGHAUS-26MAR21-T82",
             "city": "AUS",
             "status": "resting",
             "execution_style": "taker",
@@ -110,10 +173,79 @@ def test_execution_quality_summarizes_weather_trades():
     assert quality["per_city"]["AUS"]["avg_edge"] == 0.3
 
 
+def test_source_monitor_nws_helpers_filter_to_nws_weather_trades():
+    trades = [
+        {
+            "source_type": "nws",
+            "source_bot": "source-monitor",
+            "city": "DEN",
+            "ticker": "KXHIGHDEN-26MAR21-T82",
+            "status": "executed",
+            "execution_style": "maker",
+            "edge": 0.31,
+            "settlement_result": "won",
+            "count": 2,
+            "cost_cents": 120,
+            "fee_cents": 3,
+        },
+        {
+            "source_type": "album_sales",
+            "source_bot": "source-monitor",
+            "city": "DEN",
+            "ticker": "OTHER",
+            "status": "executed",
+            "settlement_result": "won",
+        },
+        {
+            "source_type": "nws",
+            "source_bot": "source-monitor",
+            "city": "DEN",
+            "ticker": "KXHIGHDEN-26MAR22-T82",
+            "status": "resting",
+            "settlement_result": "won",
+            "count": 10,
+            "cost_cents": 100,
+        },
+    ]
+    pnl = compute_source_monitor_nws_pnl_from_trades(trades)
+    quality = compute_source_monitor_nws_execution_quality(trades)
+
+    assert pnl["overall"]["settled"] == 1
+    assert pnl["by_city"][0]["city"] == "DEN"
+    assert quality["overall"]["trades"] == 2
+    assert quality["per_city"]["DEN"]["maker_share"] == 0.5
+
+
+def test_source_monitor_nws_helpers_accept_legacy_reasoning_without_source_type():
+    trades = [
+        {
+            "source_bot": "source-monitor",
+            "city": "DEN",
+            "ticker": "KXHIGHDEN-26MAR21-T82",
+            "status": "executed",
+            "reasoning": "NWS DEN running high 64.9F in bracket [64.5, 65.5)F, prob 59%",
+            "settlement_result": "won",
+            "count": 2,
+            "cost_cents": 120,
+        }
+    ]
+
+    pnl = compute_source_monitor_nws_pnl_from_trades(trades)
+    quality = compute_source_monitor_nws_execution_quality(trades)
+
+    assert pnl["overall"]["settled"] == 1
+    assert quality["overall"]["trades"] == 1
+
+
 def test_observation_pack_includes_verification_source_mix_and_execution_quality(monkeypatch):
     payloads = {
         "financial-snapshot.json": {
-            "realized_pnl": {"by_bot": {"weather": {"pnl_cents": 1250, "wins": 1, "losses": 0, "win_rate": 1.0}}}
+            "realized_pnl": {
+                "by_bot": {
+                    "weather": {"pnl_cents": 1250, "wins": 1, "losses": 0, "win_rate": 1.0},
+                    "source-monitor": {"pnl_cents": 2500, "wins": 2, "losses": 0, "win_rate": 1.0},
+                }
+            }
         },
         "backtest-results.json": {"generated_at": "2026-03-21T00:00:00Z"},
         "calibration.json": {"generated_at": "2026-03-21T01:00:00Z", "sigma_updated_at": "2026-03-21T01:00:00Z"},
@@ -137,6 +269,21 @@ def test_observation_pack_includes_verification_source_mix_and_execution_quality
                 "settlement_result": "won",
                 "count": 2,
                 "cost_cents": 150,
+                "fee_cents": 3,
+            }
+        ],
+        "kalshi-monitor-trades.json": [
+            {
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "city": "DEN",
+                "ticker": "KXHIGHDEN-26MAR21-T82",
+                "status": "executed",
+                "execution_style": "maker",
+                "edge": 0.31,
+                "settlement_result": "won",
+                "count": 2,
+                "cost_cents": 120,
                 "fee_cents": 3,
             }
         ],
@@ -168,6 +315,242 @@ def test_observation_pack_includes_verification_source_mix_and_execution_quality
     assert pack["execution_quality"]["per_city"]["AUS"]["bias_conflict"] == 1
     assert pack["sources"]["weather_bias"].endswith("weather-live-bias.json")
     assert pack["city_bias"]["top_conflicts"][0]["city"] == "AUS"
+    assert pack["source_monitor_nws"]["realized"] is None
+    assert pack["source_monitor_nws"]["source_monitor_bot_realized"]["pnl_cents"] == 2500
+    assert pack["source_monitor_nws"]["local_trade_log"]["overall"]["settled"] == 1
+    assert pack["source_monitor_nws"]["local_trade_log"]["overall"]["settled_markets"] == 1
+    assert pack["source_monitor_nws"]["execution_quality"]["overall"]["trades"] == 1
+    assert pack["source_monitor_nws"]["snapshot_attribution"]["fully_attributable_to_nws"] is True
+    assert pack["source_monitor_nws"]["reporting_recommendation"]["status"] == "mismatch_under_review"
+    assert pack["weather_family"]["reporting_recommendation"]["status"] == "mismatch_under_review"
+    assert pack["source_monitor_nws"]["snapshot_local_reconciliation"]["snapshot_settled_markets"] == 2
+    assert pack["source_monitor_nws"]["snapshot_local_reconciliation"]["local_settled_trade_rows"] == 1
+    assert pack["source_monitor_nws"]["snapshot_local_reconciliation"]["local_settled_markets"] == 1
+    assert pack["weather_family"]["realized"]["pnl_cents"] == 1250
+    assert pack["weather_family"]["realized"]["leader_by_realized_pnl"] == "forecast_weather"
+
+
+def test_observation_pack_does_not_attribute_mixed_source_monitor_snapshot_to_nws(monkeypatch):
+    payloads = {
+        "financial-snapshot.json": {
+            "realized_pnl": {
+                "by_bot": {
+                    "weather": {"pnl_cents": 1250, "wins": 1, "losses": 0, "win_rate": 1.0},
+                    "source-monitor": {"pnl_cents": 2500, "wins": 2, "losses": 0, "win_rate": 1.0},
+                }
+            }
+        },
+        "backtest-results.json": {"generated_at": "2026-03-21T00:00:00Z"},
+        "calibration.json": {"generated_at": "2026-03-21T01:00:00Z", "sigma_updated_at": "2026-03-21T01:00:00Z"},
+        "weather-verification.json": {"verified": []},
+        "kalshi-trades.json": [],
+        "kalshi-monitor-trades.json": [
+            {
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "city": "DEN",
+                "ticker": "KXHIGHDEN-26MAR21-T82",
+                "status": "executed",
+                "settlement_result": "won",
+                "count": 2,
+                "cost_cents": 120,
+            },
+            {
+                "source_type": "album_sales",
+                "source_bot": "source-monitor",
+                "city": "DEN",
+                "ticker": "OTHER",
+                "status": "executed",
+                "settlement_result": "won",
+                "count": 1,
+                "cost_cents": 30,
+            },
+        ],
+        "weather-live-bias.json": {"per_city": {}},
+    }
+
+    def fake_load_json(path, default=None):
+        return payloads.get(path.name, default)
+
+    monkeypatch.setattr("weather_observation_pack._load_json", fake_load_json)
+    pack = build_observation_pack(source_lookback_days=(7,), lookback_days=7, top_cities=3, now=datetime(2026, 3, 22, tzinfo=timezone.utc))
+
+    assert pack["source_monitor_nws"]["realized"] is None
+    assert pack["source_monitor_nws"]["snapshot_attribution"]["fully_attributable_to_nws"] is False
+    assert pack["source_monitor_nws"]["reporting_recommendation"]["status"] == "unavailable"
+
+
+def test_observation_pack_uses_local_joined_source_monitor_basis_when_eligible(monkeypatch):
+    payloads = {
+        "financial-snapshot.json": {
+            "realized_pnl": {
+                "by_bot": {
+                    "weather": {"pnl_cents": 1250, "wins": 1, "losses": 0, "win_rate": 1.0},
+                    "source-monitor": {"pnl_cents": 1700, "wins": 3, "losses": 1, "win_rate": 0.75},
+                },
+                "by_bot_api_settlements": {
+                    "weather": {"pnl_cents": 1250, "wins": 1, "losses": 0, "win_rate": 1.0},
+                    "source-monitor": {"pnl_cents": 2500, "wins": 2, "losses": 0, "win_rate": 1.0},
+                },
+                "by_bot_local_joined_fills": {
+                    "source-monitor": {"pnl_cents": 1700, "wins": 3, "losses": 1, "win_rate": 0.75},
+                },
+                "by_bot_basis_map": {
+                    "weather": "kalshi_api_settlements",
+                    "source-monitor": "local_buy_orders_joined_to_api_fills_and_settlement_outcomes",
+                },
+                "by_bot_local_reconciliation": {
+                    "source-monitor": {"eligible_local_join_basis": True},
+                },
+            }
+        },
+        "backtest-results.json": {"generated_at": "2026-03-21T00:00:00Z"},
+        "calibration.json": {"generated_at": "2026-03-21T01:00:00Z", "sigma_updated_at": "2026-03-21T01:00:00Z"},
+        "weather-verification.json": {"verified": []},
+        "kalshi-trades.json": [],
+        "kalshi-monitor-trades.json": [
+            {
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "city": "DEN",
+                "ticker": "KXHIGHDEN-26MAR21-T82",
+                "status": "executed",
+                "settlement_result": "won",
+                "count": 2,
+                "cost_cents": 120,
+            },
+            {
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "city": "DEN",
+                "ticker": "KXHIGHDEN-26MAR22-T82",
+                "status": "executed",
+                "settlement_result": "lost",
+                "count": 1,
+                "cost_cents": 50,
+            },
+            {
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "city": "DEN",
+                "ticker": "KXHIGHDEN-26MAR23-T82",
+                "status": "executed",
+                "settlement_result": "won",
+                "count": 1,
+                "cost_cents": 30,
+            },
+            {
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "city": "DEN",
+                "ticker": "KXHIGHDEN-26MAR24-T82",
+                "status": "executed",
+                "settlement_result": "won",
+                "count": 1,
+                "cost_cents": 50,
+            },
+        ],
+        "weather-live-bias.json": {"per_city": {}},
+    }
+
+    def fake_load_json(path, default=None):
+        return payloads.get(path.name, default)
+
+    monkeypatch.setattr("weather_observation_pack._load_json", fake_load_json)
+    pack = build_observation_pack(source_lookback_days=(7,), lookback_days=7, top_cities=3, now=datetime(2026, 3, 22, tzinfo=timezone.utc))
+
+    assert pack["source_monitor_nws"]["source_monitor_bot_realized_basis"] == "local_buy_orders_joined_to_api_fills_and_settlement_outcomes"
+    assert pack["source_monitor_nws"]["reporting_recommendation"]["status"] == "aligned"
+    assert pack["source_monitor_nws"]["reporting_recommendation"]["recommended_basis"] == "financial_snapshot_local_joined_fills_by_bot"
+    assert pack["source_monitor_nws"]["realized"]["pnl_cents"] == 1700
+    assert pack["weather_family"]["realized"]["pnl_cents"] == 2950
+
+
+def test_observation_pack_surfaces_unattributed_weather_without_counting_it_in_family(monkeypatch):
+    payloads = {
+        "financial-snapshot.json": {
+            "realized_pnl": {
+                "by_bot": {
+                    "weather": {"pnl_cents": 1250, "wins": 1, "losses": 0, "win_rate": 1.0},
+                    "source-monitor": {"pnl_cents": 1700, "wins": 3, "losses": 1, "win_rate": 0.75},
+                    "unattributed-weather": {"pnl_cents": 900, "wins": 2, "losses": 1, "win_rate": 0.667},
+                },
+                "by_bot_api_settlements": {
+                    "weather": {"pnl_cents": 1250, "wins": 1, "losses": 0, "win_rate": 1.0},
+                    "source-monitor": {"pnl_cents": 1700, "wins": 3, "losses": 1, "win_rate": 0.75},
+                    "unattributed-weather": {"pnl_cents": 900, "wins": 2, "losses": 1, "win_rate": 0.667},
+                },
+                "by_bot_local_joined_fills": {
+                    "source-monitor": {"pnl_cents": 1700, "wins": 3, "losses": 1, "win_rate": 0.75},
+                },
+                "by_bot_basis_map": {
+                    "weather": "kalshi_api_settlements",
+                    "source-monitor": "local_buy_orders_joined_to_api_fills_and_settlement_outcomes",
+                    "unattributed-weather": "kalshi_api_settlements",
+                },
+                "by_bot_local_reconciliation": {
+                    "source-monitor": {"eligible_local_join_basis": True},
+                },
+            }
+        },
+        "backtest-results.json": {"generated_at": "2026-03-21T00:00:00Z"},
+        "calibration.json": {"generated_at": "2026-03-21T01:00:00Z", "sigma_updated_at": "2026-03-21T01:00:00Z"},
+        "weather-verification.json": {"verified": []},
+        "kalshi-trades.json": [],
+        "kalshi-monitor-trades.json": [
+            {
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "city": "DEN",
+                "ticker": "KXHIGHDEN-26MAR21-T82",
+                "status": "executed",
+                "settlement_result": "won",
+                "count": 2,
+                "cost_cents": 120,
+            },
+            {
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "city": "DEN",
+                "ticker": "KXHIGHDEN-26MAR22-T82",
+                "status": "executed",
+                "settlement_result": "lost",
+                "count": 1,
+                "cost_cents": 50,
+            },
+            {
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "city": "DEN",
+                "ticker": "KXHIGHDEN-26MAR23-T82",
+                "status": "executed",
+                "settlement_result": "won",
+                "count": 1,
+                "cost_cents": 30,
+            },
+            {
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "city": "DEN",
+                "ticker": "KXHIGHDEN-26MAR24-T82",
+                "status": "executed",
+                "settlement_result": "won",
+                "count": 1,
+                "cost_cents": 50,
+            },
+        ],
+        "weather-live-bias.json": {"per_city": {}},
+    }
+
+    def fake_load_json(path, default=None):
+        return payloads.get(path.name, default)
+
+    monkeypatch.setattr("weather_observation_pack._load_json", fake_load_json)
+    pack = build_observation_pack(source_lookback_days=(7,), lookback_days=7, top_cities=3, now=datetime(2026, 3, 22, tzinfo=timezone.utc))
+
+    assert pack["unattributed_weather"]["realized"]["pnl_cents"] == 900
+    assert pack["unattributed_weather"]["basis"] == "kalshi_api_settlements"
+    assert pack["weather_family"]["realized"]["pnl_cents"] == 2950
 
 
 def test_city_bias_conflicts_rank_sign_flips_first():
@@ -238,3 +621,24 @@ def test_historical_and_live_bias_maps_reduce_to_city_floats():
     live = compute_live_city_bias(verified_rows, 7, now=now, min_samples=1)
     assert hist["MIA"]["bias_f"] == 9.0
     assert live["MIA"]["bias_f"] == -2.5
+
+
+def test_main_forwards_monitor_trades_path(monkeypatch, tmp_path, capsys):
+    captured = {}
+
+    def fake_build_observation_pack(**kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr("weather_observation_pack.build_observation_pack", fake_build_observation_pack)
+    monitor_path = tmp_path / "monitor.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["weather-observation-pack.py", "--json", "--monitor-trades-path", str(monitor_path)],
+    )
+
+    _mod.main()
+
+    assert captured["monitor_trades_path"] == str(monitor_path)
+    assert capsys.readouterr().out.strip() == "{}"

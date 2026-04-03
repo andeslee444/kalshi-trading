@@ -31,11 +31,11 @@
 |------|-------|-------------|--------|
 | [Plan 0: Operational Triage](./2026-03-06-plan0-operational-triage.md) | Kill zombies, fix supervisor, single-instance enforcement | Prerequisite | **Complete** ✅ |
 | [Plan 1: Shared Infrastructure](./2026-03-06-plan1-shared-infrastructure.md) | probability.py, kalshi_auth.py, capital_allocator.py | Foundation | **Complete** ✅ (Task 1.11 rate limiter deferred) |
-| [Plan 2: Weather Bot](./2026-03-06-plan2-weather-bot.md) | Ensemble optimization, day-0 dedup fix, limit orders | +$50-80/day potential | **Complete** ✅ + Phase 4 shadow-review follow-up |
+| [Plan 2: Forecast Weather](./2026-03-06-plan2-weather-bot.md) | Open-Meteo ensemble optimization, day-0 dedup fix, limit orders | +$50-80/day potential | **Complete** ✅ + Phase 4 shadow-review follow-up |
 | [Plan 3: Crypto Bot](./2026-03-06-plan3-crypto-bot.md) | OU fix, GARCH stabilization, Kelly stack reduction | +$30-50/day potential | **Complete** ✅ (OU infra ready, re-enable after backtest validation) |
 | [Plan 4: Economics Bot](./2026-03-06-plan4-economics-bot.md) | GDP sigma fix, concentration limits, belief filter tuning | Risk reduction + edge | **Complete** ✅ |
 | [Plan 5: Strategy Trader](./2026-03-06-plan5-strategy-trader.md) | **DISABLED** — CPU fix, edge formula rewrite, copula calibration | +$10-20/day potential | **Complete** ✅ (bot remains disabled pending Brier < 0.35 on new settlements) |
-| [Plan 6: Source Monitor](./2026-03-06-plan6-source-monitor.md) | Timezone fix, NWS data freshness, edge optimization | +$20-30/day potential | **Complete** ✅ |
+| [Plan 6: Source Monitor](./2026-03-06-plan6-source-monitor.md) | NWS weather info-arb, timezone fix, data freshness, edge optimization | +$20-30/day potential | **Complete** ✅ |
 | [Plan 7: Entertainment/Beat](./2026-03-06-plan7-entertainment-beat.md) | Re-enable with proper Kelly, fix trade log integration | +$10-20/day potential | **Complete** ✅ |
 | [Plan 8: Position Monitor](./2026-03-06-plan8-position-monitor.md) | Decision path fix, model-shift exit, stop-loss calibration | Loss prevention | **Complete** ✅ |
 | [Plan 9: Data Quality & S3 Sync](./2026-03-06-plan9-data-quality-and-s3-sync.md) | Pre-upload validation, sync scope, integrity reports | Data reliability | **Complete** ✅ |
@@ -43,13 +43,17 @@
 
 Observation-window follow-up:
 
-- Weather bot Phase 4 safe-now worklist:
+- Weather family Phase 4 safe-now worklist:
   - [2026-03-22-weather-observation-window-worklist.md](./2026-03-22-weather-observation-window-worklist.md)
 - Weather shadow refresh orchestrator:
   - `python3 scripts/weather-shadow-refresh.py`
   - use `--refresh-shadow-prior` only for shadow outputs under `data/shadow/**`
-- Weather bot ranked post-window promotion list:
+- Weather family ranked post-window promotion list:
   - [2026-03-22-weather-april1-promotion-list.md](./2026-03-22-weather-april1-promotion-list.md)
+- Weather-family March 29 implementation audit note:
+  - [2026-03-29-weather-family-calibration-audit.md](./2026-03-29-weather-family-calibration-audit.md)
+- Weather-family April 2 outage-recovery audit note:
+  - [2026-04-02-weather-outage-recovery-audit.md](./2026-04-02-weather-outage-recovery-audit.md)
 - Event-ledger post-Phase-4 storage retention plan:
   - [2026-03-22-ledger-storage-retention-plan.md](./2026-03-22-ledger-storage-retention-plan.md)
 
@@ -67,7 +71,7 @@ Track edge-at-entry vs final settlement. If edges consistently decay (e.g., weat
 Measure slippage: order price vs fill price vs fair value. Track limit order fill rates. Each bot logs `order_price_cents`, `fill_price_cents`, `model_fair_value_cents` in trade records.
 
 ### D. Data Source Redundancy
-Add fallback data sources. Weather: Open-Meteo + NWS + WeatherAPI. Crypto: Coinbase + Binance + Kraken. Economics: Cleveland Fed + Truflation + TIPS breakevens. Log which source was used per trade.
+Add fallback data sources. Weather family: forecast weather uses Open-Meteo + WeatherAPI, while NWS weather uses official NWS data and remains the separate observed-weather track. Crypto: Coinbase + Binance + Kraken. Economics: Cleveland Fed + Truflation + TIPS breakevens. Log which source was used per trade.
 
 ### E. Capital Deployment Efficiency
 Current: ~$918 deployed over full history. Target: $500-1000/day deployed across all bots. Capital allocator needs to be more aggressive when edges are strong and more defensive when correlation is high.

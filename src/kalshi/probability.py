@@ -135,15 +135,36 @@ def _probit(p):
 
 _CALIBRATION_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "calibration.json"
 _calibration = None
+_calibration_source = None
+_CALIBRATION_MISSING = object()
+
+
+def _calibration_fingerprint():
+    """Return a stable cache key for the current calibration artifact contents."""
+    path_key = str(_CALIBRATION_PATH.resolve()) if _CALIBRATION_PATH.exists() else str(_CALIBRATION_PATH)
+    try:
+        if not _CALIBRATION_PATH.exists():
+            return (path_key, _CALIBRATION_MISSING)
+        return (path_key, _CALIBRATION_PATH.read_text())
+    except OSError:
+        return (path_key, _CALIBRATION_MISSING)
 
 
 def _load_calibration():
-    """Lazy-load config/calibration.json. Returns dict (empty if missing)."""
-    global _calibration
-    if _calibration is not None:
+    """Lazy-load config/calibration.json and reload it when the file changes."""
+    global _calibration, _calibration_source
+    # Tests sometimes pin calibration directly in memory; preserve that behavior.
+    if _calibration is not None and _calibration_source is None:
+        return _calibration
+    fingerprint = _calibration_fingerprint()
+    if _calibration is not None and _calibration_source == fingerprint:
         return _calibration
     try:
-        _calibration = json.loads(_CALIBRATION_PATH.read_text()) if _CALIBRATION_PATH.exists() else {}
+        raw_payload = fingerprint[1]
+        if raw_payload is _CALIBRATION_MISSING:
+            _calibration = {}
+        else:
+            _calibration = json.loads(raw_payload)
         if not isinstance(_calibration, dict):
             _log.warning("calibration.json has wrong schema (expected dict, got %s), using defaults",
                          type(_calibration).__name__)
@@ -151,6 +172,7 @@ def _load_calibration():
     except (json.JSONDecodeError, OSError) as e:
         _log.warning("Failed to load calibration.json, using defaults: %s", e)
         _calibration = {}
+    _calibration_source = fingerprint
     if _calibration:
         _log.info("Calibration loaded: %d cities, %d market types",
                   len(_calibration.get("weather", {}).get("per_city", {})),
@@ -167,8 +189,9 @@ def _reset_calibration():
     without re-reading calibration.json from disk. This ensures tests
     use hardcoded default sigma values regardless of what's on disk.
     """
-    global _calibration
+    global _calibration, _calibration_source
     _calibration = {}
+    _calibration_source = None
 
 
 def check_calibration_freshness(max_age_days=7):

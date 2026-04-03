@@ -7,39 +7,130 @@
   "maxDailyLossPct": 0.07,
   "scanIntervalMinutes": 30,
   "edgeThreshold": 0.06,
+  "cityEdgeThresholds": {
+    "CHI": 0.12,
+    "HOU": 0.12,
+    "NY": 0.12
+  },
   "cities": {
-    "MIA": { "lat": 25.7959, "lon": -80.2870, "name": "Miami" },
-    "LAX": { "lat": 33.9425, "lon": -118.4081, "name": "Los Angeles" },
-    "PHIL": { "lat": 39.8721, "lon": -75.2411, "name": "Philadelphia" },
-    "NY": { "lat": 40.7829, "lon": -73.9654, "name": "New York" },
-    "CHI": { "lat": 41.7868, "lon": -87.7522, "name": "Chicago" },
-    "AUS": { "lat": 30.1945, "lon": -97.6699, "name": "Austin" },
-    "DEN": { "lat": 39.8561, "lon": -104.6737, "name": "Denver" },
-    "HOU": { "lat": 29.6454, "lon": -95.2789, "name": "Houston" },
-    "ATL": { "lat": 33.6407, "lon": -84.4277, "name": "Atlanta" },
-    "BOS": { "lat": 42.3656, "lon": -71.0096, "name": "Boston" },
-    "SFO": { "lat": 37.6213, "lon": -122.3790, "name": "San Francisco" },
-    "SEA": { "lat": 47.4502, "lon": -122.3088, "name": "Seattle" },
-    "LV": { "lat": 36.0840, "lon": -115.1537, "name": "Las Vegas" },
-    "DAL": { "lat": 32.8998, "lon": -97.0403, "name": "Dallas" },
-    "MIN": { "lat": 44.8848, "lon": -93.2223, "name": "Minneapolis" },
-    "PHX": { "lat": 33.4373, "lon": -112.0078, "name": "Phoenix" },
-    "DC": { "lat": 38.8512, "lon": -77.0402, "name": "Washington DC" },
-    "NOLA": { "lat": 29.9934, "lon": -90.2580, "name": "New Orleans" },
-    "OKC": { "lat": 35.3931, "lon": -97.6007, "name": "Oklahoma City" },
-    "SATX": { "lat": 29.5337, "lon": -98.4698, "name": "San Antonio" }
+    "MIA": {
+      "lat": 25.7959,
+      "lon": -80.287,
+      "name": "Miami"
+    },
+    "LAX": {
+      "lat": 33.9425,
+      "lon": -118.4081,
+      "name": "Los Angeles"
+    },
+    "PHIL": {
+      "lat": 39.8721,
+      "lon": -75.2411,
+      "name": "Philadelphia"
+    },
+    "NY": {
+      "lat": 40.7829,
+      "lon": -73.9654,
+      "name": "New York"
+    },
+    "CHI": {
+      "lat": 41.7868,
+      "lon": -87.7522,
+      "name": "Chicago"
+    },
+    "AUS": {
+      "lat": 30.1945,
+      "lon": -97.6699,
+      "name": "Austin"
+    },
+    "DEN": {
+      "lat": 39.8561,
+      "lon": -104.6737,
+      "name": "Denver"
+    },
+    "HOU": {
+      "lat": 29.6454,
+      "lon": -95.2789,
+      "name": "Houston"
+    },
+    "ATL": {
+      "lat": 33.6407,
+      "lon": -84.4277,
+      "name": "Atlanta"
+    },
+    "BOS": {
+      "lat": 42.3656,
+      "lon": -71.0096,
+      "name": "Boston"
+    },
+    "SFO": {
+      "lat": 37.6213,
+      "lon": -122.379,
+      "name": "San Francisco"
+    },
+    "SEA": {
+      "lat": 47.4502,
+      "lon": -122.3088,
+      "name": "Seattle"
+    },
+    "LV": {
+      "lat": 36.084,
+      "lon": -115.1537,
+      "name": "Las Vegas"
+    },
+    "DAL": {
+      "lat": 32.8998,
+      "lon": -97.0403,
+      "name": "Dallas"
+    },
+    "MIN": {
+      "lat": 44.8848,
+      "lon": -93.2223,
+      "name": "Minneapolis"
+    },
+    "PHX": {
+      "lat": 33.4373,
+      "lon": -112.0078,
+      "name": "Phoenix"
+    },
+    "DC": {
+      "lat": 38.8512,
+      "lon": -77.0402,
+      "name": "Washington DC"
+    },
+    "NOLA": {
+      "lat": 29.9934,
+      "lon": -90.258,
+      "name": "New Orleans"
+    },
+    "OKC": {
+      "lat": 35.3931,
+      "lon": -97.6007,
+      "name": "Oklahoma City"
+    },
+    "SATX": {
+      "lat": 29.5337,
+      "lon": -98.4698,
+      "name": "San Antonio"
+    }
   },
   "disableWeatherYes": false,
   "ensemble": {
     "enabled": true,
-    "models": ["gfs", "ecmwf", "icon", "nbm", "aifs", "graphcast"],
+    "models": [
+      "gfs",
+      "ecmwf",
+      "icon",
+      "nbm",
+      "aifs",
+      "graphcast"
+    ],
     "weights": {
-      "graphcast": 0.25,
-      "ecmwf": 0.23,
-      "gfs": 0.20,
-      "icon": 0.20,
-      "nbm": 0.08,
-      "aifs": 0.04
+      "icon": 0.1999,
+      "gfs": 0.3788,
+      "nbm": 0.0187,
+      "graphcast": 0.0236,
+      "ecmwf": 0.3789
     }
   },
   "verification": {
@@ -74,8 +165,8 @@
   },
   "hrrr": {
     "enabled": true,
-    "weight_day0": 0.60,
-    "weight_day1": 0.30
+    "weight_day0": 0.6,
+    "weight_day1": 0.3
   },
   "adaptiveScan": {
     "enabled": true,
@@ -91,7 +182,7 @@
   "makerExecution": {
     "enabled": true,
     "maxDaysOut": 1,
-    "minEdgeNearTerm": 0.10,
+    "minEdgeNearTerm": 0.1,
     "minEdgeFar": 0.14,
     "minImprovementCents": 1,
     "maxJoinUpliftCents": 18,
@@ -109,8 +200,8 @@
   },
   "nam": {
     "enabled": true,
-    "weight_day0": 0.40,
-    "weight_day1": 0.20
+    "weight_day0": 0.4,
+    "weight_day1": 0.2
   },
   "previousRuns": {
     "enabled": true,

@@ -22,6 +22,7 @@ DEFAULT_BACKTEST_RESULTS_PATH = DATA_DIR / "backtest-results.json"
 DEFAULT_CALIBRATION_PATH = CONFIG_DIR / "calibration.json"
 DEFAULT_WEATHER_VERIFICATION_PATH = DATA_DIR / "weather-verification.json"
 DEFAULT_KALSHI_TRADES_PATH = DATA_DIR / "kalshi-trades.json"
+DEFAULT_MONITOR_TRADES_PATH = DATA_DIR / "kalshi-monitor-trades.json"
 DEFAULT_WEATHER_BIAS_PATH = CONFIG_DIR / "weather-live-bias.json"
 
 KNOWN_CITY_ALIASES = {
@@ -86,6 +87,13 @@ def _safe_int(value, default=0):
         return int(round(float(value)))
     except (TypeError, ValueError):
         return default
+
+
+def _is_buy_action(value):
+    if value is None:
+        return True
+    normalized = str(value).strip().lower()
+    return normalized in ("", "buy", "none", "null")
 
 
 def _parse_iso_datetime(value):
@@ -166,6 +174,11 @@ def _trade_city(trade):
     return _normalize_city(trade.get("city")) or _city_from_ticker(trade.get("ticker"))
 
 
+def _is_executed_status(status):
+    normalized = str(status or "").lower()
+    return normalized in ("", "executed", "filled")
+
+
 def _trade_cost_cents(trade):
     cost = trade.get("cost_cents")
     if cost is not None:
@@ -176,8 +189,34 @@ def _trade_cost_cents(trade):
     return _safe_int(price) * _safe_int(trade.get("count", 0))
 
 
-def compute_weather_pnl_from_trades(trades):
-    """Compute city-level realized P&L from local weather trade logs."""
+def _is_forecast_weather_trade(trade):
+    ticker = str(trade.get("ticker", ""))
+    if not ticker.startswith("KXHIGH"):
+        return False
+    return trade.get("source_bot") in ("weather", None)
+
+
+def _is_source_monitor_trade(trade):
+    return trade.get("source_bot") == "source-monitor"
+
+
+def _is_source_monitor_nws_trade(trade):
+    ticker = str(trade.get("ticker", ""))
+    if not (_is_source_monitor_trade(trade) and ticker.startswith("KXHIGH")):
+        return False
+    source_type = str(trade.get("source_type", "")).lower()
+    strategy = str(trade.get("strategy", "")).lower()
+    reasoning = str(trade.get("reasoning", "")).lower()
+    return (
+        source_type == "nws"
+        or strategy.startswith("nws")
+        or "nws" in strategy
+        or reasoning.startswith("nws ")
+    )
+
+
+def _compute_city_pnl_from_trades(trades, *, include_trade):
+    """Compute city-level settled P&L proxy from executed local trade logs."""
     by_city = defaultdict(lambda: {
         "pnl_cents": 0,
         "trades": 0,
@@ -185,6 +224,7 @@ def compute_weather_pnl_from_trades(trades):
         "losses": 0,
         "settled": 0,
         "fees_cents": 0,
+        "settled_markets": set(),
     })
     overall = {
         "pnl_cents": 0,
@@ -193,12 +233,15 @@ def compute_weather_pnl_from_trades(trades):
         "losses": 0,
         "settled": 0,
         "fees_cents": 0,
+        "settled_markets": set(),
     }
 
     for trade in trades:
-        if trade.get("source_bot") not in (None, "weather") and not str(trade.get("ticker", "")).startswith("KXHIGH"):
+        if not include_trade(trade):
             continue
-        if not str(trade.get("ticker", "")).startswith("KXHIGH"):
+        if not _is_buy_action(trade.get("action")):
+            continue
+        if not _is_executed_status(trade.get("status")):
             continue
         result = trade.get("settlement_result")
         if result not in ("won", "lost"):
@@ -220,6 +263,8 @@ def compute_weather_pnl_from_trades(trades):
         row["trades"] += 1
         row["settled"] += 1
         row["fees_cents"] += fee_cents
+        if trade.get("ticker"):
+            row["settled_markets"].add(str(trade["ticker"]))
         if result == "won":
             row["wins"] += 1
         else:
@@ -229,6 +274,8 @@ def compute_weather_pnl_from_trades(trades):
         overall["trades"] += 1
         overall["settled"] += 1
         overall["fees_cents"] += fee_cents
+        if trade.get("ticker"):
+            overall["settled_markets"].add(str(trade["ticker"]))
         if result == "won":
             overall["wins"] += 1
         else:
@@ -239,13 +286,31 @@ def compute_weather_pnl_from_trades(trades):
         rows.append({
             "city": city,
             **stats,
+            "settled_markets": len(stats["settled_markets"]),
             "win_rate": round(stats["wins"] / stats["settled"], 3) if stats["settled"] else None,
             "net_after_fees_cents": stats["pnl_cents"] - stats["fees_cents"],
         })
     rows.sort(key=lambda row: (-row["pnl_cents"], row["city"]))
+    overall["settled_markets"] = len(overall["settled_markets"])
     overall["win_rate"] = round(overall["wins"] / overall["settled"], 3) if overall["settled"] else None
     overall["net_after_fees_cents"] = overall["pnl_cents"] - overall["fees_cents"]
-    return {"source": "local_trade_log_settlements", "overall": overall, "by_city": rows}
+    return {"source": "local_executed_trade_log_settlements", "overall": overall, "by_city": rows}
+
+
+def compute_weather_pnl_from_trades(trades):
+    """Compute city-level realized P&L from local forecast-weather trade logs."""
+    return _compute_city_pnl_from_trades(
+        trades,
+        include_trade=_is_forecast_weather_trade,
+    )
+
+
+def compute_source_monitor_nws_pnl_from_trades(trades):
+    """Compute city-level realized P&L from source-monitor NWS trade logs."""
+    return _compute_city_pnl_from_trades(
+        trades,
+        include_trade=_is_source_monitor_nws_trade,
+    )
 
 
 def compute_verification_source_mix(verified_rows, lookback_days, now=None):
@@ -273,7 +338,7 @@ def compute_verification_source_mix(verified_rows, lookback_days, now=None):
     }
 
 
-def compute_weather_execution_quality(trades):
+def _compute_execution_quality(trades, *, include_trade):
     city_rows = defaultdict(lambda: {
         "trades": 0,
         "executed": 0,
@@ -302,9 +367,9 @@ def compute_weather_execution_quality(trades):
     }
 
     for trade in trades:
-        if trade.get("source_bot") != "weather":
+        if not include_trade(trade):
             continue
-        city = trade.get("city") or "UNKNOWN"
+        city = _trade_city(trade) or trade.get("city") or "UNKNOWN"
         row = city_rows[city]
         status = trade.get("status")
         style = trade.get("execution_style") or "legacy"
@@ -354,6 +419,64 @@ def compute_weather_execution_quality(trades):
     return {
         "overall": finalize(overall),
         "per_city": {city: finalize(stats) for city, stats in sorted(city_rows.items())},
+    }
+
+
+def compute_weather_execution_quality(trades):
+    return _compute_execution_quality(
+        trades,
+        include_trade=_is_forecast_weather_trade,
+    )
+
+
+def compute_source_monitor_nws_execution_quality(trades):
+    return _compute_execution_quality(
+        trades,
+        include_trade=_is_source_monitor_nws_trade,
+    )
+
+
+def _compute_settled_trade_counts(trades, *, include_trade, require_executed=False):
+    total = 0
+    for trade in trades:
+        if not include_trade(trade):
+            continue
+        if require_executed and not _is_executed_status(trade.get("status")):
+            continue
+        if trade.get("settlement_result") in ("won", "lost"):
+            total += 1
+    return total
+
+
+def _source_monitor_nws_snapshot_attribution(realized_source_monitor, monitor_trades):
+    settled_source_monitor = _compute_settled_trade_counts(
+        monitor_trades,
+        include_trade=_is_source_monitor_trade,
+        require_executed=True,
+    )
+    settled_nws = _compute_settled_trade_counts(
+        monitor_trades,
+        include_trade=_is_source_monitor_nws_trade,
+        require_executed=True,
+    )
+    attributable = (
+        isinstance(realized_source_monitor, dict)
+        and settled_source_monitor > 0
+        and settled_source_monitor == settled_nws
+    )
+    if attributable:
+        reason = "all_executed_settled_source_monitor_trades_are_nws_weather"
+    elif settled_source_monitor == 0:
+        reason = "no_executed_settled_source_monitor_trades"
+    else:
+        reason = "executed_source_monitor_trade_log_contains_non_nws_or_non_weather_settlements"
+    return {
+        "fully_attributable_to_nws": attributable,
+        "source_monitor_settled_total": settled_source_monitor,
+        "source_monitor_nws_settled": settled_nws,
+        "reason": reason,
+        "requires_executed_status": True,
+        "trade_log_only": True,
     }
 
 
@@ -463,6 +586,103 @@ def _freshness_from(path, payload, now=None):
     }
 
 
+def _combine_realized_tracks(track_map):
+    rows = [(name, payload) for name, payload in track_map.items() if isinstance(payload, dict)]
+    if not rows:
+        return None
+    combined = {
+        "pnl_cents": 0,
+        "wins": 0,
+        "losses": 0,
+        "fees_cents": 0,
+        "track_count": len(rows),
+    }
+    leader = None
+    leader_pnl = None
+    for name, payload in rows:
+        pnl = _safe_int(payload.get("pnl_cents"), default=0)
+        combined["pnl_cents"] += pnl
+        combined["wins"] += _safe_int(payload.get("wins"), default=0)
+        combined["losses"] += _safe_int(payload.get("losses"), default=0)
+        combined["fees_cents"] += _safe_int(payload.get("fees_cents"), default=0)
+        if leader is None or pnl > leader_pnl:
+            leader = name
+            leader_pnl = pnl
+    total = combined["wins"] + combined["losses"]
+    combined["win_rate"] = round(combined["wins"] / total, 3) if total else None
+    combined["leader_by_realized_pnl"] = leader
+    combined["net_after_fees_cents"] = combined["pnl_cents"] - combined["fees_cents"]
+    return combined
+
+
+def _snapshot_local_reconciliation(realized_payload, local_summary):
+    realized = realized_payload if isinstance(realized_payload, dict) else {}
+    local = local_summary.get("overall", {}) if isinstance(local_summary, dict) else {}
+    snapshot_settled = _safe_int(realized.get("wins"), default=0) + _safe_int(realized.get("losses"), default=0)
+    local_settled_trade_rows = _safe_int(local.get("settled"), default=0)
+    local_settled_markets = _safe_int(local.get("settled_markets"), default=0)
+    snapshot_pnl = _safe_int(realized.get("pnl_cents"), default=0)
+    local_pnl = _safe_int(local.get("pnl_cents"), default=0)
+    return {
+        "snapshot_settled_markets": snapshot_settled,
+        "local_settled_trade_rows": local_settled_trade_rows,
+        "local_settled_markets": local_settled_markets,
+        "snapshot_pnl_cents": snapshot_pnl,
+        "local_pnl_cents": local_pnl,
+        "settled_mismatch": snapshot_settled != local_settled_markets,
+        "pnl_mismatch": snapshot_pnl != local_pnl,
+    }
+
+
+def _reporting_recommendation(snapshot_reconciliation):
+    reconciliation = snapshot_reconciliation if isinstance(snapshot_reconciliation, dict) else {}
+    if not reconciliation:
+        return {
+            "status": "unavailable",
+            "recommended_basis": None,
+            "warning": None,
+        }
+
+    mismatch = bool(
+        reconciliation.get("settled_mismatch")
+        or reconciliation.get("pnl_mismatch")
+    )
+    if mismatch:
+        return {
+            "status": "mismatch_under_review",
+            "recommended_basis": "financial_snapshot_by_bot_with_proxy_warning",
+            "warning": (
+                "financial snapshot by-bot totals and executed local weather trade proxies diverge; "
+                "keep source-monitor bot P&L visible as bot-level context, but do not attribute it "
+                "to source-monitor NWS or combined weather-family realized P&L until reconciliation "
+                "is resolved"
+            ),
+        }
+
+    return {
+        "status": "aligned",
+        "recommended_basis": "financial_snapshot_by_bot_and_local_proxy",
+        "warning": None,
+    }
+
+
+def _source_monitor_reporting_recommendation(
+    *,
+    source_monitor_basis=None,
+    source_monitor_local_reconciliation=None,
+    snapshot_reconciliation=None,
+):
+    local_basis = "local_buy_orders_joined_to_api_fills_and_settlement_outcomes"
+    if source_monitor_basis == local_basis and isinstance(source_monitor_local_reconciliation, dict):
+        if source_monitor_local_reconciliation.get("eligible_local_join_basis"):
+            return {
+                "status": "aligned",
+                "recommended_basis": "financial_snapshot_local_joined_fills_by_bot",
+                "warning": None,
+            }
+    return _reporting_recommendation(snapshot_reconciliation)
+
+
 def build_observation_pack(
     lookback_days=30,
     source_lookback_days=(7, 30),
@@ -474,6 +694,7 @@ def build_observation_pack(
     calibration_path=None,
     weather_verification_path=None,
     weather_trades_path=None,
+    monitor_trades_path=None,
     weather_bias_path=None,
 ):
     now = now or datetime.now(timezone.utc)
@@ -482,6 +703,7 @@ def build_observation_pack(
     calibration_path = _resolve_path(calibration_path, DEFAULT_CALIBRATION_PATH)
     weather_verification_path = _resolve_path(weather_verification_path, DEFAULT_WEATHER_VERIFICATION_PATH)
     weather_trades_path = _resolve_path(weather_trades_path, DEFAULT_KALSHI_TRADES_PATH)
+    monitor_trades_path = _resolve_path(monitor_trades_path, DEFAULT_MONITOR_TRADES_PATH)
     weather_bias_path = _resolve_path(weather_bias_path, DEFAULT_WEATHER_BIAS_PATH)
 
     financial_snapshot = _load_json(financial_snapshot_path, default={})
@@ -489,13 +711,40 @@ def build_observation_pack(
     calibration = _load_json(calibration_path, default={})
     verification = _load_json(weather_verification_path, default={})
     trades = _load_json(weather_trades_path, default=[])
+    monitor_trades = _load_json(monitor_trades_path, default=[])
     prior_bias = _load_json(weather_bias_path, default={})
 
     realized_weather = None
     if isinstance(financial_snapshot, dict):
         realized_pnl = financial_snapshot.get("realized_pnl", {})
         by_bot = realized_pnl.get("by_bot", {}) if isinstance(realized_pnl, dict) else {}
-        realized_weather = by_bot.get("weather")
+        by_bot_api = realized_pnl.get("by_bot_api_settlements", {}) if isinstance(realized_pnl, dict) else {}
+        by_bot_local = realized_pnl.get("by_bot_local_joined_fills", {}) if isinstance(realized_pnl, dict) else {}
+        by_bot_basis_map = realized_pnl.get("by_bot_basis_map", {}) if isinstance(realized_pnl, dict) else {}
+        by_bot_local_reconciliation = (
+            realized_pnl.get("by_bot_local_reconciliation", {}) if isinstance(realized_pnl, dict) else {}
+        )
+        realized_weather = by_bot.get("weather") or by_bot_api.get("weather")
+        realized_source_monitor = by_bot.get("source-monitor") or by_bot_api.get("source-monitor")
+        realized_unattributed_weather = (
+            by_bot.get("unattributed-weather")
+            or by_bot_api.get("unattributed-weather")
+        )
+        realized_weather_api = by_bot_api.get("weather")
+        realized_source_monitor_api = by_bot_api.get("source-monitor")
+        realized_source_monitor_local = by_bot_local.get("source-monitor")
+        realized_source_monitor_basis = by_bot_basis_map.get("source-monitor")
+        realized_source_monitor_local_reconciliation = by_bot_local_reconciliation.get("source-monitor")
+        realized_unattributed_weather_basis = by_bot_basis_map.get("unattributed-weather")
+    else:
+        realized_source_monitor = None
+        realized_unattributed_weather = None
+        realized_weather_api = None
+        realized_source_monitor_api = None
+        realized_source_monitor_local = None
+        realized_source_monitor_basis = None
+        realized_source_monitor_local_reconciliation = None
+        realized_unattributed_weather_basis = None
 
     verification_rows = verification.get("verified", []) if isinstance(verification, dict) else []
     verification_source_mix = [
@@ -503,6 +752,36 @@ def build_observation_pack(
         for days in source_lookback_days
     ]
     execution_quality = compute_weather_execution_quality(trades)
+    source_monitor_nws_pnl = compute_source_monitor_nws_pnl_from_trades(monitor_trades)
+    source_monitor_nws_execution = compute_source_monitor_nws_execution_quality(monitor_trades)
+    source_monitor_nws_attribution = _source_monitor_nws_snapshot_attribution(realized_source_monitor, monitor_trades)
+    source_monitor_nws_reconciliation = (
+        _snapshot_local_reconciliation(realized_source_monitor, source_monitor_nws_pnl)
+        if realized_source_monitor else None
+    )
+    source_monitor_nws_reporting = (
+        _source_monitor_reporting_recommendation(
+            source_monitor_basis=realized_source_monitor_basis,
+            source_monitor_local_reconciliation=realized_source_monitor_local_reconciliation,
+            snapshot_reconciliation=source_monitor_nws_reconciliation,
+        )
+        if source_monitor_nws_attribution["fully_attributable_to_nws"]
+        else {
+            "status": "unavailable",
+            "recommended_basis": None,
+            "warning": None,
+        }
+    )
+    source_monitor_nws_realized = (
+        (realized_source_monitor_local or realized_source_monitor)
+        if source_monitor_nws_attribution["fully_attributable_to_nws"]
+        and source_monitor_nws_reporting.get("status") == "aligned"
+        else None
+    )
+    weather_family_realized = _combine_realized_tracks({
+        "forecast_weather": realized_weather,
+        "source_monitor_nws": source_monitor_nws_realized,
+    })
 
     pack = {
         "artifact_type": "weather_observation_pack",
@@ -516,10 +795,40 @@ def build_observation_pack(
             "weather_bias": str(weather_bias_path),
             "kalshi_trades": str(weather_trades_path),
             "weather_execution_trades": str(weather_trades_path),
+            "monitor_trades": str(monitor_trades_path),
+            "source_monitor_nws_execution_trades": str(monitor_trades_path),
         },
         "weather_pnl": {
             "realized": realized_weather,
+            "realized_api_settlements": realized_weather_api,
             "financial_snapshot": _freshness_from(financial_snapshot_path, financial_snapshot, now=now),
+        },
+        "unattributed_weather": {
+            "realized": realized_unattributed_weather,
+            "basis": realized_unattributed_weather_basis,
+            "financial_snapshot": _freshness_from(financial_snapshot_path, financial_snapshot, now=now),
+            "reporting_note": (
+                "API-only KXHIGH settlements/fills with no canonical local order match; keep visible as historical "
+                "weather context but exclude from attributable forecast-weather and combined weather-family realized P&L"
+            ) if realized_unattributed_weather else None,
+        },
+        "source_monitor_nws": {
+            "realized": source_monitor_nws_realized,
+            "source_monitor_bot_realized": realized_source_monitor,
+            "source_monitor_bot_realized_api": realized_source_monitor_api,
+            "source_monitor_bot_realized_local_joined": realized_source_monitor_local,
+            "source_monitor_bot_realized_basis": realized_source_monitor_basis,
+            "financial_snapshot": _freshness_from(financial_snapshot_path, financial_snapshot, now=now),
+            "local_trade_log": source_monitor_nws_pnl,
+            "execution_quality": source_monitor_nws_execution,
+            "snapshot_attribution": source_monitor_nws_attribution,
+            "snapshot_local_reconciliation": source_monitor_nws_reconciliation,
+            "source_monitor_local_join_reconciliation": realized_source_monitor_local_reconciliation,
+            "reporting_recommendation": source_monitor_nws_reporting,
+        },
+        "weather_family": {
+            "realized": weather_family_realized,
+            "reporting_recommendation": source_monitor_nws_reporting if realized_source_monitor else None,
         },
         "freshness": {
             "backtest_results": _freshness_from(backtest_results_path, backtest_results, now=now),
@@ -556,6 +865,25 @@ def _print_human(pack):
             f"Weather realized P&L: {realized.get('pnl_cents', 0)} cents "
             f"({realized.get('wins', 0)}W/{realized.get('losses', 0)}L, "
             f"win_rate={realized.get('win_rate')})"
+        )
+    source_monitor = pack.get("source_monitor_nws", {}).get("realized") or {}
+    if source_monitor:
+        print(
+            f"Source-monitor NWS realized P&L: {source_monitor.get('pnl_cents', 0)} cents "
+            f"({source_monitor.get('wins', 0)}W/{source_monitor.get('losses', 0)}L, "
+            f"win_rate={source_monitor.get('win_rate')})"
+        )
+    unattributed = pack.get("unattributed_weather", {}).get("realized") or {}
+    if unattributed:
+        print(
+            f"Unattributed weather history: {unattributed.get('pnl_cents', 0)} cents "
+            f"({unattributed.get('wins', 0)}W/{unattributed.get('losses', 0)}L)"
+        )
+    family = pack.get("weather_family", {}).get("realized") or {}
+    if family:
+        print(
+            f"Weather family realized P&L: {family.get('pnl_cents', 0)} cents "
+            f"(leader={family.get('leader_by_realized_pnl')})"
         )
     freshness = pack.get("freshness", {})
     backtest = freshness.get("backtest_results", {})
@@ -647,6 +975,11 @@ def main():
         help="Path to the canonical weather trade log",
     )
     parser.add_argument(
+        "--monitor-trades-path",
+        default=str(DEFAULT_MONITOR_TRADES_PATH),
+        help="Path to the canonical source-monitor trade log",
+    )
+    parser.add_argument(
         "--weather-bias-path",
         default=str(DEFAULT_WEATHER_BIAS_PATH),
         help="Path to weather-live-bias.json",
@@ -670,6 +1003,7 @@ def main():
         calibration_path=args.calibration_path,
         weather_verification_path=args.weather_verification_path,
         weather_trades_path=args.weather_trades_path,
+        monitor_trades_path=args.monitor_trades_path,
         weather_bias_path=args.weather_bias_path,
     )
 

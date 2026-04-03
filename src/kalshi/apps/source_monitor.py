@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 from app_bootstrap import AppContext, install_app_context
 from event_ledger import get_event_ledger
 from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
-from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, quarter_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, nws_sigma_for_hour
+from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, quarter_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, nws_sigma_for_hour, MAX_SPREAD_FOR_ENTRY, MIN_LIQUIDITY_VOLUME
 from research.opportunity_log import OpportunityLog
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
 from hdd_parser import get_album_sales, compute_data_age_hours, parse_album_threshold, check_sanity_health
@@ -282,7 +282,15 @@ def _validate_market_cluster(entity_key, market_signals):
             return []
     return sorted_signals
 
-def _nws_min_edge(running_high, threshold, hour, is_bracket):
+def _nws_city_min_edge_adder(city):
+    overrides = (((config or {}).get("sources") or {}).get("nws") or {}).get("cityMinEdgeAdders", {}) or {}
+    override = overrides.get(city)
+    if isinstance(override, (int, float)) and override > 0:
+        return float(override)
+    return 0.0
+
+
+def _nws_min_edge(running_high, threshold, hour, is_bracket, city=None):
     """Compute minimum edge threshold for NWS trades based on CI confidence.
 
     Uses 99% CI of NWS observation error:
@@ -292,15 +300,69 @@ def _nws_min_edge(running_high, threshold, hour, is_bracket):
       brackets:                          20% min edge (always)
     """
     if is_bracket:
-        return 0.20
-    sigma = nws_sigma_for_hour(hour)
-    ci_margin = abs(running_high - threshold)
-    ci_99 = 2.576 * sigma
-    if ci_margin > ci_99:
-        return 0.05
-    elif ci_margin > ci_99 * 0.5:
-        return 0.10
-    return 0.15
+        base = 0.20
+    else:
+        sigma = nws_sigma_for_hour(hour)
+        ci_margin = abs(running_high - threshold)
+        ci_99 = 2.576 * sigma
+        if ci_margin > ci_99:
+            base = 0.05
+        elif ci_margin > ci_99 * 0.5:
+            base = 0.10
+        else:
+            base = 0.15
+    return min(0.95, base + _nws_city_min_edge_adder(city))
+
+
+def _nws_sizing_plan(running_high, threshold, hour, is_bracket):
+    """Choose a Kelly sizing profile for NWS trades.
+
+    Keep observed-weather sizing conservative. The strongest NWS execution
+    improvement is better candidate selection, not larger Kelly sizing on a
+    small late-day cohort.
+    """
+    return quarter_kelly, "quarter_kelly"
+
+
+def _nws_liquidity_status(market, min_volume=None, max_spread=None):
+    """Classify why an NWS market fails the standard entry liquidity gate."""
+    vol_threshold = min_volume if min_volume is not None else MIN_LIQUIDITY_VOLUME
+    spread_threshold = max_spread if max_spread is not None else MAX_SPREAD_FOR_ENTRY
+
+    yes_bid = market.get("yes_bid", 0) or 0
+    yes_ask = market.get("yes_ask", 0) or 0
+    volume = market.get("volume", 0) or 0
+
+    if not yes_bid or not yes_ask:
+        return "empty_book"
+    if yes_ask - yes_bid > spread_threshold:
+        return "wide_spread"
+    if volume < vol_threshold:
+        return "low_volume"
+    return None
+
+
+def _nws_threshold_no_liquidity_override(liquidity_status, *, market, direction, side,
+                                         edge, min_edge, observation_age_minutes=None):
+    """Allow a narrow NWS-only liquidity bypass for strong threshold NO trades.
+
+    The intent is to capture the best observed-weather threshold NO setups
+    without loosening the normal gate for brackets, YES-side entries, or
+    empty-book markets.
+    """
+    if liquidity_status is None:
+        return False
+    if liquidity_status == "empty_book":
+        return False
+    if direction != "T" or side != "no":
+        return False
+    if edge <= min_edge:
+        return False
+    if not (market.get("yes_bid", 0) or 0):
+        return False
+    if observation_age_minutes is not None and observation_age_minutes > NWS_MAX_OBS_AGE_MINUTES:
+        return False
+    return True
 
 # === Kalshi Market Helpers ===
 def get_markets_by_prefix(prefix, status="open"):
@@ -1236,6 +1298,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                 max_cost = config["maxTradeAmount"] * 100
                 is_bracket = (direction == "B")
 
+                nws_sigma = nws_sigma_for_hour(city_hour)
                 prob = nws_probability(running_high, threshold, direction, city_hour)
                 selected_confidence = prob if prob > 0.5 else 1.0 - prob
                 research_fields = _source_monitor_research_fields(
@@ -1243,6 +1306,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     observed_value=running_high,
                     threshold=threshold,
                     confidence=selected_confidence,
+                    sigma=nws_sigma,
                     source_name=temp_data[city].get("station"),
                     market_title=m.get("title", ""),
                     city=city,
@@ -1260,21 +1324,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                 yes_ask = m.get("yes_ask", 0)
                 no_ask = m.get("no_ask", 0)
                 yes_bid = m.get("yes_bid", 0)
-
-                if not is_market_liquid(m):
-                    if ss:
-                        ss.skip("illiquid")
-                    _log_source_monitor_decision(
-                        ticker,
-                        "skip",
-                        "skipped",
-                        "illiquid",
-                        price_cents=yes_ask,
-                        yes_bid=yes_bid,
-                        volume=m.get("volume", 0),
-                        **research_fields,
-                    )
-                    continue
+                liquidity_status = _nws_liquidity_status(m)
 
                 # Determine trade side and edge
                 if direction == "T":
@@ -1285,7 +1335,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                 if prob > 0.5 and yes_ask and yes_ask < 99:
                     # Buy YES (raw edge, fees handled in Kelly)
                     edge = prob - yes_ask / 100
-                    min_edge = _nws_min_edge(running_high, threshold, city_hour, is_bracket)
+                    min_edge = _nws_min_edge(running_high, threshold, city_hour, is_bracket, city=city)
                     if edge <= min_edge:
                         if ss:
                             ss.skip("low_edge")
@@ -1294,6 +1344,20 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             edge=round(edge, 4), price_cents=yes_ask, min_edge=min_edge,
                             confidence=round(prob, 4), running_high=round(running_high, 1),
                             city=city, threshold=threshold, hour=city_hour,
+                            **research_fields,
+                        )
+                        continue
+                    if liquidity_status is not None:
+                        if ss:
+                            ss.skip("illiquid")
+                        _log_source_monitor_decision(
+                            ticker, "yes", "skipped", "illiquid",
+                            edge=round(edge, 4), price_cents=yes_ask, min_edge=min_edge,
+                            confidence=round(prob, 4), running_high=round(running_high, 1),
+                            city=city, threshold=threshold, hour=city_hour,
+                            yes_bid=yes_bid, volume=m.get("volume", 0),
+                            liquidity_status=liquidity_status,
+                            execution_style="standard",
                             **research_fields,
                         )
                         continue
@@ -1309,7 +1373,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                         continue
                     price = compute_limit_price(yes_bid, yes_ask, "yes", edge=edge) or yes_ask
                     fee = kalshi_fee_cents(price)
-                    count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+                    kelly_fn, sizing_label = _nws_sizing_plan(running_high, threshold, city_hour, is_bracket)
+                    count, risk, kelly_details = kelly_fn(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
                     if count <= 0:
                         if ss:
                             ss.skip("kelly_zero")
@@ -1328,7 +1393,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     result = trade_manager.place_order(ticker, "yes", price, count, reasoning,
                                                         market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                                         model_prob=round(prob, 4), raw_edge=round(edge, 4),
-                                                        fee_cents=round(fee, 2), sizing_method="quarter_kelly",
+                                                        fee_cents=round(fee, 2), sizing_method=sizing_label,
                                                         market_close_time=m.get("close_time"),
                                                         kelly_fraction=kelly_details.get("kelly_fraction"),
                                                         bankroll_used=kelly_details.get("bankroll_used"),
@@ -1336,6 +1401,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                                                         hour_of_day=city_hour,
                                                         city=city, direction=direction, threshold=threshold,
                                                         source_type="nws",
+                                                        execution_style="standard",
                                                         **research_fields)
                     if result:
                         if ss:
@@ -1345,6 +1411,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             edge=round(edge, 4), price_cents=price, count=count,
                             confidence=round(prob, 4), running_high=round(running_high, 1),
                             city=city, threshold=threshold, hour=city_hour,
+                            execution_style="standard",
                             **research_fields,
                         )
                         allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)
@@ -1353,7 +1420,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     # Buy NO (raw edge, fees handled in Kelly)
                     no_prob = 1.0 - prob
                     edge = no_prob - no_ask / 100
-                    min_edge = _nws_min_edge(running_high, threshold, city_hour, is_bracket)
+                    min_edge = _nws_min_edge(running_high, threshold, city_hour, is_bracket, city=city)
                     if edge <= min_edge:
                         if ss:
                             ss.skip("low_edge")
@@ -1362,6 +1429,30 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             edge=round(edge, 4), price_cents=no_ask, min_edge=min_edge,
                             confidence=round(no_prob, 4), running_high=round(running_high, 1),
                             city=city, threshold=threshold, hour=city_hour,
+                            **research_fields,
+                        )
+                        continue
+                    override_liquidity = _nws_threshold_no_liquidity_override(
+                        liquidity_status,
+                        market=m,
+                        direction=direction,
+                        side="no",
+                        edge=edge,
+                        min_edge=min_edge,
+                        observation_age_minutes=temp_data[city].get("obs_age_minutes"),
+                    )
+                    execution_style = "nws_threshold_no_override" if override_liquidity else "standard"
+                    if liquidity_status is not None and not override_liquidity:
+                        if ss:
+                            ss.skip("illiquid")
+                        _log_source_monitor_decision(
+                            ticker, "no", "skipped", "illiquid",
+                            edge=round(edge, 4), price_cents=no_ask, min_edge=min_edge,
+                            confidence=round(no_prob, 4), running_high=round(running_high, 1),
+                            city=city, threshold=threshold, hour=city_hour,
+                            yes_bid=yes_bid, volume=m.get("volume", 0),
+                            liquidity_status=liquidity_status,
+                            execution_style=execution_style,
                             **research_fields,
                         )
                         continue
@@ -1377,7 +1468,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                         continue
                     price = compute_limit_price(yes_bid, yes_ask, "no", edge=edge) or no_ask
                     fee = kalshi_fee_cents(price)
-                    count, risk, kelly_details = quarter_kelly(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
+                    kelly_fn, sizing_label = _nws_sizing_plan(running_high, threshold, city_hour, is_bracket)
+                    count, risk, kelly_details = kelly_fn(edge, price, budget.max_cost_cents, bankroll_cents=budget.bankroll_cents, fee_cents=fee, return_details=True)
                     if count <= 0:
                         if ss:
                             ss.skip("kelly_zero")
@@ -1396,7 +1488,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     result = trade_manager.place_order(ticker, "no", price, count, reasoning,
                                                         market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
                                                         model_prob=round(prob, 4), raw_edge=round(edge, 4),
-                                                        fee_cents=round(fee, 2), sizing_method="quarter_kelly",
+                                                        fee_cents=round(fee, 2), sizing_method=sizing_label,
                                                         market_close_time=m.get("close_time"),
                                                         kelly_fraction=kelly_details.get("kelly_fraction"),
                                                         bankroll_used=kelly_details.get("bankroll_used"),
@@ -1404,6 +1496,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                                                         hour_of_day=city_hour,
                                                         city=city, direction=direction, threshold=threshold,
                                                         source_type="nws",
+                                                        execution_style=execution_style,
+                                                        liquidity_status=liquidity_status,
                                                         **research_fields)
                     if result:
                         if ss:
@@ -1413,6 +1507,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             edge=round(edge, 4), price_cents=price, count=count,
                             confidence=round(no_prob, 4), running_high=round(running_high, 1),
                             city=city, threshold=threshold, hour=city_hour,
+                            execution_style=execution_style,
+                            liquidity_status=liquidity_status,
                             **research_fields,
                         )
                         allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)

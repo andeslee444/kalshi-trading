@@ -75,13 +75,27 @@ def _audit_index(rows):
     return {row.get("city"): row for row in rows if row.get("city")}
 
 
+def _merged_conflict_source(conflict_row, audit_row):
+    merged = dict(conflict_row or {})
+    if audit_row:
+        merged.update(audit_row)
+    return merged
+
+
 def _merge_city_record(city, pnl_row, conflict_row, audit_row):
-    conflict_source = conflict_row or audit_row or {}
+    conflict_source = _merged_conflict_source(conflict_row, audit_row)
     record = {
         "city": city,
+        "track": "forecast_weather",
         "pnl_cents": _safe_int(pnl_row.get("pnl_cents") if pnl_row else 0),
-        "settled": _safe_int(pnl_row.get("settled") if pnl_row else 0),
-        "trades": _safe_int(pnl_row.get("trades") if pnl_row else 0),
+        "settled": _safe_int(
+            (pnl_row or {}).get("settled"),
+            default=_safe_int((audit_row or {}).get("settled"), default=0),
+        ),
+        "trades": _safe_int(
+            (pnl_row or {}).get("trades"),
+            default=_safe_int((audit_row or {}).get("trades"), default=0),
+        ),
         "win_rate": _safe_float(pnl_row.get("win_rate") if pnl_row else None),
         "fees_cents": _safe_int(pnl_row.get("fees_cents") if pnl_row else 0),
         "weather_pnl_cents": _safe_int(conflict_source.get("weather_pnl_cents"), default=0),
@@ -104,9 +118,44 @@ def _merge_city_record(city, pnl_row, conflict_row, audit_row):
         "resting_count": _safe_int((audit_row or {}).get("resting_count"), default=0),
         "maker_count": _safe_int((audit_row or {}).get("maker_count"), default=0),
     }
-    record["settled"] = record["settled"] or record["trade_count"]
-    record["trades"] = record["trades"] or record["trade_count"]
     return record
+
+
+def _source_monitor_city_records(observation_pack, thresholds):
+    source_monitor = observation_pack.get("source_monitor_nws", {}) if isinstance(observation_pack, dict) else {}
+    pnl_rows = (source_monitor.get("local_trade_log") or {}).get("by_city", [])
+    execution_rows = (source_monitor.get("execution_quality") or {}).get("per_city", {})
+    reporting = source_monitor.get("reporting_recommendation", {}) if isinstance(source_monitor, dict) else {}
+    ranked = []
+    for row in pnl_rows:
+        city = row.get("city")
+        if not city:
+            continue
+        execution = execution_rows.get(city, {}) if isinstance(execution_rows, dict) else {}
+        record = {
+            "city": city,
+            "track": "source_monitor_nws",
+            "pnl_cents": _safe_int(row.get("pnl_cents"), default=0),
+            "settled": _safe_int(row.get("settled"), default=0),
+            "trades": _safe_int(row.get("trades"), default=0),
+            "win_rate": _safe_float(row.get("win_rate")),
+            "fees_cents": _safe_int(row.get("fees_cents"), default=0),
+            "trade_count": _safe_int(row.get("trades"), default=0),
+            "executed_count": _safe_int(execution.get("executed"), default=0),
+            "resting_count": _safe_int(execution.get("resting"), default=0),
+            "maker_count": _safe_int(execution.get("maker"), default=0),
+            "bias_conflict": False,
+            "sign_flip": False,
+            "reporting_status": reporting.get("status"),
+        }
+        record["recommended_action"] = classify_city(record, thresholds=thresholds)
+        record["promotion_reason"] = _candidate_reason(record, record["recommended_action"])
+        ranked.append(record)
+
+    ranked.sort(key=_action_sort_key)
+    for idx, record in enumerate(ranked, start=1):
+        record["rank"] = idx
+    return ranked
 
 
 def classify_city(record, thresholds=None):
@@ -230,6 +279,41 @@ def build_promotion_artifact(
         record["rank"] = idx
 
     action_counts = Counter(record["recommended_action"] for record in ranked)
+    source_monitor_ranked = _source_monitor_city_records(observation_pack, thresholds)
+    source_monitor_action_counts = Counter(record["recommended_action"] for record in source_monitor_ranked)
+    forecast_realized_payload = (observation_pack.get("weather_pnl", {}) or {}).get("realized", {})
+    source_monitor_track = (observation_pack.get("source_monitor_nws", {}) or {})
+    source_monitor_realized_payload = source_monitor_track.get("realized") or {}
+    source_monitor_bot_realized_payload = source_monitor_track.get("source_monitor_bot_realized") or {}
+    weather_family_realized_payload = (observation_pack.get("weather_family", {}) or {}).get("realized", {})
+    forecast_realized = _safe_int(forecast_realized_payload.get("pnl_cents"))
+    source_monitor_realized = _safe_int(source_monitor_realized_payload.get("pnl_cents"))
+    source_monitor_bot_realized = _safe_int(source_monitor_bot_realized_payload.get("pnl_cents"))
+    weather_family_realized = _safe_int(weather_family_realized_payload.get("pnl_cents"))
+    source_monitor_reconciliation = (
+        (observation_pack.get("source_monitor_nws", {}) or {}).get("snapshot_local_reconciliation", {})
+        if isinstance(observation_pack, dict) else {}
+    )
+    source_monitor_attribution = (
+        (observation_pack.get("source_monitor_nws", {}) or {}).get("snapshot_attribution", {})
+        if isinstance(observation_pack, dict) else {}
+    )
+    source_monitor_reporting = (
+        (observation_pack.get("source_monitor_nws", {}) or {}).get("reporting_recommendation", {})
+        if isinstance(observation_pack, dict) else {}
+    )
+    review_tracks = []
+    if isinstance(source_monitor_realized_payload, dict) and source_monitor_realized_payload:
+        review_tracks.append((source_monitor_realized, "source_monitor_nws"))
+    if isinstance(forecast_realized_payload, dict) and forecast_realized_payload:
+        review_tracks.append((forecast_realized, "forecast_weather"))
+    review_order = [track for _, track in sorted(review_tracks, reverse=True)]
+    context_review_tracks = []
+    if isinstance(source_monitor_bot_realized_payload, dict) and source_monitor_bot_realized_payload:
+        context_review_tracks.append((source_monitor_bot_realized, "source_monitor_bot_context"))
+    if isinstance(forecast_realized_payload, dict) and forecast_realized_payload:
+        context_review_tracks.append((forecast_realized, "forecast_weather"))
+    context_review_order = [track for _, track in sorted(context_review_tracks, reverse=True)]
     artifact = {
         "artifact_type": "weather_promotion_candidates",
         "schema_version": 1,
@@ -248,6 +332,31 @@ def build_promotion_artifact(
             ][:3],
             "top_tighten_candidates": [row["city"] for row in ranked if row["recommended_action"] == "tighten"][:3],
             "top_shadow_only_candidates": [row["city"] for row in ranked if row["recommended_action"] == "shadow_only"][:6],
+        },
+        "forecast_weather": {
+            "summary": {
+                "counts_by_action": dict(sorted(action_counts.items())),
+            },
+            "ranked_cities": ranked,
+        },
+        "source_monitor_nws": {
+            "summary": {
+                "counts_by_action": dict(sorted(source_monitor_action_counts.items())),
+            },
+            "snapshot_attribution": source_monitor_attribution,
+            "reporting_recommendation": source_monitor_reporting,
+            "ranked_cities": source_monitor_ranked,
+        },
+        "weather_family_tracks": {
+            "forecast_weather_realized_pnl_cents": forecast_realized,
+            "source_monitor_nws_realized_pnl_cents": source_monitor_realized,
+            "source_monitor_bot_realized_pnl_cents": source_monitor_bot_realized,
+            "weather_family_realized_pnl_cents": weather_family_realized,
+            "review_order": review_order,
+            "context_review_order": context_review_order,
+            "source_monitor_snapshot_local_reconciliation": source_monitor_reconciliation,
+            "source_monitor_snapshot_attribution": source_monitor_attribution,
+            "source_monitor_reporting_recommendation": source_monitor_reporting,
         },
         "ranked_cities": ranked,
     }

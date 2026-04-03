@@ -9,6 +9,7 @@ import json
 import time
 import tempfile
 import pytest
+import capital_allocator as allocator_mod
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -312,6 +313,71 @@ class TestBalanceCacheTTL:
         alloc._get_balance()
         # Only one actual API call
         assert mock_client.get_balance.call_count == 1
+
+
+class TestDrawdownHaltRecovery:
+    def _make_allocator(self, tmp_path, *, balance=10000, available=10000, portfolio_value=None, exposure=0):
+        mock_client = MagicMock()
+        mock_client.get_balance.return_value = (balance, available)
+        mock_client._portfolio_value = portfolio_value
+        mock_client._market_exposure = exposure
+        state_path = tmp_path / "allocator-state.json"
+        state_path.write_text("{}")
+        deposits_path = tmp_path / "deposits.json"
+        deposits_path.write_text(json.dumps([{"type": "deposit", "amount_cents": 50000}]))
+        alloc = PortfolioAllocator(client=mock_client, state_path=state_path)
+        alloc._daily_date = datetime.date.today().isoformat()
+        return alloc
+
+    def test_drawdown_uses_portfolio_value_when_available(self, tmp_path, monkeypatch):
+        halt_path = tmp_path / "HALT_TRADING"
+        monkeypatch.setattr(allocator_mod, "_HALT_TRADING_PATH", halt_path)
+
+        alloc = self._make_allocator(
+            tmp_path,
+            balance=10000,
+            available=10000,
+            portfolio_value=45000,
+            exposure=0,
+        )
+
+        assert alloc._check_drawdown_halt() is False
+        assert not halt_path.exists()
+
+    def test_automated_halt_file_is_cleared_after_recovery(self, tmp_path, monkeypatch):
+        halt_path = tmp_path / "HALT_TRADING"
+        halt_path.write_text(
+            "Automated drawdown halt at 2026-04-02T00:00:00+00:00\n"
+            "NAV: $900.00 | Deposits: $5000.00 | Drawdown: 82.0%\n"
+        )
+        monkeypatch.setattr(allocator_mod, "_HALT_TRADING_PATH", halt_path)
+
+        alloc = self._make_allocator(
+            tmp_path,
+            balance=12000,
+            available=12000,
+            portfolio_value=42000,
+            exposure=0,
+        )
+
+        assert alloc._check_drawdown_halt() is False
+        assert not halt_path.exists()
+
+    def test_manual_halt_file_is_not_auto_cleared(self, tmp_path, monkeypatch):
+        halt_path = tmp_path / "HALT_TRADING"
+        halt_path.write_text("manual operator halt\n")
+        monkeypatch.setattr(allocator_mod, "_HALT_TRADING_PATH", halt_path)
+
+        alloc = self._make_allocator(
+            tmp_path,
+            balance=12000,
+            available=12000,
+            portfolio_value=42000,
+            exposure=0,
+        )
+
+        assert alloc._check_drawdown_halt() is False
+        assert halt_path.exists()
 
 
 # ===================================================================

@@ -82,11 +82,11 @@
     "weather": {
       "buckets": {
         "1-5": {
-          "wins": 3,
+          "wins": 5,
           "losses": 0
         },
         "6-10": {
-          "wins": 2,
+          "wins": 3,
           "losses": 0
         },
         "11-15": {

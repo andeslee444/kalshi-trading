@@ -2,9 +2,15 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Per CLAUDE.md, you may ONLY modify: `source-monitor.py`, `hdd_parser.py`, `test_source*.py`. Do NOT touch probability.py, kalshi_auth.py, or other bots.
 
-**Goal:** Optimize source monitor info-arbitrage signals. NWS timezone and observation gating are already correctly implemented. Focus on edge threshold optimization, data freshness hardening, and measurement. Target: +$20-30/day.
+**Goal:** Optimize the observed-weather / source-monitor NWS track. NWS timezone and observation gating are already correctly implemented. Focus on edge threshold optimization, data freshness hardening, and measurement. Target: +$20-30/day.
 
 **Architecture:** Real-time data fetching from NWS (weather actuals), HDD (album sales), Box Office Mojo. Trades when external data confirms outcome before market settles.
+
+**Weather-family note:** this is the observed-weather subtrack of the broader weather family. It is currently the strongest realized weather alpha, so its calibration and promotion decisions should be reviewed together with forecast-weather changes.
+
+**Audit note:** for the March 29, 2026 calibration refresh, source-monitor NWS execution update, and validation trail, use [2026-03-29-weather-family-calibration-audit.md](./2026-03-29-weather-family-calibration-audit.md).
+
+**Recovery note:** for the April 2, 2026 outage-recovery hardening, reconciliation repair, and live supervisor cutover, use [2026-04-02-weather-outage-recovery-audit.md](./2026-04-02-weather-outage-recovery-audit.md).
 
 **Tech Stack:** Python 3, NWS API, web scraping
 
@@ -92,3 +98,13 @@ def test_nws_uses_city_local_date():
 - Source monitor trades are logged separately but no settled outcomes available
 
 **Next steps:** Await first settlement cycle to establish baseline Brier for source-monitor trades.
+
+## Weather-Family Follow-Up
+
+- Use the shared weather family gate in [2026-03-22-weather-observation-window-worklist.md](./2026-03-22-weather-observation-window-worklist.md).
+- Treat source-monitor NWS calibration as separate from forecast-weather calibration, but do not promote them independently when the change affects the same weather-family capital bucket.
+- When reviewing weather promotions, compare source-monitor NWS performance against forecast-weather performance and rank them together by realized P&L, calibration quality, and execution quality.
+- Current live source-monitor posture after the March 29 implementation:
+  - refreshed `nws` calibration is live
+  - conservative quarter-Kelly sizing is retained
+  - the narrow threshold-NO liquidity override is the main live execution change under review

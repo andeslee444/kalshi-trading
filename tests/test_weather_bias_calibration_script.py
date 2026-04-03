@@ -1,6 +1,8 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
@@ -110,6 +112,24 @@ class TestCalibrateWeatherBiasScript:
 
         assert artifact["n_forecasts"] == 1
         assert artifact["per_city"]["MIA"]["gfs"]["bias"] == 2.0
+
+    def test_validate_bias_artifact_rejects_empty_output(self, tmp_path):
+        artifact = {"n_forecasts": 0}
+
+        with pytest.raises(SystemExit, match="Refusing to write empty weather-live-bias artifact"):
+            calibrate_live_mod.validate_bias_artifact(
+                artifact,
+                output_path=tmp_path / "weather-live-bias.json",
+            )
+
+    def test_validate_bias_artifact_can_allow_empty_output(self, tmp_path):
+        artifact = {"n_forecasts": 0}
+
+        assert calibrate_live_mod.validate_bias_artifact(
+            artifact,
+            output_path=tmp_path / "weather-live-bias.json",
+            allow_empty=True,
+        ) == artifact
 
 
 class TestBackfillWeatherDataEnhancements:

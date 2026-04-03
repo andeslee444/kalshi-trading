@@ -285,7 +285,7 @@ def format_ticker_human(ticker: str, city_names: dict | None = None) -> str:
         else:
             th_str = f"${threshold:,}"
         date_str = ""
-        if "date" in c:
+        if c.get("date"):
             date_parts = c["date"].split("-")
             month = MONTH_ABBR.get(int(date_parts[1]), date_parts[1])
             day = int(date_parts[2])

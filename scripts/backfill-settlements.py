@@ -53,6 +53,10 @@ def _gross_settlement_revenue_cents(trade):
     return 100 * _settlement_contract_count(trade) if trade.get("settlement_result") == "won" else 0
 
 
+def _is_buy_action(value):
+    return value in (None, "", "buy")
+
+
 def _trade_pnl_cents(trade):
     cost = trade.get("cost_cents", 0) or 0
     if trade.get("settlement_result") == "won":
@@ -66,7 +70,7 @@ def _sync_settled_trades_to_ledger(trade_file, trades, ledger):
     """Mirror settled local trade rows into the ledger idempotently."""
     synced = 0
     for trade in trades:
-        if trade.get("action", "buy") != "buy":
+        if not _is_buy_action(trade.get("action")):
             continue
         if trade.get("settlement_result") is None:
             continue
@@ -175,7 +179,7 @@ def backfill(dry_run=False):
         file_modified = 0
         for trade in trades:
             # Skip sell (exit) records — legacy records without action are assumed buys
-            if trade.get("action", "buy") != "buy":
+            if not _is_buy_action(trade.get("action")):
                 continue
             if trade.get("settlement_result") is not None:
                 continue

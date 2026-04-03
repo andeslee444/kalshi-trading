@@ -1,162 +1,73 @@
 {
-  "generated_at": "2026-03-07T18:34:00",
-  "n_settlements": 212,
-  "n_trades": 584,
+  "generated_at": "2026-03-29T22:02:45",
+  "n_settlements": 0,
+  "n_trades": 1535,
   "weather": {
-    "global_sigma_intercept": 5.01,
-    "global_sigma_slope": 0.2,
-    "df": 30,
-    "global_brier": 0.314465,
-    "global_log_loss": 0.949411,
-    "global_pnl_cents": 36653,
+    "global_sigma_intercept": 5.8,
+    "global_sigma_slope": 1.7,
+    "df": 4,
+    "global_brier": 0.259519,
+    "global_log_loss": 0.787451,
+    "global_pnl_cents": 19384,
     "per_city": {
-      "LAX": {
-        "sigma_intercept": 4.75,
-        "sigma_slope": 0.2,
-        "df": 8,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 4.731
-      },
-      "DEN": {
-        "sigma_intercept": 6.37,
-        "sigma_slope": 0.2,
-        "df": 7,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 6.486
-      },
-      "AUS": {
-        "sigma_intercept": 5.81,
-        "sigma_slope": 0.2,
-        "df": 5,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 5.874
-      },
-      "CHI": {
-        "sigma_intercept": 5.94,
-        "sigma_slope": 1.02,
-        "df": 5,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 6.024
-      },
-      "NY": {
-        "sigma_intercept": 5.36,
-        "sigma_slope": 0.2,
-        "df": 15,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 5.385
-      },
       "MIA": {
-        "sigma_intercept": 4.44,
-        "sigma_slope": 0.2,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 4.397
+        "sigma_intercept": 5.87,
+        "sigma_slope": 0.67,
+        "df": 4,
+        "n": 33,
+        "shrinkage_weight": 0.688
       },
-      "PHIL": {
-        "sigma_intercept": 5.51,
-        "sigma_slope": 0.2,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 5.555
+      "LAX": {
+        "sigma_intercept": 5.73,
+        "sigma_slope": 0.59,
+        "df": 4,
+        "n": 43,
+        "shrinkage_weight": 0.741
       },
       "HOU": {
-        "sigma_intercept": 4.23,
-        "sigma_slope": 0.2,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 4.165
+        "sigma_intercept": 4.96,
+        "sigma_slope": 1.17,
+        "df": 8,
+        "n": 12,
+        "shrinkage_weight": 0.444
       },
-      "ATL": {
-        "sigma_intercept": 5.22,
-        "sigma_slope": 0.2,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 5.233
+      "DEN": {
+        "sigma_intercept": 5.02,
+        "sigma_slope": 0.63,
+        "df": 4,
+        "n": 37,
+        "shrinkage_weight": 0.712
       },
-      "BOS": {
-        "sigma_intercept": 5.27,
-        "sigma_slope": 0.2,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 5.288
+      "AUS": {
+        "sigma_intercept": 5.8,
+        "sigma_slope": 0.67,
+        "df": 4,
+        "n": 33,
+        "shrinkage_weight": 0.688
       },
-      "SFO": {
-        "sigma_intercept": 3.87,
-        "sigma_slope": 0.2,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 3.775
+      "PHIL": {
+        "sigma_intercept": 5.68,
+        "sigma_slope": 0.78,
+        "df": 4,
+        "n": 24,
+        "shrinkage_weight": 0.615
       },
-      "SEA": {
-        "sigma_intercept": 3.33,
-        "sigma_slope": 0.2,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 3.19
+      "CHI": {
+        "sigma_intercept": 5.87,
+        "sigma_slope": 2.89,
+        "df": 4,
+        "n": 43,
+        "shrinkage_weight": 0.741
       },
-      "LV": {
-        "sigma_intercept": 3.43,
-        "sigma_slope": 0.2,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 3.3
-      },
-      "DAL": {
-        "sigma_intercept": 5.06,
-        "sigma_slope": 0.2,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 5.061
-      },
-      "MIN": {
-        "sigma_intercept": 6.54,
-        "sigma_slope": 0.2,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 6.664
-      },
-      "PHX": {
-        "sigma_intercept": 3.61,
-        "sigma_slope": 0.2,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 3.493
-      },
-      "DC": {
-        "sigma_intercept": 5.25,
-        "sigma_slope": 0.2,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 5.275
-      },
-      "NOLA": {
-        "sigma_intercept": 4.9,
-        "sigma_slope": 0.2,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 4.895
-      },
-      "OKC": {
-        "sigma_intercept": 6.16,
-        "sigma_slope": 0.2,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 6.26
-      },
-      "SATX": {
-        "sigma_intercept": 5.07,
-        "sigma_slope": 0.2,
-        "n": 178,
-        "shrinkage_weight": 0.922,
-        "raw_residual_std": 5.073
+      "NY": {
+        "sigma_intercept": 5.87,
+        "sigma_slope": 0.61,
+        "df": 4,
+        "n": 40,
+        "shrinkage_weight": 0.727
       }
     },
-    "n": 81,
+    "n": 268,
     "recommended_edge_threshold": 0.1,
     "bias_correction": {
       "generated_at": "2026-03-11T20:28:00.277623",
@@ -718,7 +629,23 @@
     }
   },
   "nws": {
-    "n": 0
+    "sigma_by_hour": {
+      "17+": 0.6,
+      "15-16": 2.1,
+      "before_15": 7.9
+    },
+    "n": 80,
+    "n_by_hour": {
+      "17+": 40,
+      "15-16": 12,
+      "before_15": 28
+    },
+    "basis_by_hour": {
+      "17+": "fit",
+      "15-16": "carried_forward",
+      "before_15": "carried_forward"
+    },
+    "runtime_min_hour": 8
   },
   "album_sales": {
     "n": 0
@@ -728,15 +655,20 @@
   },
   "ensemble": {
     "weights": {
-      "gfs": 0.4105,
-      "icon": 0.2295,
-      "ecmwf": 0.36
+      "icon": 0.1999,
+      "gfs": 0.3788,
+      "nbm": 0.0187,
+      "graphcast": 0.0236,
+      "ecmwf": 0.3789
     },
     "model_maes": {
-      "gfs": 0.385435,
-      "icon": 0.3927
+      "gfs": 0.355646,
+      "icon": 0.335642,
+      "ecmwf": 0.353856,
+      "nbm": 0.357464,
+      "graphcast": 0.283338
     },
-    "n": 12
+    "n": 174
   },
-  "sigma_updated_at": "2026-03-12T01:17:46.332591"
+  "sigma_updated_at": "2026-03-29T22:02:45"
 }

@@ -1,6 +1,7 @@
 """Tests for the shared probability module (src/kalshi/probability.py)."""
 
 import datetime
+import json
 import math
 import pytest
 
@@ -793,6 +794,27 @@ class TestCalibrationLoadLogging:
                 "Should log WARNING with the actual parse error"
         finally:
             probability._CALIBRATION_PATH = original
+
+    def test_calibration_reloads_when_file_changes(self, tmp_path):
+        import probability
+        original = probability._CALIBRATION_PATH
+        cal_path = tmp_path / "calibration.json"
+        cal_path.write_text(json.dumps({"nws": {"sigma_by_hour": {"17+": 0.5}}}))
+        probability._CALIBRATION_PATH = cal_path
+        probability._calibration = None
+        probability._calibration_source = None
+        try:
+            first = probability._load_calibration()
+            assert first["nws"]["sigma_by_hour"]["17+"] == 0.5
+
+            cal_path.write_text(json.dumps({"nws": {"sigma_by_hour": {"17+": 1.7}}}))
+
+            second = probability._load_calibration()
+            assert second["nws"]["sigma_by_hour"]["17+"] == 1.7
+        finally:
+            probability._CALIBRATION_PATH = original
+            probability._calibration = None
+            probability._calibration_source = None
 
 
 class TestCalibrationFreshness:

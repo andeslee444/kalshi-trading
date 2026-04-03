@@ -22,6 +22,10 @@
     },
     "nws": {
       "enabled": true,
+      "cityMinEdgeAdders": {
+        "CHI": 0.05,
+        "LAX": 0.05
+      },
       "stations": {
         "MIA": "KMIA",
         "LAX": "KLAX",

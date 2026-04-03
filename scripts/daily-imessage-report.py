@@ -45,6 +45,22 @@ def format_dollars(cents: int) -> str:
     return f"-${abs(cents) / 100:.2f}"
 
 
+def _basis_label(basis: str | None) -> str:
+    if basis == "local_buy_orders_joined_to_api_fills_and_settlement_outcomes":
+        return "local"
+    if basis == "kalshi_api_settlements":
+        return "api"
+    if basis:
+        return basis
+    return "unknown"
+
+
+def _bot_display_name(bot: str) -> str:
+    if bot == "unattributed-weather":
+        return "unattributed-weather history"
+    return bot
+
+
 def build_report(snap: dict) -> str:
     lines = []
     now = datetime.now().strftime("%b %d, %Y")
@@ -91,6 +107,7 @@ def build_report(snap: dict) -> str:
 
     # Per-bot performance
     by_bot = rp.get("by_bot", {})
+    by_bot_basis_map = rp.get("by_bot_basis_map", {})
     active_bots = {k: v for k, v in by_bot.items()
                    if v.get("wins", 0) + v.get("losses", 0) > 0 or v.get("pnl_cents", 0) != 0}
 
@@ -105,7 +122,15 @@ def build_report(snap: dict) -> str:
             wr = d.get("win_rate", 0)
             pnl = d.get("pnl_cents", 0)
             fees = d.get("fees_cents", 0)
-            lines.append(f"  {bot}: {format_dollars(pnl)} | {wins}W/{losses}L ({wr * 100:.0f}%) | fees ${fees / 100:.2f}")
+            basis = _basis_label(by_bot_basis_map.get(bot))
+            bot_name = _bot_display_name(bot)
+            line = (
+                f"  {bot_name}: {format_dollars(pnl)} | {wins}W/{losses}L "
+                f"({wr * 100:.0f}%) | fees ${fees / 100:.2f} | basis={basis}"
+            )
+            if bot == "unattributed-weather":
+                line += " | excludes canonical weather-family bots"
+            lines.append(line)
 
     # Open positions summary
     unrealized_data = snap.get("unrealized_pnl", {})

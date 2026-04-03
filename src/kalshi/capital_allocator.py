@@ -146,6 +146,7 @@ DRAWDOWN_HALT_THRESHOLD = _load_drawdown_threshold()
 DRAWDOWN_CHECK_INTERVAL = 60  # check at most once per 60 seconds
 _HALT_TRADING_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "HALT_TRADING"
 _DEPOSITS_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "deposits.json"
+_AUTOMATED_DRAWDOWN_HALT_PREFIX = "Automated drawdown halt"
 
 
 def _load_per_bot_daily_limits():
@@ -345,6 +346,26 @@ class PortfolioAllocator:
     def _clear_cluster_denial(self, bot_name):
         self._cluster_denial_streaks.pop(bot_name, None)
 
+    def _is_automated_drawdown_halt(self, path=None):
+        halt_path = Path(path) if path is not None else _HALT_TRADING_PATH
+        if not halt_path.exists():
+            return False
+        try:
+            return halt_path.read_text().startswith(_AUTOMATED_DRAWDOWN_HALT_PREFIX)
+        except OSError:
+            return False
+
+    def _clear_drawdown_halt_file(self, path=None):
+        halt_path = Path(path) if path is not None else _HALT_TRADING_PATH
+        if not self._is_automated_drawdown_halt(halt_path):
+            return False
+        try:
+            halt_path.unlink()
+            return True
+        except OSError as exc:
+            self.log.warning("Failed to clear automated drawdown halt file %s: %s", halt_path, exc)
+            return False
+
     def _check_drawdown_halt(self):
         """Check if portfolio drawdown exceeds threshold. Creates HALT_TRADING if so.
 
@@ -357,12 +378,18 @@ class PortfolioAllocator:
         self._last_drawdown_check = now
 
         try:
-            # Get current NAV (cash + cost basis of open positions)
+            # Prefer mark-to-market portfolio value when available; fall back to
+            # market_exposure for older clients/payloads.
             total_balance, _ = self._get_balance()
-            exposure = getattr(self.client, '_market_exposure', 0) if self.client else 0
-            if not isinstance(exposure, (int, float)):
-                exposure = 0
-            nav = total_balance + exposure
+            portfolio_value = getattr(self.client, "_portfolio_value", None) if self.client else None
+            if not isinstance(portfolio_value, (int, float)):
+                portfolio_value = None
+            position_value = portfolio_value
+            if position_value is None:
+                position_value = getattr(self.client, "_market_exposure", 0) if self.client else 0
+            if not isinstance(position_value, (int, float)):
+                position_value = 0
+            nav = total_balance + position_value
             if nav <= 0:
                 return False
 
@@ -383,18 +410,18 @@ class PortfolioAllocator:
             if net_funded <= 0:
                 return False
 
-            # Check drawdown using NAV (cash + position cost basis)
+            # Check drawdown using NAV (cash + current position value)
             drawdown_pct = (net_funded - nav) / net_funded
             if drawdown_pct >= DRAWDOWN_HALT_THRESHOLD:
                 if not self._drawdown_halted:
                     msg = (f"DRAWDOWN HALT: NAV ${nav/100:.2f} "
-                           f"(cash=${total_balance/100:.2f} + positions=${exposure/100:.2f}) is "
+                           f"(cash=${total_balance/100:.2f} + positions=${position_value/100:.2f}) is "
                            f"{drawdown_pct*100:.1f}% below deposits ${net_funded/100:.2f} "
                            f"(threshold: {DRAWDOWN_HALT_THRESHOLD*100:.0f}%)")
                     self.log.critical(msg)
                     _HALT_TRADING_PATH.write_text(
                         f"Automated drawdown halt at {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n"
-                        f"NAV: ${nav/100:.2f} (cash=${total_balance/100:.2f} + positions=${exposure/100:.2f}) | "
+                        f"NAV: ${nav/100:.2f} (cash=${total_balance/100:.2f} + positions=${position_value/100:.2f}) | "
                         f"Deposits: ${net_funded/100:.2f} | Drawdown: {drawdown_pct*100:.1f}%\n"
                     )
                     try:
@@ -405,6 +432,13 @@ class PortfolioAllocator:
                     self._drawdown_halted = True
                 return True
             else:
+                if self._drawdown_halted or self._is_automated_drawdown_halt():
+                    self.log.info(
+                        "Drawdown recovered: NAV $%.2f vs deposits $%.2f. Clearing automated halt.",
+                        nav / 100,
+                        net_funded / 100,
+                    )
+                    self._clear_drawdown_halt_file()
                 self._drawdown_halted = False
                 return False
         except Exception as e:

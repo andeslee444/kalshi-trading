@@ -21,6 +21,33 @@ from weather_promotion_candidates import build_promotion_artifact, classify_city
 def _observation_pack():
     return {
         "generated_at": "2026-03-23T00:47:47.383397+00:00",
+        "weather_pnl": {
+            "realized": {"pnl_cents": 58900}
+        },
+        "source_monitor_nws": {
+            "realized": None,
+            "source_monitor_bot_realized": {"pnl_cents": 163400},
+            "snapshot_local_reconciliation": {"settled_mismatch": True, "pnl_mismatch": True},
+            "snapshot_attribution": {"fully_attributable_to_nws": True},
+            "reporting_recommendation": {"status": "mismatch_under_review"},
+            "local_trade_log": {
+                "by_city": [
+                    {"city": "MIA", "pnl_cents": 253894, "settled": 8, "trades": 8, "win_rate": 0.625, "fees_cents": 12},
+                    {"city": "DEN", "pnl_cents": 39065, "settled": 11, "trades": 11, "win_rate": 0.727, "fees_cents": 13},
+                    {"city": "PHIL", "pnl_cents": 32556, "settled": 5, "trades": 5, "win_rate": 0.8, "fees_cents": 7},
+                ]
+            },
+            "execution_quality": {
+                "per_city": {
+                    "MIA": {"executed": 3, "resting": 2, "maker": 2},
+                    "DEN": {"executed": 2, "resting": 4, "maker": 3},
+                    "PHIL": {"executed": 1, "resting": 1, "maker": 1},
+                }
+            },
+        },
+        "weather_family": {
+            "realized": {"pnl_cents": 58900}
+        },
         "city_pnl": {
             "by_city": [
                 {"city": "PHIL", "pnl_cents": 81280, "settled": 18, "trades": 18, "win_rate": 0.778},
@@ -88,6 +115,12 @@ def test_build_promotion_artifact_ranks_expand_first_and_shadow_last():
     assert artifact["summary"]["counts_by_action"]["expand_after_refresh"] == 3
     assert artifact["summary"]["counts_by_action"]["tighten"] == 2
     assert artifact["summary"]["top_expand_after_refresh_candidates"] == ["PHIL", "LAX", "DEN"]
+    assert artifact["weather_family_tracks"]["review_order"] == ["forecast_weather"]
+    assert artifact["weather_family_tracks"]["context_review_order"] == ["source_monitor_bot_context", "forecast_weather"]
+    assert artifact["weather_family_tracks"]["weather_family_realized_pnl_cents"] == 58900
+    assert artifact["weather_family_tracks"]["source_monitor_nws_realized_pnl_cents"] == 0
+    assert artifact["weather_family_tracks"]["source_monitor_bot_realized_pnl_cents"] == 163400
+    assert artifact["source_monitor_nws"]["ranked_cities"][0]["city"] == "MIA"
 
 
 def test_cli_save_writes_derived_artifact(tmp_path):
@@ -144,3 +177,30 @@ def test_missing_city_audit_still_preserves_expand_after_refresh_when_conflicts_
     assert rows["PHIL"]["recommended_action"] == "expand_after_refresh"
     assert rows["LAX"]["recommended_action"] == "expand_after_refresh"
     assert rows["DEN"]["recommended_action"] == "expand_after_refresh"
+
+
+def test_city_audit_conflict_fields_override_observation_pack():
+    pack = _observation_pack()
+    pack["city_bias"]["conflicts"] = [
+        {"city": "NY", "bias_conflict": True, "sign_flip": True, "gap_f": 9.0, "live_confidence": 0.1}
+    ]
+    artifact = build_promotion_artifact(pack, city_audit_rows=[
+        {"city": "NY", "bias_conflict": False, "sign_flip": False, "gap_f": 2.0, "live_confidence": 0.9, "trade_count": 32}
+    ])
+    rows = {row["city"]: row for row in artifact["ranked_cities"]}
+
+    assert rows["NY"]["bias_conflict"] is False
+    assert rows["NY"]["sign_flip"] is False
+    assert rows["NY"]["gap_f"] == 2.0
+    assert rows["NY"]["live_confidence"] == 0.9
+
+
+def test_audit_only_trade_count_does_not_replace_settled_sample():
+    artifact = build_promotion_artifact(
+        {"city_pnl": {"by_city": []}, "city_bias": {"conflicts": []}},
+        city_audit_rows=[{"city": "ATL", "trade_count": 20, "executed_count": 5}],
+    )
+    rows = {row["city"]: row for row in artifact["ranked_cities"]}
+
+    assert rows["ATL"]["settled"] == 0
+    assert rows["ATL"]["recommended_action"] == "shadow_only"

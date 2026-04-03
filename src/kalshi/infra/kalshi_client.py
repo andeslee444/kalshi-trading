@@ -225,6 +225,8 @@ class KalshiClient:
         self._market_cache_ttl = market_cache_ttl
         self._time_module = time_module
         self._market_cache = {}
+        self._market_exposure = 0
+        self._portfolio_value = None
 
         base_url_override = os.environ.get("KALSHI_BASE_URL")
         if base_url_override:
@@ -458,6 +460,7 @@ class KalshiClient:
         """Get portfolio balance. Returns (balance_cents, available_cents)."""
         data = self.get("/portfolio/balance")
         self._market_exposure = data.get("market_exposure", 0)
+        self._portfolio_value = data.get("portfolio_value")
         return data.get("balance", 0), data.get("available_balance", data.get("balance", 0))
 
 

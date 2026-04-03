@@ -83,11 +83,13 @@ def _parse_previous_runs_daily(payload):
     return {lead_days: values for lead_days, values in by_lead.items() if values}
 
 
-def fetch_previous_runs_forecasts(lat, lon, past_days, model_name, city_code=None):
+def fetch_previous_runs_forecasts(lat, lon, past_days, model_name, city_code=None, strict=False):
     """Fetch historical deterministic forecasts from Open-Meteo Previous Runs API.
 
     Returns:
         dict of {lead_days: {date_str: temp_f}} or empty dict on failure.
+        When strict=True, raises with model/city/url context instead of
+        silently returning an empty dict.
     """
     api_key = os.environ.get("OPEN_METEO_API_KEY", "")
     request_model = open_meteo_model_name(model_name, api_key=api_key)
@@ -107,10 +109,20 @@ def fetch_previous_runs_forecasts(lat, lon, past_days, model_name, city_code=Non
     try:
         resp = retry_request("GET", url, timeout=15, max_retries=2)
         if resp is None or resp.status_code != 200:
+            if strict:
+                raise RuntimeError(
+                    f"previous-runs fetch failed for city={city_code or '?'} "
+                    f"model={model_name} status={getattr(resp, 'status_code', 'no_response')} url={url}"
+                )
             return {}
         data = resp.json()
         return _parse_previous_runs_daily(data)
     except Exception as e:
+        if strict:
+            raise RuntimeError(
+                f"previous-runs fetch failed for city={city_code or '?'} "
+                f"model={model_name} url={url}: {e}"
+            ) from e
         print(f"  Warning: Previous runs API error for {model_name}: {e}")
         return {}
 
@@ -210,15 +222,23 @@ def main():
 
         # 2. Fetch historical forecasts from Open-Meteo Previous Runs
         all_forecasts = {}  # {(model_name, lead_days): {date: temp}}
+        model_errors = []
         for api_model, short_name in selected_models.items():
             print(f"  Fetching {short_name} historical forecasts...")
-            forecasts_by_lead = fetch_previous_runs_forecasts(
-                lat,
-                lon,
-                args.days,
-                api_model,
-                city_code=code,
-            )
+            try:
+                forecasts_by_lead = fetch_previous_runs_forecasts(
+                    lat,
+                    lon,
+                    args.days,
+                    api_model,
+                    city_code=code,
+                    strict=True,
+                )
+            except Exception as e:
+                model_errors.append(str(e))
+                print(f"  Error fetching {short_name}: {e}")
+                time.sleep(0.3)
+                continue
             total_model_dates = sum(len(fc) for fc in forecasts_by_lead.values())
             for lead_days, fc in forecasts_by_lead.items():
                 all_forecasts[(short_name, lead_days)] = fc
@@ -227,6 +247,12 @@ def main():
                 f"across leads {sorted(forecasts_by_lead.keys())}"
             )
             time.sleep(0.3)  # Rate limit
+
+        if not all_forecasts and model_errors:
+            raise SystemExit(
+                f"All previous-runs forecast fetches failed for {code}: "
+                + " | ".join(model_errors)
+            )
 
         # 3. Match forecasts to actuals
         rows = []

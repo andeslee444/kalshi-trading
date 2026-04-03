@@ -87,6 +87,39 @@ def test_backfill_writes_gross_settlement_payout(tmp_path, monkeypatch):
     assert written["rows"][0]["settlement_revenue_cents"] == 200
 
 
+def test_backfill_treats_null_action_as_legacy_buy(tmp_path, monkeypatch):
+    module = _load_script()
+    trade_path = tmp_path / "trades.json"
+    trade_path.write_text("[]")
+
+    trades = [
+        {
+            "ticker": "SETTLED-BUY",
+            "action": None,
+            "side": "yes",
+            "count": 1,
+            "cost_cents": 40,
+            "price_cents": 40,
+            "settlement_result": None,
+            "timestamp": "2026-03-15T00:00:00+00:00",
+        }
+    ]
+    written = {}
+    fake_ledger = MagicMock()
+
+    monkeypatch.setattr(module, "TRADE_FILES", [trade_path])
+    monkeypatch.setattr(module, "load_trades", lambda path: [dict(t) for t in trades])
+    monkeypatch.setattr(module, "KalshiClient", lambda: object())
+    monkeypatch.setattr(module, "_query_market", lambda client, ticker: {"yes_won": True, "status": "settled"})
+    monkeypatch.setattr(module, "_atomic_write_json", lambda path, rows: written.setdefault("rows", rows))
+    monkeypatch.setattr(module, "get_event_ledger", lambda logger=None: fake_ledger)
+
+    annotated = module.backfill(dry_run=False)
+
+    assert annotated == 1
+    assert written["rows"][0]["settlement_result"] == "won"
+
+
 def test_summary_report_derives_pnl_from_outcome_not_revenue_field(tmp_path, monkeypatch, capsys):
     module = _load_script()
     trade_path = tmp_path / "trades.json"

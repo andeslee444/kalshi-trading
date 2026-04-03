@@ -96,6 +96,16 @@ def _archive_previous_loop():
         _log.warning("Failed to archive previous loop: %s", e)
 
 
+def _select_trading_outcome_by_bot(snapshot, attribution):
+    realized_pnl = snapshot.get("realized_pnl", {}) if isinstance(snapshot, dict) else {}
+    snapshot_by_bot = realized_pnl.get("by_bot", {}) if isinstance(realized_pnl, dict) else {}
+    snapshot_basis_map = realized_pnl.get("by_bot_basis_map", {}) if isinstance(realized_pnl, dict) else {}
+    if snapshot_by_bot:
+        return snapshot_by_bot, snapshot_basis_map, "financial_snapshot.by_bot"
+    attribution_by_bot = attribution.get("by_bot", {}) if isinstance(attribution, dict) else {}
+    return attribution_by_bot, {}, "attribution_report.by_bot_fallback"
+
+
 # ── Stage 0: Refresh ────────────────────────────────────────────────
 
 REFRESH_COMMANDS = [
@@ -268,6 +278,7 @@ def run_explain(logger=print):
 
     realized_pnl = snapshot.get("realized_pnl", {})
     balance_check = snapshot.get("balance_check", {})
+    by_bot, by_bot_basis_map, by_bot_source = _select_trading_outcome_by_bot(snapshot, attribution)
 
     # Extract today's realized P&L from the by_day breakdown (settlement date keyed)
     today_str = datetime.date.today().isoformat()
@@ -278,7 +289,9 @@ def run_explain(logger=print):
         "realized_pnl_cents": realized_pnl.get("total_cents", 0),
         "today_pnl_cents": today_pnl,
         "settled_trade_count": attribution.get("summary", {}).get("total_trades_settled", 0),
-        "by_bot": attribution.get("by_bot", {}),
+        "by_bot": by_bot,
+        "by_bot_basis_map": by_bot_basis_map,
+        "by_bot_source": by_bot_source,
         "by_market_type": attribution.get("by_market_type", {}),
     }
 

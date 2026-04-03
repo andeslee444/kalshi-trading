@@ -41,6 +41,9 @@ WEATHER_CONFIG_PATH = PROJECT_DIR / "config" / "kalshi-config.json"
 # Minimum sample sizes for reliable calibration
 MIN_TRADES_PER_CITY = 10
 MIN_TRADES_GLOBAL = 30
+NWS_DEFAULT_SIGMA_BY_BUCKET = {"17+": 0.5, "15-16": 1.5, "before_15": 3.0}
+NWS_MIN_TRADES_BY_BUCKET = {"17+": 10, "15-16": 20, "before_15": 40}
+NWS_RUNTIME_MIN_HOUR = 8
 
 def threshold_for_brier(brier):
     """Map Brier score to recommended edge threshold.
@@ -57,6 +60,21 @@ def threshold_for_brier(brier):
         return 0.08
     else:
         return 0.10
+
+
+def _nws_bucket_for_hour(hour):
+    """Return the runtime-aligned NWS calibration bucket for an hour."""
+    try:
+        hour = int(hour)
+    except (TypeError, ValueError):
+        return None
+    if hour >= 17:
+        return "17+"
+    if hour >= 15:
+        return "15-16"
+    if hour >= NWS_RUNTIME_MIN_HOUR:
+        return "before_15"
+    return None
 
 
 # ─── Helpers ───
@@ -113,6 +131,10 @@ def _actual_yes_outcome(trade, settlement_map):
 
     local_result = trade.get("settlement_result")
     if local_result in ("won", "lost"):
+        # Prefer per-trade settlement annotations over ticker-level API revenue.
+        # The settlement API is aggregated by ticker, which can be lossy if the
+        # local trade log contains multiple rows for the same market or both
+        # sides were traded over time.
         if side == "yes":
             return 1 if local_result == "won" else 0
         return 0 if local_result == "won" else 1
@@ -258,14 +280,64 @@ def _is_canonical_calibration_path(path):
     return Path(path).resolve() == CALIBRATION_PATH.resolve()
 
 
+def _merge_preserved_calibration_fields(calibration, existing_calibration):
+    """Preserve non-sigma metadata when refreshing the canonical calibration file."""
+    merged = dict(calibration)
+    existing = existing_calibration if isinstance(existing_calibration, dict) else {}
+
+    generated_at = merged.get("generated_at")
+    if generated_at:
+        merged["sigma_updated_at"] = generated_at
+    elif existing.get("sigma_updated_at") is not None:
+        merged["sigma_updated_at"] = existing["sigma_updated_at"]
+
+    existing_weather = existing.get("weather", {})
+    new_weather = dict(merged.get("weather", {}))
+    if isinstance(existing_weather, dict):
+        bias_correction = existing_weather.get("bias_correction")
+        if "bias_correction" not in new_weather and bias_correction is not None:
+            new_weather["bias_correction"] = bias_correction
+    if new_weather:
+        merged["weather"] = new_weather
+
+    for key, value in existing.items():
+        if key == "weather":
+            continue
+        merged.setdefault(key, value)
+
+    return merged
+
+
 def _save_calibration_output(calibration, output_path=None):
     """Write calibration output and apply live-only side effects when canonical."""
     save_path = _resolve_output_path(output_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     if _is_canonical_calibration_path(save_path):
+        existing_calibration = {}
+        if save_path.exists():
+            try:
+                existing_calibration = json.loads(save_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                existing_calibration = {}
+        if CALIBRATION_BACKUP_PATH.exists():
+            try:
+                backup_calibration = json.loads(CALIBRATION_BACKUP_PATH.read_text())
+            except (json.JSONDecodeError, OSError):
+                backup_calibration = {}
+            if isinstance(backup_calibration, dict):
+                if existing_calibration.get("sigma_updated_at") is None and backup_calibration.get("sigma_updated_at") is not None:
+                    existing_calibration["sigma_updated_at"] = backup_calibration["sigma_updated_at"]
+                existing_weather = existing_calibration.get("weather", {})
+                backup_weather = backup_calibration.get("weather", {})
+                if isinstance(existing_weather, dict) and isinstance(backup_weather, dict):
+                    if existing_weather.get("bias_correction") is None and backup_weather.get("bias_correction") is not None:
+                        existing_weather = dict(existing_weather)
+                        existing_weather["bias_correction"] = backup_weather["bias_correction"]
+                        existing_calibration["weather"] = existing_weather
+        payload = _merge_preserved_calibration_fields(calibration, existing_calibration)
         _backup_calibration()
-        _atomic_write_json(save_path, calibration)
-        _sync_runtime_weather_config(calibration.get("ensemble", {}))
+        _atomic_write_json(save_path, payload)
+        _sync_runtime_weather_config(payload.get("ensemble", {}))
         return save_path, True
 
     _atomic_write_json(save_path, calibration)
@@ -523,17 +595,37 @@ def calibrate_weather(trades, settlement_map):
     return result
 
 
-def calibrate_nws(trades, settlement_map):
+def calibrate_nws(trades, settlement_map, prior_sigma_by_hour=None):
     """Calibrate NWS sigma by hour bucket."""
+    prior_sigma_by_hour = (
+        dict(prior_sigma_by_hour)
+        if isinstance(prior_sigma_by_hour, dict)
+        else {}
+    )
     matched = []
     for t in trades:
         ticker = t.get("ticker", "")
         if not ticker.startswith("KXHIGH"):
             continue
 
-        # NWS trades from source-monitor have a "source" or "strategy" field
-        strategy = t.get("strategy", "")
-        if "nws" not in strategy.lower() and "actual" not in t.get("reasoning", "").lower():
+        source_type = str(t.get("source_type", "")).lower()
+        source_bot = str(t.get("source_bot", "")).lower()
+        strategy = str(t.get("strategy", "")).lower()
+        model_name = str(t.get("model_name", "")).lower()
+        reasoning = str(t.get("reasoning", "")).lower()
+        # Source-monitor weather trades are the canonical NWS-nowcast path.
+        # Older records may only expose a strategy marker, so keep that fallback
+        # for backward compatibility.
+        is_nws_trade = (
+            source_type == "nws"
+            or "nws" in strategy
+            or model_name.startswith("weather_nws_observation_")
+            or (
+                source_bot == "source-monitor"
+                and "nws" in reasoning
+            )
+        )
+        if not is_nws_trade:
             continue
 
         actual = _actual_yes_outcome(t, settlement_map)
@@ -545,6 +637,9 @@ def calibrate_nws(trades, settlement_map):
         hour = t.get("hour_of_day")
         if running_high is None or hour is None:
             continue
+        bucket = _nws_bucket_for_hour(hour)
+        if bucket is None:
+            continue
 
         parsed = parse_weather_ticker(ticker, reference_date=_trade_reference_date(t))
         if not parsed:
@@ -555,6 +650,7 @@ def calibrate_nws(trades, settlement_map):
             "threshold": parsed["threshold"],
             "direction": parsed["direction"],
             "hour": hour,
+            "bucket": bucket,
             "actual": actual,
         })
 
@@ -564,20 +660,23 @@ def calibrate_nws(trades, settlement_map):
     # Grid search sigma per hour bucket
     buckets = {"17+": [], "15-16": [], "before_15": []}
     for m in matched:
-        if m["hour"] >= 17:
-            buckets["17+"].append(m)
-        elif m["hour"] >= 15:
-            buckets["15-16"].append(m)
-        else:
-            buckets["before_15"].append(m)
+        buckets[m["bucket"]].append(m)
 
     sigma_by_hour = {}
+    n_by_hour = {}
+    basis_by_hour = {}
     for bucket, items in buckets.items():
-        if len(items) < 3:
+        n_by_hour[bucket] = len(items)
+        default_sigma = float(NWS_DEFAULT_SIGMA_BY_BUCKET[bucket])
+        prior_sigma = float(prior_sigma_by_hour.get(bucket, default_sigma))
+        if len(items) < NWS_MIN_TRADES_BY_BUCKET[bucket]:
+            sigma_by_hour[bucket] = round(prior_sigma, 1)
+            basis_by_hour[bucket] = "carried_forward"
             continue
-        best_sigma = {"17+": 0.5, "15-16": 1.5, "before_15": 3.0}[bucket]
+
+        best_sigma = prior_sigma
         best_bs = float("inf")
-        for sigma_x10 in range(1, 80):  # 0.1 to 7.9
+        for sigma_x10 in range(1, 101):  # 0.1 to 10.0
             sigma = sigma_x10 / 10.0
             preds = []
             for m in items:
@@ -594,8 +693,34 @@ def calibrate_nws(trades, settlement_map):
                 best_bs = bs
                 best_sigma = sigma
         sigma_by_hour[bucket] = round(best_sigma, 1)
+        basis_by_hour[bucket] = "fit"
 
-    return {"sigma_by_hour": sigma_by_hour, "n": len(matched)}
+    return {
+        "sigma_by_hour": sigma_by_hour,
+        "n": len(matched),
+        "n_by_hour": n_by_hour,
+        "basis_by_hour": basis_by_hour,
+        "runtime_min_hour": NWS_RUNTIME_MIN_HOUR,
+    }
+
+
+def _finalize_nws_calibration(nws_cal, prior_nws):
+    """Carry forward prior NWS sigmas if a refresh run has no new matches."""
+    if nws_cal.get("n", 0) > 0:
+        return nws_cal
+    if not isinstance(prior_nws, dict):
+        return nws_cal
+    prior_sigmas = prior_nws.get("sigma_by_hour")
+    if not isinstance(prior_sigmas, dict) or not prior_sigmas:
+        return nws_cal
+    return {
+        "sigma_by_hour": dict(prior_sigmas),
+        "n": 0,
+        "n_by_hour": {bucket: 0 for bucket in prior_sigmas},
+        "basis_by_hour": {bucket: "carried_forward_no_new_matches" for bucket in prior_sigmas},
+        "runtime_min_hour": int(prior_nws.get("runtime_min_hour", NWS_RUNTIME_MIN_HOUR)),
+        "carried_forward_from_prior": True,
+    }
 
 
 def calibrate_info_arb(trades, settlement_map, label):
@@ -818,6 +943,21 @@ def main():
     if args.save and _is_canonical_calibration_path(save_path) and not args.allow_canonical_save:
         parser.error("--save to config/calibration.json requires --allow-canonical-save")
 
+    old_cal = {}
+    candidate_prior_paths = []
+    if save_path is not None:
+        candidate_prior_paths.append(save_path)
+    if CALIBRATION_PATH not in candidate_prior_paths:
+        candidate_prior_paths.append(CALIBRATION_PATH)
+    for candidate in candidate_prior_paths:
+        if not candidate or not Path(candidate).exists():
+            continue
+        try:
+            old_cal = json.loads(Path(candidate).read_text())
+            break
+        except (json.JSONDecodeError, OSError):
+            continue
+
     # Load all trade logs from canonical TRADE_FILES
     DATA_DIR = PROJECT_DIR / "data"
     all_trades = {}
@@ -894,7 +1034,9 @@ def main():
     all_bot_trades = []
     for trades in all_trades.values():
         all_bot_trades.extend(trades)
-    nws_cal = calibrate_nws(all_bot_trades, settlement_map)
+    nws_prior_sigma = old_cal.get("nws", {}).get("sigma_by_hour", {}) if isinstance(old_cal, dict) else {}
+    nws_cal = calibrate_nws(all_bot_trades, settlement_map, prior_sigma_by_hour=nws_prior_sigma)
+    nws_cal = _finalize_nws_calibration(nws_cal, old_cal.get("nws", {}) if isinstance(old_cal, dict) else {})
 
     # Info-arb calibration: combine entertainment + source-monitor trades
     info_arb_trades = all_trades.get("Entertainment Bot", []) + all_trades.get("Source Monitor", [])
@@ -931,14 +1073,6 @@ def main():
                   "overwriting calibration.json with empty data.", file=sys.stderr)
         else:
             # Backup existing calibration before overwriting
-            old_cal = {}
-            save_path = _resolve_output_path(args.output)
-            if _is_canonical_calibration_path(save_path) and CALIBRATION_PATH.exists():
-                try:
-                    old_cal = json.loads(CALIBRATION_PATH.read_text())
-                except (json.JSONDecodeError, OSError):
-                    old_cal = {}
-
             saved_path, is_canonical = _save_calibration_output(calibration, args.output)
 
             # Print diff summary
@@ -982,7 +1116,15 @@ def _print_report(cal, saved, saved_path=None):
     print(f"\n--- NWS (n={n.get('n', 0)}) ---")
     if n.get("n", 0) > 0:
         for bucket, sigma in n.get("sigma_by_hour", {}).items():
-            print(f"  {bucket}: sigma = {sigma}")
+            bucket_n = (n.get("n_by_hour") or {}).get(bucket)
+            basis = (n.get("basis_by_hour") or {}).get(bucket)
+            extras = []
+            if bucket_n is not None:
+                extras.append(f"n={bucket_n}")
+            if basis:
+                extras.append(basis)
+            suffix = f" ({', '.join(extras)})" if extras else ""
+            print(f"  {bucket}: sigma = {sigma}{suffix}")
     else:
         print("  No matched NWS trades.")
 

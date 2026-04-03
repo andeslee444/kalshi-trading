@@ -2,6 +2,8 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
@@ -80,6 +82,25 @@ class TestBackfillWeatherDataScript:
         assert "models=ncep_nbm_conus" in seen["url"]
         assert parsed[0]["2026-03-14"] == 70.0
         assert parsed[1]["2026-03-14"] == 68.0
+
+    def test_fetch_previous_runs_forecasts_strict_raises_with_context(self, monkeypatch):
+        response = MagicMock()
+        response.status_code = 503
+
+        def fake_retry(method, url, timeout=15, max_retries=2):
+            return response
+
+        monkeypatch.setattr(backfill_mod, "retry_request", fake_retry)
+
+        with pytest.raises(RuntimeError, match=r"city=DEN.*model=nbm_conus.*status=503"):
+            backfill_mod.fetch_previous_runs_forecasts(
+                39.8561,
+                -104.6737,
+                7,
+                "nbm_conus",
+                city_code="DEN",
+                strict=True,
+            )
 
 
 class TestCalibrateHistoricalScript:

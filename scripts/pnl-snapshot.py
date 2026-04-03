@@ -28,6 +28,7 @@ from trade_files import TRADE_FILES as _CANONICAL_FILES
 DATA_DIR = PROJECT_DIR / "data"
 DEPOSITS_PATH = DATA_DIR / "deposits.json"
 SNAPSHOT_PATH = DATA_DIR / "financial-snapshot.json"
+UNATTRIBUTED_WEATHER_BOT = "unattributed-weather"
 
 
 # ─── Pure computation functions (no I/O, fully testable) ───
@@ -85,6 +86,340 @@ def compute_realized_pnl(settlements):
     }
 
 
+def _is_executed_status(status):
+    normalized = (status or "").lower()
+    return normalized in ("executed", "filled")
+
+
+def _safe_fee_cents(value):
+    try:
+        return int(round(float(value or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_api_fee_cents(value):
+    try:
+        return int(round(float(value or 0) * 100))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_buy_action(value):
+    if value is None:
+        return True
+    normalized = str(value).strip().lower()
+    if normalized in ("", "buy", "none", "null"):
+        return True
+    return False
+
+
+def _fill_count(fill):
+    count = fill.get("count")
+    if count in (None, "", 0):
+        count = fill.get("count_fp")
+    return _safe_int(count)
+
+
+def _dollars_to_cents(value):
+    try:
+        return int(round(float(value or 0) * 100))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fill_price_cents(fill, side):
+    if side == "yes":
+        direct = fill.get("yes_price")
+        if direct not in (None, ""):
+            return _safe_int(direct)
+        return _dollars_to_cents(fill.get("yes_price_dollars"))
+    direct = fill.get("no_price")
+    if direct not in (None, ""):
+        return _safe_int(direct)
+    return _dollars_to_cents(fill.get("no_price_dollars"))
+
+
+def _weather_city_from_ticker(ticker):
+    ticker = (ticker or "").upper()
+    if not ticker.startswith("KXHIGH"):
+        return None
+    suffix = ticker[len("KXHIGH"):].split("-", 1)[0]
+    return suffix or None
+
+
+def _trade_city(trade):
+    if not isinstance(trade, dict):
+        return None
+    city = trade.get("city")
+    if city:
+        return str(city).upper()
+    return _weather_city_from_ticker(trade.get("ticker", ""))
+
+
+def _init_rollup():
+    return {"pnl_cents": 0, "wins": 0, "losses": 0, "fees_cents": 0}
+
+
+def _accumulate_rollup(stats, pnl_cents, fee_cents):
+    stats["pnl_cents"] += pnl_cents
+    stats["fees_cents"] += fee_cents
+    if pnl_cents > 0:
+        stats["wins"] += 1
+    elif pnl_cents < 0:
+        stats["losses"] += 1
+
+
+def _finalize_rollups(group):
+    for stats in group.values():
+        total = stats["wins"] + stats["losses"]
+        stats["win_rate"] = round(stats["wins"] / total, 4) if total > 0 else 0.0
+
+
+def _init_local_reconciliation_stats():
+    return {
+        "local_buy_orders": 0,
+        "executed_local_buy_orders": 0,
+        "nonexecuted_local_buy_orders": 0,
+        "orders_with_fills": 0,
+        "unmatched_local_buy_orders_without_fills": 0,
+        "unmatched_executed_buy_orders_without_fills": 0,
+        "api_fills_without_local_order": 0,
+        "filled_orders_without_settlement": 0,
+        "settled_local_buy_orders": 0,
+        "settled_nonexecuted_buy_orders": 0,
+        "executed_settled_orders": 0,
+        "executed_settled_orders_with_fill_and_settlement": 0,
+        "executed_settled_orders_without_fill": 0,
+    }
+
+
+def _finalize_local_reconciliation_stats(group):
+    for bot, stats in group.items():
+        executed_settled = stats.get("executed_settled_orders", 0)
+        covered = stats.get("executed_settled_orders_with_fill_and_settlement", 0)
+        stats["executed_settled_fill_coverage"] = (
+            round(covered / executed_settled, 4) if executed_settled > 0 else None
+        )
+        strict_local_basis = bool(
+            executed_settled > 0
+            and covered == executed_settled
+            and stats.get("unmatched_executed_buy_orders_without_fills", 0) == 0
+            and stats.get("api_fills_without_local_order", 0) == 0
+        )
+        # Weather-family bots can still use the local joined basis once every
+        # executed-and-settled canonical order is covered. They carry a known
+        # tail of older demo/manual/orphan KXHIGH fills that should remain
+        # visible in reconciliation stats, but should not override the
+        # canonical local weather logs.
+        relaxed_weather_family_basis = bool(
+            bot in {"weather", "source-monitor"}
+            and executed_settled > 0
+            and covered == executed_settled
+            and stats.get("unmatched_executed_buy_orders_without_fills", 0) == 0
+        )
+        stats["eligible_local_join_basis"] = strict_local_basis or relaxed_weather_family_basis
+
+
+def compute_realized_pnl_by_bot_api(settlements, local_trades):
+    """Legacy per-bot attribution from API settlements + local ticker mapping."""
+    ticker_to_bot = {}
+    for trade in local_trades:
+        ticker = trade.get("ticker", "")
+        bot = trade.get("source_bot", "")
+        if ticker and bot:
+            ticker_to_bot[ticker] = bot
+
+    by_bot = defaultdict(_init_rollup)
+    for settlement in settlements:
+        ticker = settlement.get("ticker", "") or settlement.get("market_ticker", "")
+        revenue = _safe_int(settlement.get("revenue", 0))
+        cost = _safe_int(settlement.get("yes_total_cost", 0)) + _safe_int(settlement.get("no_total_cost", 0))
+        profit = revenue - cost
+        fee = _safe_api_fee_cents(settlement.get("fee_cost"))
+        bot = ticker_to_bot.get(ticker, _infer_unmatched_api_bot(ticker))
+        _accumulate_rollup(by_bot[bot], profit, fee)
+
+    result = dict(by_bot)
+    _finalize_rollups(result)
+    return result
+
+
+def compute_realized_pnl_by_bot_local(local_trades, fills, settlements):
+    """Per-bot realized P&L from local buy orders joined to fills and outcomes."""
+    settlement_result_by_ticker = {}
+    for settlement in settlements:
+        ticker = settlement.get("ticker", "") or settlement.get("market_ticker", "")
+        market_result = str(settlement.get("market_result") or settlement.get("result") or "").lower()
+        if ticker and market_result in ("yes", "no"):
+            settlement_result_by_ticker[ticker] = market_result
+
+    local_orders = {}
+    for trade in local_trades:
+        if not _is_buy_action(trade.get("action")):
+            continue
+        order_id = trade.get("order_id")
+        if not order_id:
+            continue
+        if order_id in local_orders:
+            continue
+        local_orders[order_id] = {
+            "ticker": trade.get("ticker", ""),
+            "side": str(trade.get("side", "")).lower(),
+            "source_bot": trade.get("source_bot") or _infer_bot(trade.get("ticker", "")),
+            "city": _trade_city(trade),
+            "source_type": str(trade.get("source_type", "")).lower() or None,
+            "fee_cents": _safe_fee_cents(trade.get("fee_cents")),
+            "status": str(trade.get("status", "")).lower(),
+            "settlement_result": trade.get("settlement_result"),
+        }
+
+    fills_by_order = defaultdict(lambda: {
+        "ticker": None,
+        "side": None,
+        "count": 0,
+        "cost_cents": 0,
+    })
+    for fill in fills:
+        if not _is_buy_action(fill.get("action")):
+            continue
+        order_id = fill.get("order_id")
+        if not order_id:
+            continue
+        side = str(fill.get("side", "")).lower()
+        if side not in ("yes", "no"):
+            continue
+        count = _fill_count(fill)
+        if count <= 0:
+            continue
+        price = _fill_price_cents(fill, side)
+        bucket = fills_by_order[order_id]
+        if bucket["ticker"] is None:
+            bucket["ticker"] = fill.get("ticker", "") or fill.get("market_ticker", "")
+        if bucket["side"] is None:
+            bucket["side"] = side
+        bucket["count"] += count
+        bucket["cost_cents"] += _safe_int(price) * count
+
+    by_bot = defaultdict(_init_rollup)
+    by_bot_reconciliation = defaultdict(_init_local_reconciliation_stats)
+    matched_orders = 0
+    unmatched_fills_without_local_trade = 0
+    unmatched_filled_orders_without_settlement = 0
+
+    for order_id, meta in local_orders.items():
+        bot = meta.get("source_bot") or _infer_bot(meta.get("ticker", ""))
+        bot_stats = by_bot_reconciliation[bot]
+        bot_stats["local_buy_orders"] += 1
+        executed = _is_executed_status(meta.get("status"))
+        if executed:
+            bot_stats["executed_local_buy_orders"] += 1
+        else:
+            bot_stats["nonexecuted_local_buy_orders"] += 1
+        if order_id in fills_by_order:
+            bot_stats["orders_with_fills"] += 1
+        else:
+            bot_stats["unmatched_local_buy_orders_without_fills"] += 1
+            if executed:
+                bot_stats["unmatched_executed_buy_orders_without_fills"] += 1
+
+        settled = bool(
+            meta.get("settlement_result") in ("won", "lost")
+            or (meta.get("ticker") or "") in settlement_result_by_ticker
+        )
+        if settled:
+            bot_stats["settled_local_buy_orders"] += 1
+            if not executed:
+                bot_stats["settled_nonexecuted_buy_orders"] += 1
+            else:
+                bot_stats["executed_settled_orders"] += 1
+                if order_id not in fills_by_order:
+                    bot_stats["executed_settled_orders_without_fill"] += 1
+
+    for order_id, fill_row in fills_by_order.items():
+        local = local_orders.get(order_id)
+        if not local:
+            unmatched_fills_without_local_trade += 1
+            bot = _infer_unmatched_api_bot(fill_row.get("ticker", ""))
+            by_bot_reconciliation[bot]["api_fills_without_local_order"] += 1
+            continue
+
+        ticker = local.get("ticker") or fill_row.get("ticker") or ""
+        market_result = settlement_result_by_ticker.get(ticker)
+        if market_result not in ("yes", "no"):
+            unmatched_filled_orders_without_settlement += 1
+            bot = local.get("source_bot") or _infer_bot(ticker)
+            by_bot_reconciliation[bot]["filled_orders_without_settlement"] += 1
+            continue
+
+        side = local.get("side") or fill_row.get("side")
+        if side not in ("yes", "no"):
+            continue
+
+        won = (side == market_result)
+        pnl_cents = (100 * fill_row["count"] - fill_row["cost_cents"]) if won else -fill_row["cost_cents"]
+        fee_cents = local.get("fee_cents", 0)
+        bot = local.get("source_bot") or _infer_bot(ticker)
+        _accumulate_rollup(by_bot[bot], pnl_cents, fee_cents)
+        if _is_executed_status(local.get("status")):
+            by_bot_reconciliation[bot]["executed_settled_orders_with_fill_and_settlement"] += 1
+        matched_orders += 1
+
+        city = local.get("city")
+        if city:
+            city_map = by_bot[bot].setdefault("by_city", {})
+            stats = city_map.setdefault(city, _init_rollup())
+            _accumulate_rollup(stats, pnl_cents, fee_cents)
+
+    result = dict(by_bot)
+    for stats in result.values():
+        city_map = stats.get("by_city")
+        if isinstance(city_map, dict):
+            _finalize_rollups(city_map)
+    _finalize_rollups(result)
+    _finalize_local_reconciliation_stats(by_bot_reconciliation)
+
+    local_buy_orders = len(local_orders)
+    unmatched_local_buy_orders_without_fills = sum(1 for order_id in local_orders if order_id not in fills_by_order)
+    unmatched_executed_buy_orders_without_fills = sum(
+        1
+        for order_id, meta in local_orders.items()
+        if order_id not in fills_by_order and _is_executed_status(meta.get("status"))
+    )
+
+    return {
+        "basis": "local_buy_orders_joined_to_api_fills_and_settlement_outcomes",
+        "by_bot": result,
+        "matched_orders": matched_orders,
+        "local_buy_orders": local_buy_orders,
+        "unmatched_local_buy_orders_without_fills": unmatched_local_buy_orders_without_fills,
+        "unmatched_executed_buy_orders_without_fills": unmatched_executed_buy_orders_without_fills,
+        "unmatched_fills_without_local_trade": unmatched_fills_without_local_trade,
+        "unmatched_filled_orders_without_settlement": unmatched_filled_orders_without_settlement,
+        "by_bot_reconciliation": dict(by_bot_reconciliation),
+    }
+
+
+def _select_canonical_by_bot(by_bot_api, by_bot_local, by_bot_local_reconciliation, local_basis):
+    canonical = {}
+    basis_map = {}
+    for bot in sorted(set(by_bot_api) | set(by_bot_local)):
+        local_payload = by_bot_local.get(bot)
+        api_payload = by_bot_api.get(bot)
+        local_stats = by_bot_local_reconciliation.get(bot, {}) if isinstance(by_bot_local_reconciliation, dict) else {}
+        use_local = bool(local_payload and local_stats.get("eligible_local_join_basis"))
+        if use_local:
+            canonical[bot] = local_payload
+            basis_map[bot] = local_basis
+        elif api_payload is not None:
+            canonical[bot] = api_payload
+            basis_map[bot] = "kalshi_api_settlements"
+        elif local_payload is not None:
+            canonical[bot] = local_payload
+            basis_map[bot] = local_basis
+    return canonical, basis_map
+
+
 def compute_unrealized_pnl(positions, fills):
     """Compute unrealized P&L from open positions and historical fills.
 
@@ -99,8 +434,8 @@ def compute_unrealized_pnl(positions, fills):
     for f in fills:
         ticker = f.get("ticker", "")
         side = (f.get("side", "") or "").lower()
-        price = f.get("yes_price", 0) if side == "yes" else f.get("no_price", 0)
-        count = f.get("count", 0) or 0
+        price = _fill_price_cents(f, side)
+        count = _fill_count(f)
         action = (f.get("action", "") or "").lower()
         if action == "buy":
             ticker_cost[ticker] += (price or 0) * count
@@ -145,7 +480,7 @@ def verify_settlements(api_settlements, local_trades):
     api_tickers = {s.get("ticker", "") or s.get("market_ticker", "")
                    for s in api_settlements}
     local_buy_trades = [t for t in local_trades
-                        if t.get("action", "buy") == "buy"]
+                        if _is_buy_action(t.get("action"))]
     local_tickers = {t.get("ticker", "") for t in local_buy_trades
                      if t.get("ticker")}
 
@@ -278,40 +613,50 @@ def build_snapshot(balance_cents, portfolio_value_cents, settlements, fills,
     unrealized = compute_unrealized_pnl(positions, fills)
     verification = verify_settlements(settlements, local_trades)
     deposits = load_deposits(deposits_path)
-
-    # Bot attribution from API settlements + local trade ticker→bot mapping
-    ticker_to_bot = {}
-    for t in local_trades:
-        ticker = t.get("ticker", "")
-        bot = t.get("source_bot", "")
-        if ticker and bot:
-            ticker_to_bot[ticker] = bot
-
-    by_bot = defaultdict(lambda: {"pnl_cents": 0, "wins": 0, "losses": 0, "fees_cents": 0})
-    for s in settlements:
-        ticker = s.get("ticker", "") or s.get("market_ticker", "")
-        revenue = _safe_int(s.get("revenue", 0))
-        cost = _safe_int(s.get("yes_total_cost", 0)) + _safe_int(s.get("no_total_cost", 0))
-        profit = revenue - cost
-        try:
-            fee = round(float(s.get("fee_cost", "0") or "0") * 100)
-        except (TypeError, ValueError):
-            fee = 0
-
-        bot = ticker_to_bot.get(ticker, _infer_bot(ticker))
-        by_bot[bot]["pnl_cents"] += profit
-        by_bot[bot]["fees_cents"] += fee
-        if profit > 0:
-            by_bot[bot]["wins"] += 1
-        elif profit < 0:
-            by_bot[bot]["losses"] += 1
-
-    # Add win_rate to each bot
-    for stats in by_bot.values():
-        total = stats["wins"] + stats["losses"]
-        stats["win_rate"] = round(stats["wins"] / total, 4) if total > 0 else 0.0
-
-    realized["by_bot"] = dict(by_bot)
+    by_bot_api = compute_realized_pnl_by_bot_api(settlements, local_trades)
+    by_bot_local = compute_realized_pnl_by_bot_local(local_trades, fills, settlements)
+    local_by_bot_total_cents = sum(
+        stats.get("pnl_cents", 0)
+        for stats in by_bot_local["by_bot"].values()
+        if isinstance(stats, dict)
+    )
+    local_by_bot_is_complete = (
+        by_bot_local.get("matched_orders", 0) > 0
+        and by_bot_local.get("unmatched_executed_buy_orders_without_fills", 0) == 0
+        and by_bot_local.get("unmatched_fills_without_local_trade", 0) == 0
+        and by_bot_local.get("unmatched_filled_orders_without_settlement", 0) == 0
+        and local_by_bot_total_cents == realized.get("total_cents", 0)
+    )
+    canonical_by_bot, canonical_basis_map = _select_canonical_by_bot(
+        by_bot_api,
+        by_bot_local["by_bot"],
+        by_bot_local.get("by_bot_reconciliation", {}),
+        by_bot_local["basis"],
+    )
+    basis_values = set(canonical_basis_map.values())
+    if not canonical_basis_map:
+        canonical_basis = "kalshi_api_settlements_fallback_incomplete_local_fill_coverage"
+    elif len(basis_values) == 1:
+        canonical_basis = next(iter(basis_values))
+    else:
+        canonical_basis = "hybrid_per_bot_local_or_api"
+    realized["by_bot"] = canonical_by_bot
+    realized["by_bot_basis"] = canonical_basis
+    realized["by_bot_basis_map"] = canonical_basis_map
+    realized["by_bot_api_settlements"] = by_bot_api
+    realized["by_bot_local_joined_fills"] = by_bot_local["by_bot"]
+    realized["by_bot_local_reconciliation"] = by_bot_local.get("by_bot_reconciliation", {})
+    realized["by_bot_reconciliation"] = {
+        "api_account_total_cents": realized.get("total_cents", 0),
+        "local_by_bot_total_cents": local_by_bot_total_cents,
+        "local_by_bot_is_complete": local_by_bot_is_complete,
+        "matched_orders": by_bot_local.get("matched_orders", 0),
+        "local_buy_orders": by_bot_local.get("local_buy_orders", 0),
+        "unmatched_local_buy_orders_without_fills": by_bot_local.get("unmatched_local_buy_orders_without_fills", 0),
+        "unmatched_executed_buy_orders_without_fills": by_bot_local.get("unmatched_executed_buy_orders_without_fills", 0),
+        "unmatched_fills_without_local_trade": by_bot_local.get("unmatched_fills_without_local_trade", 0),
+        "unmatched_filled_orders_without_settlement": by_bot_local.get("unmatched_filled_orders_without_settlement", 0),
+    }
 
     nav_cents = balance_cents + portfolio_value_cents
 
@@ -382,10 +727,18 @@ def _infer_bot(ticker):
     return "other"
 
 
+def _infer_unmatched_api_bot(ticker):
+    """Attribute API-only rows conservatively when no local order exists."""
+    t = (ticker or "").upper()
+    if t.startswith("KXHIGH"):
+        return UNATTRIBUTED_WEATHER_BOT
+    return _infer_bot(ticker)
+
+
 def _safe_int(val):
     """Convert to int safely."""
     try:
-        return int(val)
+        return int(round(float(val)))
     except (TypeError, ValueError):
         return 0
 

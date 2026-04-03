@@ -174,6 +174,11 @@ class TestWeatherCalibrationPathResolution:
         resolved = _mod._resolve_optional_project_path("data/test-bias.json")
         assert resolved == _mod.PROJECT_DIR / "data" / "test-bias.json"
 
+    def test_city_weather_edge_threshold_uses_override_when_present(self, monkeypatch):
+        monkeypatch.setattr(_mod, "config", {"cityEdgeThresholds": {"CHI": 0.12}})
+        assert _mod._city_weather_edge_threshold("CHI", 0.10) == 0.12
+        assert _mod._city_weather_edge_threshold("DEN", 0.10) == 0.10
+
 
 class TestWeatherExecutionPlanning:
     """Thin-book weather markets should still produce passive entry plans."""

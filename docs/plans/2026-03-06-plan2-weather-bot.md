@@ -2,13 +2,13 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Per CLAUDE.md, you may ONLY modify: `weather-bot.py`, `weather_data.py`, `forecast_verifier.py`, `test_weather*.py`, `test_advanced_weather.py`, `test_empirical_ensemble.py`, `kalshi-config.json`. Do NOT touch probability.py, kalshi_auth.py, or other bots.
 
-**Goal:** Optimize weather bot from +$112.18 realized (62 settled, 63% WR, 27% ROI) to target +$50-80/day with improved model quality and execution.
+**Goal:** Optimize the forecast-weather track from +$112.18 realized (62 settled, 63% WR, 27% ROI) to target +$50-80/day with improved model quality and execution.
 
-**Architecture:** Ensemble weather model (GFS/ECMWF/ICON via Open-Meteo) trading KXHIGH temperature markets. CDF-based probability with per-city sigma calibration.
+**Architecture:** Forecast-weather ensemble model (GFS/ECMWF/ICON via Open-Meteo) trading KXHIGH temperature markets. CDF-based probability with per-city sigma calibration.
 
 **Tech Stack:** Python 3, Open-Meteo API, math.erf
 
-Observation-window follow-up:
+Observation-window follow-up for the forecast-weather track:
 
 - During the Phase 4 parity observation window, use the safe-now worklist at
   [2026-03-22-weather-observation-window-worklist.md](./2026-03-22-weather-observation-window-worklist.md).
@@ -20,8 +20,19 @@ Observation-window follow-up:
 - Use the bias-correction design at
   [../superpowers/specs/2026-03-11-weather-bias-correction-design.md](../superpowers/specs/2026-03-11-weather-bias-correction-design.md)
   as the conceptual model for why the live verifier, stale prior refresh, and post-window recalibration sequence matter.
-- Do not apply live calibration, sizing, or schema changes from this plan until
-  after the observation window closes cleanly.
+- For the March 29 weather-family calibration implementation and validation trail, use
+  [2026-03-29-weather-family-calibration-audit.md](./2026-03-29-weather-family-calibration-audit.md).
+- For the April 2 outage-recovery and live supervisor cutover trail, use
+  [2026-04-02-weather-outage-recovery-audit.md](./2026-04-02-weather-outage-recovery-audit.md).
+- For the separate NWS observed-weather track, use [2026-03-06-plan6-source-monitor.md](./2026-03-06-plan6-source-monitor.md).
+- The March 29 live calibration refresh is already captured in the audit note above.
+- Do not apply additional live forecast-weather prior, sizing, or schema changes from this plan until
+  after the shared weather-family review clears them.
+
+Shared weather-family gate:
+
+- Forecast-weather promotions and source-monitor NWS promotions should be reviewed together before any live change.
+- Source-monitor is currently the strongest realized weather alpha, so its NWS calibration should be treated as part of the same weather-family promotion gate, not a separate afterthought.
 
 ---
 

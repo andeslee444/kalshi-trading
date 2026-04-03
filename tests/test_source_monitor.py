@@ -9,6 +9,7 @@ import json
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+import probability
 from probability import album_data_sigma, boxoffice_data_sigma, _reset_calibration
 from probability import nws_sigma_for_hour, nws_probability
 
@@ -167,6 +168,26 @@ class TestNwsSigma:
         for i in range(len(sigmas) - 1):
             assert sigmas[i] >= sigmas[i + 1]
 
+    def test_source_monitor_uses_nws_calibration_block(self, tmp_path, monkeypatch):
+        """Source-monitor runtime should read nws sigma buckets from calibration.json."""
+        cal_path = tmp_path / "config" / "calibration.json"
+        cal_path.parent.mkdir(parents=True, exist_ok=True)
+        cal_path.write_text(json.dumps({
+            "nws": {
+                "sigma_by_hour": {
+                    "17+": 9.0,
+                    "15-16": 8.0,
+                    "before_15": 7.0,
+                }
+            }
+        }))
+        monkeypatch.setattr(probability, "_CALIBRATION_PATH", cal_path)
+        monkeypatch.setattr(probability, "_calibration", None)
+
+        sm = _load_source_monitor()
+        assert nws_sigma_for_hour(17) == 9.0
+        assert sm._nws_min_edge(81, 80, 17, False) == 0.15
+
 
 # === Integration tests using source-monitor module import ===
 
@@ -292,6 +313,89 @@ class TestNWSEdgeThresholds:
         """Hour 4, sigma=5.0, ci_99=12.88, margin 3F -> uncertain."""
         sm = _load_source_monitor()
         assert sm._nws_min_edge(83, 80, 4, False) == 0.15
+
+    def test_city_min_edge_adder_applies_after_base_tier(self):
+        sm = _load_source_monitor()
+        sm.config.setdefault("sources", {}).setdefault("nws", {})["cityMinEdgeAdders"] = {"CHI": 0.05}
+        assert sm._nws_min_edge(90, 85, 15, False, city="CHI") == 0.10
+        assert sm._nws_min_edge(90, 85, 15, False, city="DEN") == 0.05
+
+    def test_late_thresholds_stay_on_quarter_kelly(self):
+        """Late threshold trades should still stay on the conservative Kelly path."""
+        sm = _load_source_monitor()
+        _, label = sm._nws_sizing_plan(85, 80, 18, False)
+        assert label == "quarter_kelly"
+
+    def test_brackets_stay_on_quarter_kelly(self):
+        sm = _load_source_monitor()
+        _, label = sm._nws_sizing_plan(85, 80, 18, True)
+        assert label == "quarter_kelly"
+
+    def test_morning_thresholds_stay_on_quarter_kelly(self):
+        sm = _load_source_monitor()
+        _, label = sm._nws_sizing_plan(90, 80, 12, False)
+        assert label == "quarter_kelly"
+
+    def test_liquidity_status_classifies_wide_spread(self):
+        sm = _load_source_monitor()
+        status = sm._nws_liquidity_status({"yes_bid": 74, "yes_ask": 95, "volume": 100})
+        assert status == "wide_spread"
+
+    def test_threshold_no_override_allows_real_book_wide_spread(self):
+        sm = _load_source_monitor()
+        status = sm._nws_liquidity_status({"yes_bid": 74, "yes_ask": 95, "volume": 100})
+        allowed = sm._nws_threshold_no_liquidity_override(
+            status,
+            market={"yes_bid": 74, "yes_ask": 95, "volume": 100},
+            direction="T",
+            side="no",
+            edge=0.30,
+            min_edge=0.05,
+            observation_age_minutes=15,
+        )
+        assert allowed is True
+
+    def test_threshold_no_override_rejects_empty_book(self):
+        sm = _load_source_monitor()
+        status = sm._nws_liquidity_status({"yes_bid": 0, "yes_ask": 95, "volume": 100})
+        allowed = sm._nws_threshold_no_liquidity_override(
+            status,
+            market={"yes_bid": 0, "yes_ask": 95, "volume": 100},
+            direction="T",
+            side="no",
+            edge=0.30,
+            min_edge=0.05,
+            observation_age_minutes=15,
+        )
+        assert allowed is False
+
+    def test_threshold_yes_never_overrides_liquidity(self):
+        sm = _load_source_monitor()
+        status = sm._nws_liquidity_status({"yes_bid": 74, "yes_ask": 95, "volume": 100})
+        allowed = sm._nws_threshold_no_liquidity_override(
+            status,
+            market={"yes_bid": 74, "yes_ask": 95, "volume": 100},
+            direction="T",
+            side="yes",
+            edge=0.30,
+            min_edge=0.05,
+            observation_age_minutes=15,
+        )
+        assert allowed is False
+
+    def test_bracket_never_overrides_liquidity(self):
+        sm = _load_source_monitor()
+        status = sm._nws_liquidity_status({"yes_bid": 74, "yes_ask": 95, "volume": 100})
+        allowed = sm._nws_threshold_no_liquidity_override(
+            status,
+            market={"yes_bid": 74, "yes_ask": 95, "volume": 100},
+            direction="B",
+            side="no",
+            edge=0.30,
+            min_edge=0.05,
+            observation_age_minutes=15,
+        )
+        assert allowed is False
 
 
 class TestDataFreshness:

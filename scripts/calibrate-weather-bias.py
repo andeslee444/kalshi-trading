@@ -116,6 +116,16 @@ def build_bias_artifact(
     }
 
 
+def validate_bias_artifact(artifact, output_path=None, allow_empty=False):
+    if allow_empty:
+        return artifact
+    if int(artifact.get("n_forecasts", 0) or 0) > 0:
+        return artifact
+    raise SystemExit(
+        f"Refusing to write empty weather-live-bias artifact to {output_path or '<unspecified>'}: n_forecasts=0"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build weather bias artifact from training DB")
     parser.add_argument(
@@ -161,6 +171,11 @@ def main():
         action="store_true",
         help="Print the artifact JSON to stdout",
     )
+    parser.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="Allow writing an artifact with zero matched forecast pairs",
+    )
     args = parser.parse_args()
 
     store = TrainingStore(db_path=args.db_path)
@@ -190,6 +205,7 @@ def main():
     output_path = Path(args.output)
     if not output_path.is_absolute():
         output_path = PROJECT_DIR / output_path
+    validate_bias_artifact(artifact, output_path=output_path, allow_empty=args.allow_empty)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(output_path, artifact)
 

@@ -25,6 +25,7 @@ spec.loader.exec_module(calibrate_sigma)
 
 calibrate_weather = calibrate_sigma.calibrate_weather
 calibrate_nws = calibrate_sigma.calibrate_nws
+finalize_nws_calibration = calibrate_sigma._finalize_nws_calibration
 calibrate_info_arb = calibrate_sigma.calibrate_info_arb
 brier_score_fn = calibrate_sigma.brier_score
 simulated_pnl_fn = calibrate_sigma.simulated_pnl
@@ -151,10 +152,10 @@ class TestBrierScoreOptimization:
 
 
 class TestNwsMinimum:
-    """Test NWS hour bucket minimum of 3 entries."""
+    """Test NWS calibration stability gates and runtime-aligned bucketing."""
 
-    def test_fewer_than_3_skips_bucket(self):
-        """Hour buckets with <3 entries should not produce sigma."""
+    def test_small_bucket_carries_forward_prior_sigma(self):
+        """Weak NWS buckets should carry forward the existing sigma."""
         trades = [
             {
                 "ticker": "KXHIGHMIA-26FEB16-T86",
@@ -177,9 +178,169 @@ class TestNwsMinimum:
             "KXHIGHMIA-26FEB16-T86": 100,
             "KXHIGHMIA-26FEB17-T86": -50,
         }
+        result = calibrate_nws(trades, smap, prior_sigma_by_hour={"17+": 0.8})
+        assert result["sigma_by_hour"]["17+"] == 0.8
+        assert result["basis_by_hour"]["17+"] == "carried_forward"
+        assert result["n_by_hour"]["17+"] == 2
+
+    def test_source_monitor_nws_trades_are_included_via_source_type(self):
+        """Current source-monitor weather trades should feed NWS calibration."""
+        trades = [
+            {
+                "ticker": "KXHIGHMIA-26FEB16-T86",
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "model_name": "weather_nws_observation_threshold",
+                "reasoning": "NWS MIA running high 88.0F > 86.0F by 2.0F",
+                "side": "yes",
+                "running_high": 88.0,
+                "hour_of_day": 17,
+                "timestamp": "2026-02-16T17:00:00Z",
+                "settlement_result": "won",
+            },
+            {
+                "ticker": "KXHIGHMIA-26FEB17-T86",
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "model_name": "weather_nws_observation_threshold",
+                "reasoning": "NWS MIA running high 84.0F < 86.0F by 2.0F",
+                "side": "yes",
+                "running_high": 84.0,
+                "hour_of_day": 17,
+                "timestamp": "2026-02-17T17:00:00Z",
+                "settlement_result": "lost",
+            },
+            {
+                "ticker": "KXHIGHMIA-26FEB18-T86",
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "model_name": "weather_nws_observation_threshold",
+                "reasoning": "NWS MIA running high 87.0F > 86.0F by 1.0F",
+                "side": "yes",
+                "running_high": 87.0,
+                "hour_of_day": 17,
+                "timestamp": "2026-02-18T17:00:00Z",
+                "settlement_result": "won",
+            },
+        ]
+        result = calibrate_nws(trades, settlement_map={})
+
+        assert result["n"] == 3
+        assert "17+" in result.get("sigma_by_hour", {})
+        assert result["basis_by_hour"]["17+"] == "carried_forward"
+
+    def test_source_monitor_records_feed_nws_calibration(self):
+        """Source-monitor NWS trades should be matched without legacy strategy fields."""
+        trades = [
+            {
+                "ticker": "KXHIGHMIA-26FEB16-T86",
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "reasoning": "NWS MIA running high 64.4F < 76.0F by 11.6F, prob NO 97% (hour 17)",
+                "side": "no",
+                "running_high": 64.4,
+                "hour_of_day": 17,
+                "timestamp": "2026-02-16T17:00:00Z",
+            },
+            {
+                "ticker": "KXHIGHMIA-26FEB17-T86",
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "reasoning": "NWS MIA running high 66.4F < 76.0F by 9.6F, prob NO 95% (hour 17)",
+                "side": "no",
+                "running_high": 66.4,
+                "hour_of_day": 17,
+                "timestamp": "2026-02-17T17:00:00Z",
+            },
+            {
+                "ticker": "KXHIGHMIA-26FEB18-T86",
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "reasoning": "NWS MIA running high 68.4F < 76.0F by 7.6F, prob NO 92% (hour 17)",
+                "side": "no",
+                "running_high": 68.4,
+                "hour_of_day": 17,
+                "timestamp": "2026-02-18T17:00:00Z",
+            },
+        ]
+        smap = {
+            "KXHIGHMIA-26FEB16-T86": -50,
+            "KXHIGHMIA-26FEB17-T86": -50,
+            "KXHIGHMIA-26FEB18-T86": -50,
+        }
         result = calibrate_nws(trades, smap)
-        # Only 2 trades in "17+" bucket, should be skipped
-        assert "17+" not in result.get("sigma_by_hour", {})
+        assert result["n"] == 3
+        assert "17+" in result.get("sigma_by_hour", {})
+        assert result["basis_by_hour"]["17+"] == "carried_forward"
+
+    def test_source_monitor_non_nws_records_are_excluded(self):
+        """Source-monitor KXHIGH rows should not match NWS calibration without NWS markers."""
+        trades = [
+            {
+                "ticker": "KXHIGHMIA-26FEB16-T86",
+                "source_type": "album_sales",
+                "source_bot": "source-monitor",
+                "model_name": "album_sales_threshold",
+                "reasoning": "album sales signal",
+                "side": "yes",
+                "running_high": 88.0,
+                "hour_of_day": 17,
+                "timestamp": "2026-02-16T17:00:00Z",
+                "settlement_result": "won",
+            }
+        ]
+
+        result = calibrate_nws(trades, settlement_map={})
+        assert result == {"n": 0}
+
+    def test_before_15_carries_forward_when_under_bucket_minimum(self):
+        trades = []
+        smap = {}
+        for idx in range(30):
+            ticker = f"KXHIGHMIA-26FEB{idx+1:02d}-T86"
+            trades.append({
+                "ticker": ticker,
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "side": "yes",
+                "running_high": 88.0 if idx % 2 == 0 else 84.0,
+                "hour_of_day": 10,
+                "timestamp": "2026-02-16T10:00:00Z",
+                "settlement_result": "won" if idx % 2 == 0 else "lost",
+            })
+            smap[ticker] = 100 if idx % 2 == 0 else -50
+
+        result = calibrate_nws(trades, smap, prior_sigma_by_hour={"before_15": 7.9})
+        assert result["n_by_hour"]["before_15"] == 30
+        assert result["sigma_by_hour"]["before_15"] == 7.9
+        assert result["basis_by_hour"]["before_15"] == "carried_forward"
+
+    def test_pre_8am_rows_are_excluded_from_before_15_bucket(self):
+        trades = [
+            {
+                "ticker": "KXHIGHMIA-26FEB16-T86",
+                "source_type": "nws",
+                "source_bot": "source-monitor",
+                "side": "yes",
+                "running_high": 88.0,
+                "hour_of_day": 6,
+                "timestamp": "2026-02-16T06:00:00Z",
+                "settlement_result": "won",
+            }
+        ]
+        smap = {"KXHIGHMIA-26FEB16-T86": 100}
+
+        result = calibrate_nws(trades, smap)
+        assert result == {"n": 0}
+
+    def test_zero_match_finalize_carries_forward_prior_sigma(self):
+        carried = finalize_nws_calibration(
+            {"n": 0},
+            {"sigma_by_hour": {"17+": 0.6, "15-16": 2.1}, "runtime_min_hour": 8},
+        )
+        assert carried["sigma_by_hour"] == {"17+": 0.6, "15-16": 2.1}
+        assert carried["basis_by_hour"]["17+"] == "carried_forward_no_new_matches"
+        assert carried["runtime_min_hour"] == 8
 
 
 class TestInfoArbMinimum:
