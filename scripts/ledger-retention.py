@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -27,6 +28,31 @@ def _save_summary(path: Path, summary: dict):
     tmp_path = Path(str(path) + ".tmp")
     tmp_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     tmp_path.replace(path)
+
+
+def _pid_is_live(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _live_pid_files(ledger_path: Path) -> list[dict]:
+    pid_dir = Path(ledger_path).resolve().parent / "pids"
+    live = []
+    if not pid_dir.exists():
+        return live
+    for pid_path in sorted(pid_dir.glob("*.pid")):
+        try:
+            pid = int(pid_path.read_text().strip())
+        except (OSError, ValueError):
+            continue
+        if _pid_is_live(pid):
+            live.append({"path": str(pid_path), "pid": pid})
+    return live
 
 
 def _text_report(summary: dict) -> str:
@@ -81,6 +107,11 @@ def main():
         help="VACUUM the hot ledger after archive/prune completes",
     )
     parser.add_argument(
+        "--force-compact",
+        action="store_true",
+        help="Allow --compact even if sibling runtime PID files still point to live processes",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Inspect archive candidates without writing archive files or pruning rows",
@@ -107,7 +138,15 @@ def main():
         max_event_dates=args.max_event_dates,
     )
     summary["compacted"] = False
+    summary["compact_blocked_by_live_pids"] = []
     if args.compact and not args.dry_run:
+        live_pid_files = _live_pid_files(Path(args.ledger_path))
+        summary["compact_blocked_by_live_pids"] = live_pid_files
+        if live_pid_files and not args.force_compact:
+            raise SystemExit(
+                "Refusing to compact while live bot PID files exist. "
+                "Stop the sibling runtime or rerun with --force-compact."
+            )
         ledger.compact_hot_ledger()
         summary["compacted"] = True
 
