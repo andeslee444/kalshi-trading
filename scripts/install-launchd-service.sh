@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 <dashboard|supervisor|daily-report|boot-notify|oracle-latency-probe|oracle-shadow-bot|oracle-alpha-maintenance|ops-loop>" >&2
+  echo "Usage: $0 <dashboard|supervisor|daily-report|boot-notify|oracle-latency-probe|oracle-h2-pregame-collector|oracle-shadow-bot|oracle-h8-maker-demo|oracle-alpha-maintenance|ops-loop>" >&2
   exit 1
 }
 
@@ -43,9 +43,18 @@ case "$SERVICE" in
     LABEL="com.kalshi.oracle-latency-probe"
     TEMPLATE="$PROJECT_DIR/scripts/com.kalshi.oracle-latency-probe.plist"
     ;;
+  oracle-h2-pregame-collector)
+    LABEL="com.kalshi.oracle-h2-pregame-collector"
+    TEMPLATE="$PROJECT_DIR/scripts/com.kalshi.oracle-h2-pregame-collector.plist"
+    START_MODE="bootstrap-only"
+    ;;
   oracle-shadow-bot)
     LABEL="com.kalshi.oracle-shadow-bot"
     TEMPLATE="$PROJECT_DIR/scripts/com.kalshi.oracle-shadow-bot.plist"
+    ;;
+  oracle-h8-maker-demo)
+    LABEL="com.kalshi.oracle-h8-maker-demo"
+    TEMPLATE="$PROJECT_DIR/scripts/com.kalshi.oracle-h8-maker-demo.plist"
     ;;
   oracle-alpha-maintenance)
     LABEL="com.kalshi.oracle-alpha-maintenance"

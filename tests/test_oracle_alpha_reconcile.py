@@ -208,3 +208,51 @@ def test_oracle_alpha_reconcile_main_json_output(tmp_path, monkeypatch, capsys):
     assert payload["order_rows"] == 1
     assert payload["fill_rows"] == 1
     assert payload["settlement_rows"] == 1
+
+
+def test_reconcile_alpha_ledger_skips_non_oracle_trades_by_default(tmp_path):
+    source_path = tmp_path / "event-ledger.sqlite3"
+    ledger = EventLedger(source_path)
+    ledger.record_order_submitted(
+        {
+            "ticker": "KXHIGHAUS-26MAR14-T89",
+            "action": "buy",
+            "side": "no",
+            "count": 2,
+            "price_cents": 45,
+            "order_id": "weather-order-1",
+            "timestamp": "2026-03-19T12:00:00+00:00",
+            "source_bot": "weather",
+            "status": "resting",
+        },
+        source_path=source_path,
+    )
+    ledger.record_order_submitted(
+        {
+            "ticker": "KXNBAGAME-26MAR21GSWATL-ATL",
+            "action": "buy",
+            "side": "yes",
+            "count": 1,
+            "price_cents": 58,
+            "order_id": "oracle-order-1",
+            "timestamp": "2026-03-19T12:01:00+00:00",
+            "source_bot": "oracle",
+            "status": "resting",
+        },
+        source_path=source_path,
+    )
+    capture = OracleAlphaCapture(path=tmp_path / "oracle-alpha.sqlite3")
+
+    summary = oracle_alpha_reconcile.reconcile_alpha_ledger(
+        source_ledger_path=source_path,
+        alpha_ledger_path=capture.path,
+        dry_run=False,
+    )
+
+    orders = capture.load_order_rows()
+    assert summary["source_trade_rows"] == 2
+    assert summary["oracle_trade_rows"] == 1
+    assert summary["skipped_non_oracle_rows"] == 1
+    assert summary["order_rows"] == 1
+    assert len(orders) == 1
+    assert orders[0]["ticker"] == "KXNBAGAME-26MAR21GSWATL-ATL"

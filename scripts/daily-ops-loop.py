@@ -128,6 +128,24 @@ REFRESH_COMMANDS = [
         "critical": False,
     },
     {
+        "name": "oracle_alpha_cleanup",
+        "cmd": [sys.executable, str(PROJECT_DIR / "src" / "kalshi" / "oracle-alpha-ledger-cleanup.py"), "--format", "json", "--save"],
+        "artifact": DATA_DIR / "reports" / "oracle-alpha-ledger-cleanup-latest.json",
+        "critical": False,
+    },
+    {
+        "name": "oracle_scorecard",
+        "cmd": [sys.executable, str(PROJECT_DIR / "src" / "kalshi" / "oracle-scorecard.py"), "--format", "json", "--save"],
+        "artifact": DATA_DIR / "oracle-scorecard.json",
+        "critical": False,
+    },
+    {
+        "name": "oracle_h2_divergence",
+        "cmd": [sys.executable, str(SCRIPTS_DIR / "oracle-h2-crowd-divergence.py"), "--source", "ledger", "--json"],
+        "artifact": DATA_DIR / "reports" / "oracle-h2-crowd-divergence.json",
+        "critical": False,
+    },
+    {
         "name": "attribution",
         "cmd": [sys.executable, str(SCRIPTS_DIR / "daily-attribution.py"), "--save"],
         "artifact": DATA_DIR / "attribution-report.json",

@@ -1,24 +1,12 @@
 #!/usr/bin/env python3
-"""H2 Crowd Divergence Analysis: Real Sports crowd probability vs Kalshi game price.
-
-Tests whether Real Sports crowd win probabilities diverge from Kalshi game
-market prices, and whether that divergence predicts Kalshi price movement.
-
-Data sources:
-1. Real-time: fetch current crowd probs + Kalshi orderbooks for live/upcoming games
-2. Alpha ledger: pair crowd_probability snapshots with market_snapshot quotes (new capture)
-3. Historical: crowd probabilityHistory timeseries from the per-game endpoint
-
-Usage:
-    python3 scripts/oracle-h2-crowd-divergence.py [--json]
-"""
+"""H2 crowd divergence analysis from live fetches or collected ledger data."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime as dt
 import json
-import math
 import random
 import statistics
 import sys
@@ -29,36 +17,50 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR / "src" / "kalshi"))
 
 from dotenv import load_dotenv
+
+from domain.oracle.alpha_capture import DEFAULT_ORACLE_ALPHA_LEDGER_PATH
+from domain.oracle.execution.quote_check import quote_from_orderbook
+from domain.oracle.nba_ticker_utils import parse_nba_ticker
+from domain.oracle.real_sports_client import RealSportsClient, RealSportsConfig
+from domain.shared.sizing import kalshi_fee_cents
+from event_ledger import EVENT_TYPE_MARKET_SNAPSHOT, EVENT_TYPE_SOURCE_OBSERVATION, EventLedger
+from infra.kalshi_client import KalshiClient
+
 load_dotenv(PROJECT_DIR / ".env")
 
 
-def _mean(values: list) -> float | None:
+def _mean(values: list[float]) -> float | None:
     return round(sum(values) / len(values), 4) if values else None
 
 
-def _median(values: list) -> float | None:
+def _median(values: list[float]) -> float | None:
     return round(statistics.median(values), 4) if values else None
 
 
-def _bootstrap_ci(values: list[float], cluster_keys: list[str] | None = None,
-                  samples: int = 500, seed: int = 42) -> dict:
+def _bootstrap_ci(
+    values: list[float],
+    *,
+    cluster_keys: list[str] | None = None,
+    samples: int = 500,
+    seed: int = 42,
+) -> dict:
     if not values:
         return {"mean": None, "ci_low": None, "ci_high": None, "n": 0}
     clusters: dict[str, list[float]] = defaultdict(list)
     if cluster_keys and len(cluster_keys) == len(values):
-        for v, k in zip(values, cluster_keys):
-            clusters[k].append(v)
+        for value, key in zip(values, cluster_keys):
+            clusters[key].append(value)
     else:
         clusters["all"] = values
     rng = random.Random(seed)
-    keys = list(clusters)
-    nc = len(keys)
+    cluster_names = list(clusters)
+    cluster_count = len(cluster_names)
     draws = []
     for _ in range(samples):
-        s = [keys[rng.randrange(nc)] for _ in range(nc)]
-        d = [v for k in s for v in clusters[k]]
-        if d:
-            draws.append(sum(d) / len(d))
+        sampled = [cluster_names[rng.randrange(cluster_count)] for _ in range(cluster_count)]
+        sample_values = [value for key in sampled for value in clusters[key]]
+        if sample_values:
+            draws.append(sum(sample_values) / len(sample_values))
     draws.sort()
     lo = max(0, int(len(draws) * 0.025))
     hi = min(len(draws) - 1, int(len(draws) * 0.975))
@@ -67,250 +69,390 @@ def _bootstrap_ci(values: list[float], cluster_keys: list[str] | None = None,
         "ci_low": round(draws[lo], 4) if draws else None,
         "ci_high": round(draws[hi], 4) if draws else None,
         "n": len(values),
-        "clusters": nc,
+        "clusters": cluster_count,
     }
+
+
+def _coerce_float(value):
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_int(value):
+    try:
+        if value in (None, ""):
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_datetime(value) -> dt.datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _hours_to_tip_bucket(value: float | None) -> str:
+    if value is None:
+        return "unknown"
+    if value < 1.0:
+        return "<1h"
+    if value < 2.0:
+        return "1-2h"
+    if value < 4.0:
+        return "2-4h"
+    if value < 8.0:
+        return "4-8h"
+    return "8h+"
+
+
+def _build_divergence_row(crowd_row: dict, quote_row: dict) -> dict | None:
+    ticker = str(quote_row.get("ticker") or "")
+    parsed = parse_nba_ticker(ticker)
+    if not parsed or parsed.get("type") != "game":
+        return None
+
+    pick = parsed.get("pick")
+    team_a = str(crowd_row.get("team_a") or "")
+    team_b = str(crowd_row.get("team_b") or "")
+    if pick == team_a:
+        crowd_prob = _coerce_float(crowd_row.get("team_a_prob"))
+    elif pick == team_b:
+        crowd_prob = _coerce_float(crowd_row.get("team_b_prob"))
+    else:
+        return None
+
+    yes_bid = _coerce_int(quote_row.get("yes_bid_cents"))
+    yes_ask = _coerce_int(quote_row.get("yes_ask_cents"))
+    if crowd_prob is None or yes_bid is None or yes_ask is None:
+        return None
+    midpoint_cents = _coerce_int(quote_row.get("midpoint_cents"))
+    if midpoint_cents is None:
+        midpoint_cents = round((yes_bid + yes_ask) / 2)
+    spread_cents = _coerce_int(quote_row.get("spread_cents"))
+    if spread_cents is None:
+        spread_cents = yes_ask - yes_bid
+    midpoint_prob = midpoint_cents / 100.0
+    divergence = crowd_prob - midpoint_prob
+    fee_cents = kalshi_fee_cents(midpoint_cents)
+    net_edge_after_cost = abs(divergence) - (spread_cents / 100.0) - (fee_cents / 100.0)
+
+    observed_at = _parse_datetime(crowd_row.get("observed_at")) or _parse_datetime(quote_row.get("quote_timestamp_utc"))
+    start_time = _parse_datetime(crowd_row.get("start_time")) or _parse_datetime(quote_row.get("start_time"))
+    hours_to_tip = _coerce_float(crowd_row.get("hours_to_tip"))
+    if hours_to_tip is None and observed_at is not None and start_time is not None:
+        hours_to_tip = round((start_time - observed_at).total_seconds() / 3600.0, 4)
+
+    return {
+        "source": "ledger",
+        "collector_cycle_id": crowd_row.get("collector_cycle_id") or quote_row.get("collector_cycle_id"),
+        "observed_at": observed_at.isoformat() if observed_at is not None else None,
+        "game_id": str(crowd_row.get("game_id") or quote_row.get("game_id") or ""),
+        "ticker": ticker,
+        "team": pick,
+        "status": crowd_row.get("game_status") or quote_row.get("game_status") or "unknown",
+        "crowd_prob": round(crowd_prob, 4),
+        "kalshi_implied": round(midpoint_prob, 4),
+        "divergence": round(divergence, 4),
+        "abs_divergence": round(abs(divergence), 4),
+        "spread_cents": spread_cents,
+        "fee_cents": round(fee_cents, 3),
+        "net_edge_after_cost": round(net_edge_after_cost, 4),
+        "survives_spread_and_fees": net_edge_after_cost > 0,
+        "hours_to_tip": round(hours_to_tip, 4) if hours_to_tip is not None else None,
+        "hours_to_tip_bucket": _hours_to_tip_bucket(hours_to_tip),
+    }
+
+
+def load_ledger_divergence(ledger_path: str | Path) -> list[dict]:
+    ledger = EventLedger(ledger_path)
+    source_rows = ledger._fetch_event_payloads(
+        EVENT_TYPE_SOURCE_OBSERVATION,
+        source_path=str(ledger_path),
+    )
+    quote_rows = ledger._fetch_event_payloads(
+        EVENT_TYPE_MARKET_SNAPSHOT,
+        source_path=str(ledger_path),
+    )
+
+    crowd_rows = [
+        row
+        for row in source_rows
+        if row.get("snapshot_name") == "crowd_probability" and row.get("collector_mode") == "pregame"
+    ]
+    pregame_quotes = [
+        row
+        for row in quote_rows
+        if row.get("collector_mode") == "pregame"
+        and row.get("capture_mode") == "baseline"
+    ]
+    quotes_by_cycle_game: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for quote in pregame_quotes:
+        cycle_id = str(quote.get("collector_cycle_id") or "")
+        game_id = str(quote.get("game_id") or "")
+        if not cycle_id or not game_id:
+            continue
+        quotes_by_cycle_game[(cycle_id, game_id)].append(quote)
+
+    rows = []
+    for crowd in crowd_rows:
+        cycle_id = str(crowd.get("collector_cycle_id") or "")
+        game_id = str(crowd.get("game_id") or "")
+        if not cycle_id or not game_id:
+            continue
+        for quote in quotes_by_cycle_game.get((cycle_id, game_id), []):
+            row = _build_divergence_row(crowd, quote)
+            if row is not None:
+                rows.append(row)
+    return rows
 
 
 async def fetch_live_divergence() -> list[dict]:
     """Fetch current crowd probabilities and Kalshi prices for all games."""
-    from domain.oracle.real_sports_client import RealSportsClient, RealSportsConfig
-    from domain.oracle.market_mapper import normalize_team, match_game_markets
-    from infra.kalshi_client import KalshiClient
+    from domain.oracle.market_mapper import match_game_markets, normalize_team
 
-    real_config = RealSportsConfig.from_bots_config({
-        "realSports": {
-            "baseUrl": "https://web.realapp.com",
-            "wsUrl": "https://web.realsports.io",
+    real_config = RealSportsConfig.from_bots_config(
+        {
+            "realSports": {
+                "baseUrl": "https://web.realapp.com",
+                "wsUrl": "https://web.realsports.io",
+            }
         }
-    })
+    )
     real_client = RealSportsClient(real_config)
+    if real_config.can_auto_login:
+        ok = await real_client.login()
+        if not ok:
+            raise SystemExit("Real Sports auto-login failed for H2 live divergence fetch")
     kalshi_client = KalshiClient()
 
-    # Fetch crowd markets (per-game for richer data)
     home = await real_client.get_home_feed("nba")
     games = home.get("latestDayContent", {}).get("games", []) if isinstance(home, dict) else []
-
+    crowd_markets = await real_client.get_game_markets("nba")
+    crowd_by_game = {
+        str(m.get("gameId") or m.get("id")): m
+        for m in crowd_markets
+        if isinstance(m, dict) and (m.get("gameId") or m.get("id"))
+    }
     kalshi_markets = kalshi_client.get_all_markets("KXNBAGAME", "open", max_pages=5)
 
     results = []
-    for g in games:
-        game_id = g.get("id") or g.get("gameId")
+    for game in games:
+        game_id = str(game.get("id") or game.get("gameId") or "")
         if not game_id:
             continue
-        status = g.get("status", "unknown")
-        home_team = g.get("homeTeam", {}).get("name", "")
-        away_team = g.get("awayTeam", {}).get("name", "")
-
-        # Fetch per-game crowd markets
-        per_game = await real_client._get(f"/predictions/game/nba/{game_id}/markets")
-        crowd_markets = per_game.get("markets", []) if isinstance(per_game, dict) else []
-
-        game_winner = None
-        for m in crowd_markets:
-            if m.get("label") == "Game Winner":
-                game_winner = m
-                break
-
-        if not game_winner:
+        market = crowd_by_game.get(game_id)
+        if not market or market.get("label") != "Game Winner":
             continue
-
-        outcomes = game_winner.get("outcomes", [])
+        outcomes = market.get("outcomes", [])
         if len(outcomes) != 2:
             continue
+        crowd_probs = {outcome.get("key", ""): outcome.get("probability", 0) for outcome in outcomes}
+        home_team = game.get("homeTeam", {}).get("name", "")
+        away_team = game.get("awayTeam", {}).get("name", "")
+        status = game.get("status", "unknown")
 
-        # Extract crowd probabilities
-        crowd_probs = {}
-        for o in outcomes:
-            crowd_probs[o.get("key", "")] = o.get("probability", 0)
-
-        volume = game_winner.get("volumeDisplay", "0")
-        history = game_winner.get("probabilityHistory", [])
-
-        # Match to Kalshi markets
-        import datetime as dt
-        scheduled_day = g.get("dateTime", "")
+        scheduled_day = game.get("dateTime", "")
         game_date = None
         if scheduled_day:
             try:
                 game_date = dt.datetime.fromisoformat(scheduled_day.replace("Z", "+00:00")).date()
             except ValueError:
-                pass
+                game_date = None
+        if not game_date:
+            continue
 
-        matched = []
-        if game_date:
-            matched = match_game_markets(home_team, away_team, game_date, kalshi_markets)
-
-        for kalshi_mkt in matched:
-            ticker = kalshi_mkt.get("ticker", "")
-            yes_price = kalshi_mkt.get("yes_price", 0)
+        for kalshi_market in match_game_markets(home_team, away_team, game_date, kalshi_markets):
+            ticker = kalshi_market.get("ticker", "")
+            parsed = parse_nba_ticker(ticker)
+            if not parsed or parsed.get("type") != "game":
+                continue
+            pick = parsed.get("pick")
+            crowd_prob = crowd_probs.get(pick)
+            if crowd_prob is None:
+                continue
+            yes_price = kalshi_market.get("yes_price", 0)
             if yes_price <= 0:
-                # Try to get from orderbook
                 try:
-                    ob = kalshi_client.get_orderbook(ticker)
-                    fp = ob.get("orderbook_fp", ob.get("orderbook", {}))
-                    yes_bids = fp.get("yes_dollars", [])
-                    yes_asks = fp.get("no_dollars", [])  # no_dollars = yes_asks in Kalshi format
-                    if yes_bids:
-                        yes_price = int(float(yes_bids[0][0]) * 100)
+                    orderbook = kalshi_client.get_orderbook(ticker)
+                    quote = quote_from_orderbook(ticker, orderbook)
+                    yes_price = round((quote.yes_bid + quote.yes_ask) / 2)
                 except Exception:
                     continue
-
             if yes_price <= 0 or yes_price >= 100:
                 continue
 
-            kalshi_implied = yes_price / 100.0
-
-            # Determine which team this ticker is for
-            home_code = normalize_team(home_team)
-            away_code = normalize_team(away_team)
-            ticker_team = None
-            if home_code and home_code in ticker:
-                ticker_team = home_code
-                crowd_prob = crowd_probs.get(home_code, 0)
-            elif away_code and away_code in ticker:
-                ticker_team = away_code
-                crowd_prob = crowd_probs.get(away_code, 0)
-            else:
-                continue
-
-            divergence = crowd_prob - kalshi_implied
-
-            results.append({
-                "game_id": game_id,
-                "ticker": ticker,
-                "team": ticker_team,
-                "home_team": home_team,
-                "away_team": away_team,
-                "status": status,
-                "crowd_prob": round(crowd_prob, 4),
-                "kalshi_implied": round(kalshi_implied, 4),
-                "divergence": round(divergence, 4),
-                "abs_divergence": round(abs(divergence), 4),
-                "crowd_volume": volume,
-                "crowd_history_length": len(history),
-            })
+            divergence = crowd_prob - (yes_price / 100.0)
+            team = normalize_team(home_team) if pick == normalize_team(home_team) else normalize_team(away_team)
+            results.append(
+                {
+                    "source": "live",
+                    "game_id": game_id,
+                    "ticker": ticker,
+                    "team": team,
+                    "status": status,
+                    "crowd_prob": round(crowd_prob, 4),
+                    "kalshi_implied": round(yes_price / 100.0, 4),
+                    "divergence": round(divergence, 4),
+                    "abs_divergence": round(abs(divergence), 4),
+                    "spread_cents": None,
+                    "fee_cents": None,
+                    "net_edge_after_cost": None,
+                    "survives_spread_and_fees": None,
+                    "hours_to_tip": None,
+                    "hours_to_tip_bucket": "unknown",
+                }
+            )
 
     await real_client.close()
     return results
 
 
 def analyze_divergence(rows: list[dict]) -> dict:
-    """Analyze crowd-Kalshi divergence patterns."""
     if not rows:
         return {"n": 0, "error": "No divergence data"}
 
-    divergences = [r["divergence"] for r in rows]
-    abs_divs = [r["abs_divergence"] for r in rows]
-    game_ids = [str(r["game_id"]) for r in rows]
+    divergences = [row["divergence"] for row in rows]
+    abs_divs = [row["abs_divergence"] for row in rows]
+    cluster_keys = [str(row.get("game_id") or row.get("ticker") or "na") for row in rows]
+    net_edge_rows = [row["net_edge_after_cost"] for row in rows if row.get("net_edge_after_cost") is not None]
 
-    # By status
     by_status = defaultdict(list)
-    for r in rows:
-        by_status[r["status"]].append(r)
+    by_hours_to_tip = defaultdict(list)
+    for row in rows:
+        by_status[str(row.get("status") or "unknown")].append(row)
+        by_hours_to_tip[str(row.get("hours_to_tip_bucket") or "unknown")].append(row)
 
-    status_analysis = {}
-    for status, items in by_status.items():
-        divs = [r["divergence"] for r in items]
-        status_analysis[status] = {
+    def summarize_group(items: list[dict]) -> dict:
+        values = [item["divergence"] for item in items]
+        net_edges = [item["net_edge_after_cost"] for item in items if item.get("net_edge_after_cost") is not None]
+        return {
             "n": len(items),
-            "mean_divergence": _mean(divs),
-            "median_divergence": _median(divs),
-            "mean_abs_divergence": _mean([abs(d) for d in divs]),
-            "positive_rate": round(sum(1 for d in divs if d > 0) / len(divs), 3),
+            "mean_divergence": _mean(values),
+            "median_divergence": _median(values),
+            "mean_abs_divergence": _mean([abs(value) for value in values]),
+            "positive_rate": round(sum(1 for value in values if value > 0) / len(values), 3),
+            "survives_spread_and_fees": sum(1 for item in items if item.get("survives_spread_and_fees") is True),
+            "mean_net_edge_after_cost": _mean(net_edges),
         }
 
-    # By divergence direction and magnitude
-    overpriced_on_kalshi = [r for r in rows if r["divergence"] < -0.05]
-    underpriced_on_kalshi = [r for r in rows if r["divergence"] > 0.05]
-    aligned = [r for r in rows if abs(r["divergence"]) <= 0.05]
+    overpriced_on_kalshi = [row for row in rows if row["divergence"] < -0.05]
+    underpriced_on_kalshi = [row for row in rows if row["divergence"] > 0.05]
+    aligned = [row for row in rows if abs(row["divergence"]) <= 0.05]
 
     return {
         "n": len(rows),
-        "games": len(set(game_ids)),
+        "games": len(set(cluster_keys)),
         "mean_divergence": _mean(divergences),
         "median_divergence": _median(divergences),
         "mean_abs_divergence": _mean(abs_divs),
         "std_divergence": round(statistics.stdev(divergences), 4) if len(divergences) > 1 else None,
         "max_divergence": round(max(divergences), 4),
         "min_divergence": round(min(divergences), 4),
-        "bootstrap": _bootstrap_ci(divergences, cluster_keys=game_ids),
+        "bootstrap": _bootstrap_ci(divergences, cluster_keys=cluster_keys),
+        "mean_net_edge_after_cost": _mean(net_edge_rows),
+        "survives_spread_and_fees": sum(1 for row in rows if row.get("survives_spread_and_fees") is True),
         "overpriced_on_kalshi": len(overpriced_on_kalshi),
         "underpriced_on_kalshi": len(underpriced_on_kalshi),
         "aligned_within_5pct": len(aligned),
-        "by_status": status_analysis,
+        "by_status": {status: summarize_group(items) for status, items in sorted(by_status.items())},
+        "by_hours_to_tip": {bucket: summarize_group(items) for bucket, items in sorted(by_hours_to_tip.items())},
     }
 
 
 def print_human_readable(rows: list[dict], analysis: dict):
     print("=" * 80)
-    print("H2 CROWD DIVERGENCE ANALYSIS (Real Sports vs Kalshi)")
+    print("H2 CROWD DIVERGENCE ANALYSIS")
     print("=" * 80)
 
     if analysis.get("n", 0) == 0:
         print("No divergence data available.")
         return
 
-    a = analysis
-    print(f"Markets compared:        {a['n']}")
-    print(f"Games:                   {a['games']}")
-    print(f"Mean divergence:         {a['mean_divergence']:+.2%}")
-    print(f"Mean abs divergence:     {a['mean_abs_divergence']:.2%}")
-    print(f"Std divergence:          {a.get('std_divergence', 0):.2%}")
-    ci = a.get("bootstrap", {})
-    print(f"Bootstrap CI:            [{ci.get('ci_low', '?')}, {ci.get('ci_high', '?')}]")
-    print(f"Overpriced on Kalshi:    {a['overpriced_on_kalshi']} (crowd says < Kalshi price)")
-    print(f"Underpriced on Kalshi:   {a['underpriced_on_kalshi']} (crowd says > Kalshi price)")
-    print(f"Aligned (within 5%):     {a['aligned_within_5pct']}")
+    print(f"Markets compared:        {analysis['n']}")
+    print(f"Games:                   {analysis['games']}")
+    print(f"Mean divergence:         {analysis['mean_divergence']:+.2%}")
+    print(f"Mean abs divergence:     {analysis['mean_abs_divergence']:.2%}")
+    print(f"Mean net edge after cost:{analysis.get('mean_net_edge_after_cost', 0):+.2%}")
+    print(f"Survive spread+fees:     {analysis['survives_spread_and_fees']}")
     print()
 
-    print("--- By Game Status ---")
-    for status, data in a.get("by_status", {}).items():
-        print(f"  {status}: N={data['n']}  mean_div={data['mean_divergence']:+.2%}  "
-              f"abs_div={data['mean_abs_divergence']:.2%}")
+    print("--- By Hours To Tip ---")
+    for bucket, data in analysis.get("by_hours_to_tip", {}).items():
+        print(
+            f"  {bucket}: N={data['n']} mean_div={data['mean_divergence']:+.2%} "
+            f"abs_div={data['mean_abs_divergence']:.2%} "
+            f"post_cost={data.get('mean_net_edge_after_cost', 0):+.2%} "
+            f"survive={data['survives_spread_and_fees']}"
+        )
     print()
 
-    print("--- Individual Markets ---")
-    print(f"{'Ticker':<45} {'Status':<15} {'Crowd':>7} {'Kalshi':>7} {'Div':>8} {'Volume':>8}")
-    print("-" * 95)
-    for r in sorted(rows, key=lambda x: -abs(x["divergence"])):
-        flag = " <<<" if abs(r["divergence"]) >= 0.08 else ""
-        print(f"{r['ticker']:<45} {r['status']:<15} {r['crowd_prob']:>7.1%} "
-              f"{r['kalshi_implied']:>7.1%} {r['divergence']:>+7.1%} {r['crowd_volume']:>8}{flag}")
+    print("--- Top Divergences ---")
+    print(f"{'Ticker':<38} {'Tip':>6} {'Crowd':>7} {'Kalshi':>7} {'Div':>8} {'Net':>8}")
+    print("-" * 82)
+    for row in sorted(rows, key=lambda item: -abs(item["divergence"]))[:20]:
+        print(
+            f"{row['ticker']:<38} "
+            f"{(row.get('hours_to_tip_bucket') or '-'):>6} "
+            f"{row['crowd_prob']:>7.1%} "
+            f"{row['kalshi_implied']:>7.1%} "
+            f"{row['divergence']:>+7.1%} "
+            f"{(row.get('net_edge_after_cost') or 0):>+7.1%}"
+        )
     print()
 
-    # Verdict
-    abs_div = a["mean_abs_divergence"] or 0
-    n = a["n"]
     print("=" * 80)
-    if abs_div >= 0.05 and n >= 4:
-        print("VERDICT: PROMISING -- meaningful divergence exists between crowd and Kalshi")
-        print(f"Mean absolute divergence of {abs_div:.1%} suggests the two markets price differently.")
-        print("Next: accumulate divergence data over multiple game nights and test for CLV.")
-    elif abs_div >= 0.03:
-        print("VERDICT: MARGINAL -- small divergence, may or may not be tradeable")
-        print("Need more data to determine if this is noise or signal.")
+    if analysis["survives_spread_and_fees"] > 0 and (analysis.get("mean_net_edge_after_cost") or 0) > 0:
+        print("VERDICT: PROMISING -- some pregame crowd divergences survive spread and fee hurdles.")
+    elif analysis["mean_abs_divergence"] >= 0.03:
+        print("VERDICT: RESEARCH ONLY -- divergence exists but does not yet clear cost hurdles cleanly.")
     else:
-        print("VERDICT: NO DIVERGENCE -- crowd and Kalshi prices are well-aligned")
-        print("Book A has no edge if the two markets agree.")
+        print("VERDICT: NO EDGE -- crowd and Kalshi remain too aligned after realistic costs.")
     print("=" * 80)
 
 
 def main():
     parser = argparse.ArgumentParser(description="H2 crowd divergence analysis")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--source",
+        choices=("ledger", "live"),
+        default="ledger",
+        help="Analyze collected ledger data or fetch current live data",
+    )
+    parser.add_argument(
+        "--ledger-path",
+        default=str(DEFAULT_ORACLE_ALPHA_LEDGER_PATH),
+        help="Path to the Oracle alpha ledger SQLite file",
+    )
     args = parser.parse_args()
 
-    rows = asyncio.run(fetch_live_divergence())
+    if args.source == "live":
+        rows = asyncio.run(fetch_live_divergence())
+    else:
+        rows = load_ledger_divergence(args.ledger_path)
     analysis = analyze_divergence(rows)
+    payload = {"source": args.source, "rows": rows, "analysis": analysis}
 
     if args.json:
-        print(json.dumps({"rows": rows, "analysis": analysis}, indent=2, default=str))
+        print(json.dumps(payload, indent=2, default=str))
     else:
         print_human_readable(rows, analysis)
 
     out_path = PROJECT_DIR / "data" / "reports" / "oracle-h2-crowd-divergence.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps({"rows": rows, "analysis": analysis}, indent=2, default=str))
+    out_path.write_text(json.dumps(payload, indent=2, default=str))
     print(f"\nJSON written to {out_path}", file=sys.stderr)
 
 

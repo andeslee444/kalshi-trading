@@ -5,9 +5,11 @@ Data: 340,526 alpha ledger events (Mar 15 - Apr 3), 200 stored game feeds, 38 se
 
 ---
 
+> Correction (2026-04-02): the Apr 3 passive H8 PASS story was invalidated after rewriting H8 to evaluate deployable fixed-side policies. Current t+5s results are `passive_yes = -0.115c` EV/attempt and `passive_no = -0.113c`, both with confidence intervals below zero. Oracle should remain fail-closed until new evidence exists.
+
 ## Executive Summary
 
-Five hypotheses tested, one major fix discovered:
+Five hypotheses tested. Current deployable result: no Oracle book is trading-ready.
 
 | Hypothesis | Verdict | Key Finding |
 |-----------|---------|-------------|
@@ -15,11 +17,13 @@ Five hypotheses tested, one major fix discovered:
 | **H2** Crowd divergence | **DATA COLLECTING** | Crowd API was broken by JSON key bug (fixed). Live-game divergence 0.3-2.8% (too small). Need pregame data. |
 | **H3** Comeback overpricing | **KILLED** | Model *underprices* trailing teams by 19-33pp. Fading comebacks would lose money. |
 | **H6** Pregame props | **KILLED** | 0/32 NO-side wins. Model calibration catastrophically overconfident. Edge inversion. |
-| **H8** Maker-vs-taker | **PASS** | +1.83c passive markout, CI [+1.51, +2.13], 20.8% fill rate. Every event class positive. |
+| **H8** Maker-vs-taker | **INVALIDATED** | The prior PASS depended on ex-post side selection and counting unrealized markout on unfilled passive orders. Deployable fixed-side passive policies are negative. |
 
-**Key fix:** Real Sports crowd market API was returning empty due to JSON key bug (`"markets"` vs `"gameMarkets"`). Fixed on Apr 2. Crowd probabilities now flowing into alpha ledger (12 markets with 2M+ volume, probability histories). This unblocks Book A and H2 testing.
+**Key fixes:** The Real Sports crowd market API bug (`"markets"` vs `"gameMarkets"`) was fixed, and the H8 methodology was corrected to evaluate actual tradable policies rather than ex-post best-side outcomes.
 
-**Strategic shift:** H8 (passive execution) is the breakthrough. Taker execution loses -0.76c but passive gains +1.83c. This changes Oracle from "narrow clutch-only" to "broad passive maker across all event classes on game markets."
+**Current posture:** Keep Oracle disabled. H1's clutch-state signal remains a research lead, but H8 does not justify passive execution, Book B remains killed, and Book A still needs pregame evidence before any trading decision.
+
+**Operational guardrails:** The current bounded-study gates and kill deadline live in `research/oracle-activation-gates-2026-04-02.md`. The daily operational artifact is `python3 src/kalshi/oracle-scorecard.py`.
 
 ---
 
@@ -157,33 +161,36 @@ KILLED as currently designed. The autoresearch pipeline has been optimizing a mo
 
 ### What to do now
 
-1. **Shadow-trade clutch_entry only** on game markets with tight spreads. This is the sole surviving signal. Configure Oracle's Book C scanner to emit signals only on `clutch_entry` events with spread <= 6c and depth >= 10. Run shadow for 20+ game nights.
+1. **Keep Oracle fail-closed.** Leave the Oracle bot disabled in config. Leave Book C disabled, `passiveExecution` off, and both `propSignalsEnabled` and `clutchComebackEnabled` off until fresh evidence clears explicit go-live gates.
 
-2. **Recalibrate the comeback model** using the empirical win rate table from H3. The current `detect_clutch_comeback()` formula is ~20-30pp too pessimistic. Consider testing an *inverted* H3: buying the trailing team in tight clutch situations.
+2. **Use the fixed execution path only for shadow/demo validation.** The demo recording bug and passive cancel-after-timeout gap are fixed, but that only makes validation possible. It is not evidence of profitability.
 
-3. **Stop the autoresearch pipeline** on Book B parameters. It is optimizing the wrong metric (synthetic-line Brier) and the exported calibration provides no executable alpha.
+3. **Treat clutch comeback as research-only.** If Book C is reactivated for calibration, start with game markets only, props off, passive execution off, and require 100+ clean shadow signals plus measured post-fee EV before revisiting live capital.
 
-4. **Collect more real Kalshi prop data** for H6 if you want to resurrect Book B. Need 50+ settled signals per stat class with real prices. The signal_generator.py infrastructure works; just needs to run on more game nights.
+4. **Stop the Book B autoresearch loop.** H6 is killed as currently designed. Any future Book B work needs a different model family, sportsbook/base-rate anchoring, and a YES-side-first design.
 
-5. **Investigate H8 (maker-vs-taker)** as the next research priority. The H1 analysis shows the information edge exists (market moves after Real events) but the spread crossing destroys it. Passive limit orders that capture the spread instead of paying it might recover 2-3c per contract.
+5. **Treat H8 as a separate market-making research track if revisited.** Any future maker work must be based on real demo fills, queue behavior, and cancel outcomes rather than quote-follow proxies.
+   The bounded runner is `scripts/run-oracle-h8-maker-demo.sh`, and the resulting maker-study metrics roll into `python3 src/kalshi/oracle-scorecard.py`.
 
 ### What to stop doing
 
 - Autoresearch parameter sweeps on Book B
-- Book A divergence trading (Real crowd prices have 8,284 empty responses -- unreliable data source)
-- Book C signals for scoring_run, injury, blowout, technical_foul (all negative markout)
+- Book A divergence trading before pregame H2 data exists
+- Broad Book C passive execution based on the old H8 PASS
+- Book C prop signals as a live trading strategy
 - NO-side prop trades (0/32 win rate)
 
 ### Shadow trading configuration
 
-If you want to activate shadow trading for the clutch_entry signal:
+If you want to run a fresh Oracle calibration cycle:
 
-1. Oracle bot Book C scan filter:
-   - `derived_event_class == "clutch_entry"` only
-   - `market_type == "game"` only
-   - `baseline_spread <= 6` and `baseline_bid_depth >= 10`
-   - `period == "Q4"` only
+1. Keep Oracle disabled by default. Re-enable only for a bounded demo/shadow study with:
+   - Book C only
+   - `propSignalsEnabled = false`
+   - `clutchComebackEnabled = true`
+   - `passiveExecution = false`
+   - game markets only
 
-2. Position sizing: 1% of bankroll (Book C default), $1-2 fixed size for calibration period
+2. Position sizing: minimum demo size only. Do not deploy real capital from this configuration.
 
-3. Target: 200+ shadow observations across 20+ game nights before any live trading decision
+3. Target: 100+ clean shadow signals, 50+ real demo orders if maker research resumes, measured cancel/fill behavior, and post-fee EV confidence above zero before any live trading discussion.

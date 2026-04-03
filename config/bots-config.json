@@ -106,26 +106,28 @@
     "books": {
       "A": {
         "enabled": false,
-        "_note": "H2 killed: Real crowd prices unreliable (8284 empty responses)"
+        "_note": "H2 not validated yet: crowd market feed now works, but pregame divergence evidence is still insufficient."
       },
       "B": {
         "enabled": false,
         "_note": "H6 killed: 0/32 NO-side wins, catastrophic calibration, -58.8% ROI"
       },
       "C": {
-        "enabled": true,
+        "enabled": false,
         "minEdge": 0.08,
         "maxPositions": 2,
         "maxExposurePct": 0.04,
         "maxSpreadCents": 6,
         "minDepthContracts": 10,
+        "propSignalsEnabled": false,
+        "clutchComebackEnabled": false,
         "fillTimeoutSeconds": 15,
         "maxReprices": 2,
         "slippageDisableThresholdCents": 3,
         "slippageDisableMinTrades": 20,
-        "passiveExecution": true,
+        "passiveExecution": false,
         "passiveCancelTimeoutSeconds": 5,
-        "_note": "H8 PASS: passive execution +1.83c markout. Post at bid/ask instead of crossing. Cancel unfilled after 5s."
+        "_note": "Fail closed after oracle audit review. Leave Book C disabled until corrected passive research, demo-order timeout validation, and fresh shadow evidence clear go-live gates."
       }
     },
     "killSwitches": {

@@ -6,6 +6,19 @@ Commits: `85236bb`, `5ebd808`, `b51792d`
 
 ---
 
+## Reviewer Addendum (2026-04-02)
+
+This file is an audit trail, not the current deployable recommendation.
+
+- The passive H8 conclusion in this document is stale. `python3 scripts/oracle-h8-maker-analysis.py --json` now reports `h8_status = "INVALIDATED"` after rewriting the analysis to score deployable fixed-side policies instead of ex-post side selection.
+- Current t+5s deployable passive results are negative: `passive_yes = -0.115c` EV/attempt and `passive_no = -0.113c`, with 95% confidence intervals below zero.
+- The earlier claim that passive execution should be enabled across Book C is therefore not valid.
+- The demo/shadow execution path and passive cancel-after-timeout gap referenced later in this audit have since been fixed in `src/kalshi/apps/oracle_bot.py`.
+- Oracle is now fail-closed in `config/bots-config.json`: the Oracle bot is disabled, Book C is disabled, `passiveExecution` is false, and both `propSignalsEnabled` and `clutchComebackEnabled` are false.
+- Use `research/oracle-research-verdict-2026-04-02.md`, the current config, and the latest test/research reruns for present-state decisions.
+
+---
+
 ## 1. What prompted this work
 
 The Oracle NBA bot was built (Mar 18) as a three-book trading system but had never been validated against real execution data. The nba-props autoresearch pipeline (86 experiments, Brier 0.19) appeared successful but was optimizing against synthetic line proxies, not real Kalshi prices. The alpha test matrix (Mar 19) defined 8 ranked hypotheses but none had been tested to verdict. The system had been collecting data since Mar 15 (305K+ events) but no analysis had been run against it.

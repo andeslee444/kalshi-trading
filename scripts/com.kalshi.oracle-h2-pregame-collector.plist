@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.kalshi.oracle-h2-pregame-collector</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>REPLACE_WITH_PROJECT_DIR/scripts/run-oracle-h2-pregame-collector.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>REPLACE_WITH_PROJECT_DIR</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>14</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>REPLACE_WITH_HOME</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>REPLACE_WITH_PROJECT_DIR/data/logs/oracle-h2-pregame-collector-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>REPLACE_WITH_PROJECT_DIR/data/logs/oracle-h2-pregame-collector-launchd.log</string>
+</dict>
+</plist>

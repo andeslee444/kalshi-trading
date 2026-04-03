@@ -4,7 +4,7 @@ Three discrete signals from in-game events:
 1. Foul trouble: SELL over if player has 4th foul before Q4 and is below line
 2. OT likely: BUY over if tied with <2min in Q4, player projected to clear with OT
 3. Blowout: SELL over if 20+ pt differential in Q3+, player below line (garbage time)
-4. Clutch comeback: SELL the trailing team late when comeback odds are overpriced
+4. Clutch comeback: Trade the trailing team late when the market misprices comeback odds
 
 Each signal requires orderbook quote quality check before execution.
 Signals are derived from WebSocket events (GameUpdated, PlayerBoxScoreUpdated).

@@ -40,3 +40,11 @@ def test_select_trading_outcome_by_bot_falls_back_to_attribution_when_needed():
     assert by_bot == {"weather": {"pnl_cents": 999}}
     assert basis_map == {}
     assert source == "attribution_report.by_bot_fallback"
+
+
+def test_refresh_commands_include_oracle_scorecard_and_h2_divergence():
+    names = {spec["name"] for spec in _mod.REFRESH_COMMANDS}
+
+    assert "oracle_alpha_cleanup" in names
+    assert "oracle_scorecard" in names
+    assert "oracle_h2_divergence" in names

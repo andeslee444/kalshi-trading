@@ -18,6 +18,7 @@ from event_ledger import (
     EVENT_TYPE_FILL,
     EVENT_TYPE_MARKET_SNAPSHOT,
     EVENT_TYPE_ORDER_SUBMITTED,
+    EVENT_TYPE_ORDER_UPDATE,
     EVENT_TYPE_SETTLEMENT,
     EVENT_TYPE_SOURCE_OBSERVATION,
     EVENT_TYPE_TRADE_DECISION,
@@ -936,6 +937,73 @@ class OracleAlphaCapture:
         )
         return payload
 
+    def record_order_update(
+        self,
+        *,
+        order_id: str,
+        market_ticker: str,
+        update_timestamp_utc: Any = None,
+        signal_id: str | None = None,
+        signal_timestamp_utc: Any = None,
+        side: str = "",
+        price_cents: int | None = None,
+        count: int | None = None,
+        fill_price_cents: int | None = None,
+        fill_count: int | None = None,
+        book: str = "",
+        hypothesis_id: str = DEFAULT_HYPOTHESIS_ID,
+        game_id: str | int | None = None,
+        player_id: int | None = None,
+        status: str = "",
+        entry_type: str = "",
+        reason: str | None = None,
+        expected_fill_probability: float | None = None,
+        extra: dict | None = None,
+        source_artifact: str = "oracle_signal_capture",
+    ) -> dict:
+        updated_iso = _iso_from_value(update_timestamp_utc) or _iso_from_value(signal_timestamp_utc) or _utc_now_iso()
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "record_kind": "order_update",
+            "hypothesis_id": hypothesis_id,
+            "signal_id": signal_id,
+            "ticker": market_ticker,
+            "market_ticker": market_ticker,
+            "book": book,
+            "game_id": game_id,
+            "player_id": player_id,
+            "side": side,
+            "order_id": order_id,
+            "timestamp": updated_iso,
+            "update_timestamp_utc": updated_iso,
+            "signal_timestamp_utc": _iso_from_value(signal_timestamp_utc),
+            "price_cents": price_cents,
+            "count": count,
+            "fill_price_cents": fill_price_cents,
+            "fill_count": fill_count,
+            "status": status,
+            "entry_type": entry_type,
+            "reason": reason,
+            "expected_fill_probability": expected_fill_probability,
+        }
+        if extra:
+            payload.update(extra)
+        event_id = f"oracle-order-update:{order_id}:{_stable_hash(payload)}"
+        payload["event_id"] = event_id
+        self.ledger.record_event(
+            event_type=EVENT_TYPE_ORDER_UPDATE,
+            event_id=event_id,
+            payload=payload,
+            event_time=updated_iso,
+            bot_name="oracle",
+            ticker=market_ticker,
+            order_id=order_id,
+            source_artifact=source_artifact,
+            source_path=self.path,
+            legacy_key=order_id or signal_id or event_id,
+        )
+        return payload
+
     def _fetch_rows(
         self,
         event_type: str,
@@ -977,6 +1045,20 @@ class OracleAlphaCapture:
     ) -> list[dict]:
         return self._fetch_rows(
             EVENT_TYPE_ORDER_SUBMITTED,
+            hypothesis_id=hypothesis_id,
+            start=start,
+            end=end,
+        )
+
+    def load_order_update_rows(
+        self,
+        *,
+        hypothesis_id: str | None = DEFAULT_HYPOTHESIS_ID,
+        start: Any = None,
+        end: Any = None,
+    ) -> list[dict]:
+        return self._fetch_rows(
+            EVENT_TYPE_ORDER_UPDATE,
             hypothesis_id=hypothesis_id,
             start=start,
             end=end,

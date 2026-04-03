@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 from domain.oracle.alpha_capture import DEFAULT_HYPOTHESIS_ID, DEFAULT_ORACLE_ALPHA_LEDGER_PATH, OracleAlphaCapture
+from domain.oracle.nba_ticker_utils import parse_nba_ticker
 from event_ledger import DEFAULT_LEDGER_PATH, EventLedger
 from storage import TradeStore
 
@@ -56,6 +57,24 @@ def _load_trade_rows(source_ledger_path: Path | None, trade_paths: list[Path]) -
     return deduped
 
 
+def _is_oracle_trade_row(row: dict) -> bool:
+    if not isinstance(row, dict):
+        return False
+    source_bot = str(row.get("source_bot") or "").strip().lower()
+    if source_bot == "oracle":
+        return True
+    book = str(row.get("book") or "").strip().upper()
+    if book in {"A", "B", "C"}:
+        return True
+    signal_id = str(row.get("signal_id") or "").strip()
+    if signal_id.startswith("oracle-signal:"):
+        return True
+    ticker = str(row.get("ticker") or row.get("market_ticker") or "").strip()
+    if ticker and parse_nba_ticker(ticker):
+        return True
+    return False
+
+
 def reconcile_alpha_ledger(
     *,
     source_ledger_path: Path | None = None,
@@ -63,16 +82,27 @@ def reconcile_alpha_ledger(
     trade_paths: list[Path] | None = None,
     hypothesis_id: str = DEFAULT_HYPOTHESIS_ID,
     linked_only: bool = False,
+    oracle_only: bool = True,
     dry_run: bool = False,
 ) -> dict[str, int]:
     alpha = OracleAlphaCapture(path=alpha_ledger_path)
     signal_index = alpha.load_signal_index_by_order_id(hypothesis_id=hypothesis_id)
     trade_rows = _load_trade_rows(source_ledger_path, trade_paths or [])
     eligible_trade_rows = list(trade_rows)
-    skipped_unlinked_rows = 0
-    if linked_only:
+    skipped_non_oracle_rows = 0
+    if oracle_only:
         eligible_trade_rows = []
         for row in trade_rows:
+            if _is_oracle_trade_row(row):
+                eligible_trade_rows.append(row)
+            else:
+                skipped_non_oracle_rows += 1
+
+    skipped_unlinked_rows = 0
+    if linked_only:
+        filtered_trade_rows = list(eligible_trade_rows)
+        eligible_trade_rows = []
+        for row in filtered_trade_rows:
             if not isinstance(row, dict):
                 continue
             signal_id = row.get("signal_id")
@@ -88,12 +118,15 @@ def reconcile_alpha_ledger(
     summary = {
         "source_trade_rows": len(trade_rows),
         "eligible_trade_rows": len(eligible_trade_rows),
+        "oracle_trade_rows": len(trade_rows) - skipped_non_oracle_rows,
         "order_rows": 0,
         "fill_rows": 0,
         "settlement_rows": 0,
         "linked_signal_rows": 0,
         "unlinked_order_rows": 0,
+        "skipped_non_oracle_rows": skipped_non_oracle_rows,
         "skipped_unlinked_rows": skipped_unlinked_rows,
+        "oracle_only": oracle_only,
         "linked_only": linked_only,
     }
     if dry_run:
@@ -139,6 +172,11 @@ def main() -> int:
         help="Import only trade rows linked to Oracle signal ids or known Oracle order ids",
     )
     parser.add_argument(
+        "--include-non-oracle-trades",
+        action="store_true",
+        help="Disable the default Oracle-only trade filter and import all trade rows",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Preview changes without writing to the alpha ledger",
@@ -161,6 +199,7 @@ def main() -> int:
         trade_paths=trade_paths,
         hypothesis_id=args.hypothesis_id,
         linked_only=args.linked_only,
+        oracle_only=not args.include_non_oracle_trades,
         dry_run=args.dry_run,
     )
 
@@ -175,12 +214,15 @@ def main() -> int:
         "source_trade_rows="
         f"{summary['source_trade_rows']} "
         f"eligible_trade_rows={summary['eligible_trade_rows']} "
+        f"oracle_trade_rows={summary['oracle_trade_rows']} "
         f"order_rows={summary['order_rows']} "
         f"fill_rows={summary['fill_rows']} "
         f"settlement_rows={summary['settlement_rows']} "
         f"linked_signal_rows={summary['linked_signal_rows']} "
         f"unlinked_order_rows={summary['unlinked_order_rows']} "
+        f"skipped_non_oracle_rows={summary['skipped_non_oracle_rows']} "
         f"skipped_unlinked_rows={summary['skipped_unlinked_rows']} "
+        f"oracle_only={summary['oracle_only']} "
         f"linked_only={summary['linked_only']} "
         f"dry_run={args.dry_run}"
     )

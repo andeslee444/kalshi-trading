@@ -3,6 +3,7 @@
 import json
 import asyncio
 import logging
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -215,6 +216,171 @@ def test_execute_signal_records_order_metadata_without_false_fill(monkeypatch):
     assert fake_capture.fills == []
 
 
+def test_execute_signal_demo_mode_records_once_and_returns_true(monkeypatch):
+    fake_capture = _FakeOracleAlphaCapture()
+    monkeypatch.setattr(oracle_bot, "_get_oracle_alpha_capture", lambda: fake_capture)
+    monkeypatch.setattr(oracle_bot, "save_decision", lambda *args, **kwargs: None)
+    monkeypatch.setattr(oracle_bot, "_demo_mode", True)
+    monkeypatch.setattr(oracle_bot, "oracle_config", {"books": {"C": {"passiveExecution": True}}})
+    monkeypatch.setattr(oracle_bot, "contracts_for_book", lambda *args, **kwargs: 2)
+    monkeypatch.setattr(oracle_bot, "expected_value_cents", lambda *args, **kwargs: 8)
+    monkeypatch.setattr(
+        oracle_bot,
+        "check_all_limits",
+        lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""),
+    )
+    monkeypatch.setattr(oracle_bot, "check_cross_book_sizing", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(oracle_bot, "log", logging.getLogger("test.oracle_bot"))
+
+    signal = Signal(
+        book=Book.C,
+        ticker="KXNBAGAME-26MAR22GSWATL-GSW",
+        side="yes",
+        model_prob=0.61,
+        kalshi_price=0.40,
+        edge=0.21,
+        metadata={
+            "signal_type": "clutch_comeback",
+            "game_id": "ATL-GSW-20260322",
+            "kalshi_yes_bid": 39,
+            "kalshi_yes_ask": 40,
+        },
+    )
+
+    result = oracle_bot._execute_signal(signal, bankroll_cents=100000)
+
+    assert result is True
+    assert len(fake_capture.signals) == 1
+    assert len(fake_capture.orders) == 1
+    assert fake_capture.signals[0]["reason"] == "demo mode (passive)"
+    assert fake_capture.orders[0]["price_cents"] == 39
+
+
+def test_execute_signal_registers_passive_order_for_timeout(monkeypatch, tmp_path):
+    fake_capture = _FakeOracleAlphaCapture()
+    monkeypatch.setattr(oracle_bot, "_get_oracle_alpha_capture", lambda: fake_capture)
+    monkeypatch.setattr(oracle_bot, "save_decision", lambda *args, **kwargs: None)
+    monkeypatch.setattr(oracle_bot, "_demo_mode", False)
+    monkeypatch.setattr(
+        oracle_bot,
+        "oracle_config",
+        {"books": {"C": {"enabled": True, "passiveExecution": True, "passiveCancelTimeoutSeconds": 5}}},
+    )
+    monkeypatch.setattr(oracle_bot, "contracts_for_book", lambda *args, **kwargs: 2)
+    monkeypatch.setattr(oracle_bot, "expected_value_cents", lambda *args, **kwargs: 12)
+    monkeypatch.setattr(
+        oracle_bot,
+        "check_all_limits",
+        lambda *args, **kwargs: SimpleNamespace(allowed=True, reason=""),
+    )
+    monkeypatch.setattr(oracle_bot, "check_cross_book_sizing", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(oracle_bot, "allocator", SimpleNamespace(
+        request_budget=lambda *args, **kwargs: SimpleNamespace(approved=True, reason="ok")
+    ))
+    monkeypatch.setattr(
+        oracle_bot,
+        "trade_manager",
+        SimpleNamespace(
+            place_order=lambda *args, **kwargs: {
+                "order_id": "ord_passive_1",
+                "status": "resting",
+                "count": 2,
+                "price_cents": 39,
+            }
+        ),
+    )
+    monkeypatch.setattr(oracle_bot, "ledger", OracleRiskLedger(state_path=tmp_path / "oracle-risk.json"))
+    monkeypatch.setattr(oracle_bot, "log", logging.getLogger("test.oracle_bot"))
+    oracle_bot._clear_passive_orders()
+
+    signal = Signal(
+        book=Book.C,
+        ticker="KXNBAGAME-26MAR22GSWATL-GSW",
+        side="yes",
+        model_prob=0.61,
+        kalshi_price=0.40,
+        edge=0.21,
+        metadata={
+            "signal_type": "clutch_comeback",
+            "game_id": "ATL-GSW-20260322",
+            "kalshi_yes_bid": 39,
+            "kalshi_yes_ask": 40,
+        },
+    )
+
+    result = oracle_bot._execute_signal(signal, bankroll_cents=100000)
+
+    pending = oracle_bot._passive_order_snapshot()
+    assert result is True
+    assert len(pending) == 1
+    assert pending[0]["order_id"] == "ord_passive_1"
+    assert pending[0]["price_cents"] == 39
+    assert pending[0]["cancel_deadline_iso"] == signal.metadata["passive_cancel_deadline"]
+
+
+def test_reconcile_passive_orders_cancels_expired_resting_order(monkeypatch, tmp_path):
+    class _PassiveClient:
+        def __init__(self):
+            self.deleted = []
+
+        def get(self, path):
+            assert path == "/portfolio/orders/ord_passive_2"
+            return {"order": {"order_id": "ord_passive_2", "status": "resting", "fill_count": 0}}
+
+        def delete(self, path):
+            self.deleted.append(path)
+            return {"success": True}
+
+    monkeypatch.setattr(oracle_bot, "client", _PassiveClient())
+    monkeypatch.setattr(oracle_bot, "log", logging.getLogger("test.oracle_bot"))
+    monkeypatch.setattr(
+        oracle_bot,
+        "ledger",
+        OracleRiskLedger(state_path=tmp_path / "oracle-risk.json"),
+    )
+    oracle_bot._clear_passive_orders()
+
+    signal = Signal(
+        book=Book.C,
+        ticker="KXNBAGAME-26MAR22GSWATL-GSW",
+        side="yes",
+        model_prob=0.61,
+        kalshi_price=0.40,
+        edge=0.21,
+        metadata={
+            "signal_type": "clutch_comeback",
+            "game_id": "ATL-GSW-20260322",
+            "kalshi_yes_bid": 39,
+            "kalshi_yes_ask": 40,
+        },
+    )
+    oracle_bot.ledger.add_position(
+        OraclePosition(
+            book=Book.C,
+            ticker=signal.ticker,
+            side=signal.side,
+            contracts=2,
+            entry_price_cents=39,
+            game_id="ATL-GSW-20260322",
+        )
+    )
+    oracle_bot._register_passive_order(
+        signal,
+        order_id="ord_passive_2",
+        contracts=2,
+        price_cents=39,
+        cancel_timeout_seconds=5,
+    )
+    with oracle_bot._passive_orders_lock:
+        oracle_bot._passive_orders["ord_passive_2"]["cancel_deadline_ts"] = 0.0
+
+    oracle_bot._reconcile_passive_orders()
+
+    assert oracle_bot.client.deleted == ["/portfolio/orders/ord_passive_2"]
+    assert oracle_bot._passive_order_snapshot() == []
+    assert not oracle_bot.ledger.has_position(signal.ticker)
+
+
 def test_passive_execution_price_resolution(monkeypatch):
     """Passive mode should use bid (YES) or 100-ask (NO) instead of ask."""
     monkeypatch.setattr(oracle_bot, "oracle_config", {
@@ -223,9 +389,9 @@ def test_passive_execution_price_resolution(monkeypatch):
 
     # YES side: should use bid (40c) instead of ask (42c)
     yes_signal = Signal(
-        book=Book.C, ticker="T1", side="yes", edge=0.10,
+        book=Book.C, ticker="KXNBAGAME-26MAR22GSWATL-GSW", side="yes", edge=0.10,
         model_prob=0.55, kalshi_price=0.42,
-        metadata={"kalshi_yes_bid": 40, "kalshi_yes_ask": 42},
+        metadata={"kalshi_yes_bid": 40, "kalshi_yes_ask": 42, "signal_type": "clutch_comeback"},
     )
     price, mode = oracle_bot._resolve_execution_price(yes_signal)
     assert mode == "passive"
@@ -233,9 +399,9 @@ def test_passive_execution_price_resolution(monkeypatch):
 
     # NO side: should use 100 - ask (58c) instead of signal price
     no_signal = Signal(
-        book=Book.C, ticker="T2", side="no", edge=0.10,
+        book=Book.C, ticker="KXNBAGAME-26MAR22GSWATL-GSW", side="no", edge=0.10,
         model_prob=0.55, kalshi_price=0.60,
-        metadata={"kalshi_yes_bid": 40, "kalshi_yes_ask": 42},
+        metadata={"kalshi_yes_bid": 40, "kalshi_yes_ask": 42, "signal_type": "clutch_comeback"},
     )
     price, mode = oracle_bot._resolve_execution_price(no_signal)
     assert mode == "passive"
@@ -258,6 +424,43 @@ def test_passive_execution_price_resolution(monkeypatch):
     price, mode = oracle_bot._resolve_execution_price(yes_signal)
     assert mode == "taker"
     assert price == 42  # ask
+
+
+def test_apply_oracle_env_overrides(monkeypatch):
+    for key in (
+        "ORACLE_ENABLED_OVERRIDE",
+        "ORACLE_BOOK_C_ENABLED_OVERRIDE",
+        "ORACLE_BOOK_C_PROP_SIGNALS_ENABLED_OVERRIDE",
+        "ORACLE_BOOK_C_CLUTCH_COMEBACK_ENABLED_OVERRIDE",
+        "ORACLE_BOOK_C_PASSIVE_EXECUTION_OVERRIDE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    monkeypatch.setenv("ORACLE_ENABLED_OVERRIDE", "yes")
+    monkeypatch.setenv("ORACLE_BOOK_C_ENABLED_OVERRIDE", "yes")
+    monkeypatch.setenv("ORACLE_BOOK_C_PROP_SIGNALS_ENABLED_OVERRIDE", "no")
+    monkeypatch.setenv("ORACLE_BOOK_C_CLUTCH_COMEBACK_ENABLED_OVERRIDE", "yes")
+    monkeypatch.setenv("ORACLE_BOOK_C_PASSIVE_EXECUTION_OVERRIDE", "yes")
+
+    config = {
+        "enabled": False,
+        "books": {
+            "C": {
+                "enabled": False,
+                "propSignalsEnabled": True,
+                "clutchComebackEnabled": False,
+                "passiveExecution": False,
+            }
+        },
+    }
+
+    overridden = oracle_bot._apply_oracle_env_overrides(config)
+
+    assert overridden["enabled"] is True
+    assert overridden["books"]["C"]["enabled"] is True
+    assert overridden["books"]["C"]["propSignalsEnabled"] is False
+    assert overridden["books"]["C"]["clutchComebackEnabled"] is True
+    assert overridden["books"]["C"]["passiveExecution"] is True
 
 
 def test_limit_check_passes_fresh_ledger(tmp_path):
@@ -497,9 +700,12 @@ def test_oracle_config_structure():
     assert "C" in books
     assert books["A"]["enabled"] is False
     assert books["B"]["enabled"] is False
-    assert books["C"]["enabled"] is True
+    assert books["C"]["enabled"] is False
     assert books["C"]["maxSpreadCents"] == 6
     assert books["C"]["minDepthContracts"] == 10
+    assert books["C"]["propSignalsEnabled"] is False
+    assert books["C"]["clutchComebackEnabled"] is False
+    assert books["C"]["passiveExecution"] is False
 
     # Kill switches
     ks = oracle["killSwitches"]
@@ -636,6 +842,8 @@ def _configure_book_c_runtime(monkeypatch, tmp_path, *, home_feed, game_details,
                     "minEdge": 0.12,
                     "maxSpreadCents": 8,
                     "minDepthContracts": 5,
+                    "propSignalsEnabled": True,
+                    "clutchComebackEnabled": True,
                 },
             },
         },
@@ -697,6 +905,8 @@ def test_scan_book_c_generates_clutch_comeback_signal(tmp_path, monkeypatch):
                     "minEdge": 0.12,
                     "maxSpreadCents": 8,
                     "minDepthContracts": 5,
+                    "propSignalsEnabled": False,
+                    "clutchComebackEnabled": True,
                 },
             },
         },

@@ -32,7 +32,11 @@ RESULTS_TSV = PROJECT_DIR / "research" / "nba-props" / "results.tsv"
 def load_signals() -> list[dict]:
     if not SIGNALS_PATH.exists():
         return []
-    return json.loads(SIGNALS_PATH.read_text())
+    data = json.loads(SIGNALS_PATH.read_text())
+    if isinstance(data, dict):
+        payload = data.get("signals", [])
+        return payload if isinstance(payload, list) else []
+    return data if isinstance(data, list) else []
 
 
 def load_scored_results() -> list[dict]:
@@ -242,7 +246,13 @@ def run_analysis() -> dict:
     edge_inversion = (by_edge.get("30%+", {}).get("pnl", 0) < 0
                       and by_edge.get("<6%", {}).get("pnl", 0) > 0)
 
-    if not sufficient_sample:
+    if no_side_catastrophe:
+        verdict = "KILLED"
+        reason = (
+            f"Catastrophic directional failure: NO-side is {by_side.get('NO', {}).get('wins', 0)}/"
+            f"{by_side.get('NO', {}).get('n', 0)} wins across {total_trades} settled signals."
+        )
+    elif not sufficient_sample:
         verdict = "INCONCLUSIVE"
         reason = f"Only {total_trades} settled signals (need >= 50). Directional evidence is strongly negative."
     elif any_stat_positive:
@@ -301,8 +311,12 @@ def run_analysis() -> dict:
         "critical_findings": {
             "no_side_catastrophe": no_side_catastrophe,
             "edge_inversion": edge_inversion,
-            "no_side_record": f"0/{by_side.get('NO', {}).get('n', 0)} wins",
-            "yes_side_record": f"{by_side.get('YES', {}).get('wins', 0)}/{by_side.get('YES', {}).get('n', 0)} wins",
+            "no_side_record": (
+                f"{by_side.get('NO', {}).get('wins', 0)}/{by_side.get('NO', {}).get('n', 0)} wins"
+            ),
+            "yes_side_record": (
+                f"{by_side.get('YES', {}).get('wins', 0)}/{by_side.get('YES', {}).get('n', 0)} wins"
+            ),
         },
         "verdict": {
             "h6_status": verdict,

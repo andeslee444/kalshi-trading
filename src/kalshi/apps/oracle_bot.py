@@ -29,6 +29,7 @@ import os
 import sys
 import argparse
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -100,7 +101,15 @@ _demo_mode = False
 _book_c_live_state_cache = None
 _oracle_alpha_capture = None
 _oracle_alpha_capture_unavailable = False
+_passive_orders = {}
+_passive_orders_lock = threading.Lock()
 LIVE_GAME_STATUSES = frozenset({"inprogress", "live", "active"})
+_PASSIVE_ORDER_FILLED_STATUSES = frozenset({"filled", "complete", "executed"})
+_PASSIVE_ORDER_CANCELED_STATUSES = frozenset(
+    {"canceled", "cancelled", "expired", "rejected", "voided", "closed"}
+)
+_PASSIVE_ORDER_PARTIAL_STATUSES = frozenset({"partially_filled", "partial_fill", "partial"})
+_PASSIVE_ORDER_POLL_INTERVAL_SECONDS = 1.0
 _STAT_VALUE_TYPE_MAP = {
     1: "points",
     2: "assists",
@@ -150,6 +159,37 @@ def _env_flag(name: str) -> bool | None:
     if normalized in {"0", "false", "no", "off"}:
         return False
     return None
+
+
+def _apply_oracle_env_overrides(config: dict) -> dict:
+    result = dict(config or {})
+    books = dict(result.get("books") or {})
+    result["books"] = books
+
+    enabled_override = _env_flag("ORACLE_ENABLED_OVERRIDE")
+    if enabled_override is not None:
+        result["enabled"] = enabled_override
+
+    book_c = dict(books.get("C") or {})
+    books["C"] = book_c
+
+    book_c_enabled_override = _env_flag("ORACLE_BOOK_C_ENABLED_OVERRIDE")
+    if book_c_enabled_override is not None:
+        book_c["enabled"] = book_c_enabled_override
+
+    prop_signals_override = _env_flag("ORACLE_BOOK_C_PROP_SIGNALS_ENABLED_OVERRIDE")
+    if prop_signals_override is not None:
+        book_c["propSignalsEnabled"] = prop_signals_override
+
+    clutch_override = _env_flag("ORACLE_BOOK_C_CLUTCH_COMEBACK_ENABLED_OVERRIDE")
+    if clutch_override is not None:
+        book_c["clutchComebackEnabled"] = clutch_override
+
+    passive_override = _env_flag("ORACLE_BOOK_C_PASSIVE_EXECUTION_OVERRIDE")
+    if passive_override is not None:
+        book_c["passiveExecution"] = passive_override
+
+    return result
 
 
 def _cache_key(value):
@@ -951,6 +991,305 @@ def _oracle_logger():
     return log or logging.getLogger("oracle")
 
 
+def _copy_signal_metadata(signal: Signal) -> dict:
+    metadata = signal.metadata or {}
+    return dict(metadata)
+
+
+def _order_payload(order_response: dict | None) -> dict:
+    if not isinstance(order_response, dict):
+        return {}
+    order = order_response.get("order")
+    if isinstance(order, dict):
+        merged = dict(order)
+        for key, value in order_response.items():
+            if key != "order" and key not in merged:
+                merged[key] = value
+        return merged
+    return dict(order_response)
+
+
+def _order_fill_count(order_payload: dict) -> int:
+    return (
+        _coerce_int(order_payload.get("fill_count"))
+        or _coerce_int(order_payload.get("filled_count"))
+        or _coerce_int(order_payload.get("filled_quantity"))
+        or 0
+    )
+
+
+def _passive_order_signal(info: dict) -> Signal:
+    return Signal(
+        book=Book[info["book_name"]],
+        ticker=info["ticker"],
+        side=info["side"],
+        edge=float(info.get("edge", 0.0)),
+        model_prob=float(info.get("model_prob", 0.5)),
+        kalshi_price=float(info.get("kalshi_price", 0.5)),
+        metadata=dict(info.get("metadata") or {}),
+    )
+
+
+def _register_passive_order(
+    signal: Signal,
+    *,
+    order_id: str,
+    contracts: int,
+    price_cents: int,
+    cancel_timeout_seconds: float,
+    signal_record: dict | None = None,
+) -> str:
+    hypothesis_id = (
+        (signal_record or {}).get("hypothesis_id")
+        or (signal.metadata or {}).get("hypothesis_id")
+        or DEFAULT_HYPOTHESIS_ID
+    )
+    signal_id = (signal_record or {}).get("signal_id")
+    submitted_at_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    deadline_ts = time.time() + float(cancel_timeout_seconds)
+    deadline_iso = (
+        datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(seconds=float(cancel_timeout_seconds))
+    ).isoformat()
+    info = {
+        "order_id": order_id,
+        "ticker": signal.ticker,
+        "side": signal.side,
+        "contracts": contracts,
+        "price_cents": price_cents,
+        "cancel_deadline_ts": deadline_ts,
+        "cancel_deadline_iso": deadline_iso,
+        "book_name": signal.book.name if isinstance(signal.book, Book) else str(signal.book),
+        "edge": signal.edge,
+        "model_prob": signal.model_prob,
+        "kalshi_price": signal.kalshi_price,
+        "hypothesis_id": hypothesis_id,
+        "signal_id": signal_id,
+        "submitted_at_iso": submitted_at_iso,
+        "last_update_status": "resting",
+        "last_update_fill_count": 0,
+        "metadata": _copy_signal_metadata(signal),
+    }
+    with _passive_orders_lock:
+        _passive_orders[order_id] = info
+    return deadline_iso
+
+
+def _passive_order_snapshot() -> list[dict]:
+    with _passive_orders_lock:
+        return [dict(info) for info in _passive_orders.values()]
+
+
+def _pop_passive_order(order_id: str) -> dict | None:
+    with _passive_orders_lock:
+        return _passive_orders.pop(order_id, None)
+
+
+def _update_passive_order_tracking(order_id: str, **changes) -> None:
+    if not order_id:
+        return
+    with _passive_orders_lock:
+        info = _passive_orders.get(order_id)
+        if info is None:
+            return
+        info.update(changes)
+
+
+def _clear_passive_orders() -> None:
+    with _passive_orders_lock:
+        _passive_orders.clear()
+
+
+def _remove_passive_position_if_unfilled(info: dict, order_payload: dict) -> None:
+    if ledger is None:
+        return
+    if _order_fill_count(order_payload) > 0:
+        return
+    ticker = info.get("ticker", "")
+    if ticker and ledger.has_position(ticker):
+        ledger.remove_position(ticker)
+
+
+def _record_passive_fill_if_present(info: dict, order_payload: dict) -> None:
+    if _order_fill_count(order_payload) <= 0:
+        return
+    fill_price = _coerce_int(order_payload.get("fill_price_cents"))
+    if fill_price is None:
+        fill_price = _coerce_int(order_payload.get("price_cents")) or info.get("price_cents")
+    fill_payload = dict(order_payload)
+    fill_payload.setdefault("fill_price_cents", fill_price)
+    fill_payload.setdefault("fill_count", _order_fill_count(order_payload))
+    _record_oracle_alpha_fill(_passive_order_signal(info), fill_payload)
+
+
+def _record_passive_order_update(info: dict, order_payload: dict | None, *, status: str, reason: str) -> None:
+    capture = _get_oracle_alpha_capture()
+    if capture is None:
+        return
+
+    order_payload = dict(order_payload or {})
+    update_timestamp = (
+        order_payload.get("update_timestamp_utc")
+        or order_payload.get("updated_at")
+        or order_payload.get("updated_time")
+        or order_payload.get("fill_timestamp_utc")
+        or order_payload.get("filled_at")
+        or datetime.datetime.now(datetime.timezone.utc).isoformat()
+    )
+    fill_count = _order_fill_count(order_payload)
+    fill_price_cents = _coerce_int(order_payload.get("fill_price_cents"))
+    if fill_price_cents is None and fill_count > 0:
+        fill_price_cents = _coerce_int(order_payload.get("price_cents")) or _coerce_int(info.get("price_cents"))
+
+    try:
+        capture.record_order_update(
+            order_id=str(info.get("order_id") or ""),
+            market_ticker=str(info.get("ticker") or ""),
+            update_timestamp_utc=update_timestamp,
+            signal_id=info.get("signal_id"),
+            signal_timestamp_utc=info.get("submitted_at_iso"),
+            side=str(info.get("side") or ""),
+            price_cents=_coerce_int(order_payload.get("price_cents")) or _coerce_int(info.get("price_cents")),
+            count=_coerce_int(order_payload.get("count")) or _coerce_int(info.get("contracts")),
+            fill_price_cents=fill_price_cents,
+            fill_count=fill_count,
+            book=str(info.get("book_name") or ""),
+            hypothesis_id=str(info.get("hypothesis_id") or DEFAULT_HYPOTHESIS_ID),
+            game_id=(info.get("metadata") or {}).get("game_id"),
+            player_id=(info.get("metadata") or {}).get("player_id"),
+            status=status,
+            entry_type="passive",
+            reason=reason,
+            expected_fill_probability=_coerce_float((info.get("metadata") or {}).get("expected_fill_probability")),
+            extra={
+                "mode": _signal_execution_mode(order_payload),
+                "signal_type": (info.get("metadata") or {}).get("signal_type"),
+                "team": (info.get("metadata") or {}).get("team"),
+                "stat": (info.get("metadata") or {}).get("stat_type") or (info.get("metadata") or {}).get("stat"),
+            },
+            source_artifact="oracle_bot_execution",
+        )
+    except Exception as exc:
+        _oracle_logger().warning(
+            "Oracle passive order update capture failed for %s: %s",
+            info.get("order_id", ""),
+            exc,
+        )
+
+
+def _maybe_record_passive_order_update(info: dict, order_payload: dict | None, *, status: str, reason: str) -> None:
+    fill_count = _order_fill_count(dict(order_payload or {}))
+    last_status = str(info.get("last_update_status") or "")
+    last_fill_count = _coerce_int(info.get("last_update_fill_count")) or 0
+    if status == last_status and fill_count == last_fill_count:
+        return
+
+    _record_passive_order_update(info, order_payload, status=status, reason=reason)
+    info["last_update_status"] = status
+    info["last_update_fill_count"] = fill_count
+    _update_passive_order_tracking(
+        str(info.get("order_id") or ""),
+        last_update_status=status,
+        last_update_fill_count=fill_count,
+    )
+
+
+def _cancel_passive_order(info: dict, order_payload: dict | None = None) -> bool:
+    order_id = info.get("order_id", "")
+    if not order_id:
+        return False
+    try:
+        client.delete(f"/portfolio/orders/{order_id}")
+    except Exception as exc:
+        _oracle_logger().warning("Passive order cancel failed for %s: %s", order_id, exc)
+        _maybe_record_passive_order_update(
+            info,
+            order_payload,
+            status="cancel_failed",
+            reason="passive_timeout_cancel_failed",
+        )
+        return False
+
+    order_payload = order_payload or {}
+    _maybe_record_passive_order_update(
+        info,
+        order_payload,
+        status="canceled",
+        reason="passive_timeout_cancel",
+    )
+    _record_passive_fill_if_present(info, order_payload)
+    _remove_passive_position_if_unfilled(info, order_payload)
+    _oracle_logger().info(
+        "Passive order %s on %s canceled after timeout",
+        order_id,
+        info.get("ticker", ""),
+    )
+    _pop_passive_order(order_id)
+    return True
+
+
+def _reconcile_passive_orders() -> None:
+    if client is None:
+        return
+
+    now_ts = time.time()
+    for info in _passive_order_snapshot():
+        order_id = info.get("order_id", "")
+        if not order_id:
+            continue
+        try:
+            response = client.get(f"/portfolio/orders/{order_id}")
+        except Exception as exc:
+            _oracle_logger().debug("Passive order status check failed for %s: %s", order_id, exc)
+            continue
+
+        order = _order_payload(response)
+        status = str(order.get("status") or "").strip().lower()
+
+        if status in _PASSIVE_ORDER_FILLED_STATUSES:
+            _maybe_record_passive_order_update(info, order, status=status, reason="passive_terminal_status")
+            _record_passive_fill_if_present(info, order)
+            _oracle_logger().info(
+                "Passive order %s on %s reached terminal filled status=%s",
+                order_id,
+                info.get("ticker", ""),
+                status,
+            )
+            _pop_passive_order(order_id)
+            continue
+
+        if status in _PASSIVE_ORDER_CANCELED_STATUSES:
+            _maybe_record_passive_order_update(info, order, status=status, reason="passive_terminal_status")
+            _record_passive_fill_if_present(info, order)
+            _remove_passive_position_if_unfilled(info, order)
+            _oracle_logger().info(
+                "Passive order %s on %s reached terminal status=%s",
+                order_id,
+                info.get("ticker", ""),
+                status,
+            )
+            _pop_passive_order(order_id)
+            continue
+
+        if status in _PASSIVE_ORDER_PARTIAL_STATUSES:
+            _maybe_record_passive_order_update(info, order, status=status, reason="passive_partial_fill")
+            if now_ts >= float(info.get("cancel_deadline_ts", now_ts)):
+                _cancel_passive_order(info, order_payload=order)
+            continue
+
+        if status == "resting" and now_ts >= float(info.get("cancel_deadline_ts", now_ts)):
+            _cancel_passive_order(info, order_payload=order)
+
+
+async def _passive_order_maintenance_loop() -> None:
+    while not is_shutdown_requested():
+        try:
+            await asyncio.to_thread(_reconcile_passive_orders)
+        except Exception as exc:
+            _oracle_logger().warning("Passive order maintenance failed: %s", exc)
+        await asyncio.sleep(_PASSIVE_ORDER_POLL_INTERVAL_SECONDS)
+
+
 def _build_oracle_alpha_capture():
     ledger_path = os.environ.get("ORACLE_ALPHA_LEDGER_PATH") or DEFAULT_ORACLE_ALPHA_LEDGER_PATH
     return OracleAlphaCapture(path=ledger_path, logger=_oracle_logger())
@@ -1029,6 +1368,8 @@ def _record_oracle_alpha_order_submission(
 
     metadata = signal.metadata or {}
     price_cents = _coerce_int(order_info.get("price_cents")) if isinstance(order_info, dict) else None
+    if price_cents is None:
+        price_cents = _coerce_int(metadata.get("entry_price_cents"))
     if price_cents is None and signal.kalshi_price is not None and signal.kalshi_price > 0:
         price_cents = int(round(signal.kalshi_price * 100))
     if price_cents is None:
@@ -1222,11 +1563,7 @@ def _load_config():
     try:
         with open(BOTS_CONFIG_PATH) as f:
             bots_config = json.load(f)
-        oracle_config = bots_config.get("oracle", {})
-        enabled_override = _env_flag("ORACLE_ENABLED_OVERRIDE")
-        if enabled_override is not None:
-            oracle_config = dict(oracle_config)
-            oracle_config["enabled"] = enabled_override
+        oracle_config = _apply_oracle_env_overrides(bots_config.get("oracle", {}))
     except Exception as e:
         if log:
             log.warning("Failed to load oracle config: %s", e)
@@ -1248,6 +1585,7 @@ def init():
         sys.exit(1)
 
     _load_config()
+    _clear_passive_orders()
 
     if not oracle_config.get("enabled", False):
         log.info("Oracle bot is disabled in config. Exiting.")
@@ -1362,14 +1700,22 @@ def _resolve_execution_price(signal: Signal) -> tuple[int, str]:
 
     Taker (aggressive): cross the spread — buy at ask, sell at bid.
     Maker (passive): post at our side of the spread — buy at bid, sell at ask.
-      H8 research shows +2.6c maker advantage over taker on game markets.
+    Oracle only permits passive pricing for explicitly enabled Book C game signals.
 
     Returns (price_cents, execution_mode).
     """
     book_c_config = oracle_config.get("books", {}).get("C", {})
     use_passive = book_c_config.get("passiveExecution", False)
+    parsed_ticker = parse_nba_ticker(signal.ticker)
+    passive_allowed = (
+        use_passive
+        and signal.book == Book.C
+        and parsed_ticker is not None
+        and parsed_ticker.get("type") == "game"
+        and signal.metadata.get("signal_type") == "clutch_comeback"
+    )
 
-    if use_passive and signal.book == Book.C:
+    if passive_allowed:
         # Passive: post at the bid (YES) or 100-ask (NO) to capture spread
         if signal.side == "yes":
             passive_price = signal.metadata.get("kalshi_yes_bid")
@@ -1399,6 +1745,10 @@ def _execute_signal(signal: Signal, bankroll_cents: int):
 
     # Compute price based on execution mode (taker vs passive/maker)
     price_cents, exec_mode = _resolve_execution_price(signal)
+    signal.metadata["execution_mode"] = exec_mode
+    signal.metadata["entry_type"] = "passive" if exec_mode == "passive" else "aggressive"
+    signal.metadata["entry_price_cents"] = price_cents
+    signal.metadata["entry_price"] = price_cents / 100.0
 
     # Preliminary contract count for proposed_cost_cents estimate
     preliminary_contracts = contracts_for_book(book_str, bankroll_cents, price_cents)
@@ -1453,8 +1803,6 @@ def _execute_signal(signal: Signal, bankroll_cents: int):
             signal.edge * 100, book_str,
         )
         _log_decision(signal, triggered=True, reason=f"demo mode ({exec_mode})", contracts=contracts)
-        _record_oracle_alpha_signal(signal)
-        _record_oracle_alpha_order(signal, None)
         return True  # count as placed for scan summary
 
     # Request budget from portfolio allocator (skipped in demo mode)
@@ -1529,14 +1877,15 @@ def _execute_signal(signal: Signal, bankroll_cents: int):
                     "Passive order %s: will cancel in %.0fs if not filled",
                     order_id, cancel_timeout,
                 )
-                # The cancel is handled by the existing fill_monitor or
-                # can be scheduled via asyncio in the scan loop.
-                # For now, store the order_id + deadline for the next scan cycle.
                 signal.metadata["passive_order_id"] = order_id
-                signal.metadata["passive_cancel_deadline"] = (
-                    datetime.datetime.now(datetime.timezone.utc)
-                    + datetime.timedelta(seconds=cancel_timeout)
-                ).isoformat()
+                signal.metadata["passive_cancel_deadline"] = _register_passive_order(
+                    signal,
+                    order_id=order_id,
+                    contracts=contracts,
+                    price_cents=price_cents,
+                    cancel_timeout_seconds=cancel_timeout,
+                    signal_record=signal_record,
+                )
 
             return True
         else:
@@ -1616,6 +1965,11 @@ async def scan_book_c(kalshi_markets: list):
     """Scan Book C: live event signals."""
     book_c_config = oracle_config.get("books", {}).get("C", {})
     if not book_c_config.get("enabled", True):
+        return []
+    prop_signals_enabled = book_c_config.get("propSignalsEnabled", False)
+    clutch_comeback_enabled = book_c_config.get("clutchComebackEnabled", False)
+    if not prop_signals_enabled and not clutch_comeback_enabled:
+        log.info("Book C scan: no live strategies enabled")
         return []
 
     if fill_monitor.is_disabled:
@@ -1711,17 +2065,21 @@ async def scan_book_c(kalshi_markets: list):
         if not game_state:
             continue
 
-        signals.extend(
-            await _scan_book_c_prop_signals_for_game(
-                game=game,
-                game_date=game_date,
-                game_state=game_state,
-                players=players,
-                kalshi_markets=kalshi_markets,
-                book_c_config=book_c_config,
-                scan_metrics=scan_metrics,
+        if prop_signals_enabled:
+            signals.extend(
+                await _scan_book_c_prop_signals_for_game(
+                    game=game,
+                    game_date=game_date,
+                    game_state=game_state,
+                    players=players,
+                    kalshi_markets=kalshi_markets,
+                    book_c_config=book_c_config,
+                    scan_metrics=scan_metrics,
+                )
             )
-        )
+
+        if not clutch_comeback_enabled:
+            continue
 
         matched_markets = match_game_markets(
             game.get("home_team", ""),
@@ -1934,6 +2292,7 @@ def _record_scan_health(
 async def async_main(once: bool = False):
     """Async main loop."""
     scan_interval = oracle_config.get("scanIntervalMinutes", 1) * 60
+    passive_maintenance_task = asyncio.create_task(_passive_order_maintenance_loop())
 
     try:
         while True:
@@ -1958,6 +2317,12 @@ async def async_main(once: bool = False):
 
             await asyncio.sleep(scan_interval)
     finally:
+        passive_maintenance_task.cancel()
+        try:
+            await passive_maintenance_task
+        except asyncio.CancelledError:
+            pass
+        await asyncio.to_thread(_reconcile_passive_orders)
         log.info("Oracle bot shutting down, cleaning up async resources")
         if real_ws is not None:
             try:
