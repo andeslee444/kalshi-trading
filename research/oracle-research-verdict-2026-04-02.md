@@ -1,21 +1,25 @@
 # Oracle NBA Research Verdict
 
-Date: 2026-04-02
-Data: 305,735 alpha ledger events (Mar 15 - Apr 2), 200 stored game feeds, 38 settled prop signals
+Date: 2026-04-02 (updated 2026-04-03)
+Data: 340,526 alpha ledger events (Mar 15 - Apr 3), 200 stored game feeds, 38 settled prop signals
 
 ---
 
 ## Executive Summary
 
-Three hypotheses were tested to definitive verdicts:
+Five hypotheses tested, one major fix discovered:
 
 | Hypothesis | Verdict | Key Finding |
 |-----------|---------|-------------|
-| **H1** Latency edge | **PARTIAL PASS** | Only `clutch_entry` events show positive markout (+0.535c, CI [+0.04, +0.88]). All other event classes are negative. |
+| **H1** Latency edge (taker) | **PARTIAL PASS** | Only `clutch_entry` events show positive markout (+0.535c, CI [+0.04, +0.88]). All other event classes are negative. |
+| **H2** Crowd divergence | **DATA COLLECTING** | Crowd API was broken by JSON key bug (fixed). Live-game divergence 0.3-2.8% (too small). Need pregame data. |
 | **H3** Comeback overpricing | **KILLED** | Model *underprices* trailing teams by 19-33pp. Fading comebacks would lose money. |
 | **H6** Pregame props | **KILLED** | 0/32 NO-side wins. Model calibration catastrophically overconfident. Edge inversion. |
+| **H8** Maker-vs-taker | **PASS** | +1.83c passive markout, CI [+1.51, +2.13], 20.8% fill rate. Every event class positive. |
 
-**Bottom line:** Oracle has one narrow, barely-significant signal (clutch_entry game markets at t+5s). Everything else -- scoring runs, injuries, blowouts, technical fouls, pregame props -- shows no executable alpha on Kalshi.
+**Key fix:** Real Sports crowd market API was returning empty due to JSON key bug (`"markets"` vs `"gameMarkets"`). Fixed on Apr 2. Crowd probabilities now flowing into alpha ledger (12 markets with 2M+ volume, probability histories). This unblocks Book A and H2 testing.
+
+**Strategic shift:** H8 (passive execution) is the breakthrough. Taker execution loses -0.76c but passive gains +1.83c. This changes Oracle from "narrow clutch-only" to "broad passive maker across all event classes on game markets."
 
 ---
 

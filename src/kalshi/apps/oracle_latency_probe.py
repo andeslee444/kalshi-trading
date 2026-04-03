@@ -311,6 +311,7 @@ async def _fetch_market_context(real_client: RealSportsClient, kalshi_client: Ka
         "discovery_games": discovery_games,
         "player_market_contexts": player_market_contexts,
         "crowd_markets": crowd_markets,
+        "crowd_markets_raw": crowd_markets_raw,
         "kalshi_markets": kalshi_markets,
         "kalshi_prop_markets": kalshi_prop_markets,
     }
@@ -467,6 +468,61 @@ def _crowd_source_failures(context: dict) -> list[dict]:
             },
         }
     ]
+
+
+def _extract_crowd_probabilities(crowd_markets_raw: list[dict]) -> list[dict]:
+    """Extract crowd win probabilities from raw Real Sports game market data.
+
+    Each raw market has: id, gameId, sport, label, outcomes (with probability),
+    volumeDisplay, isLocked, isSettled, probabilityHistory.
+
+    Returns one row per game with home/away crowd probabilities.
+    """
+    rows = []
+    for m in crowd_markets_raw:
+        if m.get("label") != "Game Winner":
+            continue
+        outcomes = m.get("outcomes", [])
+        if len(outcomes) != 2:
+            continue
+        game_id = m.get("gameId")
+        prob_a = outcomes[0].get("probability", 0)
+        prob_b = outcomes[1].get("probability", 0)
+        key_a = outcomes[0].get("key", "")
+        key_b = outcomes[1].get("key", "")
+        volume = m.get("volumeDisplay", "")
+        locked = m.get("isLocked", False)
+        settled = m.get("isSettled", False)
+        history = m.get("probabilityHistory", [])
+        rows.append({
+            "game_id": game_id,
+            "market_id": m.get("id"),
+            "team_a": key_a,
+            "team_a_prob": round(prob_a, 4),
+            "team_b": key_b,
+            "team_b_prob": round(prob_b, 4),
+            "volume_display": volume,
+            "is_locked": locked,
+            "is_settled": settled,
+            "history_length": len(history),
+        })
+    return rows
+
+
+def _record_crowd_probabilities(capture: OracleAlphaCapture, crowd_rows: list[dict]) -> int:
+    """Record crowd probability snapshots into the alpha ledger."""
+    recorded = 0
+    for row in crowd_rows:
+        try:
+            capture.record_probe_snapshot(
+                snapshot_name="crowd_probability",
+                payload=row,
+                source_artifact="oracle_latency_probe",
+            )
+            recorded += 1
+        except Exception:
+            pass
+    return recorded
 
 
 def _record_source_failures(capture: OracleAlphaCapture, failures: list[dict]) -> list[dict]:
@@ -756,6 +812,11 @@ async def _refresh_loop(
                     "Latency probe crowd source unavailable: %s",
                     "; ".join(f["message"] for f in crowd_failures),
                 )
+            else:
+                crowd_rows = _extract_crowd_probabilities(context.get("crowd_markets_raw", []))
+                if crowd_rows:
+                    n_recorded = _record_crowd_probabilities(capture, crowd_rows)
+                    log.info("Recorded %d crowd probability snapshots", n_recorded)
             index = probe.refresh_market_indexes(
                 _mapping_games(context),
                 _mapping_kalshi_markets(context),
@@ -852,6 +913,11 @@ async def async_main(
             "Latency probe crowd source unavailable at startup: %s",
             "; ".join(f["message"] for f in crowd_failures),
         )
+    else:
+        crowd_rows = _extract_crowd_probabilities(context.get("crowd_markets_raw", []))
+        if crowd_rows:
+            n_recorded = _record_crowd_probabilities(capture, crowd_rows)
+            log.info("Startup: recorded %d crowd probability snapshots", n_recorded)
 
     index = probe.refresh_market_indexes(
         _mapping_games(context),
