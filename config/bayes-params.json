@@ -4,15 +4,15 @@
     "sports": {
       "buckets": {
         "1-5": {
-          "wins": 0,
-          "losses": 0
+          "wins": 3,
+          "losses": 5
         },
         "6-10": {
-          "wins": 481,
+          "wins": 496,
           "losses": 111
         },
         "11-15": {
-          "wins": 447,
+          "wins": 456,
           "losses": 182
         },
         "16-20": {
@@ -56,11 +56,11 @@
     "crypto": {
       "buckets": {
         "1-5": {
-          "wins": 30,
+          "wins": 35,
           "losses": 3
         },
         "6-10": {
-          "wins": 6,
+          "wins": 7,
           "losses": 4
         },
         "11-15": {
@@ -160,19 +160,19 @@
     "entertainment": {
       "buckets": {
         "1-5": {
-          "wins": 0,
+          "wins": 1,
           "losses": 0
         },
         "6-10": {
-          "wins": 5,
-          "losses": 0
+          "wins": 6,
+          "losses": 1
         },
         "11-15": {
-          "wins": 2,
+          "wins": 8,
           "losses": 0
         },
         "16-20": {
-          "wins": 0,
+          "wins": 1,
           "losses": 0
         },
         "21-30": {

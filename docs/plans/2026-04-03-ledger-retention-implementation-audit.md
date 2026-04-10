@@ -1,7 +1,7 @@
 # Ledger Retention Implementation Audit
 
 Generated: 2026-04-03
-Status: Implemented in dev, validated, first staged dev-ledger rollout completed, ready for staged promotion.
+Status: Implemented in dev, validated, trade-decision backlog caught up through the rolling one-day retention window.
 
 ## Goal
 
@@ -83,7 +83,7 @@ The focused ledger suite was rerun after this fix and remained green.
 
 ## First Real Rollout
 
-Completed on the old dev ledger:
+Completed on the old dev ledger in staged per-date batches:
 
 - ledger path: `data/event-ledger.sqlite3`
 - archive root: `data/archive/events`
@@ -92,13 +92,54 @@ Completed on the old dev ledger:
   1. `2026-03-14`
   2. `2026-03-15`
   3. `2026-03-16`
+  4. `2026-03-17`
+  5. `2026-03-18`
+  6. `2026-03-19`
+  7. `2026-03-20`
+  8. `2026-03-21`
+  9. `2026-03-22`
+  10. `2026-03-23`
+  11. `2026-03-24`
+  12. `2026-03-25`
+  13. `2026-03-26`
+  14. `2026-03-27`
+  15. `2026-03-28`
+  16. `2026-03-29`
+  17. `2026-03-30`
+  18. `2026-03-31`
+  19. `2026-04-01`
+  20. `2026-04-02`
+  21. `2026-04-03`
 
 Real result:
 
-- archived rows: `1,270,254`
-- archived dates: `2026-03-14`, `2026-03-15`, `2026-03-16`
-- cold-store size after first rollout: about `92 MB`
-- hot rows remaining for those dates: `0`
+- archived rows:
+  - `2026-03-14`: `200,261`
+  - `2026-03-15`: `714,004`
+  - `2026-03-16`: `355,989`
+  - `2026-03-17`: `1,901,132`
+  - `2026-03-18`: `2,133,122`
+  - `2026-03-19`: `2,275,705`
+  - `2026-03-20`: `2,321,512`
+  - `2026-03-21`: `2,288,923`
+  - `2026-03-22`: `2,097,720`
+  - `2026-03-23`: `1,979,053`
+  - `2026-03-24`: `2,126,785`
+  - `2026-03-25`: `2,198,575`
+  - `2026-03-26`: `2,179,490`
+  - `2026-03-27`: `2,171,755`
+  - `2026-03-28`: `2,188,459`
+  - `2026-03-29`: `2,201,282`
+  - `2026-03-30`: `467,915`
+  - `2026-03-31`: `17,331`
+  - `2026-04-01`: `12,128`
+  - `2026-04-02`: `5,275`
+  - `2026-04-03`: `998,037`
+- total archived rows so far: `30,352,127`
+- archive partitions written: `21`
+- archived dates: `2026-03-14` through `2026-04-03`
+- cold-store size after the staged rollout: about `2.4 GB`
+- hot `trade_decision` rows remaining older than the rolling one-day cutoff: `0`
 
 Artifacts written:
 
@@ -108,13 +149,19 @@ Artifacts written:
 - `data/archive/events/trade_decision/date=2026-03-15/manifest.json`
 - `data/archive/events/trade_decision/date=2026-03-16/events.jsonl.gz`
 - `data/archive/events/trade_decision/date=2026-03-16/manifest.json`
+- `data/archive/events/trade_decision/date=2026-03-17/events.jsonl.gz`
+- `data/archive/events/trade_decision/date=2026-03-17/manifest.json`
+- `data/archive/events/trade_decision/date=2026-03-18/events.jsonl.gz`
+- `data/archive/events/trade_decision/date=2026-03-18/manifest.json`
+- `data/archive/events/trade_decision/date=2026-03-19/events.jsonl.gz`
+- `data/archive/events/trade_decision/date=2026-03-19/manifest.json`
 - `data/reports/ledger-retention-latest.json`
 
 Logical space reclaimed in hot SQLite:
 
-- `freelist_count = 537,280`
+- `freelist_count = 13,291,730`
 - `page_size = 4096`
-- reclaimable on next compact: about `2.05 GiB`
+- reclaimable on next compact: about `50.70 GiB`
 
 The SQLite file itself remains about `54 GB` because no `VACUUM` has been run yet.
 
@@ -130,7 +177,7 @@ The SQLite file itself remains about `54 GB` because no `VACUUM` has been run ye
 ## Known Operational Follow-Up
 
 - The old dev-root ledger at `data/event-ledger.sqlite3` is now about 54 GB before compaction.
-- The first real staged archive/prune run is complete, but the broader legacy-ledger rollout should still proceed by event type / event-date batch.
+- The staged `trade_decision` archive/prune rollout is now caught up to the rolling one-day retention window, but the broader legacy-ledger rollout should still proceed by event type / event-date batch.
 - The first likely rollout order remains:
   1. `trade_decision`
   2. `forecast_snapshot`
@@ -138,8 +185,50 @@ The SQLite file itself remains about `54 GB` because no `VACUUM` has been run ye
   4. `source_observation`
   5. `position_snapshot`
   6. `budget_decision`
-- The next three `trade_decision` dates are materially larger:
-  - `2026-03-17`: `1,901,132`
-  - `2026-03-18`: `2,133,122`
-  - `2026-03-19`: `2,275,705`
-- Because of that step-up, the next rollout should remain bounded and should not compact until more hot space has been reclaimed.
+- The next rollout target should move to the next highest-volume event type:
+  1. `forecast_snapshot`
+  2. `market_snapshot`
+  3. `source_observation`
+  4. `position_snapshot`
+  5. `budget_decision`
+- `VACUUM` is now worth considering because the hot ledger has roughly `50.70 GiB` of reclaimable free pages, but it should still be run in a dedicated maintenance window, not chained onto retention batches.
+
+## Compaction Planning
+
+Current compaction preconditions:
+
+- no active process is holding the old dev ledger open
+- `trade_decision` retention is caught up to the rolling one-day window
+- reclaimable free space inside SQLite is about `50.70 GiB`
+
+Current compaction blocker:
+
+- the host volume only has about `2.8 GiB` free
+- the current compaction path is an in-place SQLite `VACUUM`
+- that is not safe to run with this little free space
+
+Operational conclusion:
+
+- do **not** run in-place compaction on the current machine state
+
+Recommended compaction preconditions before running:
+
+- confirm the old dev ledger is idle with `lsof`
+- confirm no active runtime is writing to `data/event-ledger.sqlite3`
+- free at least `60-70 GiB` on the host volume before attempting in-place `VACUUM`
+
+Preferred compaction command once preconditions are met:
+
+- `python3 scripts/ledger-retention.py --event-type trade_decision --compact --json --save`
+
+Why that command is acceptable once space exists:
+
+- retention is already caught up, so the archive/prune portion should be a no-op
+- the script already has sibling-runtime PID guards for compaction
+
+If local free space cannot be increased enough:
+
+- add an alternate compaction path using `VACUUM INTO` on a different volume
+- write the compacted ledger to external storage
+- validate counts and integrity
+- swap the compacted ledger into place during a maintenance window
