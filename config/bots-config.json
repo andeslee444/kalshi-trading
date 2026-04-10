@@ -7,11 +7,12 @@
       "modelShiftPp": 20,
       "trailingDropCents": 10,
       "trailingMinProfitCents": 10,
-      "takeProfitFraction": 0.50
-    }
+      "takeProfitFraction": 0.5
+    },
+    "enabled": false
   },
   "entertainment": {
-    "enabled": true,
+    "enabled": false,
     "sanityProject": "8aky18h3",
     "sanityApiVersion": "2021-10-21",
     "maxTradeAmount": 5,
@@ -19,16 +20,28 @@
     "maxDailyTrades": 5,
     "maxDailyLoss": 10,
     "maxDailyLossPct": 0.03,
-    "confidenceThreshold": 0.70,
+    "confidenceThreshold": 0.7,
     "scanIntervalMinutes": 15,
-    "tickers": ["ALBUM", "BOX", "MOVIE", "STREAM", "MUSIC", "BILLBOARD", "OSCAR", "GRAMMY", "SPOTIFY", "FILM", "ENTERTAIN"],
+    "tickers": [
+      "ALBUM",
+      "BOX",
+      "MOVIE",
+      "STREAM",
+      "MUSIC",
+      "BILLBOARD",
+      "OSCAR",
+      "GRAMMY",
+      "SPOTIFY",
+      "FILM",
+      "ENTERTAIN"
+    ],
     "exit": {
       "takeProfitCents": 80,
       "stopLossCents": 30,
       "modelShiftPp": 20,
       "trailingDropCents": 10,
       "trailingMinProfitCents": 10,
-      "takeProfitFraction": 0.50
+      "takeProfitFraction": 0.5
     }
   },
   "hdd_monitor": {
@@ -36,7 +49,7 @@
     "scanIntervalMinutes": 15
   },
   "beatrelease": {
-    "enabled": true,
+    "enabled": false,
     "checkIntervalHours": 1,
     "maxTradeAmount": 15,
     "maxTradeAmountPct": 0.03,
@@ -54,21 +67,21 @@
       "modelShiftPp": 20,
       "trailingDropCents": 10,
       "trailingMinProfitCents": 10,
-      "takeProfitFraction": 0.50
+      "takeProfitFraction": 0.5
     }
   },
   "strategy": {
-    "enabled": true,
+    "enabled": false,
     "maxTradeAmount": 10,
     "maxTradeAmountPct": 0.02,
     "maxDailyTrades": 20,
     "maxDailyLoss": 100,
-    "maxDailyLossPct": 0.10,
+    "maxDailyLossPct": 0.1,
     "scanIntervalMinutes": 15,
     "enableBuyLongshots": true,
     "sellMaxPrice": 30,
     "buyMinPrice": 70,
-    "categoryCap": 0.30,
+    "categoryCap": 0.3,
     "singleTradeCap": 0.05,
     "bayesianEdge": true,
     "bayesKappa": 30,
@@ -83,7 +96,7 @@
       "modelShiftPp": 20,
       "trailingDropCents": 10,
       "trailingMinProfitCents": 10,
-      "takeProfitFraction": 0.50
+      "takeProfitFraction": 0.5
     }
   },
   "oracle": {
@@ -91,9 +104,9 @@
     "maxTradeAmount": 25,
     "maxDailyTrades": 30,
     "maxDailyLoss": 100,
-    "maxDailyLossPct": 0.10,
+    "maxDailyLossPct": 0.1,
     "scanIntervalMinutes": 1,
-    "edgeThreshold": 0.10,
+    "edgeThreshold": 0.1,
     "risk": {
       "maxTotalExposurePct": 0.18,
       "maxSimultaneousPositions": 10,
@@ -130,7 +143,7 @@
     },
     "killSwitches": {
       "consecutiveOrderFailures": 3,
-      "singleBookDrawdownPct": 0.10
+      "singleBookDrawdownPct": 0.1
     },
     "realSports": {
       "baseUrl": "https://web.realapp.com",
@@ -142,7 +155,7 @@
     "maxTradeAmountPct": 0.05,
     "maxDailyTrades": 30,
     "maxDailyLoss": 100,
-    "maxDailyLossPct": 0.10,
+    "maxDailyLossPct": 0.1,
     "scanIntervalMinutes": 5,
     "edgeThreshold": 0.08,
     "driftPct": 0.0,
@@ -160,8 +173,9 @@
       "modelShiftPp": 15,
       "trailingDropCents": 15,
       "trailingMinProfitCents": 15,
-      "takeProfitFraction": 0.50
-    }
+      "takeProfitFraction": 0.5
+    },
+    "enabled": false
   },
   "economics": {
     "maxTradeAmount": 50,
@@ -179,7 +193,7 @@
       "fredApiKey": "",
       "maxSentimentArticles": 5,
       "biasClampPp": 0.15,
-      "sigmaTighteningMax": 0.30
+      "sigmaTighteningMax": 0.3
     },
     "exit": {
       "takeProfitCents": 80,
@@ -187,8 +201,9 @@
       "modelShiftPp": 20,
       "trailingDropCents": 10,
       "trailingMinProfitCents": 10,
-      "takeProfitFraction": 0.50
-    }
+      "takeProfitFraction": 0.5
+    },
+    "enabled": false
   },
   "cross_platform_arb": {
     "enabled": false,
@@ -203,20 +218,21 @@
   },
   "position_monitor": {
     "scanIntervalMinutes": 15,
-    "takeProfitThreshold": 0.80,
-    "stopLossThreshold": 0.30,
-    "stopLossPct": 0.40,
-    "modelShiftThreshold": 0.20,
+    "takeProfitThreshold": 0.8,
+    "stopLossThreshold": 0.3,
+    "stopLossPct": 0.4,
+    "modelShiftThreshold": 0.2,
     "maxDailyExits": 20,
     "orderTtlMinutes": 120,
     "trailingDropCents": 10,
-    "trailingMinProfitCents": 10
+    "trailingMinProfitCents": 10,
+    "enabled": false
   },
   "allocator": {
     "maxConcurrentPositions": 30,
     "absoluteDailyLossCap": 750,
     "absoluteDailyLossCapPct": 0.15,
-    "drawdownHaltThreshold": 0.80,
+    "drawdownHaltThreshold": 0.8,
     "perBotDailyLimit": {
       "weather": 200,
       "economics": 300,
@@ -240,7 +256,9 @@
     "maxDailyTrades": 50,
     "maxDailyLoss": 25,
     "maxDailyLossPct": 0.05,
-    "targetMarkets": ["KXHIGH"]
+    "targetMarkets": [
+      "KXHIGH"
+    ]
   },
   "correlation": {
     "clusterMaxFraction": 0.15,
@@ -249,5 +267,9 @@
     "tailDepKellyCut": 0.25,
     "varConfidence": 0.99,
     "copulaDf": 5
+  },
+  "monitor": {
+    "enabled": true,
+    "_note": "Prod pilot: source-monitor NWS weather only"
   }
 }

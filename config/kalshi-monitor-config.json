@@ -1,23 +1,43 @@
 {
-  "maxTradeAmount": 25,
+  "maxTradeAmount": 50,
   "maxTradeAmountPct": 0.05,
-  "maxDailyTrades": 25,
-  "maxDailyLoss": 50,
-  "maxDailyLossPct": 0.10,
+  "maxDailyTrades": 12,
+  "maxDailyLoss": 150,
+  "maxDailyLossPct": 0.02,
   "sources": {
     "hdd": {
-      "enabled": true,
-      "urls": ["https://www.hitsdailydouble.com/news", "https://www.hitsdailydouble.com/news/charts"],
+      "enabled": false,
+      "urls": [
+        "https://www.hitsdailydouble.com/news",
+        "https://www.hitsdailydouble.com/news/charts"
+      ],
       "sanityProject": "8aky18h3",
-      "chartSlugs": ["hits-top-50", "midweek-20"],
+      "chartSlugs": [
+        "hits-top-50",
+        "midweek-20"
+      ],
       "intervalMinutes": 15,
-      "keywords": ["first week", "sales", "units", "projected", "building"]
+      "keywords": [
+        "first week",
+        "sales",
+        "units",
+        "projected",
+        "building"
+      ]
     },
     "boxoffice": {
-      "enabled": true,
-      "urls": ["https://www.boxofficemojo.com/", "https://www.the-numbers.com/"],
+      "enabled": false,
+      "urls": [
+        "https://www.boxofficemojo.com/",
+        "https://www.the-numbers.com/"
+      ],
       "intervalMinutes": 30,
-      "activeDays": ["Friday", "Saturday", "Sunday", "Monday"],
+      "activeDays": [
+        "Friday",
+        "Saturday",
+        "Sunday",
+        "Monday"
+      ],
       "tmdbEnabled": false
     },
     "nws": {
@@ -31,26 +51,10 @@
       "highConfidenceDailyLossMinConfidence": 0.85,
       "highConfidenceDailyLossMinHour": 17,
       "stations": {
-        "MIA": "KMIA",
-        "LAX": "KLAX",
-        "PHIL": "KPHL",
-        "NY": "KNYC",
-        "CHI": "KMDW",
         "AUS": "KAUS",
         "DEN": "KDEN",
-        "HOU": "KHOU",
-        "ATL": "KATL",
-        "BOS": "KBOS",
-        "SFO": "KSFO",
-        "SEA": "KSEA",
-        "LV": "KLAS",
-        "DAL": "KDFW",
-        "MIN": "KMSP",
-        "PHX": "KPHX",
-        "DC": "KDCA",
-        "NOLA": "KMSY",
-        "OKC": "KOKC",
-        "SATX": "KSAT"
+        "MIA": "KMIA",
+        "PHIL": "KPHL"
       },
       "intervalMinutes": 10
     }

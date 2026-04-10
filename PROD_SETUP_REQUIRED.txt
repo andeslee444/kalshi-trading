@@ -1,0 +1,4 @@
+Production deploy is bootstrapped.
+Current /Users/andeslee/deploy/kalshi-prod/.env uses the Oracle production Kalshi API key
+as the generic KALSHI_API_KEY for the narrow weather prod pilot.
+Review the prod config before loading the supervisor.
