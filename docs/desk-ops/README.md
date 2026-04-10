@@ -19,6 +19,7 @@ Until named humans are assigned, ownership is by functional role instead of pers
 - [change-management.md](./change-management.md)
 - [incident-template.md](./incident-template.md)
 - [runbooks/README.md](./runbooks/README.md)
+- [runbooks/fresh-mac-rebuild-and-deploy.md](./runbooks/fresh-mac-rebuild-and-deploy.md)
 
 ## Cadence
 

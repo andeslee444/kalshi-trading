@@ -125,6 +125,17 @@ cp .env.example .env
 # config/keys/deepseek.txt
 ```
 
+## Deploy Layout
+
+Operational deploy roots are separate Git worktrees, not separate repositories:
+
+- dev: `Documents/cursor-projects/kalshi-trading`
+- demo: `~/deploy/kalshi-demo`
+- prod: `~/deploy/kalshi-prod`
+- oracle demo: `~/deploy/kalshi-oracle-demo`
+
+See [docs/desk-ops/runbooks/fresh-mac-rebuild-and-deploy.md](docs/desk-ops/runbooks/fresh-mac-rebuild-and-deploy.md) for the clean-Mac restore flow and the deploy bootstrap/install commands.
+
 ### Environment Variables
 
 | Variable | Required | Default | Description |
@@ -224,5 +235,4 @@ The `research/` directory contains strategy documentation:
 - `kalshi-deep-dive.md` — Comprehensive Kalshi API analysis, community insights, strategy ranking
 - `kalshi-info-arbitrage.md` — Settlement source monitoring: which sources publish before Kalshi settles, timing windows, scraping methods
 - `kalshi-markets-research.md` — Academic findings (Becker 2025, Whelan 2025), strategy rankings, mathematical methods, cross-platform arbitrage analysis
-
 

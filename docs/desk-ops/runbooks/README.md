@@ -4,6 +4,7 @@ These runbooks cover the highest-value operational failure modes first.
 
 ## Index
 
+- [fresh-mac-rebuild-and-deploy.md](./fresh-mac-rebuild-and-deploy.md)
 - [supervisor-and-stale-bots.md](./supervisor-and-stale-bots.md)
 - [source-freshness-and-parser-failures.md](./source-freshness-and-parser-failures.md)
 - [ledger-parity-regression.md](./ledger-parity-regression.md)
