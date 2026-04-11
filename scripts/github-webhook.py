@@ -2,7 +2,7 @@
 """GitHub webhook listener — fast inline deploy on push events.
 
 Runs on port 3458, exposed via Cloudflare tunnel at deploy.andeslee.com.
-On push to main: git pull, send iMessage via BlueBubbles, then reload bots in background.
+On push to main: git pull, send a WhatsApp notification, then reload bots in background.
 
 Usage:
     python3 scripts/github-webhook.py                  # default (warn if no secret)
@@ -18,20 +18,18 @@ import os
 import subprocess
 import sys
 import threading
-import urllib.request
-import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 PORT = 3458
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RELOAD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reload-bots.sh")
 LOG = "/tmp/github-webhook.log"
+sys.path.insert(0, os.path.join(PROJECT_DIR, "src", "kalshi"))
 
 # Module-level — set by main() after arg parsing / env loading
+from kalshi_auth import notify_whatsapp
+
 WEBHOOK_SECRET = ""
-BLUEBUBBLES_URL = ""
-BLUEBUBBLES_PASSWORD = ""
-BLUEBUBBLES_CHAT_GUID = ""
 
 
 def log(msg):
@@ -52,22 +50,15 @@ def verify_signature(payload, signature):
     return hmac.compare_digest(f"sha256={expected}", signature)
 
 
-def send_imessage(text):
-    """Send iMessage via BlueBubbles API. Logs and returns on failure."""
-    if not BLUEBUBBLES_PASSWORD or not BLUEBUBBLES_CHAT_GUID:
-        log("Skipping iMessage: BLUEBUBBLES_PASSWORD or BLUEBUBBLES_CHAT_GUID not set")
-        return
-    url = f"{BLUEBUBBLES_URL}/api/v1/message/text?password={BLUEBUBBLES_PASSWORD}"
-    body = json.dumps({
-        "chatGuid": BLUEBUBBLES_CHAT_GUID,
-        "message": text,
-    }).encode()
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+def send_whatsapp(text):
+    """Send a deploy notification through WhatsApp."""
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            log(f"iMessage sent (HTTP {resp.status})")
+        if notify_whatsapp(text):
+            log("WhatsApp notification sent")
+        else:
+            log("WhatsApp notification skipped or failed")
     except Exception as e:
-        log(f"iMessage failed: {e}")
+        log(f"WhatsApp notification failed: {e}")
 
 
 def run_command(cmd, cwd=None, timeout=60):
@@ -91,14 +82,14 @@ def deploy(repo_name, commits, changed_files):
         ok, output = run_command("git pull --ff-only", cwd=PROJECT_DIR, timeout=30)
         log(f"git pull: {'OK' if ok else 'FAILED'} — {output}")
         if not ok:
-            send_imessage(f"⚠️ {repo_name} deploy FAILED: git pull\n{output[:200]}")
+            send_whatsapp(f"⚠️ {repo_name} deploy FAILED: git pull\n{output[:200]}")
             return
 
-        # 2. Send iMessage immediately
+        # 2. Send WhatsApp notification immediately
         commit_summary = "\n".join(f"• {c}" for c in commits[:5])
         if len(commits) > 5:
             commit_summary += f"\n  ...and {len(commits) - 5} more"
-        send_imessage(f"🚀 {repo_name} deployed\n{commit_summary}")
+        send_whatsapp(f"🚀 {repo_name} deployed\n{commit_summary}")
 
         # 3. pip install (only if requirements.txt changed)
         if "requirements.txt" in changed_files:
@@ -216,7 +207,7 @@ def load_env():
 
 
 def main(args=None):
-    global WEBHOOK_SECRET, BLUEBUBBLES_URL, BLUEBUBBLES_PASSWORD, BLUEBUBBLES_CHAT_GUID
+    global WEBHOOK_SECRET
 
     parser = argparse.ArgumentParser(description="GitHub webhook listener")
     parser.add_argument("--require-secret", action="store_true",
@@ -226,9 +217,6 @@ def main(args=None):
     load_env()
 
     WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
-    BLUEBUBBLES_URL = os.environ.get("BLUEBUBBLES_URL", "http://localhost:1234")
-    BLUEBUBBLES_PASSWORD = os.environ.get("BLUEBUBBLES_PASSWORD", "")
-    BLUEBUBBLES_CHAT_GUID = os.environ.get("BLUEBUBBLES_CHAT_GUID", "")
 
     if parsed.require_secret and not WEBHOOK_SECRET:
         print("ERROR: --require-secret set but GITHUB_WEBHOOK_SECRET env var is empty.",
@@ -238,9 +226,6 @@ def main(args=None):
 
     if not WEBHOOK_SECRET:
         print("WARNING: GITHUB_WEBHOOK_SECRET not set — webhook signature verification disabled")
-
-    if not BLUEBUBBLES_PASSWORD or not BLUEBUBBLES_CHAT_GUID:
-        print("WARNING: BLUEBUBBLES_PASSWORD or BLUEBUBBLES_CHAT_GUID not set — iMessage notifications disabled")
 
     log(f"Starting webhook listener on port {PORT}")
     server = HTTPServer(("127.0.0.1", PORT), WebhookHandler)

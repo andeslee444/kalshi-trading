@@ -1,7 +1,9 @@
 #!/bin/bash
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="/opt/homebrew/opt/python@3.11/libexec/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export SHELL="/bin/bash"
-cd /Users/andeslee/Documents/cursor-projects/kalshi-trading
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+cd "$PROJECT_DIR"
 
 # Load env vars for API access
 set -a
@@ -9,6 +11,7 @@ source .env 2>/dev/null || true
 set +a
 
 LOG="data/logs/sync-cron.log"
+mkdir -p "$(dirname "$LOG")"
 echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) — sync-up-cron starting" >> "$LOG"
 
 # Step 1: Refresh P&L snapshot (captures current API state)

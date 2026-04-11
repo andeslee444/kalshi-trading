@@ -16,11 +16,29 @@ PROJECT_DIR = Path(__file__).resolve().parents[3]
 
 _log = logging.getLogger("notifications")
 
-_webhook_rate_limiter = {}
+# Keep webhook/iMessage compatibility entry points on a shared limiter so
+# callers that still invoke both paths do not generate duplicate WhatsApp
+# alerts.
+_alert_rate_limiter = {}
+_webhook_rate_limiter = _alert_rate_limiter
 _WEBHOOK_COOLDOWN_SECONDS = 1800
 
-_imessage_rate_limiter = {}
+_imessage_rate_limiter = _alert_rate_limiter
 _IMESSAGE_COOLDOWN_SECONDS = 1800
+
+
+def _resolve_notification_phone(project_dir, env):
+    """Resolve the WhatsApp destination from env or repo config."""
+    resolved_phone = env.get("NOTIFICATION_PHONE", "").strip()
+    if resolved_phone:
+        return resolved_phone
+    try:
+        cfg_path = Path(project_dir) / "config" / "bots-config.json"
+        with open(cfg_path) as handle:
+            cfg = json.load(handle)
+        return str(cfg.get("notificationPhone", "")).strip()
+    except Exception:
+        return ""
 
 
 def notify_whatsapp(
@@ -35,15 +53,7 @@ def notify_whatsapp(
     """Send a WhatsApp notification via openclaw CLI."""
     log = logger or logging.getLogger("notify")
     environ = os.environ if env is None else env
-    resolved_phone = phone or environ.get("NOTIFICATION_PHONE", "")
-    if not resolved_phone:
-        try:
-            cfg_path = Path(project_dir) / "config" / "bots-config.json"
-            with open(cfg_path) as handle:
-                cfg = json.load(handle)
-            resolved_phone = cfg.get("notificationPhone", "")
-        except Exception:
-            pass
+    resolved_phone = phone or _resolve_notification_phone(project_dir, environ)
     if not resolved_phone:
         log.warning("No notificationPhone configured — notification logged only")
         return False
@@ -78,16 +88,15 @@ def notify_webhook(
     level="info",
     logger=None,
     *,
+    project_dir=PROJECT_DIR,
     env=None,
     requests_module=requests,
+    subprocess_module=subprocess,
     time_func=time.time,
 ):
-    """Send an alert to a Slack or Discord webhook."""
+    """Legacy webhook entry point routed through WhatsApp."""
     log = logger or _log
     environ = os.environ if env is None else env
-    url = environ.get("ALERT_WEBHOOK_URL", "")
-    if not url:
-        return False
 
     prefix = message[:80]
     now = time_func()
@@ -95,28 +104,20 @@ def notify_webhook(
     if now - last_sent < _WEBHOOK_COOLDOWN_SECONDS:
         return False
 
+    _ = requests_module  # Kept for backward-compatible call signatures.
     emoji = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨"}.get(level, "ℹ️")
     full_message = f"{emoji} [{level.upper()}] {message}"
-    payload = {"content": full_message} if "discord" in url.lower() else {"text": full_message}
-
-    try:
-        response = requests_module.post(url, json=payload, timeout=10)
-        response.raise_for_status()
+    if notify_whatsapp(
+        full_message,
+        logger=log,
+        project_dir=project_dir,
+        env=environ,
+        subprocess_module=subprocess_module,
+    ):
         _webhook_rate_limiter[prefix] = now
-        log.info("Webhook alert sent: %s", message[:100])
+        log.info("Legacy webhook alert routed to WhatsApp: %s", message[:100])
         return True
-    except requests_module.exceptions.ConnectionError:
-        log.warning("Webhook connection error — alert not delivered")
-        return False
-    except requests_module.exceptions.HTTPError as exc:
-        log.warning(
-            "Webhook HTTP error %s — alert not delivered",
-            exc.response.status_code if exc.response else "?",
-        )
-        return False
-    except Exception as exc:
-        log.warning("Webhook error: %s", exc)
-        return False
+    return False
 
 
 def _reset_imessage_rate_limiter():
@@ -124,42 +125,48 @@ def _reset_imessage_rate_limiter():
     _imessage_rate_limiter.clear()
 
 
-def _send_imessage_blocking(message, prefix, logger, *, env=None, requests_module=requests, time_func=time.time):
-    """Blocking iMessage send (runs in background thread)."""
+def _send_imessage_blocking(
+    message,
+    prefix,
+    logger,
+    *,
+    project_dir=PROJECT_DIR,
+    env=None,
+    requests_module=requests,
+    subprocess_module=subprocess,
+    time_func=time.time,
+):
+    """Blocking legacy iMessage send routed to WhatsApp (runs in a background thread)."""
     log = logger or _log
-    environ = os.environ if env is None else env
-    bb_url = environ.get("BLUEBUBBLES_URL", "")
-    bb_password = environ.get("BLUEBUBBLES_PASSWORD", "")
-    bb_chat = environ.get("BLUEBUBBLES_CHAT_GUID", "")
     try:
-        response = requests_module.post(
-            f"{bb_url}/api/v1/message/text",
-            params={"password": bb_password},
-            json={"chatGuid": bb_chat, "message": message},
-            timeout=10,
-        )
-        response.raise_for_status()
-        _imessage_rate_limiter[prefix] = time_func()
-        log.info("iMessage sent: %s", prefix)
+        _ = requests_module  # Kept for backward-compatible call signatures.
+        if notify_whatsapp(
+            message,
+            logger=log,
+            project_dir=project_dir,
+            env=os.environ if env is None else env,
+            subprocess_module=subprocess_module,
+        ):
+            _imessage_rate_limiter[prefix] = time_func()
+            log.info("Legacy iMessage notification routed to WhatsApp: %s", prefix)
     except Exception as exc:
-        log.warning("iMessage send failed: %s", exc)
+        log.warning("Legacy iMessage notification failed: %s", exc)
 
 
 def notify_imessage(
     message,
     logger=None,
     *,
+    project_dir=PROJECT_DIR,
     env=None,
     requests_module=requests,
     threading_module=threading,
+    subprocess_module=subprocess,
     time_func=time.time,
 ):
-    """Send an iMessage via BlueBubbles API (fire-and-forget)."""
+    """Legacy iMessage entry point routed through WhatsApp (fire-and-forget)."""
     environ = os.environ if env is None else env
-    bb_url = environ.get("BLUEBUBBLES_URL", "")
-    bb_password = environ.get("BLUEBUBBLES_PASSWORD", "")
-    bb_chat = environ.get("BLUEBUBBLES_CHAT_GUID", "")
-    if not bb_url or not bb_password or not bb_chat:
+    if not _resolve_notification_phone(project_dir, environ):
         return False
 
     prefix = message[:80]
@@ -171,7 +178,13 @@ def notify_imessage(
     thread = threading_module.Thread(
         target=_send_imessage_blocking,
         args=(message, prefix, logger),
-        kwargs={"env": environ, "requests_module": requests_module, "time_func": time_func},
+        kwargs={
+            "project_dir": project_dir,
+            "env": environ,
+            "requests_module": requests_module,
+            "subprocess_module": subprocess_module,
+            "time_func": time_func,
+        },
         daemon=True,
     )
     thread.start()

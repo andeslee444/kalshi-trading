@@ -4,8 +4,6 @@ import json
 import threading
 from unittest.mock import MagicMock
 
-import requests
-
 from ops.notifications import (
     _reset_imessage_rate_limiter,
     _reset_webhook_rate_limiter,
@@ -33,17 +31,16 @@ def test_notify_whatsapp_reads_phone_from_config(tmp_path):
     assert subprocess_module.run.call_args[0][0][4] == "+15555550123"
 
 
-def test_notify_webhook_sends_slack_payload_and_rate_limits():
-    response = MagicMock()
-    response.raise_for_status = MagicMock()
-    requests_module = MagicMock()
-    requests_module.post.return_value = response
-    requests_module.exceptions = requests.exceptions
-    env = {"ALERT_WEBHOOK_URL": "https://hooks.slack.com/services/T/B/X"}
+def test_notify_webhook_routes_to_whatsapp_and_rate_limits():
+    subprocess_module = MagicMock()
+    subprocess_module.run.return_value = MagicMock(returncode=0, stderr="")
+    env = {"NOTIFICATION_PHONE": "+15555550123"}
 
-    assert notify_webhook("test message", env=env, requests_module=requests_module) is True
-    assert notify_webhook("test message", env=env, requests_module=requests_module) is False
-    assert requests_module.post.call_args[1]["json"]["text"].endswith("test message")
+    assert notify_webhook("test message", env=env, subprocess_module=subprocess_module) is True
+    assert notify_webhook("test message", env=env, subprocess_module=subprocess_module) is False
+    command = subprocess_module.run.call_args[0][0]
+    assert command[4] == "+15555550123"
+    assert command[6] == "ℹ️ [INFO] test message"
 
 
 def _dispatch_and_join(message, **kwargs):
@@ -56,25 +53,17 @@ def _dispatch_and_join(message, **kwargs):
 
 
 def test_notify_imessage_dispatches_background_request():
-    response = MagicMock()
-    response.raise_for_status = MagicMock()
-    requests_module = MagicMock()
-    requests_module.post.return_value = response
-    requests_module.exceptions = requests.exceptions
-    env = {
-        "BLUEBUBBLES_URL": "http://localhost:1234",
-        "BLUEBUBBLES_PASSWORD": "secret",
-        "BLUEBUBBLES_CHAT_GUID": "iMessage;+;chat123",
-    }
+    subprocess_module = MagicMock()
+    subprocess_module.run.return_value = MagicMock(returncode=0, stderr="")
+    env = {"NOTIFICATION_PHONE": "+15555550123"}
 
-    result = _dispatch_and_join("hello world", env=env, requests_module=requests_module)
+    result = _dispatch_and_join("hello world", env=env, subprocess_module=subprocess_module)
 
     assert result is True
-    args, kwargs = requests_module.post.call_args
-    assert args[0] == "http://localhost:1234/api/v1/message/text"
-    assert kwargs["params"] == {"password": "secret"}
-    assert kwargs["json"]["chatGuid"] == "iMessage;+;chat123"
+    command = subprocess_module.run.call_args[0][0]
+    assert command[4] == "+15555550123"
+    assert command[6] == "hello world"
 
 
-def test_notify_imessage_returns_false_without_env():
-    assert notify_imessage("hello", env={}) is False
+def test_notify_imessage_returns_false_without_notification_target(tmp_path):
+    assert notify_imessage("hello", env={}, project_dir=tmp_path) is False

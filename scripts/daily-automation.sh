@@ -6,6 +6,7 @@
 # Recommended schedule: daily at 9:00 AM ET (after overnight settlements)
 
 set -euo pipefail
+export PATH="/opt/homebrew/opt/python@3.11/libexec/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -47,26 +48,25 @@ echo "$(date): Starting daily automation" >> "$LOG_FILE"
 
 # Step 1: Run backfill (settle any unsettled trades)
 echo "$(date): Running settlement backfill..." >> "$LOG_FILE"
-python3 scripts/backfill-settlements.py >> "$LOG_FILE" 2>&1 || true
+/opt/homebrew/bin/python3.11 scripts/backfill-settlements.py >> "$LOG_FILE" 2>&1 || true
 
 # Step 2: Run reconciliation
 echo "$(date): Running trade reconciliation..." >> "$LOG_FILE"
-python3 scripts/reconcile-trades.py >> "$LOG_FILE" 2>&1 || true
+/opt/homebrew/bin/python3.11 scripts/reconcile-trades.py >> "$LOG_FILE" 2>&1 || true
 
 # Step 3: Generate verified P&L snapshot
 echo "$(date): Generating P&L snapshot..." >> "$LOG_FILE"
-python3 scripts/pnl-snapshot.py >> "$LOG_FILE" 2>&1 || true
+/opt/homebrew/bin/python3.11 scripts/pnl-snapshot.py >> "$LOG_FILE" 2>&1 || true
 
 # Step 4: Run daily report with WhatsApp notification
 echo "$(date): Running daily report..." >> "$LOG_FILE"
-python3 scripts/daily-report.py --notify --with-backtest >> "$LOG_FILE" 2>&1
+/opt/homebrew/bin/python3.11 scripts/daily-report.py --notify --with-backtest >> "$LOG_FILE" 2>&1
 
-# Step 5: Send daily iMessage report via BlueBubbles
-echo "$(date): Sending iMessage report..." >> "$LOG_FILE"
-python3 scripts/daily-imessage-report.py >> "$LOG_FILE" 2>&1 || true
+# Step 5: Legacy iMessage report disabled; daily report above already routes to WhatsApp
+echo "$(date): Skipping legacy iMessage report; WhatsApp-only notifications enabled." >> "$LOG_FILE"
 
 # Step 6: Run daily backtest with drift detection
 echo "$(date): Running daily backtest..." >> "$LOG_FILE"
-python3 scripts/daily-backtest.py >> "$LOG_FILE" 2>&1 || true
+/opt/homebrew/bin/python3.11 scripts/daily-backtest.py >> "$LOG_FILE" 2>&1 || true
 
 echo "$(date): Daily automation complete" >> "$LOG_FILE"

@@ -15,7 +15,7 @@ usage() {
 }
 
 protected_download_files() {
-  python3 -c "
+  /opt/homebrew/bin/python3.11 -c "
 from pathlib import Path
 import sys
 proj = Path('$PROJECT_DIR')
@@ -139,7 +139,7 @@ cmd_upload() {
 
   # Pre-upload validation
   echo "Running pre-upload validation..."
-  if ! python3 "$PROJECT_DIR/scripts/validate-sync-data.py"; then
+  if ! /opt/homebrew/bin/python3.11 "$PROJECT_DIR/scripts/validate-sync-data.py"; then
     echo "Upload blocked by validation. Use --force to override."
     if [ "${2:-}" != "--force" ]; then
       exit 1
@@ -169,7 +169,7 @@ cmd_upload() {
   # Verify key files by comparing local vs remote sizes
   # Generate verify list from trade_files.py (canonical source of truth)
   echo "Verifying upload..."
-  verify_files=$(python3 -c "
+  verify_files=$(/opt/homebrew/bin/python3.11 -c "
 import sys; sys.path.insert(0, '$PROJECT_DIR/src/kalshi')
 from trade_files import TRADE_FILES
 for tf in TRADE_FILES:
@@ -192,7 +192,7 @@ for f in ['health-state.json', 'scan-summaries.json', 'financial-snapshot.json']
 
   # Generate sync manifest for audit trail
   echo "Generating sync manifest..."
-  python3 -c "
+  /opt/homebrew/bin/python3.11 -c "
 import json, sys, os
 from pathlib import Path
 from datetime import datetime, timezone
@@ -262,7 +262,7 @@ cmd_download() {
       local_mod=$(stat -f%m "$local_file" 2>/dev/null || stat -c%Y "$local_file" 2>/dev/null || echo 0)
       remote_info=$(aws s3api head-object --bucket "$BUCKET" --key "data/$f" 2>/dev/null || true)
       if [ -n "$remote_info" ]; then
-        remote_mod=$(echo "$remote_info" | python3 -c "
+        remote_mod=$(echo "$remote_info" | /opt/homebrew/bin/python3.11 -c "
 import sys,json
 from datetime import datetime
 info = json.load(sys.stdin)
@@ -302,7 +302,7 @@ print(int(dt.timestamp()))
 
   # Post-download integrity report
   echo ""
-  python3 "$PROJECT_DIR/scripts/check-sync-health.py" || true
+  /opt/homebrew/bin/python3.11 "$PROJECT_DIR/scripts/check-sync-health.py" || true
 }
 
 case "${1:-}" in

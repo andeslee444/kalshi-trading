@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Daily P&L iMessage report via BlueBubbles.
+"""Legacy daily report sender routed through WhatsApp.
 
 Reads the financial snapshot and sends a concise performance summary
-to iMessage. Designed to run after pnl-snapshot.py in daily automation.
+to WhatsApp. The filename is kept for compatibility with existing
+launchd/npm hooks.
 
 Usage:
     python3 scripts/daily-imessage-report.py           # Send report
@@ -12,23 +13,17 @@ Usage:
 import argparse
 import json
 import sys
-import urllib.request
-import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "kalshi"))
-from kalshi_auth import setup_logging
+from kalshi_auth import notify_whatsapp, setup_logging
 
 log = setup_logging("daily-imessage-report")
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 SNAPSHOT_PATH = PROJECT_DIR / "data" / "financial-snapshot.json"
 BACKTEST_PATH = PROJECT_DIR / "data" / "backtest-results.json"
-
-BB_URL = "http://localhost:1234/api/v1/message/text"
-BB_PASSWORD = "Cheeseslice8!"
-BB_CHAT_GUID = "iMessage;-;+14255336828"
 
 
 def load_snapshot() -> dict:
@@ -143,31 +138,17 @@ def build_report(snap: dict) -> str:
     return "\n".join(lines)
 
 
-def send_imessage(message: str) -> bool:
-    """Send iMessage via BlueBubbles REST API."""
-    url = f"{BB_URL}?password={urllib.parse.quote(BB_PASSWORD)}"
-    payload = json.dumps({
-        "chatGuid": BB_CHAT_GUID,
-        "message": message,
-        "tempGuid": f"temp-daily-{int(datetime.now().timestamp())}"
-    }).encode()
-
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            result = json.loads(resp.read())
-            if result.get("status") == 200:
-                log.info("iMessage sent successfully")
-                return True
-            log.warning("BlueBubbles returned status %s: %s", result.get("status"), result.get("message"))
-            return False
-    except Exception as e:
-        log.error("Failed to send iMessage: %s", e)
-        return False
+def send_whatsapp(message: str) -> bool:
+    """Send the daily report via WhatsApp."""
+    if notify_whatsapp(message, logger=log):
+        log.info("WhatsApp report sent successfully")
+        return True
+    log.warning("WhatsApp report send failed")
+    return False
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Daily P&L iMessage report")
+    parser = argparse.ArgumentParser(description="Daily P&L WhatsApp report")
     parser.add_argument("--dry-run", action="store_true", help="Print report without sending")
     args = parser.parse_args()
 
@@ -177,7 +158,7 @@ def main():
     print(report)
 
     if not args.dry_run:
-        send_imessage(report)
+        send_whatsapp(report)
 
 
 if __name__ == "__main__":

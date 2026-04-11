@@ -6,7 +6,7 @@
     <string>com.kalshi.supervisor</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/opt/homebrew/bin/python3</string>
+        <string>/opt/homebrew/bin/python3.11</string>
         <string>REPLACE_WITH_PROJECT_DIR/scripts/supervisor.py</string>
         <string>run</string>
     </array>
@@ -25,7 +25,7 @@
         <key>HOME</key>
         <string>REPLACE_WITH_HOME</string>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/opt/homebrew/opt/python@3.11/libexec/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
     <key>ThrottleInterval</key>
     <integer>10</integer>

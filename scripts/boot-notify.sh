@@ -1,27 +1,22 @@
 #!/bin/bash
-# Sends an iMessage notification when the Mac Mini boots up.
+# Sends a WhatsApp notification when the Mac Mini boots up.
 # Installed as a LaunchAgent (com.kalshi.boot-notify) with RunAtLoad: true.
 
 set -euo pipefail
 
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-PROJECT_DIR="/Users/andeslee/Documents/cursor-projects/kalshi-trading"
+export PATH="/opt/homebrew/opt/python@3.11/libexec/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+if [ -f "$PROJECT_DIR/.env" ]; then
+    set -a
+    source "$PROJECT_DIR/.env"
+    set +a
+fi
 LOG="$PROJECT_DIR/data/logs/boot-notify.log"
-BB_URL="http://localhost:1234/api/v1/message/text?password=Cheeseslice8%21"
-CHAT_GUID="iMessage;-;+14255336828"
 
 log() { echo "[$(date)] $1" >> "$LOG"; }
 
-log "Boot detected. Waiting for BlueBubbles to come online..."
-
-# Wait up to 2 minutes for BlueBubbles to respond
-for i in $(seq 1 24); do
-    if curl -sf "http://localhost:1234/api/v1/ping?password=Cheeseslice8%21" > /dev/null 2>&1; then
-        log "BlueBubbles is online after ${i}x5s"
-        break
-    fi
-    sleep 5
-done
+mkdir -p "$(dirname "$LOG")"
 
 # Gather system info
 UPTIME=$(uptime | sed 's/.*up /up /' | sed 's/,.*//')
@@ -35,10 +30,8 @@ fi
 
 MSG="[Kalshi Mac Mini] System rebooted at $BOOT_TIME ($UPTIME). Supervisor: $SUPERVISOR_STATUS."
 
-TEMP_GUID="temp-boot-$(date +%s)-$$-$RANDOM"
-RESPONSE=$(curl -sf -X POST "$BB_URL" \
-    -H "Content-Type: application/json" \
-    -d "{\"chatGuid\": \"$CHAT_GUID\", \"message\": \"$MSG\", \"tempGuid\": \"$TEMP_GUID\"}" 2>&1) || true
-
-log "Notification sent: $MSG"
-log "BlueBubbles response: $RESPONSE"
+if /opt/homebrew/bin/python3.11 -c 'import sys; from pathlib import Path; project_dir = Path(sys.argv[1]); message = sys.argv[2]; sys.path.insert(0, str(project_dir / "src" / "kalshi")); from ops.notifications import notify_whatsapp; raise SystemExit(0 if notify_whatsapp(message, project_dir=project_dir) else 1)' "$PROJECT_DIR" "$MSG" >> "$LOG" 2>&1; then
+    log "WhatsApp boot notification sent: $MSG"
+else
+    log "WhatsApp boot notification failed or no notification target is configured."
+fi

@@ -8,6 +8,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import sys
+
+
+PYTHON_CMD = sys.executable or "python3"
 
 
 @dataclass(frozen=True)
@@ -63,7 +67,7 @@ BOT_DEFINITIONS: tuple[BotDefinition, ...] = (
     BotDefinition(
         bot_id="weather",
         display_name="Weather",
-        command=("python3", "src/kalshi/weather-bot.py"),
+        command=(PYTHON_CMD, "src/kalshi/weather-bot.py"),
         process_kind="daemon",
         config_key="weather",
         health_key="weather",
@@ -75,7 +79,7 @@ BOT_DEFINITIONS: tuple[BotDefinition, ...] = (
     BotDefinition(
         bot_id="entertainment",
         display_name="Entertainment",
-        command=("python3", "src/kalshi/entertainment-bot.py"),
+        command=(PYTHON_CMD, "src/kalshi/entertainment-bot.py"),
         process_kind="daemon",
         health_key="entertainment",
         log_name="entertainment",
@@ -86,7 +90,7 @@ BOT_DEFINITIONS: tuple[BotDefinition, ...] = (
     BotDefinition(
         bot_id="crypto",
         display_name="Crypto",
-        command=("python3", "src/kalshi/crypto-bot.py"),
+        command=(PYTHON_CMD, "src/kalshi/crypto-bot.py"),
         process_kind="daemon",
         health_key="crypto",
         log_name="crypto",
@@ -97,7 +101,7 @@ BOT_DEFINITIONS: tuple[BotDefinition, ...] = (
     BotDefinition(
         bot_id="economics",
         display_name="Economics",
-        command=("python3", "src/kalshi/economics-bot.py"),
+        command=(PYTHON_CMD, "src/kalshi/economics-bot.py"),
         process_kind="daemon",
         health_key="economics",
         log_name="economics",
@@ -108,7 +112,7 @@ BOT_DEFINITIONS: tuple[BotDefinition, ...] = (
     BotDefinition(
         bot_id="positions",
         display_name="Position Mgmt",
-        command=("python3", "src/kalshi/position-monitor.py"),
+        command=(PYTHON_CMD, "src/kalshi/position-monitor.py"),
         process_kind="daemon",
         config_key="position_monitor",
         health_key="position-monitor",
@@ -121,7 +125,7 @@ BOT_DEFINITIONS: tuple[BotDefinition, ...] = (
     BotDefinition(
         bot_id="monitor",
         display_name="Data Monitor",
-        command=("python3", "src/kalshi/source-monitor.py"),
+        command=(PYTHON_CMD, "src/kalshi/source-monitor.py"),
         process_kind="daemon",
         health_key="source-monitor",
         log_name="source-monitor",
@@ -133,7 +137,7 @@ BOT_DEFINITIONS: tuple[BotDefinition, ...] = (
     BotDefinition(
         bot_id="strategy",
         display_name="Opportunistic",
-        command=("python3", "src/kalshi/strategy-trader.py"),
+        command=(PYTHON_CMD, "src/kalshi/strategy-trader.py"),
         process_kind="daemon",
         health_key="strategy",
         log_name="strategy",
@@ -144,7 +148,7 @@ BOT_DEFINITIONS: tuple[BotDefinition, ...] = (
     BotDefinition(
         bot_id="hdd",
         display_name="Data Scraper",
-        command=("python3", "src/kalshi/hdd-scraper.py"),
+        command=(PYTHON_CMD, "src/kalshi/hdd-scraper.py"),
         process_kind="oneshot",
         log_name="hdd-scraper",
         always_disabled=True,
@@ -152,7 +156,7 @@ BOT_DEFINITIONS: tuple[BotDefinition, ...] = (
     BotDefinition(
         bot_id="hdd-monitor",
         display_name="HDD Monitor",
-        command=("python3", "src/kalshi/hdd-scraper.py", "monitor"),
+        command=(PYTHON_CMD, "src/kalshi/hdd-scraper.py", "monitor"),
         process_kind="daemon",
         config_key="hdd_monitor",
         health_key="hdd-monitor",
@@ -162,7 +166,7 @@ BOT_DEFINITIONS: tuple[BotDefinition, ...] = (
     BotDefinition(
         bot_id="arb",
         display_name="Cross-Platform",
-        command=("python3", "src/kalshi/cross-platform-arb.py"),
+        command=(PYTHON_CMD, "src/kalshi/cross-platform-arb.py"),
         process_kind="daemon",
         config_key="cross_platform_arb",
         health_key="cross-platform-arb",
@@ -175,7 +179,7 @@ BOT_DEFINITIONS: tuple[BotDefinition, ...] = (
     BotDefinition(
         bot_id="mm",
         display_name="Market Making",
-        command=("python3", "src/kalshi/market-maker.py"),
+        command=(PYTHON_CMD, "src/kalshi/market-maker.py"),
         process_kind="daemon",
         config_key="market_maker",
         health_key="market-maker",
@@ -189,7 +193,7 @@ BOT_DEFINITIONS: tuple[BotDefinition, ...] = (
     BotDefinition(
         bot_id="beatrelease",
         display_name="Beat Release",
-        command=("python3", "src/kalshi/beatrelease-scanner.py"),
+        command=(PYTHON_CMD, "src/kalshi/beatrelease-scanner.py"),
         process_kind="daemon",
         health_key="beatrelease",
         log_name="beatrelease",
@@ -200,7 +204,7 @@ BOT_DEFINITIONS: tuple[BotDefinition, ...] = (
     BotDefinition(
         bot_id="demo",
         display_name="Demo",
-        command=("python3", "src/kalshi/demo-trader.py"),
+        command=(PYTHON_CMD, "src/kalshi/demo-trader.py"),
         process_kind="oneshot",
         log_name="demo",
         always_disabled=True,

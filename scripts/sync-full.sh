@@ -9,17 +9,17 @@ echo ""
 
 # Step 1: Fresh P&L snapshot
 echo "[1/4] Running P&L snapshot..."
-python3 scripts/pnl-snapshot.py
+/opt/homebrew/bin/python3.11 scripts/pnl-snapshot.py
 echo ""
 
 # Step 2: Reconcile trades with API settlements/fills
 echo "[2/4] Running trade reconciliation..."
-python3 scripts/reconcile-trades.py
+/opt/homebrew/bin/python3.11 scripts/reconcile-trades.py
 echo ""
 
 # Step 3: Pre-upload validation
 echo "[3/4] Validating data quality..."
-python3 scripts/validate-sync-data.py
+/opt/homebrew/bin/python3.11 scripts/validate-sync-data.py
 echo ""
 
 # Step 4: Upload to S3
