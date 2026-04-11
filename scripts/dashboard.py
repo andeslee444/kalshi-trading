@@ -1125,7 +1125,7 @@ async def api_settlements(limit: int = Query(50, ge=1, le=200)):
     try:
         all_settlements = []
         cursor = None
-        for _ in range(3):
+        while True:
             path = "/portfolio/settlements?limit=200"
             if cursor:
                 path += f"&cursor={cursor}"
@@ -1150,8 +1150,8 @@ async def api_settlements(limit: int = Query(50, ge=1, le=200)):
         losses = 0
         for s in all_settlements:
             revenue = s.get("revenue", 0)
-            yes_cost = s.get("yes_total_cost", 0)
-            no_cost = s.get("no_total_cost", 0)
+            yes_cost = round(float(s.get("yes_total_cost_dollars", "0") or "0") * 100)
+            no_cost = round(float(s.get("no_total_cost_dollars", "0") or "0") * 100)
             profit = revenue - yes_cost - no_cost
             ticker = s.get("market_ticker", "") or s.get("ticker", "")
             settled_time = s.get("settled_time", "")
@@ -1355,7 +1355,7 @@ async def api_positions():
     try:
         data = client.get("/portfolio/positions")
         positions = data.get("market_positions", [])
-        active = [p for p in positions if p.get("position", 0) != 0]
+        active = [p for p in positions if float(p.get("position_fp", "0") or "0") != 0]
 
         # Batch-fetch market data concurrently
         tickers = [p.get("ticker", "") for p in active]
@@ -1377,15 +1377,20 @@ async def api_positions():
             ticker = p.get("ticker", "")
             market = market_map.get(ticker)
             bot = _infer_bot_from_ticker(ticker)
+            position_count = float(p.get("position_fp", "0") or "0")
+            exposure_cents = round(float(p.get("market_exposure_dollars", "0") or "0") * 100)
+            realized_pnl_cents = round(float(p.get("realized_pnl_dollars", "0") or "0") * 100)
+            total_traded_cents = round(float(p.get("total_traded_dollars", "0") or "0") * 100)
+            fees_paid_cents = round(float(p.get("fees_paid_dollars", "0") or "0") * 100)
             entry = {
                 "ticker": ticker,
                 "human_ticker": format_ticker_human(ticker),
                 "strategy": STRATEGY_DISPLAY.get(bot, bot),
-                "position": p.get("position", 0),
-                "market_exposure": p.get("market_exposure", 0),
-                "realized_pnl": p.get("realized_pnl", 0),
-                "total_traded": p.get("total_traded", 0),
-                "fees_paid": p.get("fees_paid", 0),
+                "position": int(position_count),
+                "market_exposure": exposure_cents,
+                "realized_pnl": realized_pnl_cents,
+                "total_traded": total_traded_cents,
+                "fees_paid": fees_paid_cents,
                 "resting_orders_count": p.get("resting_orders_count", 0),
             }
             if market:

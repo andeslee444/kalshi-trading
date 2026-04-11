@@ -5,51 +5,56 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Kalshi Trading Dashboard</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
-    * { font-family: 'Inter', system-ui, -apple-system, sans-serif; }
-    .mono { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace; }
-    body { background: #0a0e1a; color: #f1f5f9; }
+    * { font-family: 'IBM Plex Sans', system-ui, -apple-system, sans-serif; }
+    .mono { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace; font-feature-settings: 'tnum'; }
+    body { background: #080b12; color: #e2e8f0; }
 
     .card {
-      background: #111827;
-      border: none;
-      border-radius: 12px;
-      padding: 24px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+      background: #0d1117;
+      border: 1px solid #1c2433;
+      border-radius: 6px;
+      padding: 20px;
+      box-shadow: none;
     }
     .section-label {
-      font-size: 0.6875rem;
+      font-size: 0.625rem;
       font-weight: 600;
       text-transform: uppercase;
-      letter-spacing: 0.1em;
-      color: #64748b;
-      margin-bottom: 16px;
+      letter-spacing: 0.12em;
+      color: #4b5c72;
+      margin-bottom: 12px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #1c2433;
     }
 
     .tab-btn {
-      padding: 10px 16px;
-      font-size: 0.875rem;
+      padding: 8px 20px;
+      font-size: 0.75rem;
       font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
       border-bottom: 2px solid transparent;
-      color: #64748b;
+      color: #4b5c72;
       cursor: pointer;
       transition: all 0.15s;
       background: none;
       border-top: none; border-left: none; border-right: none;
     }
     .tab-btn:hover { color: #94a3b8; }
-    .tab-btn.active { color: #f1f5f9; border-bottom-color: #3b82f6; }
+    .tab-btn.active { color: #e2e8f0; border-bottom-color: #3b82f6; }
 
     .pill {
       display: inline-block;
-      padding: 2px 10px;
-      border-radius: 9999px;
-      font-size: 0.6875rem;
+      padding: 1px 8px;
+      border-radius: 3px;
+      font-size: 0.625rem;
       font-weight: 600;
-      letter-spacing: 0.02em;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
     }
     .pill-weather { background: #1e3a5f; color: #60a5fa; }
     .pill-crypto { background: #3b1f54; color: #c084fc; }
@@ -58,52 +63,83 @@
     .pill-strategy { background: #2d2d2d; color: #94a3b8; }
     .pill-monitor { background: #1a2f3b; color: #67e8f9; }
     .pill-positions { background: #2a1a1a; color: #fb923c; }
-    .pill-default { background: #1e293b; color: #94a3b8; }
+    .pill-default { background: #1c2433; color: #94a3b8; }
 
-    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-    .dot-green { background: #10b981; box-shadow: 0 0 6px #10b981; }
-    .dot-red { background: #f43f5e; box-shadow: 0 0 6px #f43f5e; }
-    .dot-yellow { background: #eab308; box-shadow: 0 0 6px #eab308; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+    .dot-green { background: #10b981; box-shadow: 0 0 4px #10b981; animation: pulse-glow 2.5s ease-in-out infinite; }
+    .dot-red { background: #f43f5e; box-shadow: 0 0 4px #f43f5e; }
+    .dot-yellow { background: #eab308; box-shadow: 0 0 4px #eab308; }
     .dot-gray { background: #475569; }
+    @keyframes pulse-glow { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
-    .progress-bar { height: 6px; border-radius: 3px; background: #1e293b; overflow: hidden; }
-    .progress-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+    .progress-bar { height: 4px; border-radius: 2px; background: #1c2433; overflow: hidden; }
+    .progress-fill { height: 100%; border-radius: 2px; transition: width 0.3s; }
 
-    .log-viewer { max-height: 400px; overflow-y: auto; }
-    .log-viewer::-webkit-scrollbar { width: 5px; }
-    .log-viewer::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    .log-viewer { max-height: 400px; overflow-y: auto; background: #060810; border: 1px solid #1c2433; border-radius: 4px; }
+    .log-viewer::-webkit-scrollbar { width: 4px; }
+    .log-viewer::-webkit-scrollbar-thumb { background: #1c2433; border-radius: 2px; }
 
-    .kpi-value { font-size: 1.75rem; font-weight: 700; line-height: 1.2; }
-    .kpi-label { font-size: 0.75rem; color: #64748b; margin-top: 4px; }
+    .kpi-value { font-size: 1.5rem; font-weight: 600; line-height: 1.2; letter-spacing: -0.02em; }
+    .kpi-label { font-size: 0.6875rem; color: #4b5c72; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 500; }
 
     .filter-btn {
-      padding: 4px 12px; border-radius: 6px; font-size: 0.75rem; font-weight: 500;
-      background: #1e293b; color: #94a3b8; border: none; cursor: pointer; transition: all 0.15s;
+      padding: 4px 12px; border-radius: 4px; font-size: 0.6875rem; font-weight: 500;
+      background: #0d1117; color: #4b5c72; border: 1px solid #1c2433; cursor: pointer; transition: all 0.15s;
+      text-transform: uppercase; letter-spacing: 0.04em;
     }
-    .filter-btn.active { background: #3b82f6; color: #fff; }
-    .filter-btn:hover:not(.active) { background: #334155; }
+    .filter-btn.active { background: #1c2433; color: #e2e8f0; border-color: #3b82f6; }
+    .filter-btn:hover:not(.active) { border-color: #2d3a4d; color: #94a3b8; }
 
     .position-card {
-      background: #0f172a; border-radius: 10px; padding: 16px;
-      border: 1px solid #1e293b; transition: border-color 0.15s;
+      background: #0d1117; border-radius: 6px; padding: 16px;
+      border: 1px solid #1c2433; transition: border-color 0.15s;
     }
-    .position-card:hover { border-color: #334155; }
+    .position-card:hover { border-color: #2d3a4d; }
 
     .timeline-row {
       display: grid; grid-template-columns: 80px 100px 1fr auto;
-      gap: 12px; align-items: center; padding: 8px 0;
-      border-bottom: 1px solid #1e293b;
-      font-size: 0.8125rem;
+      gap: 12px; align-items: center; padding: 6px 0;
+      border-bottom: 1px solid #111827;
+      font-size: 0.75rem;
     }
     .timeline-row:last-child { border-bottom: none; }
+
+    /* Table refinements */
+    table th {
+      font-size: 0.625rem;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #4b5c72;
+    }
+    table tbody tr { transition: background-color 0.1s; }
+    table tbody tr:hover { background-color: rgba(59, 130, 246, 0.04) !important; }
+
+    /* Alert banners */
+    .alert-banner {
+      border: 1px solid;
+      border-radius: 4px;
+      padding: 12px 16px;
+    }
+    .alert-critical { border-color: rgba(244, 63, 94, 0.35); background: rgba(244, 63, 94, 0.06); }
+    .alert-warning { border-color: rgba(234, 179, 8, 0.25); background: rgba(234, 179, 8, 0.04); }
+
+    /* System banner */
+    #system-banner { border-radius: 4px; border: 1px solid #1c2433; }
+
+    /* Scrollbar for main content */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #1c2433; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #2d3a4d; }
   </style>
 </head>
 <body class="min-h-screen">
 
   <!-- Header -->
-  <header style="border-bottom: 1px solid #1e293b;" class="px-6 py-3 flex items-center justify-between">
+  <header style="border-bottom: 1px solid #1c2433; background: #080b12;" class="px-6 py-2.5 flex items-center justify-between">
     <div class="flex items-center gap-3">
-      <h1 class="text-base font-semibold text-slate-100">Kalshi Fund</h1>
+      <h1 class="text-sm font-semibold text-slate-100 tracking-wide uppercase">Kalshi Fund</h1>
       <span id="system-badge" class="pill pill-default text-xs">Loading...</span>
     </div>
     <div class="flex items-center gap-4 text-xs text-slate-500">
@@ -116,7 +152,7 @@
   </header>
 
   <!-- Tab Nav -->
-  <nav style="border-bottom: 1px solid #1e293b;" class="px-6 flex gap-1">
+  <nav style="border-bottom: 1px solid #1c2433; background: #080b12;" class="px-6 flex gap-0">
     <button class="tab-btn active" data-tab="overview">Overview</button>
     <button class="tab-btn" data-tab="positions">Positions</button>
     <button class="tab-btn" data-tab="activity">Activity</button>
@@ -131,7 +167,7 @@
     <div id="tab-overview" class="space-y-6">
 
       <!-- Ground Truth P&L (Primary) -->
-      <div class="card" style="background: linear-gradient(135deg, #111827 0%, #0f172a 100%); border: 1px solid #1e3a5f;">
+      <div class="card" style="border-left: 3px solid #3b82f6;">
         <div class="flex items-center justify-between mb-4">
           <div class="section-label mb-0">Ground Truth P&L</div>
           <span id="snapshot-status" class="text-xs text-slate-600"></span>
@@ -189,6 +225,53 @@
         </div>
       </div>
 
+      <!-- Risk Alerts (dynamic) -->
+      <div id="risk-alerts" class="space-y-3"></div>
+
+      <!-- Risk & Analytics -->
+      <div class="card">
+        <div class="section-label">Risk & Analytics</div>
+        <div class="grid grid-cols-2 lg:grid-cols-5 gap-6">
+          <!-- Capital Utilization -->
+          <div>
+            <div class="kpi-label">Capital Deployed</div>
+            <div id="risk-cap-util" class="text-xl font-bold mono">--</div>
+            <div id="risk-cap-util-detail" class="text-xs text-slate-500 mt-1"></div>
+            <div class="progress-bar mt-2"><div id="risk-cap-bar" class="progress-fill" style="width:0%;background:#3b82f6"></div></div>
+          </div>
+          <!-- Concentration -->
+          <div>
+            <div class="kpi-label">Top Concentration</div>
+            <div id="risk-concentration" class="text-xl font-bold mono">--</div>
+            <div id="risk-concentration-detail" class="text-xs text-slate-500 mt-1"></div>
+          </div>
+          <!-- Max Drawdown -->
+          <div>
+            <div class="kpi-label">Max Drawdown</div>
+            <div id="risk-drawdown" class="text-xl font-bold mono">--</div>
+            <div id="risk-drawdown-detail" class="text-xs text-slate-500 mt-1"></div>
+          </div>
+          <!-- Sharpe Ratio -->
+          <div>
+            <div class="kpi-label">Sharpe Ratio</div>
+            <div id="risk-sharpe" class="text-xl font-bold mono">--</div>
+            <div id="risk-sharpe-detail" class="text-xs text-slate-500 mt-1"></div>
+          </div>
+          <!-- Win Rate Trend -->
+          <div>
+            <div class="kpi-label">Win Rate Trend</div>
+            <div id="risk-wintrend" class="text-xl font-bold mono">--</div>
+            <div id="risk-wintrend-detail" class="text-xs text-slate-500 mt-1"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Settlement Timeline -->
+      <div id="settlement-timeline-card" class="card hidden">
+        <div class="section-label">Time to Settlement</div>
+        <div id="settlement-timeline" class="space-y-2"></div>
+      </div>
+
       <!-- Equity Curve -->
       <div class="card">
         <div class="section-label">Equity Curve</div>
@@ -218,6 +301,14 @@
           <div id="daily-budget" class="space-y-3">
             <div class="text-slate-500 text-sm">Loading...</div>
           </div>
+        </div>
+      </div>
+
+      <!-- Daily P&L by Bot Heatmap -->
+      <div class="card">
+        <div class="section-label">Daily P&L by Strategy (Last 14 Days)</div>
+        <div id="daily-pnl-heatmap" class="overflow-x-auto">
+          <div class="text-slate-500 text-sm">Loading...</div>
         </div>
       </div>
 
@@ -586,6 +677,16 @@ async function loadOverview() {
   if (backtest && !backtest.error) {
     renderForecastAccuracy(backtest);
   }
+
+  // Risk & Analytics (needs snapshot, positions, settlements, bots)
+  if (snapshot && !snapshot.error) {
+    renderRiskAnalytics(snapshot, positions, settlements, cachedBots);
+  }
+
+  // Daily P&L Heatmap by Bot
+  if (settlements?.settlements) {
+    renderDailyPnlHeatmap(settlements);
+  }
 }
 
 // Bot strategy descriptions for fund manager context
@@ -650,23 +751,30 @@ function tickerToBot(ticker) {
 
 function renderStrategyCombinedTable(snapshot, positions) {
   const byBot = snapshot.realized_pnl?.by_bot || {};
-  const unrealizedPositions = snapshot.unrealized_pnl?.positions || [];
 
   // Ground truth unrealized from balance check (NAV - deposits - realized)
   const groundTruthUnrealized = snapshot.balance_check?.implied_unrealized_cents || 0;
-  // Per-position unrealized (limited - Kalshi doesn't provide MTM for most positions)
-  const positionUnrealized = snapshot.unrealized_pnl?.total_cents || 0;
-  // Unattributed unrealized = ground truth - what we can attribute from positions
-  const unattributedUnrealized = groundTruthUnrealized - positionUnrealized;
 
-  // Calculate unrealized P&L per bot from positions (what little data we have)
+  // Attribute unrealized to bots proportionally by exposure from live positions.
+  // The snapshot's unrealized_pnl.positions uses fill-based cost basis which is
+  // unreliable (Kalshi's market_exposure is cost basis, not MTM), so we distribute
+  // the ground truth unrealized proportionally by each bot's share of total exposure.
   const unrealizedByBot = {};
-  for (const pos of unrealizedPositions) {
+  const livePositions = Array.isArray(positions) ? positions : [];
+  let totalExposure = 0;
+  for (const pos of livePositions) {
     const bot = tickerToBot(pos.ticker);
-    if (!unrealizedByBot[bot]) unrealizedByBot[bot] = { total: 0, positions: 0, cost: 0 };
-    unrealizedByBot[bot].total += (pos.unrealized_cents || 0);
-    unrealizedByBot[bot].cost += (pos.cost_cents || 0);
+    const exp = Math.abs(pos.market_exposure || 0);
+    if (!unrealizedByBot[bot]) unrealizedByBot[bot] = { total: 0, positions: 0, exposure: 0 };
+    unrealizedByBot[bot].exposure += exp;
     unrealizedByBot[bot].positions++;
+    totalExposure += exp;
+  }
+  // Distribute ground truth unrealized proportionally by exposure
+  if (totalExposure > 0) {
+    for (const bot of Object.keys(unrealizedByBot)) {
+      unrealizedByBot[bot].total = Math.round(groundTruthUnrealized * unrealizedByBot[bot].exposure / totalExposure);
+    }
   }
 
   // Build rows for all bots
@@ -788,7 +896,7 @@ function renderStrategyCombinedTable(snapshot, positions) {
   // Use ground truth for total P&L and unrealized
   const totalPnl = totals.netRealized + groundTruthUnrealized;
 
-  html += `<tr class="border-t-2 border-slate-700 font-medium">
+  html += `<tr style="border-top: 1px solid #334155;" class="font-medium">
     <td class="py-3 text-slate-300">Total</td>
     <td class="py-3 text-xs text-slate-600">Unrealized uses ground truth (NAV−deposits−realized)</td>
     <td class="text-right py-3 mono" style="color:${pnlColor(totalPnl)}">${pnlSign(totalPnl)}${cents(totalPnl)}</td>
@@ -896,14 +1004,14 @@ function renderEquityCurve(settlements) {
               return formatDate(label);
             }
           },
-          grid: { color: '#1e293b' }
+          grid: { color: '#141a24' }
         },
         y: {
           ticks: {
             color: '#475569', font: { size: 10, family: 'ui-monospace, monospace' },
             callback: v => `$${v.toFixed(2)}`
           },
-          grid: { color: '#1e293b' }
+          grid: { color: '#141a24' }
         }
       },
       interaction: { intersect: false, mode: 'index' },
@@ -1446,6 +1554,291 @@ async function loadLogs() {
   } else {
     el.textContent = data?.error || 'No logs available';
   }
+}
+
+// ─── RISK & ANALYTICS ───
+function renderRiskAnalytics(snapshot, positions, settlements, bots) {
+  const livePositions = Array.isArray(positions) ? positions : [];
+  const nav = snapshot?.account?.nav_cents || 0;
+  const deposits = snapshot?.deposits?.net_funded_cents || 0;
+  const balance = snapshot?.account?.balance_cents || 0;
+
+  // 1. Capital Utilization
+  let totalExposure = 0;
+  const exposureByBot = {};
+  for (const pos of livePositions) {
+    const exp = Math.abs(pos.market_exposure || 0);
+    totalExposure += exp;
+    const bot = tickerToBot(pos.ticker);
+    exposureByBot[bot] = (exposureByBot[bot] || 0) + exp;
+  }
+  const utilPct = nav > 0 ? (totalExposure / nav * 100) : 0;
+  const utilColor = utilPct > 90 ? '#f43f5e' : utilPct > 70 ? '#eab308' : '#10b981';
+  document.getElementById('risk-cap-util').textContent = `${utilPct.toFixed(0)}%`;
+  document.getElementById('risk-cap-util').style.color = utilColor;
+  document.getElementById('risk-cap-util-detail').textContent = `${cents(totalExposure)} of ${cents(nav)} NAV`;
+  const bar = document.getElementById('risk-cap-bar');
+  bar.style.width = `${Math.min(100, utilPct)}%`;
+  bar.style.background = utilColor;
+
+  // 2. Concentration Risk
+  let topBot = '--', topPct = 0;
+  if (totalExposure > 0) {
+    const sorted = Object.entries(exposureByBot).sort((a, b) => b[1] - a[1]);
+    if (sorted.length > 0) {
+      topBot = sorted[0][0];
+      topPct = (sorted[0][1] / totalExposure * 100);
+    }
+  }
+  const concColor = topPct > 80 ? '#f43f5e' : topPct > 60 ? '#eab308' : '#10b981';
+  document.getElementById('risk-concentration').textContent = `${topPct.toFixed(0)}%`;
+  document.getElementById('risk-concentration').style.color = concColor;
+  const strategy = BOT_STRATEGIES[topBot];
+  document.getElementById('risk-concentration-detail').textContent = strategy ? `${strategy.name} (${cents(exposureByBot[topBot] || 0)})` : '--';
+
+  // 3. Max Drawdown from daily P&L
+  const byDay = snapshot?.realized_pnl?.by_day || {};
+  const dailyEntries = Object.entries(byDay).sort((a, b) => a[0].localeCompare(b[0]));
+  let cumPnl = 0, peak = 0, maxDD = 0, ddDate = '';
+  for (const [date, pnl] of dailyEntries) {
+    cumPnl += pnl;
+    if (cumPnl > peak) peak = cumPnl;
+    const dd = peak - cumPnl;
+    if (dd > maxDD) { maxDD = dd; ddDate = date; }
+  }
+  const ddEl = document.getElementById('risk-drawdown');
+  ddEl.textContent = maxDD > 0 ? `-${cents(maxDD)}` : '$0.00';
+  ddEl.style.color = maxDD > deposits * 0.1 ? '#f43f5e' : maxDD > 0 ? '#eab308' : '#10b981';
+  document.getElementById('risk-drawdown-detail').textContent = ddDate ? `Trough: ${formatDate(ddDate + 'T12:00:00')}` : 'No drawdown';
+
+  // 4. Sharpe Ratio (annualized, using daily P&L)
+  if (dailyEntries.length >= 7) {
+    const dailyReturns = dailyEntries.map(([_, pnl]) => pnl / 100);
+    const mean = dailyReturns.reduce((s, v) => s + v, 0) / dailyReturns.length;
+    const variance = dailyReturns.reduce((s, v) => s + (v - mean) ** 2, 0) / dailyReturns.length;
+    const stddev = Math.sqrt(variance);
+    const sharpe = stddev > 0 ? (mean / stddev) * Math.sqrt(252) : 0;
+    const sharpeEl = document.getElementById('risk-sharpe');
+    sharpeEl.textContent = sharpe.toFixed(2);
+    sharpeEl.style.color = sharpe >= 1.5 ? '#10b981' : sharpe >= 0.5 ? '#eab308' : '#f43f5e';
+    document.getElementById('risk-sharpe-detail').textContent = `${dailyEntries.length}d sample`;
+  }
+
+  // 5. Win Rate Trend (7d vs 30d)
+  if (dailyEntries.length > 0) {
+    const allSettlements = settlements?.settlements || [];
+    const now = new Date();
+    const d7 = new Date(now - 7 * 86400000).toISOString();
+    const d30 = new Date(now - 30 * 86400000).toISOString();
+    const recent7 = allSettlements.filter(s => (s.settled_time || '') >= d7);
+    const recent30 = allSettlements.filter(s => (s.settled_time || '') >= d30);
+    const wr7 = recent7.length > 0 ? (recent7.filter(s => s.profit > 0).length / recent7.length * 100) : null;
+    const wr30 = recent30.length > 0 ? (recent30.filter(s => s.profit > 0).length / recent30.length * 100) : null;
+
+    const trendEl = document.getElementById('risk-wintrend');
+    if (wr7 != null && wr30 != null) {
+      const delta = wr7 - wr30;
+      const arrow = delta > 2 ? '\u2191' : delta < -2 ? '\u2193' : '\u2192';
+      trendEl.textContent = `${wr7.toFixed(0)}% ${arrow}`;
+      trendEl.style.color = delta > 2 ? '#10b981' : delta < -2 ? '#f43f5e' : '#eab308';
+      document.getElementById('risk-wintrend-detail').textContent = `7d: ${wr7.toFixed(0)}% vs 30d: ${wr30.toFixed(0)}%`;
+    } else {
+      trendEl.textContent = '--';
+    }
+  }
+
+  // Risk Alerts
+  const alerts = [];
+
+  // Concentration alert
+  if (topPct > 80 && totalExposure > 10000) {
+    const botName = BOT_STRATEGIES[topBot]?.name || topBot;
+    alerts.push({
+      severity: 'critical',
+      title: `Concentration Risk: ${botName} is ${topPct.toFixed(0)}% of exposure`,
+      detail: `${cents(exposureByBot[topBot])} of ${cents(totalExposure)} total. Single-thesis risk.`,
+    });
+  }
+
+  // Stale heartbeat + high exposure alert
+  if (Array.isArray(bots)) {
+    for (const b of bots) {
+      if (b.status === 'stale' || (b.heartbeat_age_min && b.heartbeat_age_min > 60)) {
+        const botExp = exposureByBot[b.name] || 0;
+        if (botExp > 50000) {
+          alerts.push({
+            severity: 'critical',
+            title: `${b.display_name || b.name}: stale heartbeat with ${cents(botExp)} exposure`,
+            detail: `Last heartbeat ${b.heartbeat_age_min ? Math.round(b.heartbeat_age_min) + 'm ago' : 'unknown'}. Bot may be unresponsive while holding significant positions.`,
+          });
+        }
+      }
+      // Restart badge alert
+      if (b.restart_count >= 3) {
+        alerts.push({
+          severity: 'warning',
+          title: `${b.display_name || b.name}: ${b.restart_count} restarts today`,
+          detail: 'Frequent restarts suggest a crash loop or API instability. Check logs.',
+        });
+      }
+    }
+  }
+
+  // Capital over-deployment alert
+  if (utilPct > 95) {
+    alerts.push({
+      severity: 'warning',
+      title: `Capital over-deployed: ${utilPct.toFixed(0)}% utilization`,
+      detail: `Only ${cents(balance)} cash remaining. New trades may fail insufficient balance checks.`,
+    });
+  }
+
+  const alertsEl = document.getElementById('risk-alerts');
+  if (alerts.length > 0) {
+    alertsEl.innerHTML = alerts.map(a => {
+      const dotClass = a.severity === 'critical' ? 'dot-red' : 'dot-yellow';
+      const textColor = a.severity === 'critical' ? 'text-rose-300' : 'text-yellow-300';
+      return `<div class="alert-banner ${a.severity === 'critical' ? 'alert-critical' : 'alert-warning'}">
+        <div class="flex items-start gap-3">
+          <span class="dot ${dotClass} mt-1 shrink-0"></span>
+          <div>
+            <div class="text-sm font-medium ${textColor}">${a.title}</div>
+            <div class="text-xs text-slate-400 mt-1">${a.detail}</div>
+          </div>
+        </div>
+      </div>`;
+    }).join('');
+  } else {
+    alertsEl.innerHTML = '';
+  }
+
+  // 8. Settlement Timeline
+  renderSettlementTimeline(livePositions);
+}
+
+function renderSettlementTimeline(positions) {
+  if (!positions || positions.length === 0) {
+    document.getElementById('settlement-timeline-card').classList.add('hidden');
+    return;
+  }
+  document.getElementById('settlement-timeline-card').classList.remove('hidden');
+
+  // Group positions by settlement bucket
+  const buckets = { '<1h': [], '1-6h': [], '6-24h': [], '1-7d': [], '7-30d': [], '30d+': [] };
+  const bucketExposure = { '<1h': 0, '1-6h': 0, '6-24h': 0, '1-7d': 0, '7-30d': 0, '30d+': 0 };
+  const now = Date.now();
+
+  for (const p of positions) {
+    if (!p.close_time) { buckets['30d+'].push(p); bucketExposure['30d+'] += Math.abs(p.market_exposure || 0); continue; }
+    const remaining = new Date(p.close_time).getTime() - now;
+    const hours = remaining / 3600000;
+    let bucket;
+    if (hours <= 0) bucket = '<1h';
+    else if (hours < 1) bucket = '<1h';
+    else if (hours < 6) bucket = '1-6h';
+    else if (hours < 24) bucket = '6-24h';
+    else if (hours < 168) bucket = '1-7d';
+    else if (hours < 720) bucket = '7-30d';
+    else bucket = '30d+';
+    buckets[bucket].push(p);
+    bucketExposure[bucket] += Math.abs(p.market_exposure || 0);
+  }
+
+  const totalExp = Object.values(bucketExposure).reduce((s, v) => s + v, 0) || 1;
+  let html = '<div class="grid grid-cols-6 gap-2">';
+  for (const [label, poss] of Object.entries(buckets)) {
+    const exp = bucketExposure[label];
+    const pct = (exp / totalExp * 100);
+    const barHeight = Math.max(4, Math.min(80, pct * 0.8));
+    const color = label === '<1h' || label === '1-6h' ? '#10b981' : label === '30d+' || label === '7-30d' ? '#f43f5e' : '#3b82f6';
+    html += `<div class="text-center">
+      <div class="flex flex-col items-center justify-end" style="height:80px">
+        <div style="width:24px;height:${barHeight}px;background:${color};border-radius:4px 4px 0 0;opacity:0.7"></div>
+      </div>
+      <div class="text-[10px] text-slate-500 mt-1">${label}</div>
+      <div class="mono text-xs text-slate-300">${cents(exp)}</div>
+      <div class="text-[10px] text-slate-600">${poss.length} pos</div>
+    </div>`;
+  }
+  html += '</div>';
+  document.getElementById('settlement-timeline').innerHTML = html;
+}
+
+// ─── DAILY P&L BY BOT HEATMAP ───
+function renderDailyPnlHeatmap(settlements) {
+  const allSettlements = settlements?.settlements || [];
+  if (allSettlements.length === 0) {
+    document.getElementById('daily-pnl-heatmap').innerHTML = '<div class="text-slate-500 text-sm">No settlement data</div>';
+    return;
+  }
+
+  // Build date → bot → pnl map
+  const botSet = new Set();
+  const dateMap = {};
+  for (const s of allSettlements) {
+    const date = (s.settled_time || '').slice(0, 10);
+    if (!date) continue;
+    const bot = s.bot || tickerToBot(s.ticker);
+    botSet.add(bot);
+    if (!dateMap[date]) dateMap[date] = {};
+    dateMap[date][bot] = (dateMap[date][bot] || 0) + (s.profit || 0);
+  }
+
+  // Last 14 days
+  const dates = Object.keys(dateMap).sort().slice(-14);
+  const botList = ['weather', 'crypto', 'economics', 'entertainment', 'other'].filter(b => botSet.has(b));
+  if (botList.length === 0 || dates.length === 0) {
+    document.getElementById('daily-pnl-heatmap').innerHTML = '<div class="text-slate-500 text-sm">No data for heatmap</div>';
+    return;
+  }
+
+  // Find max for color scaling
+  let maxAbs = 1;
+  for (const date of dates) {
+    for (const bot of botList) {
+      maxAbs = Math.max(maxAbs, Math.abs(dateMap[date]?.[bot] || 0));
+    }
+  }
+
+  function heatColor(val) {
+    if (val === 0 || val == null) return 'rgba(30,41,59,0.5)';
+    const intensity = Math.min(1, Math.abs(val) / maxAbs);
+    if (val > 0) return `rgba(16,185,129,${0.15 + intensity * 0.55})`;
+    return `rgba(244,63,94,${0.15 + intensity * 0.55})`;
+  }
+
+  let html = '<table class="w-full" style="border-spacing:3px;border-collapse:separate"><thead><tr>';
+  html += '<th class="text-xs text-slate-600 text-left py-1 pr-2" style="width:80px"></th>';
+  for (const date of dates) {
+    const d = new Date(date + 'T12:00:00');
+    const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    html += `<th class="text-[10px] text-slate-600 text-center py-1 font-normal">${label}</th>`;
+  }
+  html += '</tr></thead><tbody>';
+
+  for (const bot of botList) {
+    const name = BOT_STRATEGIES[bot]?.name || bot;
+    html += `<tr><td class="text-xs text-slate-400 pr-2 py-0.5">${name}</td>`;
+    for (const date of dates) {
+      const val = dateMap[date]?.[bot] || 0;
+      const bg = heatColor(val);
+      const label = val !== 0 ? `${val > 0 ? '+' : ''}${(val / 100).toFixed(0)}` : '';
+      html += `<td class="text-center mono" style="background:${bg};border-radius:4px;padding:4px 2px;font-size:10px;color:${val > 0 ? '#a7f3d0' : val < 0 ? '#fca5a5' : '#475569'}" title="${cents(val)}">${label}</td>`;
+    }
+    html += '</tr>';
+  }
+
+  // Total row
+  html += '<tr style="border-top:1px solid #334155"><td class="text-xs text-slate-300 pr-2 py-0.5 font-medium">Total</td>';
+  for (const date of dates) {
+    let total = 0;
+    for (const bot of botList) total += (dateMap[date]?.[bot] || 0);
+    const bg = heatColor(total);
+    html += `<td class="text-center mono font-medium" style="background:${bg};border-radius:4px;padding:4px 2px;font-size:10px;color:${total > 0 ? '#a7f3d0' : total < 0 ? '#fca5a5' : '#475569'}" title="${cents(total)}">${total !== 0 ? (total > 0 ? '+' : '') + (total / 100).toFixed(0) : ''}</td>`;
+  }
+  html += '</tr></tbody></table>';
+
+  document.getElementById('daily-pnl-heatmap').innerHTML = html;
 }
 
 // ─── Refresh Loop ───

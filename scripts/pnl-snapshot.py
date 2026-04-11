@@ -48,8 +48,8 @@ def compute_realized_pnl(settlements):
 
     for s in settlements:
         revenue = _safe_int(s.get("revenue", 0))
-        yes_cost = _safe_int(s.get("yes_total_cost", 0))
-        no_cost = _safe_int(s.get("no_total_cost", 0))
+        yes_cost = _cost_cents(s, "yes")
+        no_cost = _cost_cents(s, "no")
         profit = revenue - yes_cost - no_cost
 
         # Fee: Kalshi returns dollars as string (e.g. "0.04")
@@ -99,28 +99,34 @@ def compute_unrealized_pnl(positions, fills):
     for f in fills:
         ticker = f.get("ticker", "")
         side = (f.get("side", "") or "").lower()
-        price = f.get("yes_price", 0) if side == "yes" else f.get("no_price", 0)
-        count = f.get("count", 0) or 0
+        if side == "yes":
+            price_d = float(f.get("yes_price_dollars", "0") or f.get("yes_price", 0) or "0")
+        else:
+            price_d = float(f.get("no_price_dollars", "0") or f.get("no_price", 0) or "0")
+        count = float(f.get("count_fp", "0") or f.get("count", 0) or "0")
+        price_cents = round(price_d * 100)
         action = (f.get("action", "") or "").lower()
         if action == "buy":
-            ticker_cost[ticker] += (price or 0) * count
+            ticker_cost[ticker] += price_cents * int(count)
         elif action == "sell":
-            ticker_cost[ticker] -= (price or 0) * count
+            ticker_cost[ticker] -= price_cents * int(count)
 
     result_positions = []
     total_unrealized = 0
 
     for p in positions:
-        if p.get("position", 0) == 0:
+        pos_count = float(p.get("position_fp", "0") or p.get("position", 0) or "0")
+        if pos_count == 0:
             continue
         ticker = p.get("ticker", "")
-        current_value = p.get("market_exposure", 0)
+        exposure_d = float(p.get("market_exposure_dollars", "0") or p.get("market_exposure", 0) or "0")
+        current_value = round(exposure_d * 100)
         cost = ticker_cost.get(ticker, 0)
         unrealized = current_value - cost
 
         result_positions.append({
             "ticker": ticker,
-            "position": p.get("position", 0),
+            "position": int(pos_count),
             "cost_cents": cost,
             "current_value_cents": current_value,
             "unrealized_cents": unrealized,
@@ -169,7 +175,7 @@ def verify_settlements(api_settlements, local_trades):
     for s in api_settlements:
         ticker = s.get("ticker", "") or s.get("market_ticker", "")
         revenue = _safe_int(s.get("revenue", 0))
-        cost = _safe_int(s.get("yes_total_cost", 0)) + _safe_int(s.get("no_total_cost", 0))
+        cost = _cost_cents(s, "yes") + _cost_cents(s, "no")
         api_pnl_by_ticker[ticker] = revenue - cost
 
     # Build local P&L by ticker from settlement_result + cost_cents + count.
@@ -291,7 +297,7 @@ def build_snapshot(balance_cents, portfolio_value_cents, settlements, fills,
     for s in settlements:
         ticker = s.get("ticker", "") or s.get("market_ticker", "")
         revenue = _safe_int(s.get("revenue", 0))
-        cost = _safe_int(s.get("yes_total_cost", 0)) + _safe_int(s.get("no_total_cost", 0))
+        cost = _cost_cents(s, "yes") + _cost_cents(s, "no")
         profit = revenue - cost
         try:
             fee = round(float(s.get("fee_cost", "0") or "0") * 100)
@@ -390,6 +396,23 @@ def _safe_int(val):
         return 0
 
 
+def _cost_cents(settlement, side):
+    """Extract cost in cents from a settlement record.
+
+    Kalshi API v2 uses dollar-string fields (yes_total_cost_dollars,
+    no_total_cost_dollars) instead of cent-integer fields.  Fall back to
+    the legacy cent-integer field if the dollar field is missing.
+    """
+    dollar_key = f"{side}_total_cost_dollars"
+    cent_key = f"{side}_total_cost"
+    if dollar_key in settlement:
+        try:
+            return round(float(settlement[dollar_key]) * 100)
+        except (TypeError, ValueError):
+            return 0
+    return _safe_int(settlement.get(cent_key, 0))
+
+
 # ─── I/O functions (not tested in unit tests) ───
 
 def _load_local_trades():
@@ -468,7 +491,7 @@ def _fetch_api_data():
     try:
         pos_data = client.get("/portfolio/positions")
         positions = [p for p in pos_data.get("market_positions", [])
-                     if p.get("position", 0) != 0]
+                     if float(p.get("position_fp", "0") or p.get("position", 0) or "0") != 0]
     except Exception as e:
         print(f"  WARNING: positions fetch failed: {e}")
         positions = []
