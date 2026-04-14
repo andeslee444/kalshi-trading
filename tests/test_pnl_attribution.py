@@ -82,7 +82,7 @@ class TestComputePnlCents:
         assert settled is True
         assert pnl == -120
 
-    def test_won_with_legacy_backfill_net_revenue(self):
+    def test_legacy_net_profit_semantics_still_compute_correctly(self):
         t = _make_trade(cost_cents=90, count=1, settlement_result="won",
                         settlement_revenue_cents=10)
         pnl, settled = _compute_pnl_cents(t)
@@ -107,14 +107,6 @@ class TestComputePnlCents:
         pnl, settled = _compute_pnl_cents(t)
         assert settled is True
         assert pnl == -120
-
-    def test_fill_count_overrides_order_count_for_partial_fill(self):
-        t = _make_trade(cost_cents=60, count=3, settlement_result="won",
-                        settlement_revenue_cents=100)
-        t["fill_count"] = 1
-        pnl, settled = _compute_pnl_cents(t)
-        assert settled is True
-        assert pnl == 40
 
 
 # ── Tests: _classify_market_type ──

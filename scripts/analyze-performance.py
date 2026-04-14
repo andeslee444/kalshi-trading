@@ -30,8 +30,9 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 # Import from canonical trade_files module (shared across all scripts)
 from trade_files import TRADE_FILES as _CANONICAL_TRADE_FILES
 from event_ledger import DEFAULT_LEDGER_PATH, get_event_ledger
+from runtime_paths import resolve_data_dir
 
-DATA_DIR = PROJECT_DIR / "data"
+DATA_DIR = resolve_data_dir(PROJECT_DIR)
 TRADE_FILES = [
     {"label": tf["label"], "bot": tf["bot"], "path": DATA_DIR / tf["filename"]}
     for tf in _CANONICAL_TRADE_FILES

@@ -438,14 +438,15 @@ class TestIsSourceOpen:
 
 
 class TestNotifyImessage:
-    """Test iMessage notification via BlueBubbles API."""
+    """Test legacy iMessage compatibility routing through WhatsApp."""
 
     def setup_method(self):
         _kalshi_auth()._reset_imessage_rate_limiter()
 
-    def test_returns_false_when_env_vars_missing(self):
-        with patch.dict("os.environ", {}, clear=True):
+    def test_returns_false_when_notification_backend_returns_false(self):
+        with patch("kalshi_auth.ops_notify_imessage", return_value=False) as mock_notify:
             assert _kalshi_auth().notify_imessage("test message") is False
+            mock_notify.assert_called_once()
 
     def _dispatch_and_join(self, message):
         """Call notify_imessage and join the background thread so assertions are safe."""
@@ -457,50 +458,28 @@ class TestNotifyImessage:
             t.join(timeout=5)
         return result
 
-    def test_sends_post_to_correct_url(self):
-        env = {
-            "BLUEBUBBLES_URL": "http://localhost:1234",
-            "BLUEBUBBLES_PASSWORD": "secret",
-            "BLUEBUBBLES_CHAT_GUID": "iMessage;+;chat123",
-        }
-        with patch.dict("os.environ", env, clear=True):
-            with patch("kalshi_auth.requests.post") as mock_post:
-                mock_post.return_value = MagicMock(status_code=200)
-                mock_post.return_value.raise_for_status = MagicMock()
-                result = self._dispatch_and_join("hello world")
-                assert result is True
-                mock_post.assert_called_once()
-                args, kwargs = mock_post.call_args
-                assert args[0] == "http://localhost:1234/api/v1/message/text"
-                assert kwargs["params"] == {"password": "secret"}
-                assert kwargs["json"]["chatGuid"] == "iMessage;+;chat123"
-                assert kwargs["json"]["message"] == "hello world"
+    @patch("ops.notifications.notify_whatsapp")
+    def test_dispatches_whatsapp_notification(self, mock_notify):
+        mock_notify.return_value = True
+        with patch.dict("os.environ", {"NOTIFICATION_PHONE": "+15555550123"}, clear=True):
+            result = self._dispatch_and_join("hello world")
+        assert result is True
+        mock_notify.assert_called_once()
+        args, _ = mock_notify.call_args
+        assert args[0] == "hello world"
 
-    def test_rate_limits_duplicate_messages(self):
-        env = {
-            "BLUEBUBBLES_URL": "http://localhost:1234",
-            "BLUEBUBBLES_PASSWORD": "secret",
-            "BLUEBUBBLES_CHAT_GUID": "iMessage;+;chat123",
-        }
-        with patch.dict("os.environ", env, clear=True):
-            with patch("kalshi_auth.requests.post") as mock_post:
-                mock_post.return_value = MagicMock(status_code=200)
-                mock_post.return_value.raise_for_status = MagicMock()
-                assert self._dispatch_and_join("duplicate msg") is True
-                assert _kalshi_auth().notify_imessage("duplicate msg") is False
-                assert mock_post.call_count == 1
+    @patch("ops.notifications.notify_whatsapp")
+    def test_rate_limits_duplicate_messages(self, mock_notify):
+        mock_notify.return_value = True
+        with patch.dict("os.environ", {"NOTIFICATION_PHONE": "+15555550123"}, clear=True):
+            assert self._dispatch_and_join("duplicate msg") is True
+            assert _kalshi_auth().notify_imessage("duplicate msg") is False
+        assert mock_notify.call_count == 1
 
-    def test_http_error_does_not_crash(self):
-        """HTTP errors are swallowed in the background thread (fire-and-forget)."""
-        env = {
-            "BLUEBUBBLES_URL": "http://localhost:1234",
-            "BLUEBUBBLES_PASSWORD": "secret",
-            "BLUEBUBBLES_CHAT_GUID": "iMessage;+;chat123",
-        }
-        with patch.dict("os.environ", env, clear=True):
-            with patch("kalshi_auth.requests.post") as mock_post:
-                mock_post.return_value = MagicMock()
-                mock_post.return_value.raise_for_status.side_effect = Exception("500 error")
-                # Dispatches True (fire-and-forget), error handled in thread
-                assert self._dispatch_and_join("fail msg") is True
-                mock_post.assert_called_once()
+    @patch("ops.notifications.notify_whatsapp")
+    def test_background_errors_do_not_crash(self, mock_notify):
+        """Background WhatsApp errors are swallowed (fire-and-forget)."""
+        mock_notify.side_effect = Exception("send failed")
+        with patch.dict("os.environ", {"NOTIFICATION_PHONE": "+15555550123"}, clear=True):
+            assert self._dispatch_and_join("fail msg") is True
+        mock_notify.assert_called_once()

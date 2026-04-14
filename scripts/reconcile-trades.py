@@ -3,10 +3,10 @@
 
 Walks all trade log files, matches each trade to API settlement data and fill info,
 and writes settlement_result, settlement_revenue_cents, fill_price_cents, and
-realized_edge back into the trade record. settlement_revenue_cents is stored as
-gross settlement payout (100c per winning contract, 0 for losses).
+realized_edge back into the trade record.
 
-Idempotent: skips records that already have settlement_result set.
+Idempotent: normalizes existing records in place and clears stale settlement
+annotations from unfilled orders.
 Writes go through TradeStore so file format stays unchanged.
 
 Usage:
@@ -15,8 +15,8 @@ Usage:
 """
 
 import argparse
-import json
 import sys
+import time
 from pathlib import Path
 
 # Add src/kalshi to path for imports
@@ -26,6 +26,12 @@ if _SRC_DIR not in sys.path:
 
 from event_ledger import get_event_ledger
 from kalshi_auth import KalshiClient, setup_logging
+from settlement_utils import (
+    realized_edge_for_trade,
+    settlement_payout_cents,
+    settlement_result_for_trade,
+    trade_has_filled_exposure,
+)
 from storage import TradeStore
 from trade_files import ALL_TRADE_PATHS
 
@@ -34,6 +40,72 @@ ledger = get_event_ledger(logger=log)
 
 # Use canonical trade file list from trade_files module
 TRADE_FILES = ALL_TRADE_PATHS
+
+
+def _get_with_retries(client, path, *, attempts=4, base_sleep_seconds=0.5):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return client.get(path)
+        except Exception as exc:
+            last_error = exc
+            if attempt == attempts:
+                raise
+            delay = base_sleep_seconds * attempt
+            log.warning(
+                "Retrying %s after error (%d/%d): %s",
+                path,
+                attempt,
+                attempts,
+                exc,
+            )
+            time.sleep(delay)
+    raise last_error
+
+
+def _safe_int(value):
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _dollars_to_cents(value):
+    try:
+        return int(round(float(value or 0) * 100))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fill_count(fill):
+    count = fill.get("count_fp")
+    if count in (None, ""):
+        count = fill.get("count")
+    return _safe_int(count)
+
+
+def _fill_price_cents(fill):
+    side = str(fill.get("side", "") or "").lower()
+    if side == "yes":
+        direct = fill.get("yes_price")
+        if direct not in (None, ""):
+            return _safe_int(direct)
+        return _dollars_to_cents(fill.get("yes_price_dollars"))
+    if side == "no":
+        direct = fill.get("no_price")
+        if direct not in (None, ""):
+            return _safe_int(direct)
+        return _dollars_to_cents(fill.get("no_price_dollars"))
+
+    direct = fill.get("yes_price")
+    if direct not in (None, ""):
+        return _safe_int(direct)
+    direct = fill.get("no_price")
+    if direct not in (None, ""):
+        return _safe_int(direct)
+    if fill.get("yes_price_dollars") not in (None, ""):
+        return _dollars_to_cents(fill.get("yes_price_dollars"))
+    return _dollars_to_cents(fill.get("no_price_dollars"))
 
 
 def _fetch_all_settlements(client):
@@ -48,7 +120,7 @@ def _fetch_all_settlements(client):
         if cursor:
             path += f"&cursor={cursor}"
         try:
-            data = client.get(path)
+            data = _get_with_retries(client, path)
         except Exception as e:
             log.warning("Failed to fetch settlements: %s", e)
             break
@@ -69,7 +141,7 @@ def _fetch_all_settlements(client):
 def _fetch_all_fills(client):
     """Fetch all order fills from the API (paginated).
 
-    Returns dict: {order_id: {"fill_price_cents": int, "fill_count": int}}
+    Returns dict: {order_id: {"fill_price_cents": int, "fill_count": int, "fill_cost_cents": int}}
     """
     fills = {}
     cursor = None
@@ -78,28 +150,27 @@ def _fetch_all_fills(client):
         if cursor:
             path += f"&cursor={cursor}"
         try:
-            data = client.get(path)
+            data = _get_with_retries(client, path)
         except Exception as e:
             log.warning("Failed to fetch fills: %s", e)
             break
         for f in data.get("fills", []):
             order_id = f.get("order_id", "")
             if order_id:
-                if order_id in fills:
-                    existing = fills[order_id]
-                    total_count = existing["fill_count"] + (f.get("count", 0) or 0)
-                    if total_count > 0:
-                        existing["fill_price_cents"] = int(
-                            (existing["fill_price_cents"] * existing["fill_count"] +
-                             (f.get("yes_price", 0) or f.get("no_price", 0)) * (f.get("count", 0) or 0))
-                            / total_count
-                        )
-                        existing["fill_count"] = total_count
-                else:
-                    fills[order_id] = {
-                        "fill_price_cents": f.get("yes_price", 0) or f.get("no_price", 0),
-                        "fill_count": f.get("count", 0) or 0,
-                    }
+                fill_count = _fill_count(f)
+                if fill_count <= 0:
+                    continue
+                fill_price_cents = _fill_price_cents(f)
+                existing = fills.setdefault(order_id, {
+                    "fill_price_cents": None,
+                    "fill_count": 0,
+                    "fill_cost_cents": 0,
+                })
+                existing["fill_count"] += fill_count
+                existing["fill_cost_cents"] += fill_price_cents * fill_count
+                existing["fill_price_cents"] = int(
+                    round(existing["fill_cost_cents"] / existing["fill_count"])
+                )
         cursor = data.get("cursor")
         if not cursor or not data.get("fills"):
             break
@@ -113,57 +184,60 @@ def _annotate_trade(trade, settlements, fills):
     Skips sell (exit) records — settlement belongs to the original buy.
     """
     # Skip sell (exit) records — legacy records without action are assumed buys
-    action = trade.get("action")
-    if action not in (None, "", "buy"):
-        return False
-
-    # Skip already-annotated records
-    if trade.get("settlement_result") is not None:
+    if trade.get("action", "buy") != "buy":
         return False
 
     ticker = trade.get("ticker", "")
     order_id = trade.get("order_id", "")
-    side = trade.get("side", "yes")
     modified = False
+    has_exposure, contract_count, fill_price_cents = trade_has_filled_exposure(trade, fills=fills)
 
-    # Match settlement
-    if ticker in settlements:
-        s = settlements[ticker]
-        yes_won = s["yes_won"]
-
-        if side == "yes":
-            trade["settlement_result"] = "won" if yes_won else "lost"
-        else:
-            trade["settlement_result"] = "won" if not yes_won else "lost"
-
-        filled_count = trade.get("count", 1) or 1
-        if order_id and order_id in fills:
-            api_fill_count = fills[order_id].get("fill_count")
-            if api_fill_count:
-                filled_count = api_fill_count
-        trade["settlement_revenue_cents"] = 100 * filled_count if trade["settlement_result"] == "won" else 0
+    # Match fill metadata.
+    fill = fills.get(order_id) if order_id else None
+    fill_count = fill.get("fill_count") if fill else None
+    fill_cost_cents = fill.get("fill_cost_cents") if fill else None
+    if fill_price_cents is not None and trade.get("fill_price_cents") != fill_price_cents:
+        trade["fill_price_cents"] = fill_price_cents
+        modified = True
+    if fill_price_cents is None and not has_exposure and trade.get("fill_price_cents") is not None:
+        trade["fill_price_cents"] = None
+        modified = True
+    if fill_count is not None and trade.get("fill_count") != fill_count:
+        trade["fill_count"] = fill_count
+        modified = True
+    if fill_count is None and not has_exposure and trade.get("fill_count") is not None:
+        trade["fill_count"] = None
+        modified = True
+    if fill_cost_cents is not None and trade.get("cost_cents") != fill_cost_cents:
+        trade["cost_cents"] = fill_cost_cents
         modified = True
 
-    # Match fill price
-    if order_id and order_id in fills:
-        f = fills[order_id]
-        trade["fill_price_cents"] = f["fill_price_cents"]
-        modified = True
+    settlement_result = trade.get("settlement_result")
+    settlement_revenue_cents = trade.get("settlement_revenue_cents")
+    realized_edge = trade.get("realized_edge")
 
-    # Compute realized edge (in P(YES) frame to match model_prob convention)
-    if trade.get("settlement_result") and trade.get("model_prob") is not None:
-        fill_price = trade.get("fill_price_cents")
-        if fill_price is None:
-            fill_price = trade.get("price_cents")
-        if fill_price is None:
-            fill_price = 50
-        if side == "yes":
-            actual = 1.0 if trade["settlement_result"] == "won" else 0.0
-            implied = fill_price / 100.0
-        else:
-            actual = 0.0 if trade["settlement_result"] == "won" else 1.0
-            implied = 1.0 - fill_price / 100.0
-        trade["realized_edge"] = round(actual - implied, 4)
+    if ticker in settlements and has_exposure:
+        yes_won = settlements[ticker]["yes_won"]
+        settlement_result = settlement_result_for_trade(trade.get("side", "yes"), yes_won)
+        settlement_revenue_cents = settlement_payout_cents(settlement_result, contract_count)
+        realized_edge = realized_edge_for_trade(
+            trade,
+            settlement_result,
+            fill_price_cents=trade.get("fill_price_cents"),
+        )
+    elif not has_exposure:
+        settlement_result = None
+        settlement_revenue_cents = None
+        realized_edge = None
+
+    if trade.get("settlement_result") != settlement_result:
+        trade["settlement_result"] = settlement_result
+        modified = True
+    if trade.get("settlement_revenue_cents") != settlement_revenue_cents:
+        trade["settlement_revenue_cents"] = settlement_revenue_cents
+        modified = True
+    if trade.get("realized_edge") != realized_edge:
+        trade["realized_edge"] = realized_edge
         modified = True
 
     return modified
@@ -193,21 +267,22 @@ def reconcile_all(dry_run=False):
         file_modified = 0
         for trade in trades:
             if _annotate_trade(trade, settlements, fills):
-                try:
-                    if trade.get("order_id") and trade.get("fill_price_cents") is not None:
-                        fill = fills.get(trade.get("order_id"), {})
-                        ledger.record_fill({
-                            "timestamp": trade.get("timestamp"),
-                            "ticker": trade.get("ticker"),
-                            "order_id": trade.get("order_id"),
-                            "fill_price_cents": fill.get("fill_price_cents", trade.get("fill_price_cents")),
-                            "fill_count": fill.get("fill_count"),
-                            "source_bot": trade.get("source_bot"),
-                        }, source_path=trade_file)
-                    if trade.get("settlement_result") is not None:
+                if not dry_run:
+                    try:
+                        if trade.get("order_id") and trade.get("fill_price_cents") is not None:
+                            fill_count = trade.get("fill_count") or trade.get("count")
+                            if fill_count:
+                                ledger.record_fill({
+                                    "timestamp": trade.get("timestamp"),
+                                    "ticker": trade.get("ticker"),
+                                    "order_id": trade.get("order_id"),
+                                    "fill_price_cents": trade.get("fill_price_cents"),
+                                    "fill_count": fill_count,
+                                    "source_bot": trade.get("source_bot"),
+                                }, source_path=trade_file)
                         ledger.record_settlement(trade, source_path=trade_file)
-                except Exception as e:
-                    log.warning("Failed to dual-write reconcile event for %s: %s", trade.get("ticker", "?"), e)
+                    except Exception as e:
+                        log.warning("Failed to dual-write reconcile event for %s: %s", trade.get("ticker", "?"), e)
                 file_modified += 1
             else:
                 total_skipped += 1
@@ -218,7 +293,7 @@ def reconcile_all(dry_run=False):
                 store.save(trades)
             total_annotated += file_modified
 
-    log.info("Reconciliation complete: %d annotated, %d skipped (already done or no match)",
+    log.info("Reconciliation complete: %d annotated, %d skipped (unchanged or no match)",
              total_annotated, total_skipped)
     if dry_run:
         log.info("DRY RUN — no files were modified")

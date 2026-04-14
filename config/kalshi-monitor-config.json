@@ -1,6 +1,8 @@
 {
   "maxTradeAmount": 25,
   "maxTradeAmountPct": 0.05,
+  "maxContractsPerTrade": 100,
+  "maxGrossPayoutCents": 10000,
   "maxDailyTrades": 25,
   "maxDailyLoss": 50,
   "maxDailyLossPct": 0.10,
@@ -52,7 +54,13 @@
         "OKC": "KOKC",
         "SATX": "KSAT"
       },
-      "intervalMinutes": 10
+      "intervalMinutes": 10,
+      "brackets": {
+        "enabled": true,
+        "minLocalHour": 13,
+        "maxObservationAgeMinutes": 30,
+        "minEdge": 0.25
+      }
     }
   }
 }

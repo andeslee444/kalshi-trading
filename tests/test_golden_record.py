@@ -125,6 +125,7 @@ class TestGoldenRecordBuild:
         assert record["settlement_result"] is None
         assert record["settlement_revenue_cents"] is None
         assert record["fill_price_cents"] is None
+        assert record["fill_count"] is None
 
     def test_record_flattens_snapshot(self):
         tm = self._make_tm()
@@ -276,6 +277,8 @@ class TestReconcileAnnotation:
             "ticker": "KXHIGHNY-26FEB16-T40",
             "side": "no",
             "order_id": "ord_123",
+            "status": "filled",
+            "count": 1,
             "price_cents": 70,
             "model_prob": 0.25,
             "settlement_result": None,
@@ -305,17 +308,26 @@ class TestReconcileAnnotation:
         modified = mod._annotate_trade(trade, settlements, fills)
         assert modified is True
         assert trade["settlement_result"] == "won"  # NO side, yes didn't win -> we won
+        assert trade["settlement_revenue_cents"] == 100
         assert trade["fill_price_cents"] == 69
         assert trade["realized_edge"] is not None
 
     def test_annotation_idempotent(self):
-        """Already-annotated trades should be skipped."""
+        """Already-normalized trades should be left unchanged."""
         trade = {
             "ticker": "KXHIGHNY-26FEB16-T40",
+            "action": "buy",
+            "side": "yes",
+            "count": 1,
+            "order_id": "ord_123",
+            "status": "filled",
             "settlement_result": "won",
+            "settlement_revenue_cents": 100,
+            "fill_price_cents": 69,
+            "fill_count": 1,
         }
-        settlements = {}
-        fills = {}
+        settlements = {"KXHIGHNY-26FEB16-T40": {"yes_won": True, "revenue_cents": 100}}
+        fills = {"ord_123": {"fill_price_cents": 69, "fill_count": 1}}
 
         spec = __import__("importlib").util.spec_from_file_location(
             "reconcile",

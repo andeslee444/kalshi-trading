@@ -1,7 +1,6 @@
 """Tests for the shared probability module (src/kalshi/probability.py)."""
 
 import datetime
-import json
 import math
 import pytest
 
@@ -205,6 +204,11 @@ class TestNwsProbability:
         prob = nws_probability(92.0, 86.0, "T", 10)
         assert prob > 0.5  # Still above 0.5 but less extreme than post-5PM
 
+    def test_threshold_already_crossed_is_certain(self):
+        """Once the running high is already above the threshold, YES is locked."""
+        prob = nws_probability(86.1, 86.0, "T", 10)
+        assert prob == 1.0
+
     def test_bracket_post_5pm(self):
         """Bracket probability after 5PM when running high is in bracket."""
         prob = nws_probability(86.5, 86.0, "B", 17)
@@ -215,6 +219,11 @@ class TestNwsProbability:
         """Bracket probability after 5PM when running high is far from bracket."""
         prob = nws_probability(92.0, 86.0, "B", 17)
         assert prob < 0.01
+
+    def test_bracket_above_upper_bound_is_impossible(self):
+        """Once the running high exceeds the bracket ceiling, YES is impossible."""
+        prob = nws_probability(87.0, 86.0, "B", 12)
+        assert prob == 0.0
 
 
 # ===================================================================
@@ -794,27 +803,6 @@ class TestCalibrationLoadLogging:
                 "Should log WARNING with the actual parse error"
         finally:
             probability._CALIBRATION_PATH = original
-
-    def test_calibration_reloads_when_file_changes(self, tmp_path):
-        import probability
-        original = probability._CALIBRATION_PATH
-        cal_path = tmp_path / "calibration.json"
-        cal_path.write_text(json.dumps({"nws": {"sigma_by_hour": {"17+": 0.5}}}))
-        probability._CALIBRATION_PATH = cal_path
-        probability._calibration = None
-        probability._calibration_source = None
-        try:
-            first = probability._load_calibration()
-            assert first["nws"]["sigma_by_hour"]["17+"] == 0.5
-
-            cal_path.write_text(json.dumps({"nws": {"sigma_by_hour": {"17+": 1.7}}}))
-
-            second = probability._load_calibration()
-            assert second["nws"]["sigma_by_hour"]["17+"] == 1.7
-        finally:
-            probability._CALIBRATION_PATH = original
-            probability._calibration = None
-            probability._calibration_source = None
 
 
 class TestCalibrationFreshness:

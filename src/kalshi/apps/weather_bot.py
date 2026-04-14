@@ -123,12 +123,7 @@ def _effective_weather_edge_threshold():
 
 
 def _city_weather_edge_threshold(city_code, base_threshold=None):
-    """Return the active weather edge threshold for a city.
-
-    City overrides are explicit absolute thresholds layered on top of the
-    calibrated global baseline. They can tighten or loosen a city relative to
-    the default, but remain opt-in and audit-friendly through config.
-    """
+    """Return the active weather edge threshold for a city."""
     threshold = (
         base_threshold
         if isinstance(base_threshold, (int, float)) and base_threshold > 0
@@ -169,6 +164,19 @@ def _resolve_optional_project_path(path_str, project_dir=None):
     return Path(project_dir or PROJECT_DIR) / path
 
 
+# Cities where Kalshi uses KXHIGHT{city} series ticker instead of KXHIGH{city}.
+# The original 8 cities (AUS, CHI, DEN, LAX, MIA, NY, PHIL) use KXHIGH{city}.
+# Expanded cities added ~Apr 2026 use KXHIGHT{city} (HOU migrated from non-T to T-prefix).
+_T_PREFIX_CITIES = {"ATL", "BOS", "DAL", "DC", "HOU", "LV", "MIN", "NOLA", "OKC", "PHX", "SATX", "SEA", "SFO"}
+
+
+def _weather_series_ticker(city_code):
+    """Return the Kalshi series ticker for a weather city."""
+    if city_code in _T_PREFIX_CITIES:
+        return f"KXHIGHT{city_code}"
+    return f"KXHIGH{city_code}"
+
+
 def get_weather_markets(cache_ttl=600):
     """Fetch weather markets directly by city series.
 
@@ -186,7 +194,7 @@ def get_weather_markets(cache_ttl=600):
     series_failures = 0
 
     for city_code in CITIES:
-        series_ticker = f"KXHIGH{city_code}"
+        series_ticker = _weather_series_ticker(city_code)
         cursor = None
         while True:
             path = f"/markets?series_ticker={series_ticker}&status=open&limit=1000"
@@ -1694,9 +1702,11 @@ def scan_and_trade():
                     bias, hist_bias, alpha, bias_meta = bias_corrector.blend_live_bias(
                         city,
                         live_bias=live_bias,
+                        live_confidence=live_confidence,
                         live_n=live_n,
                         ramp_n=int(bias_cfg.get("liveRampSamples", 8)),
                         min_live_samples=int(bias_cfg.get("liveMinSamples", 2)),
+                        min_live_confidence=bias_cfg.get("liveMinConfidence"),
                         max_abs_bias_f=float(bias_cfg.get("historicalMaxAbsF", 6.0)),
                         conflict_gap_f=float(bias_cfg.get("conflictGapF", 4.0)),
                         conflict_alpha_floor=float(bias_cfg.get("conflictAlphaFloor", 0.35)),
@@ -1965,8 +1975,6 @@ def scan_and_trade():
         side_prob = our_prob if side == "yes" else (1 - our_prob)
         displayed_plan = _build_displayed_entry_plan(m, side, side_prob, liquid)
         maker_plan = _build_maker_entry_plan(m, side, side_prob, days_out, maker_cfg=maker_cfg)
-
-        # Adjust edge threshold for high ensemble spread or disagreement (defense in depth)
         effective_edge_threshold = city_edge_threshold
         disagree_mult = VERIFICATION_CONFIG.get("disagreement_edge_multiplier", 2.0)
         if disagreement_score > 0.3:
@@ -1975,7 +1983,6 @@ def scan_and_trade():
             effective_edge_threshold = city_edge_threshold * 2
         elif verification_confidence and verification_confidence < 0.6:
             effective_edge_threshold *= 1.0 + ((0.6 - verification_confidence) * 0.5)
-
         entry_plan = _select_weather_execution_plan(displayed_plan, maker_plan, liquid, maker_cfg=maker_cfg)
         taker_escalated = False
         if _should_taker_escalate_weather(
@@ -2498,6 +2505,8 @@ def build_app(project_dir=None):
         "maxDailyTrades": loaded_config.get("maxDailyTrades", 10),
         "maxDailyLoss": loaded_config.get("maxDailyLoss", 10),
         "maxDailyLossPct": loaded_config.get("maxDailyLossPct"),
+        "maxContractsPerTrade": loaded_config.get("maxContractsPerTrade"),
+        "maxGrossPayoutCents": loaded_config.get("maxGrossPayoutCents"),
     }, logger=logger, order_monitor=order_monitor_obj, cooldown_hours=0.5, bot_name="weather")
     opportunity_log_obj = OpportunityLog(
         project_dir / "data" / "opportunity-log.json",

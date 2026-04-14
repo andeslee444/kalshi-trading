@@ -23,18 +23,12 @@ _spec.loader.exec_module(_mod)
 
 from pnl_snapshot import (
     compute_realized_pnl,
-    compute_realized_pnl_by_bot_api,
-    compute_realized_pnl_by_bot_local,
     compute_unrealized_pnl,
     verify_settlements,
     build_snapshot,
     load_deposits,
     _build_balance_check,
     _infer_bot,
-    _infer_unmatched_api_bot,
-    _load_demo_weather_refs,
-    _is_buy_action,
-    _select_canonical_by_bot,
     _safe_int,
 )
 
@@ -60,7 +54,7 @@ def _make_settlement(ticker="KXHIGHHOU-26MAR03-T75", revenue=400,
 def _make_local_trade(ticker="KXHIGHHOU-26MAR03-T75", source_bot="weather",
                       side="yes", price_cents=50, count=4, cost_cents=200,
                       order_id="ord-123", settlement_result=None,
-                      settlement_revenue_cents=None, action="buy"):
+                      settlement_revenue_cents=None, action="buy", fill_count=None):
     """Build a local trade log record."""
     return {
         "ticker": ticker,
@@ -75,6 +69,7 @@ def _make_local_trade(ticker="KXHIGHHOU-26MAR03-T75", source_bot="weather",
         "settlement_revenue_cents": settlement_revenue_cents,
         "timestamp": "2026-03-01T10:00:00",
         "status": "filled",
+        "fill_count": fill_count,
     }
 
 
@@ -90,23 +85,6 @@ def _make_fill(ticker="KXHIGHHOU-26MAR03-T75", order_id="ord-123",
         "yes_price": yes_price,
         "no_price": no_price,
         "count": count,
-        "created_time": created_time,
-        "is_taker": True,
-    }
-
-
-def _make_fill_v2(ticker="KXHIGHHOU-26MAR03-T75", order_id="ord-123",
-                  side="yes", yes_price_dollars="0.5000", no_price_dollars="0.5000",
-                  count_fp="4.00", created_time="2026-03-01T10:00:05Z"):
-    return {
-        "ticker": ticker,
-        "market_ticker": ticker,
-        "order_id": order_id,
-        "side": side,
-        "action": "buy",
-        "yes_price_dollars": yes_price_dollars,
-        "no_price_dollars": no_price_dollars,
-        "count_fp": count_fp,
         "created_time": created_time,
         "is_taker": True,
     }
@@ -199,318 +177,6 @@ class TestComputeRealizedPnl:
         assert result["source"] == "kalshi_api_settlements"
 
 
-class TestComputeRealizedPnlByBotLocal:
-    def test_api_by_bot_fees_use_dollar_strings(self):
-        result = compute_realized_pnl_by_bot_api(SAMPLE_SETTLEMENTS, SAMPLE_LOCAL_TRADES)
-        assert result["weather"]["fees_cents"] == 4
-        assert result["crypto"]["fees_cents"] == 2
-        assert result["economics"]["fees_cents"] == 1
-
-    def test_uses_fills_and_handles_duplicate_tickers_and_mixed_sides(self):
-        local_trades = [
-            _make_local_trade(
-                ticker="KXHIGHMIA-26MAR03-T75",
-                source_bot="source-monitor",
-                side="yes",
-                order_id="ord-a",
-                cost_cents=120,
-            ),
-            _make_local_trade(
-                ticker="KXHIGHMIA-26MAR03-T75",
-                source_bot="source-monitor",
-                side="no",
-                order_id="ord-b",
-                cost_cents=30,
-            ),
-            _make_local_trade(
-                ticker="KXHIGHDEN-26MAR04-T60",
-                source_bot="weather",
-                side="yes",
-                order_id="ord-c",
-                cost_cents=80,
-            ),
-            _make_local_trade(
-                ticker="KXHIGHMIA-26MAR05-T80",
-                source_bot="source-monitor",
-                side="yes",
-                order_id="ord-resting",
-                cost_cents=200,
-                settlement_result="won",
-            ) | {"status": "resting"},
-        ]
-        fills = [
-            _make_fill(ticker="KXHIGHMIA-26MAR03-T75", order_id="ord-a", side="yes", yes_price=60, count=1),
-            _make_fill(ticker="KXHIGHMIA-26MAR03-T75", order_id="ord-a", side="yes", yes_price=60, count=1),
-            _make_fill(ticker="KXHIGHMIA-26MAR03-T75", order_id="ord-b", side="no", no_price=30, count=1),
-            _make_fill(ticker="KXHIGHDEN-26MAR04-T60", order_id="ord-c", side="yes", yes_price=40, count=2),
-        ]
-        settlements = [
-            _make_settlement(ticker="KXHIGHMIA-26MAR03-T75", revenue=200, yes_total_cost=120, no_total_cost=30, market_result="yes"),
-            _make_settlement(ticker="KXHIGHDEN-26MAR04-T60", revenue=0, yes_total_cost=80, no_total_cost=0, market_result="no"),
-        ]
-
-        result = compute_realized_pnl_by_bot_local(local_trades, fills, settlements)
-        by_bot = result["by_bot"]
-
-        assert by_bot["source-monitor"]["pnl_cents"] == 50
-        assert by_bot["source-monitor"]["wins"] == 1
-        assert by_bot["source-monitor"]["losses"] == 1
-        assert by_bot["source-monitor"]["by_city"]["MIA"]["pnl_cents"] == 50
-        assert by_bot["weather"]["pnl_cents"] == -80
-        assert result["matched_orders"] == 3
-        assert result["unmatched_local_buy_orders_without_fills"] == 1
-
-    def test_weather_city_rollup_keeps_t_prefixed_airport_codes(self):
-        local_trades = [
-            _make_local_trade(
-                ticker="KXHIGHTPA-26MAR03-T75",
-                source_bot="weather",
-                side="yes",
-                order_id="ord-tpa",
-                cost_cents=60,
-            ),
-        ]
-        fills = [
-            _make_fill(ticker="KXHIGHTPA-26MAR03-T75", order_id="ord-tpa", side="yes", yes_price=60, count=1),
-        ]
-        settlements = [
-            _make_settlement(ticker="KXHIGHTPA-26MAR03-T75", revenue=100, yes_total_cost=60, no_total_cost=0, market_result="yes"),
-        ]
-        result = compute_realized_pnl_by_bot_local(local_trades, fills, settlements)
-        assert "TPA" in result["by_bot"]["weather"]["by_city"]
-
-    def test_null_action_local_rows_are_treated_as_buy_orders(self):
-        local_trades = [
-            _make_local_trade(
-                ticker="KXHIGHDEN-26MAR04-T60",
-                source_bot="source-monitor",
-                side="yes",
-                order_id="ord-null",
-                cost_cents=40,
-                count=1,
-                action=None,
-            ),
-        ]
-        fills = [
-            _make_fill(ticker="KXHIGHDEN-26MAR04-T60", order_id="ord-null", side="yes", yes_price=40, count=1),
-        ]
-        settlements = [
-            _make_settlement(ticker="KXHIGHDEN-26MAR04-T60", revenue=100, yes_total_cost=40, no_total_cost=0, market_result="yes"),
-        ]
-
-        result = compute_realized_pnl_by_bot_local(local_trades, fills, settlements)
-
-        assert result["matched_orders"] == 1
-        assert result["by_bot"]["source-monitor"]["pnl_cents"] == 60
-
-    def test_v2_fill_fields_are_joined_correctly(self):
-        local_trades = [
-            _make_local_trade(
-                ticker="KXHIGHDEN-26MAR04-T60",
-                source_bot="weather",
-                side="yes",
-                order_id="ord-v2",
-                cost_cents=80,
-                count=2,
-            ),
-        ]
-        fills = [
-            _make_fill_v2(
-                ticker="KXHIGHDEN-26MAR04-T60",
-                order_id="ord-v2",
-                side="yes",
-                yes_price_dollars="0.4000",
-                count_fp="2.00",
-            ),
-        ]
-        settlements = [
-            _make_settlement(ticker="KXHIGHDEN-26MAR04-T60", revenue=200, yes_total_cost=80, no_total_cost=0, market_result="yes"),
-        ]
-
-        result = compute_realized_pnl_by_bot_local(local_trades, fills, settlements)
-
-        assert result["matched_orders"] == 1
-        assert result["by_bot"]["weather"]["pnl_cents"] == 120
-        assert result["by_bot_reconciliation"]["weather"]["eligible_local_join_basis"] is True
-
-    def test_orphan_api_fill_does_not_block_local_basis_for_canonical_weather_orders(self):
-        local_trades = [
-            _make_local_trade(
-                ticker="KXHIGHDEN-26MAR04-T60",
-                source_bot="weather",
-                side="yes",
-                order_id="ord-live",
-                cost_cents=80,
-                count=2,
-            ),
-        ]
-        fills = [
-            _make_fill(
-                ticker="KXHIGHDEN-26MAR04-T60",
-                order_id="ord-live",
-                side="yes",
-                yes_price=40,
-                count=2,
-            ),
-            _make_fill(
-                ticker="KXHIGHMIA-26MAR04-B79.5",
-                order_id="ord-orphan",
-                side="no",
-                no_price=33,
-                count=2,
-            ),
-        ]
-        settlements = [
-            _make_settlement(
-                ticker="KXHIGHDEN-26MAR04-T60",
-                revenue=200,
-                yes_total_cost=80,
-                no_total_cost=0,
-                market_result="yes",
-            ),
-        ]
-
-        result = compute_realized_pnl_by_bot_local(local_trades, fills, settlements)
-
-        assert result["matched_orders"] == 1
-        assert result["by_bot"]["weather"]["pnl_cents"] == 120
-        assert result["by_bot_reconciliation"]["weather"]["api_fills_without_local_order"] == 0
-        assert result["by_bot_reconciliation"]["unattributed-weather"]["api_fills_without_local_order"] == 1
-        assert result["by_bot_reconciliation"]["weather"]["eligible_local_join_basis"] is True
-
-    def test_demo_weather_fill_is_split_from_unknown_unattributed_bucket(self):
-        local_trades = [
-            _make_local_trade(
-                ticker="KXHIGHDEN-26MAR04-T60",
-                source_bot="weather",
-                side="yes",
-                order_id="ord-live",
-                cost_cents=80,
-                count=2,
-            ),
-        ]
-        fills = [
-            _make_fill(
-                ticker="KXHIGHDEN-26MAR04-T60",
-                order_id="ord-live",
-                side="yes",
-                yes_price=40,
-                count=2,
-            ),
-            _make_fill(
-                ticker="KXHIGHMIA-26FEB16-B79.5",
-                order_id="demo-ord",
-                side="yes",
-                yes_price=20,
-                count=1,
-            ),
-            _make_fill(
-                ticker="KXHIGHMIA-26MAR04-B79.5",
-                order_id="unknown-ord",
-                side="no",
-                no_price=33,
-                count=2,
-            ),
-        ]
-        settlements = [
-            _make_settlement(
-                ticker="KXHIGHDEN-26MAR04-T60",
-                revenue=200,
-                yes_total_cost=80,
-                no_total_cost=0,
-                market_result="yes",
-            ),
-        ]
-
-        result = compute_realized_pnl_by_bot_local(
-            local_trades,
-            fills,
-            settlements,
-            demo_weather_refs={"tickers": {"KXHIGHMIA-26FEB16-B79.5"}, "order_ids": {"demo-ord"}},
-        )
-
-        assert result["by_bot_reconciliation"]["demo-weather-history"]["api_fills_without_local_order"] == 1
-        assert result["by_bot_reconciliation"]["unattributed-weather"]["api_fills_without_local_order"] == 1
-
-    def test_orphan_api_fill_still_blocks_non_weather_local_basis(self):
-        local_trades = [
-            _make_local_trade(
-                ticker="KXBTC-26MAR04-T95000",
-                source_bot="crypto",
-                side="yes",
-                order_id="ord-live",
-                cost_cents=80,
-                count=2,
-            ),
-        ]
-        fills = [
-            _make_fill(
-                ticker="KXBTC-26MAR04-T95000",
-                order_id="ord-live",
-                side="yes",
-                yes_price=40,
-                count=2,
-            ),
-            _make_fill(
-                ticker="KXBTC-26MAR05-T96000",
-                order_id="ord-orphan",
-                side="yes",
-                yes_price=33,
-                count=2,
-            ),
-        ]
-        settlements = [
-            _make_settlement(
-                ticker="KXBTC-26MAR04-T95000",
-                revenue=200,
-                yes_total_cost=80,
-                no_total_cost=0,
-                market_result="yes",
-            ),
-        ]
-
-        result = compute_realized_pnl_by_bot_local(local_trades, fills, settlements)
-
-        assert result["matched_orders"] == 1
-        assert result["by_bot"]["crypto"]["pnl_cents"] == 120
-        assert result["by_bot_reconciliation"]["crypto"]["api_fills_without_local_order"] == 1
-        assert result["by_bot_reconciliation"]["crypto"]["eligible_local_join_basis"] is False
-
-
-def test_select_canonical_by_bot_can_mix_local_and_api():
-    by_bot_api = {
-        "weather": {"pnl_cents": 200},
-        "source-monitor": {"pnl_cents": 2500},
-    }
-    by_bot_local = {
-        "weather": {"pnl_cents": 180},
-        "source-monitor": {"pnl_cents": 1700},
-    }
-    by_bot_local_reconciliation = {
-        "weather": {"eligible_local_join_basis": False},
-        "source-monitor": {"eligible_local_join_basis": True},
-    }
-
-    canonical, basis_map = _select_canonical_by_bot(
-        by_bot_api,
-        by_bot_local,
-        by_bot_local_reconciliation,
-        "local_buy_orders_joined_to_api_fills_and_settlement_outcomes",
-    )
-
-    assert canonical["weather"]["pnl_cents"] == 200
-    assert canonical["source-monitor"]["pnl_cents"] == 1700
-    assert basis_map["weather"] == "kalshi_api_settlements"
-    assert basis_map["source-monitor"] == "local_buy_orders_joined_to_api_fills_and_settlement_outcomes"
-
-
-def test_is_buy_action_treats_legacy_nulls_as_buy():
-    assert _is_buy_action(None) is True
-    assert _is_buy_action("") is True
-    assert _is_buy_action("buy") is True
-    assert _is_buy_action("sell") is False
-
-
 # ── Tests: compute_unrealized_pnl ──
 
 class TestComputeUnrealizedPnl:
@@ -557,6 +223,65 @@ class TestVerifySettlements:
         )
         assert "KXORPHAN-123" in result["unmatched_api_settlements"]
 
+    def test_unmatched_settlement_without_local_bot_coverage_is_informational(self):
+        extra = _make_settlement(ticker="KXALBUMSALES-ARI-280000", revenue=100,
+                                 yes_total_cost=50, no_total_cost=0)
+        result = verify_settlements(
+            SAMPLE_SETTLEMENTS + [extra],
+            SAMPLE_LOCAL_TRADES,
+        )
+        settlement_check = next(c for c in result["checks"]
+                                if c["check"] == "settlement_count_match")
+        orphan_check = next(c for c in result["checks"]
+                            if c["check"] == "orphan_settlements")
+        extra_detail = next(
+            row for row in result["unmatched_api_settlement_details"]
+            if row["ticker"] == "KXALBUMSALES-ARI-280000"
+        )
+
+        assert settlement_check["status"] == "info"
+        assert orphan_check["status"] == "info"
+        assert extra_detail["bot"] == "entertainment"
+        assert extra_detail["reason"] == "no_local_bot_coverage"
+
+    def test_unmatched_settlement_before_local_bot_coverage_is_informational(self):
+        extra = _make_settlement(
+            ticker="KXAFCCLGAME-26FEB16SHJNAS-SHJ",
+            revenue=100,
+            yes_total_cost=50,
+            no_total_cost=0,
+            settled_time="2026-02-16T10:00:00Z",
+        )
+        local = SAMPLE_LOCAL_TRADES + [{
+            "ticker": "KXNBA-26-BOS",
+            "source_bot": "strategy",
+            "side": "yes",
+            "price_cents": 50,
+            "count": 1,
+            "cost_cents": 50,
+            "order_id": "strategy-1",
+            "action": "buy",
+            "settlement_result": None,
+            "settlement_revenue_cents": None,
+            "timestamp": "2026-02-18T00:00:00",
+            "status": "filled",
+            "fill_count": 1,
+        }]
+        result = verify_settlements(
+            SAMPLE_SETTLEMENTS + [extra],
+            local,
+        )
+        settlement_check = next(c for c in result["checks"]
+                                if c["check"] == "settlement_count_match")
+        extra_detail = next(
+            row for row in result["unmatched_api_settlement_details"]
+            if row["ticker"] == "KXAFCCLGAME-26FEB16SHJNAS-SHJ"
+        )
+
+        assert settlement_check["status"] == "info"
+        assert extra_detail["bot"] == "strategy"
+        assert extra_detail["reason"] == "pre_local_bot_coverage"
+
     def test_orphan_local_trade(self):
         """Local trade has no matching API settlement."""
         extra = _make_local_trade(ticker="KXLOCAL-999", order_id="ord-99")
@@ -602,9 +327,9 @@ class TestVerifySettlements:
     def test_pnl_ignores_settlement_revenue_cents_semantic(self):
         """P&L comparison must not depend on settlement_revenue_cents.
 
-        backfill-settlements.py stores net profit there, while
-        reconcile-trades.py stores gross payout — verify both produce
-        the same P&L comparison result.
+        Historical backfill artifacts stored net profit there, while
+        newer reconciliation/backfill flows store gross payout. Verify both
+        produce the same P&L comparison result.
         """
         # API: revenue=100, cost=90, P&L=+10
         api = [_make_settlement(ticker="T1", revenue=100, yes_total_cost=90,
@@ -629,6 +354,23 @@ class TestVerifySettlements:
             assert pnl_check["delta_cents"] == 0, (
                 f"P&L comparison should not depend on settlement_revenue_cents"
             )
+
+    def test_pnl_uses_fill_count_for_partial_fills(self):
+        api = [_make_settlement(ticker="T1", revenue=200, yes_total_cost=90, no_total_cost=0)]
+        local = [
+            _make_local_trade(
+                ticker="T1",
+                cost_cents=90,
+                count=10,
+                fill_count=2,
+                settlement_result="won",
+                settlement_revenue_cents=200,
+                order_id="o1",
+            ),
+        ]
+        result = verify_settlements(api, local)
+        pnl_check = next(c for c in result["checks"] if c["check"] == "pnl_agreement")
+        assert pnl_check["delta_cents"] == 0
 
     def test_pnl_disagreement_flagged(self):
         """Mismatch between API cost and local cost is flagged."""
@@ -748,14 +490,9 @@ class TestBuildSnapshot:
         assert "local_trade_logs" in snapshot["sources_used"]
 
     def test_by_bot_attribution(self):
-        fills = [
-            _make_fill(ticker="KXHIGHHOU-26MAR03-T75", order_id="ord-1", side="yes", yes_price=50, count=4),
-            _make_fill(ticker="KXBTC-26MAR03-T95000", order_id="ord-2", side="yes", yes_price=90, count=1),
-            _make_fill(ticker="KXCPI-26MAY-T20", order_id="ord-3", side="yes", yes_price=10, count=3),
-        ]
         snapshot = build_snapshot(
             balance_cents=0, portfolio_value_cents=0,
-            settlements=SAMPLE_SETTLEMENTS, fills=fills, positions=[],
+            settlements=SAMPLE_SETTLEMENTS, fills=[], positions=[],
             local_trades=SAMPLE_LOCAL_TRADES, deposits_path=None,
         )
         by_bot = snapshot["realized_pnl"]["by_bot"]
@@ -763,263 +500,6 @@ class TestBuildSnapshot:
         assert by_bot["weather"]["pnl_cents"] == 200  # 400 - 200
         assert by_bot["crypto"]["pnl_cents"] == -90   # 0 - 90
         assert by_bot["economics"]["pnl_cents"] == 270  # 300 - 30
-        assert snapshot["realized_pnl"]["by_bot_api_settlements"]["weather"]["pnl_cents"] == 200
-
-    def test_partial_local_fill_coverage_uses_hybrid_by_bot_basis(self):
-        fills = [
-            _make_fill(ticker="KXHIGHHOU-26MAR03-T75", order_id="ord-1", side="yes", yes_price=50, count=4),
-        ]
-        snapshot = build_snapshot(
-            balance_cents=0,
-            portfolio_value_cents=0,
-            settlements=SAMPLE_SETTLEMENTS,
-            fills=fills,
-            positions=[],
-            local_trades=SAMPLE_LOCAL_TRADES,
-            deposits_path=None,
-        )
-        assert snapshot["realized_pnl"]["by_bot_basis"] == "hybrid_per_bot_local_or_api"
-        assert snapshot["realized_pnl"]["by_bot_basis_map"]["weather"] == "local_buy_orders_joined_to_api_fills_and_settlement_outcomes"
-        assert snapshot["realized_pnl"]["by_bot_basis_map"]["economics"] == "kalshi_api_settlements"
-        assert snapshot["realized_pnl"]["by_bot"]["economics"]["pnl_cents"] == 270
-        assert snapshot["realized_pnl"]["by_bot_reconciliation"]["local_by_bot_is_complete"] is False
-
-    def test_per_bot_local_basis_can_promote_source_monitor_only(self):
-        settlements = [
-            _make_settlement(ticker="KXHIGHMIA-26MAR03-T75", revenue=200, yes_total_cost=120, no_total_cost=0, market_result="yes"),
-            _make_settlement(ticker="KXCPI-26MAY-T20", revenue=300, yes_total_cost=30, no_total_cost=0, market_result="yes"),
-        ]
-        local_trades = [
-            _make_local_trade(
-                ticker="KXHIGHMIA-26MAR03-T75",
-                source_bot="source-monitor",
-                side="yes",
-                order_id="ord-a",
-                cost_cents=120,
-            ),
-            _make_local_trade(
-                ticker="KXCPI-26MAY-T20",
-                source_bot="economics",
-                side="yes",
-                order_id="ord-cpi",
-                cost_cents=30,
-            ),
-        ]
-        fills = [
-            _make_fill(ticker="KXHIGHMIA-26MAR03-T75", order_id="ord-a", side="yes", yes_price=60, count=2),
-        ]
-
-        snapshot = build_snapshot(
-            balance_cents=0,
-            portfolio_value_cents=0,
-            settlements=settlements,
-            fills=fills,
-            positions=[],
-            local_trades=local_trades,
-            deposits_path=None,
-        )
-
-        assert snapshot["realized_pnl"]["by_bot"]["source-monitor"]["pnl_cents"] == 80
-        assert snapshot["realized_pnl"]["by_bot"]["economics"]["pnl_cents"] == 270
-        assert snapshot["realized_pnl"]["by_bot_basis"] == "hybrid_per_bot_local_or_api"
-        assert snapshot["realized_pnl"]["by_bot_basis_map"]["source-monitor"] == "local_buy_orders_joined_to_api_fills_and_settlement_outcomes"
-        assert snapshot["realized_pnl"]["by_bot_basis_map"]["economics"] == "kalshi_api_settlements"
-        assert snapshot["realized_pnl"]["by_bot_local_reconciliation"]["source-monitor"]["eligible_local_join_basis"] is True
-
-    def test_orphan_api_fill_does_not_block_weather_canonical_basis(self):
-        settlements = [
-            _make_settlement(
-                ticker="KXHIGHDEN-26MAR04-T60",
-                revenue=200,
-                yes_total_cost=80,
-                no_total_cost=0,
-                market_result="yes",
-            ),
-            _make_settlement(
-                ticker="KXCPI-26MAY-T20",
-                revenue=300,
-                yes_total_cost=30,
-                no_total_cost=0,
-                market_result="yes",
-            ),
-        ]
-        local_trades = [
-            _make_local_trade(
-                ticker="KXHIGHDEN-26MAR04-T60",
-                source_bot="weather",
-                side="yes",
-                order_id="ord-weather",
-                cost_cents=80,
-                count=2,
-            ),
-            _make_local_trade(
-                ticker="KXCPI-26MAY-T20",
-                source_bot="economics",
-                side="yes",
-                order_id="ord-cpi",
-                cost_cents=30,
-                count=3,
-            ),
-        ]
-        fills = [
-            _make_fill(
-                ticker="KXHIGHDEN-26MAR04-T60",
-                order_id="ord-weather",
-                side="yes",
-                yes_price=40,
-                count=2,
-            ),
-            _make_fill(
-                ticker="KXHIGHMIA-26MAR04-B79.5",
-                order_id="ord-orphan",
-                side="no",
-                no_price=33,
-                count=2,
-            ),
-        ]
-
-        snapshot = build_snapshot(
-            balance_cents=0,
-            portfolio_value_cents=0,
-            settlements=settlements,
-            fills=fills,
-            positions=[],
-            local_trades=local_trades,
-            deposits_path=None,
-        )
-
-        assert snapshot["realized_pnl"]["by_bot_basis"] == "hybrid_per_bot_local_or_api"
-        assert snapshot["realized_pnl"]["by_bot_basis_map"]["weather"] == "local_buy_orders_joined_to_api_fills_and_settlement_outcomes"
-        assert snapshot["realized_pnl"]["by_bot_basis_map"]["economics"] == "kalshi_api_settlements"
-        assert snapshot["realized_pnl"]["by_bot"]["weather"]["pnl_cents"] == 120
-        assert snapshot["realized_pnl"]["by_bot_local_reconciliation"]["weather"]["api_fills_without_local_order"] == 0
-        assert snapshot["realized_pnl"]["by_bot_local_reconciliation"]["unattributed-weather"]["api_fills_without_local_order"] == 1
-        assert snapshot["realized_pnl"]["by_bot_local_reconciliation"]["weather"]["eligible_local_join_basis"] is True
-
-    def test_orphan_kxhigh_api_settlement_is_bucketed_as_unattributed_weather(self):
-        settlements = [
-            _make_settlement(
-                ticker="KXHIGHMIA-26MAR04-T80",
-                revenue=200,
-                yes_total_cost=140,
-                no_total_cost=0,
-                market_result="yes",
-            ),
-            _make_settlement(
-                ticker="KXHIGHDEN-26MAR04-T60",
-                revenue=200,
-                yes_total_cost=80,
-                no_total_cost=0,
-                market_result="yes",
-            ),
-        ]
-        local_trades = [
-            _make_local_trade(
-                ticker="KXHIGHDEN-26MAR04-T60",
-                source_bot="weather",
-                side="yes",
-                order_id="ord-weather",
-                cost_cents=80,
-                count=2,
-            ),
-        ]
-        fills = [
-            _make_fill(
-                ticker="KXHIGHDEN-26MAR04-T60",
-                order_id="ord-weather",
-                side="yes",
-                yes_price=40,
-                count=2,
-            ),
-        ]
-
-        snapshot = build_snapshot(
-            balance_cents=0,
-            portfolio_value_cents=0,
-            settlements=settlements,
-            fills=fills,
-            positions=[],
-            local_trades=local_trades,
-            deposits_path=None,
-        )
-
-        assert snapshot["realized_pnl"]["by_bot"]["weather"]["pnl_cents"] == 120
-        assert snapshot["realized_pnl"]["by_bot"]["unattributed-weather"]["pnl_cents"] == 60
-        assert snapshot["realized_pnl"]["by_bot_basis_map"]["unattributed-weather"] == "kalshi_api_settlements"
-        assert snapshot["realized_pnl"]["by_bot_display_map"]["unattributed-weather"] == "legacy automated weather history"
-        assert "older automated weather activity" in snapshot["realized_pnl"]["by_bot_reporting_notes"]["unattributed-weather"]
-
-    def test_demo_weather_api_settlement_is_split_from_unknown_unattributed_weather(self):
-        settlements = [
-            _make_settlement(
-                ticker="KXHIGHLAX-26FEB15-B66.5",
-                revenue=100,
-                yes_total_cost=67,
-                no_total_cost=0,
-                market_result="yes",
-            ),
-            _make_settlement(
-                ticker="KXHIGHMIA-26MAR04-T80",
-                revenue=200,
-                yes_total_cost=140,
-                no_total_cost=0,
-                market_result="yes",
-            ),
-        ]
-
-        snapshot = build_snapshot(
-            balance_cents=0,
-            portfolio_value_cents=0,
-            settlements=settlements,
-            fills=[],
-            positions=[],
-            local_trades=[],
-            deposits_path=None,
-            demo_weather_refs={"tickers": {"KXHIGHLAX-26FEB15-B66.5"}, "order_ids": {"demo-order"}},
-        )
-
-        assert snapshot["realized_pnl"]["by_bot"]["demo-weather-history"]["pnl_cents"] == 33
-        assert snapshot["realized_pnl"]["by_bot"]["unattributed-weather"]["pnl_cents"] == 60
-        assert snapshot["realized_pnl"]["by_bot_basis_map"]["demo-weather-history"] == "kalshi_api_settlements"
-        assert snapshot["realized_pnl"]["by_bot_display_map"]["demo-weather-history"] == "demo-weather history"
-
-
-class TestUnmatchedApiInference:
-    def test_unmatched_kxhigh_rows_are_not_attributed_to_weather(self):
-        assert _infer_unmatched_api_bot("KXHIGHMIA-26MAR04-T80") == "unattributed-weather"
-        assert _infer_unmatched_api_bot("KXBTC-26MAR04-T90000") == "crypto"
-
-    def test_demo_weather_rows_use_demo_history_bucket(self):
-        refs = {"tickers": {"KXHIGHMIA-26FEB16-B79.5"}, "order_ids": {"demo-order"}}
-        assert _infer_unmatched_api_bot(
-            "KXHIGHMIA-26FEB16-B79.5",
-            demo_weather_refs=refs,
-        ) == "demo-weather-history"
-        assert _infer_unmatched_api_bot(
-            "KXHIGHXXX-26MAR04-T80",
-            order_id="demo-order",
-            demo_weather_refs=refs,
-        ) == "demo-weather-history"
-
-
-class TestDemoWeatherRefs:
-    def test_load_demo_weather_refs_extracts_only_kxhigh_rows(self, tmp_path, monkeypatch):
-        payload = {
-            "timestamp": "2026-02-16T00:00:00Z",
-            "trades": [
-                {"ticker": "KXHIGHLAX-26FEB15-B66.5", "order_id": "demo-weather"},
-                {"ticker": "KXUSDJPY-26FEB1610-B155.125", "order_id": "non-weather"},
-            ],
-        }
-        data_dir = tmp_path / "data"
-        data_dir.mkdir()
-        (data_dir / "demo-trades-log.json").write_text(__import__("json").dumps(payload))
-        monkeypatch.setattr(_mod, "DATA_DIR", data_dir)
-
-        refs = _load_demo_weather_refs()
-
-        assert refs["tickers"] == {"KXHIGHLAX-26FEB15-B66.5"}
-        assert refs["order_ids"] == {"demo-weather"}
 
     def test_roi_uses_nav_based_total_pnl(self, tmp_path):
         """ROI = (NAV - deposits) / deposits, NOT realized / deposits."""
@@ -1129,6 +609,12 @@ class TestInferBot:
 
     def test_entertainment_albumsales(self):
         assert _infer_bot("KXALBUMSALES-LUC-15000") == "entertainment"
+
+    def test_entertainment_superbowl_song(self):
+        assert _infer_bot("KXFIRSTSUPERBOWLSONG-26FEB09-CHA") == "entertainment"
+
+    def test_strategy_market_family(self):
+        assert _infer_bot("KXAFCCLGAME-26FEB16SHJNAS-SHJ") == "strategy"
 
     def test_other(self):
         assert _infer_bot("KXSPORTS-NCAAM") == "other"

@@ -15,10 +15,11 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from artifact_contracts import normalize_trade_attribution
+from runtime_paths import resolve_data_dir
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
-DEFAULT_LEDGER_PATH = PROJECT_DIR / "data" / "event-ledger.sqlite3"
-DEFAULT_ARCHIVE_ROOT = PROJECT_DIR / "data" / "archive" / "events"
+DEFAULT_LEDGER_PATH = resolve_data_dir(PROJECT_DIR) / "event-ledger.sqlite3"
+DEFAULT_ARCHIVE_ROOT = resolve_data_dir(PROJECT_DIR) / "archive" / "events"
 LEDGER_SCHEMA_VERSION = 1
 
 EVENT_TYPE_SOURCE_OBSERVATION = "source_observation"

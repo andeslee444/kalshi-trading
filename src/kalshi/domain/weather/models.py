@@ -608,7 +608,12 @@ def nws_sigma_for_hour(hour_of_day, load_calibration_func=None):
 
 def nws_probability(running_high, threshold, direction, hour_of_day,
                     load_calibration_func=None, logger=None):
-    """Probability for NWS actual-temp arbitrage."""
+    """Probability for NWS actual-temp arbitrage.
+
+    Same-day daily highs are monotonic: the final high cannot go below the
+    running high already observed. We model the remaining move as a one-sided
+    positive tail with a point mass at zero by truncating negative moves.
+    """
     log = logger or _log
     cal = _calibration(load_calibration_func)
     nws_df = cal.get("nws", {}).get("df", 6)
@@ -619,12 +624,22 @@ def nws_probability(running_high, threshold, direction, hour_of_day,
     sigma = nws_sigma_for_hour(hour_of_day, load_calibration_func=load_calibration_func)
 
     if direction == "T":
+        if running_high > threshold:
+            return 1.0
         z = (threshold - running_high) / sigma
-        return 1.0 - _student_t_cdf(z, nws_df)
+        return max(0.0, min(1.0, 1.0 - _student_t_cdf(z, nws_df)))
+
+    upper = threshold + 1.0
+    if running_high >= upper:
+        return 0.0
+    if running_high >= threshold:
+        z = (upper - running_high) / sigma
+        return max(0.0, min(1.0, _student_t_cdf(z, nws_df)))
 
     z_low = (threshold - running_high) / sigma
-    z_high = (threshold + 1 - running_high) / sigma
-    return _student_t_cdf(z_high, nws_df) - _student_t_cdf(z_low, nws_df)
+    z_high = (upper - running_high) / sigma
+    prob = _student_t_cdf(z_high, nws_df) - _student_t_cdf(z_low, nws_df)
+    return max(0.0, min(1.0, prob))
 
 
 __all__ = [

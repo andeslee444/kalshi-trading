@@ -18,7 +18,6 @@ from weather_data import (
     NWSForecastFetcher,
     NWS_GRID_MAP,
     NAMFetcher,
-    IntradayFeatureFetcher,
     PreviousRunsFetcher,
     BiasCorrector,
     latest_available_model_run,
@@ -554,101 +553,6 @@ class TestHRRRFetcher:
 
 
 # ===================================================================
-# IntradayFeatureFetcher tests (with mocked HTTP)
-# ===================================================================
-
-
-class TestIntradayFeatureFetcher:
-
-    def _make_mock_response(self, json_data, status_code=200):
-        mock_resp = MagicMock()
-        mock_resp.status_code = status_code
-        mock_resp.json.return_value = json_data
-        return mock_resp
-
-    @patch("weather_data._retry_request")
-    def test_fetch_same_day_summary_parses_hrrr_minutely_features(self, mock_retry):
-        json_data = {
-            "minutely_15_units": {
-                "temperature_2m": "°F",
-                "cape": "J/kg",
-                "precipitation": "mm",
-                "cloud_cover": "%",
-                "dewpoint_2m": "°F",
-            },
-            "minutely_15": {
-                "time": [
-                    "2026-04-02T00:00",
-                    "2026-04-02T00:15",
-                    "2026-04-02T00:30",
-                    "2026-04-03T00:00",
-                ],
-                "temperature_2m": [70.0, 74.5, 73.0, 68.0],
-                "cape": [100.0, 350.0, 200.0, 25.0],
-                "precipitation": [0.0, 0.2, 0.1, 0.0],
-                "cloud_cover": [10.0, 40.0, 60.0, 70.0],
-                "dewpoint_2m": [62.0, 65.0, 64.0, 61.0],
-            },
-        }
-        mock_retry.return_value = self._make_mock_response(json_data)
-
-        fetcher = IntradayFeatureFetcher()
-        result = fetcher.fetch_same_day_summary(25.7, -80.2, city_code="MIA", target_date="2026-04-02")
-
-        assert result is not None
-        assert result["date"] == "2026-04-02"
-        assert result["samples"] == 3
-        assert result["temperature_max_f"] == 74.5
-        assert result["temperature_peak_time"] == "2026-04-02T00:15"
-        assert result["cape_max_jkg"] == 350.0
-        assert result["precipitation_total"] == pytest.approx(0.3, abs=1e-6)
-        assert result["cloud_cover_mean_pct"] == pytest.approx((10.0 + 40.0 + 60.0) / 3, abs=1e-3)
-        assert result["dewpoint_max_f"] == 65.0
-
-    @patch("weather_data._retry_request")
-    def test_fetch_same_day_summary_uses_hrrr_minutely_url(self, mock_retry):
-        mock_retry.return_value = self._make_mock_response(
-            {
-                "minutely_15": {
-                    "time": ["2026-04-02T00:00"],
-                    "temperature_2m": [72.0],
-                    "cape": [120.0],
-                    "precipitation": [0.0],
-                    "cloud_cover": [25.0],
-                    "dewpoint_2m": [61.0],
-                },
-                "minutely_15_units": {
-                    "temperature_2m": "°F",
-                    "cape": "J/kg",
-                    "precipitation": "mm",
-                    "cloud_cover": "%",
-                    "dewpoint_2m": "°F",
-                },
-            }
-        )
-
-        fetcher = IntradayFeatureFetcher()
-        fetcher.fetch_same_day_summary(25.7, -80.2, city_code="MIA", target_date="2026-04-02")
-
-        url = mock_retry.call_args[0][1]
-        assert "hrrr_conus" in url
-        assert "minutely_15=temperature_2m,cape,precipitation,cloud_cover,dewpoint_2m" in url
-        assert "forecast_hours=24" in url
-        assert "temperature_unit=fahrenheit" in url
-        assert "timezone=auto" in url
-
-    @patch("weather_data._retry_request")
-    def test_fetch_same_day_summary_returns_none_on_bad_status(self, mock_retry):
-        mock_resp = MagicMock()
-        mock_resp.status_code = 500
-        mock_retry.return_value = mock_resp
-
-        fetcher = IntradayFeatureFetcher()
-        result = fetcher.fetch_same_day_summary(25.7, -80.2, city_code="MIA", target_date="2026-04-02")
-
-        assert result is None
-
-# ===================================================================
 # OrderBookDepth tests (with mocked client)
 # ===================================================================
 
@@ -963,16 +867,14 @@ class TestNWSForecastFetcher:
     def test_cross_validate_sources_agree(self):
         """Sources within 3F should return True."""
         fetcher = NWSForecastFetcher()
-        with patch("probability.weather_sigma", return_value=3.0):
-            assert fetcher.cross_validate("MIA", 85.0, 84.0) is True
-            assert fetcher.cross_validate("MIA", 85.0, 82.0) is True  # exactly 3F
+        assert fetcher.cross_validate("MIA", 85.0, 84.0) is True
+        assert fetcher.cross_validate("MIA", 85.0, 82.0) is True  # exactly 3F
 
     def test_cross_validate_sources_disagree(self):
         """Sources diverging >3F should return False."""
         fetcher = NWSForecastFetcher()
-        with patch("probability.weather_sigma", return_value=3.0):
-            assert fetcher.cross_validate("MIA", 85.0, 81.0) is False  # 4F diff
-            assert fetcher.cross_validate("MIA", 85.0, 90.0) is False  # 5F diff
+        assert fetcher.cross_validate("MIA", 85.0, 81.0) is False  # 4F diff
+        assert fetcher.cross_validate("MIA", 85.0, 90.0) is False  # 5F diff
 
     def test_cross_validate_uses_city_specific_thresholds(self):
         fetcher = NWSForecastFetcher()
@@ -1438,6 +1340,39 @@ class TestBiasCorrector:
         assert blended == pytest.approx(expected)
         assert alpha == 0.0
         assert meta["capped"] is False
+
+    def test_blend_live_bias_requires_min_confidence(self):
+        bc = self._make_corrector()
+        blended, hist_bias, alpha, meta = bc.blend_live_bias(
+            "MIA",
+            live_bias=-4.0,
+            live_confidence=0.4,
+            live_n=8,
+            ramp_n=8,
+            min_live_samples=2,
+            min_live_confidence=0.6,
+            max_abs_bias_f=10.0,
+        )
+        assert blended == pytest.approx(hist_bias)
+        assert alpha == 0.0
+        assert meta["low_confidence"] is True
+
+    def test_blend_live_bias_scales_alpha_by_confidence(self):
+        bc = self._make_corrector()
+        blended, hist_bias, alpha, meta = bc.blend_live_bias(
+            "MIA",
+            live_bias=4.0,
+            live_confidence=0.5,
+            live_n=4,
+            ramp_n=8,
+            min_live_samples=2,
+            max_abs_bias_f=10.0,
+        )
+        expected_hist = (8.9 + 7.0) / 2
+        assert hist_bias == pytest.approx(expected_hist)
+        assert alpha == pytest.approx(0.25)
+        assert blended == pytest.approx(0.25 * 4.0 + 0.75 * expected_hist)
+        assert meta["confidence_scale"] == pytest.approx(0.5)
 
     def test_residual_std_specific_model(self):
         bc = self._make_corrector()
