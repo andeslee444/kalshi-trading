@@ -34,6 +34,16 @@ def test_validate_trade_config_accepts_valid_values():
     validate_trade_config({"maxTradeAmount": 5, "maxDailyTrades": 10, "maxDailyLoss": 25})
 
 
+def test_validate_trade_config_accepts_count_caps():
+    validate_trade_config({
+        "maxTradeAmount": 5,
+        "maxDailyTrades": 10,
+        "maxDailyLoss": 25,
+        "maxContractsPerTrade": 100,
+        "maxGrossPayoutCents": 10000,
+    })
+
+
 def test_recent_trade_tracker_loads_recent_entries(tmp_path):
     trades_path = tmp_path / "trades.json"
     recent_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -71,6 +81,22 @@ def test_trade_manager_places_order_and_persists_trade(tmp_path):
     assert records[-1]["source_bot"] == "execution-trade-manager-test"
     assert records[-1]["strategy_id"] == "execution-trade-manager-test"
     assert records[-1]["config_version"]
+
+
+def test_trade_manager_applies_gross_payout_cap(tmp_path):
+    manager, client = _make_manager(tmp_path, {
+        "maxTradeAmount": 5,
+        "maxDailyTrades": 10,
+        "maxDailyLoss": 25,
+        "maxGrossPayoutCents": 300,
+    })
+
+    result = manager.place_order("TICK-1", "yes", 1, 25, "test reason")
+
+    assert result["count"] == 3
+    assert "gross_payout_cap" in result["caps_applied"]
+    records = json.loads((tmp_path / "trades.json").read_text())
+    assert "gross_payout_cap" in records[-1]["caps_applied"]
 
 
 def test_trade_manager_log_decision_persists_record(tmp_path):

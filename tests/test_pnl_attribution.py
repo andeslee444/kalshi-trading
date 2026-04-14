@@ -82,6 +82,13 @@ class TestComputePnlCents:
         assert settled is True
         assert pnl == -120
 
+    def test_legacy_net_profit_semantics_still_compute_correctly(self):
+        t = _make_trade(cost_cents=90, count=1, settlement_result="won",
+                        settlement_revenue_cents=10)
+        pnl, settled = _compute_pnl_cents(t)
+        assert settled is True
+        assert pnl == 10
+
     def test_unsettled_returns_zero(self):
         pnl, settled = _compute_pnl_cents(UNSETTLED_TRADE)
         assert settled is False

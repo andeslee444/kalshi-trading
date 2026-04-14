@@ -1373,9 +1373,11 @@ class BiasCorrector:
         self,
         city,
         live_bias=None,
+        live_confidence=None,
         live_n=0,
         ramp_n=20,
         min_live_samples=2,
+        min_live_confidence=None,
         max_abs_bias_f=None,
         conflict_gap_f=4.0,
         conflict_alpha_floor=0.35,
@@ -1383,20 +1385,43 @@ class BiasCorrector:
     ):
         """Blend historical city bias with live verification bias conservatively."""
         hist_bias = self.city_average_bias(city, model_weights=hist_model_weights)
+        if hist_bias is None:
+            hist_bias = 0.0
         alpha = 0.0
         conflict = False
+        confidence_scale = 1.0
+        low_confidence = False
         if live_bias is None or live_n < min_live_samples:
             blended = hist_bias
         else:
-            alpha = min(1.0, float(live_n) / max(1.0, float(ramp_n)))
-            if (
-                abs(hist_bias - live_bias) >= conflict_gap_f
-                or (hist_bias > 0 > live_bias)
-                or (hist_bias < 0 < live_bias)
-            ):
-                alpha = max(alpha, conflict_alpha_floor)
-                conflict = True
-            blended = alpha * live_bias + (1.0 - alpha) * hist_bias
+            if min_live_confidence is not None:
+                if live_confidence is None or float(live_confidence) < float(min_live_confidence):
+                    low_confidence = True
+                    confidence_scale = 0.0
+                    blended = hist_bias
+                else:
+                    confidence_scale = max(0.0, min(1.0, float(live_confidence)))
+                    alpha = min(1.0, float(live_n) / max(1.0, float(ramp_n))) * confidence_scale
+                    if (
+                        abs(hist_bias - live_bias) >= conflict_gap_f
+                        or (hist_bias > 0 > live_bias)
+                        or (hist_bias < 0 < live_bias)
+                    ):
+                        alpha = max(alpha, conflict_alpha_floor * confidence_scale)
+                        conflict = True
+                    blended = alpha * live_bias + (1.0 - alpha) * hist_bias
+            else:
+                if live_confidence is not None:
+                    confidence_scale = max(0.0, min(1.0, float(live_confidence)))
+                alpha = min(1.0, float(live_n) / max(1.0, float(ramp_n))) * confidence_scale
+                if (
+                    abs(hist_bias - live_bias) >= conflict_gap_f
+                    or (hist_bias > 0 > live_bias)
+                    or (hist_bias < 0 < live_bias)
+                ):
+                    alpha = max(alpha, conflict_alpha_floor * confidence_scale)
+                    conflict = True
+                blended = alpha * live_bias + (1.0 - alpha) * hist_bias
 
         capped = False
         if isinstance(max_abs_bias_f, (int, float)) and max_abs_bias_f > 0:
@@ -1408,6 +1433,9 @@ class BiasCorrector:
             "capped": capped,
             "cap_f": max_abs_bias_f,
             "conflict": conflict,
+            "confidence_scale": confidence_scale,
+            "live_confidence": live_confidence,
+            "low_confidence": low_confidence,
         }
 
     def residual_std(self, city, model=None):

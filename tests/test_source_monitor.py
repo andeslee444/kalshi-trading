@@ -586,6 +586,35 @@ class TestNWSObservationFreshness:
         assert age < sm.NWS_MAX_OBS_AGE_MINUTES
 
 
+class TestNWSBracketGuardrails:
+    def test_bracket_guardrail_rejects_early_local_hour(self):
+        sm = _load_source_monitor()
+        reason = sm._nws_bracket_guardrail_reason(
+            11,
+            5,
+            {"enabled": True, "minLocalHour": 13, "maxObservationAgeMinutes": 30},
+        )
+        assert reason == "bracket_too_early"
+
+    def test_bracket_guardrail_rejects_stale_observation(self):
+        sm = _load_source_monitor()
+        reason = sm._nws_bracket_guardrail_reason(
+            14,
+            45,
+            {"enabled": True, "minLocalHour": 13, "maxObservationAgeMinutes": 30},
+        )
+        assert reason == "stale_bracket_obs"
+
+    def test_bracket_guardrail_accepts_fresh_afternoon_observation(self):
+        sm = _load_source_monitor()
+        reason = sm._nws_bracket_guardrail_reason(
+            14,
+            15,
+            {"enabled": True, "minLocalHour": 13, "maxObservationAgeMinutes": 30},
+        )
+        assert reason is None
+
+
 class TestNWSEdgeThresholdBoundaries:
     """Test edge threshold tier boundaries in detail.
 

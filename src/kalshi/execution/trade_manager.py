@@ -101,6 +101,20 @@ def validate_trade_config(config, bot_name=""):
             if pct > 0.25:
                 raise ValueError(f"{prefix}{label}={pct} exceeds 25% safety cap")
 
+    contracts_cap = config.get("maxContractsPerTrade")
+    if contracts_cap is not None:
+        if not isinstance(contracts_cap, int) or contracts_cap <= 0:
+            raise ValueError(f"{prefix}maxContractsPerTrade must be a positive integer, got {contracts_cap}")
+        if contracts_cap > 10000:
+            raise ValueError(f"{prefix}maxContractsPerTrade={contracts_cap} exceeds 10000 safety cap")
+
+    gross_payout_cap = config.get("maxGrossPayoutCents")
+    if gross_payout_cap is not None:
+        if not isinstance(gross_payout_cap, (int, float)) or gross_payout_cap < 100:
+            raise ValueError(f"{prefix}maxGrossPayoutCents must be at least 100, got {gross_payout_cap}")
+        if gross_payout_cap > 100000:
+            raise ValueError(f"{prefix}maxGrossPayoutCents={gross_payout_cap} exceeds $1000 safety cap")
+
 
 def trim_trade_log(
     trades_path,
@@ -487,6 +501,7 @@ class TradeManager:
         record.setdefault("settlement_result", None)
         record.setdefault("settlement_revenue_cents", None)
         record.setdefault("fill_price_cents", None)
+        record.setdefault("fill_count", None)
         return record
 
     def place_order(self, ticker, side, price_cents, count, reasoning, available_balance_cents=None, market_data_age_seconds=None, **extra_fields):
@@ -536,6 +551,29 @@ class TradeManager:
 
         max_cost_cents = self._effective_max_trade_cents()
         cost_per_contract = price_cents
+
+        max_contracts = self.config.get("maxContractsPerTrade")
+        if max_contracts is not None and count > max_contracts:
+            original_count = count
+            count = max_contracts
+            caps_applied.append("contracts_cap")
+            self.log.info("Contracts cap: %dx → %dx on %s", original_count, count, ticker)
+
+        max_gross_payout_cents = self.config.get("maxGrossPayoutCents")
+        if max_gross_payout_cents is not None:
+            payout_contract_cap = max(1, int(max_gross_payout_cents // 100))
+            if count > payout_contract_cap:
+                original_count = count
+                count = payout_contract_cap
+                caps_applied.append("gross_payout_cap")
+                self.log.info(
+                    "Gross payout cap: %dx → %dx on %s (max $%.2f payout)",
+                    original_count,
+                    count,
+                    ticker,
+                    max_gross_payout_cents / 100,
+                )
+
         if cost_per_contract * count > max_cost_cents:
             original_count = count
             count = max(1, max_cost_cents // cost_per_contract)

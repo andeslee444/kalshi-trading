@@ -1594,9 +1594,11 @@ def scan_and_trade():
                     bias, hist_bias, alpha, bias_meta = bias_corrector.blend_live_bias(
                         city,
                         live_bias=live_bias,
+                        live_confidence=live_confidence,
                         live_n=live_n,
                         ramp_n=int(bias_cfg.get("liveRampSamples", 8)),
                         min_live_samples=int(bias_cfg.get("liveMinSamples", 2)),
+                        min_live_confidence=bias_cfg.get("liveMinConfidence"),
                         max_abs_bias_f=float(bias_cfg.get("historicalMaxAbsF", 6.0)),
                         conflict_gap_f=float(bias_cfg.get("conflictGapF", 4.0)),
                         conflict_alpha_floor=float(bias_cfg.get("conflictAlphaFloor", 0.35)),
@@ -2364,6 +2366,8 @@ def build_app(project_dir=None):
         "maxDailyTrades": loaded_config.get("maxDailyTrades", 10),
         "maxDailyLoss": loaded_config.get("maxDailyLoss", 10),
         "maxDailyLossPct": loaded_config.get("maxDailyLossPct"),
+        "maxContractsPerTrade": loaded_config.get("maxContractsPerTrade"),
+        "maxGrossPayoutCents": loaded_config.get("maxGrossPayoutCents"),
     }, logger=logger, order_monitor=order_monitor_obj, cooldown_hours=0.5, bot_name="weather")
     opportunity_log_obj = OpportunityLog(
         project_dir / "data" / "opportunity-log.json",

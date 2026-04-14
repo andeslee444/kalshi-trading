@@ -38,11 +38,12 @@ from execution_quality import ExecutionAnalyzer
 from storage import SnapshotStore, TradeStore
 from ticker_utils import format_ticker_human
 from trade_files import TRADE_FILES as _CANONICAL_FILES
+from runtime_paths import resolve_data_dir
 
 logger = logging.getLogger("dashboard")
 
 DASHBOARD_HTML = Path(__file__).resolve().parent / "dashboard.html"
-DATA_DIR = PROJECT_DIR / "data"
+DATA_DIR = resolve_data_dir(PROJECT_DIR)
 PID_DIR = DATA_DIR / "pids"
 LOG_DIR = DATA_DIR / "logs"
 HEALTH_STATE_PATH = DATA_DIR / "health-state.json"
@@ -126,7 +127,7 @@ def load_trades_safe(filepath: Path) -> list | None:
             return ledger.get_trade_records(filepath)
         if path_str in decision_paths:
             return ledger.get_decision_records(filepath)
-    return TradeStore(filepath, logger=logger).load(default=None)
+    return TradeStore(filepath, logger=logger).load(default=[])
 
 
 def extract_side(trade: dict) -> str:

@@ -204,6 +204,11 @@ class TestNwsProbability:
         prob = nws_probability(92.0, 86.0, "T", 10)
         assert prob > 0.5  # Still above 0.5 but less extreme than post-5PM
 
+    def test_threshold_already_crossed_is_certain(self):
+        """Once the running high is already above the threshold, YES is locked."""
+        prob = nws_probability(86.1, 86.0, "T", 10)
+        assert prob == 1.0
+
     def test_bracket_post_5pm(self):
         """Bracket probability after 5PM when running high is in bracket."""
         prob = nws_probability(86.5, 86.0, "B", 17)
@@ -214,6 +219,11 @@ class TestNwsProbability:
         """Bracket probability after 5PM when running high is far from bracket."""
         prob = nws_probability(92.0, 86.0, "B", 17)
         assert prob < 0.01
+
+    def test_bracket_above_upper_bound_is_impossible(self):
+        """Once the running high exceeds the bracket ceiling, YES is impossible."""
+        prob = nws_probability(87.0, 86.0, "B", 12)
+        assert prob == 0.0
 
 
 # ===================================================================

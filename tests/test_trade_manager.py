@@ -148,6 +148,16 @@ class TestConfigValidation:
                   "maxTradeAmountPct": 0.02, "maxDailyLossPct": 0.05}
         validate_trade_config(config)  # should not raise
 
+    def test_contract_and_payout_caps_accepted(self):
+        config = {
+            "maxTradeAmount": 5,
+            "maxDailyTrades": 10,
+            "maxDailyLoss": 25,
+            "maxContractsPerTrade": 100,
+            "maxGrossPayoutCents": 10000,
+        }
+        validate_trade_config(config)  # should not raise
+
     def test_pct_none_accepted(self):
         """Config with None percentage keys should pass validation."""
         config = {"maxTradeAmount": 5, "maxDailyTrades": 10, "maxDailyLoss": 25,
@@ -163,6 +173,16 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match="maxDailyLossPct.*25%"):
             validate_trade_config({"maxTradeAmount": 5, "maxDailyTrades": 10,
                                    "maxDailyLoss": 25, "maxDailyLossPct": 0.50})
+
+    def test_non_integer_contract_cap_fails(self):
+        with pytest.raises(ValueError, match="maxContractsPerTrade"):
+            validate_trade_config({"maxTradeAmount": 5, "maxDailyTrades": 10,
+                                   "maxDailyLoss": 25, "maxContractsPerTrade": 5.5})
+
+    def test_small_gross_payout_cap_fails(self):
+        with pytest.raises(ValueError, match="maxGrossPayoutCents"):
+            validate_trade_config({"maxTradeAmount": 5, "maxDailyTrades": 10,
+                                   "maxDailyLoss": 25, "maxGrossPayoutCents": 50})
 
 
 # ===================================================================
@@ -372,6 +392,30 @@ class TestTradeManager:
         assert result is not None
         assert client.post.call_args[1]["body"]["count"] == 1
         assert result["cost_cents"] == 20
+
+    def test_contract_cap_adjustment(self, tmp_path):
+        mgr, client, _ = _make_manager(tmp_path, {
+            "maxTradeAmount": 10,
+            "maxDailyTrades": 100,
+            "maxDailyLoss": 100,
+            "maxContractsPerTrade": 4,
+        })
+        result = mgr.place_order("T1", "yes", 10, 8, "r1")
+        assert result is not None
+        assert client.post.call_args[1]["body"]["count"] == 4
+        assert "contracts_cap" in result["caps_applied"]
+
+    def test_gross_payout_cap_adjustment(self, tmp_path):
+        mgr, client, _ = _make_manager(tmp_path, {
+            "maxTradeAmount": 10,
+            "maxDailyTrades": 100,
+            "maxDailyLoss": 100,
+            "maxGrossPayoutCents": 300,
+        })
+        result = mgr.place_order("T1", "yes", 1, 50, "r1")
+        assert result is not None
+        assert client.post.call_args[1]["body"]["count"] == 3
+        assert "gross_payout_cap" in result["caps_applied"]
 
     def test_dedup_blocks_repeat(self, tmp_path):
         mgr, _, _ = _make_manager(tmp_path)

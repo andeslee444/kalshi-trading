@@ -11,6 +11,7 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR / "src" / "kalshi"))
 
 from forecast_verifier import ForecastVerifier
+from runtime_paths import resolve_data_dir
 from weather_data import BiasCorrector
 
 
@@ -61,10 +62,10 @@ def weather_trade_summary(path, lookback_prefix=None):
     return out
 
 
-def build_rows(lookback_days, historical_path, trades_path):
+def build_rows(lookback_days, historical_path, trades_path, state_path):
     config = load_config()
     bias_cfg = config.get("biasCorrection", {})
-    verifier = ForecastVerifier(PROJECT_DIR / "data" / "weather-verification.json")
+    verifier = ForecastVerifier(state_path)
     verifier.load()
     bias_corrector = BiasCorrector(calibration_path=str(historical_path), logger=None)
 
@@ -87,9 +88,11 @@ def build_rows(lookback_days, historical_path, trades_path):
         blended, _, alpha, meta = bias_corrector.blend_live_bias(
             city,
             live_bias=live_f,
+            live_confidence=confidence,
             live_n=live_n,
             ramp_n=int(bias_cfg.get("liveRampSamples", 8)),
             min_live_samples=int(bias_cfg.get("liveMinSamples", 2)),
+            min_live_confidence=bias_cfg.get("liveMinConfidence"),
             max_abs_bias_f=float(bias_cfg.get("historicalMaxAbsF", 6.0)),
             conflict_gap_f=float(bias_cfg.get("conflictGapF", 4.0)),
             conflict_alpha_floor=float(bias_cfg.get("conflictAlphaFloor", 0.35)),
@@ -150,8 +153,13 @@ def main():
     )
     parser.add_argument(
         "--trades-path",
-        default="data/kalshi-trades.json",
+        default=str(resolve_data_dir(PROJECT_DIR) / "kalshi-trades.json"),
         help="Trade log path",
+    )
+    parser.add_argument(
+        "--state-path",
+        default=str(resolve_data_dir(PROJECT_DIR) / "weather-verification.json"),
+        help="Weather verification state path",
     )
     parser.add_argument("--json", action="store_true", help="Emit JSON")
     args = parser.parse_args()
@@ -160,6 +168,7 @@ def main():
         args.lookback_days,
         resolve_path(args.historical_path),
         resolve_path(args.trades_path),
+        resolve_path(args.state_path),
     )
     if args.json:
         print(json.dumps({"rows": rows}, indent=2, sort_keys=True))

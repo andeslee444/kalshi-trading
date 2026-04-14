@@ -54,7 +54,7 @@ def _make_settlement(ticker="KXHIGHHOU-26MAR03-T75", revenue=400,
 def _make_local_trade(ticker="KXHIGHHOU-26MAR03-T75", source_bot="weather",
                       side="yes", price_cents=50, count=4, cost_cents=200,
                       order_id="ord-123", settlement_result=None,
-                      settlement_revenue_cents=None, action="buy"):
+                      settlement_revenue_cents=None, action="buy", fill_count=None):
     """Build a local trade log record."""
     return {
         "ticker": ticker,
@@ -69,6 +69,7 @@ def _make_local_trade(ticker="KXHIGHHOU-26MAR03-T75", source_bot="weather",
         "settlement_revenue_cents": settlement_revenue_cents,
         "timestamp": "2026-03-01T10:00:00",
         "status": "filled",
+        "fill_count": fill_count,
     }
 
 
@@ -267,9 +268,9 @@ class TestVerifySettlements:
     def test_pnl_ignores_settlement_revenue_cents_semantic(self):
         """P&L comparison must not depend on settlement_revenue_cents.
 
-        backfill-settlements.py stores net profit there, while
-        reconcile-trades.py stores gross payout — verify both produce
-        the same P&L comparison result.
+        Historical backfill artifacts stored net profit there, while
+        newer reconciliation/backfill flows store gross payout. Verify both
+        produce the same P&L comparison result.
         """
         # API: revenue=100, cost=90, P&L=+10
         api = [_make_settlement(ticker="T1", revenue=100, yes_total_cost=90,
@@ -294,6 +295,23 @@ class TestVerifySettlements:
             assert pnl_check["delta_cents"] == 0, (
                 f"P&L comparison should not depend on settlement_revenue_cents"
             )
+
+    def test_pnl_uses_fill_count_for_partial_fills(self):
+        api = [_make_settlement(ticker="T1", revenue=200, yes_total_cost=90, no_total_cost=0)]
+        local = [
+            _make_local_trade(
+                ticker="T1",
+                cost_cents=90,
+                count=10,
+                fill_count=2,
+                settlement_result="won",
+                settlement_revenue_cents=200,
+                order_id="o1",
+            ),
+        ]
+        result = verify_settlements(api, local)
+        pnl_check = next(c for c in result["checks"] if c["check"] == "pnl_agreement")
+        assert pnl_check["delta_cents"] == 0
 
     def test_pnl_disagreement_flagged(self):
         """Mismatch between API cost and local cost is flagged."""

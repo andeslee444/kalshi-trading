@@ -5,7 +5,8 @@ Walks all trade log files, matches each trade to API settlement data and fill in
 and writes settlement_result, settlement_revenue_cents, fill_price_cents, and
 realized_edge back into the trade record.
 
-Idempotent: skips records that already have settlement_result set.
+Idempotent: normalizes existing records in place and clears stale settlement
+annotations from unfilled orders.
 Writes go through TradeStore so file format stays unchanged.
 
 Usage:
@@ -14,7 +15,6 @@ Usage:
 """
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -25,6 +25,12 @@ if _SRC_DIR not in sys.path:
 
 from event_ledger import get_event_ledger
 from kalshi_auth import KalshiClient, setup_logging
+from settlement_utils import (
+    realized_edge_for_trade,
+    settlement_payout_cents,
+    settlement_result_for_trade,
+    trade_has_filled_exposure,
+)
 from storage import TradeStore
 from trade_files import ALL_TRADE_PATHS
 
@@ -115,48 +121,53 @@ def _annotate_trade(trade, settlements, fills):
     if trade.get("action", "buy") != "buy":
         return False
 
-    # Skip already-annotated records
-    if trade.get("settlement_result") is not None:
-        return False
-
     ticker = trade.get("ticker", "")
     order_id = trade.get("order_id", "")
-    side = trade.get("side", "yes")
     modified = False
+    has_exposure, contract_count, fill_price_cents = trade_has_filled_exposure(trade, fills=fills)
 
-    # Match settlement
-    if ticker in settlements:
-        s = settlements[ticker]
-        yes_won = s["yes_won"]
-
-        if side == "yes":
-            trade["settlement_result"] = "won" if yes_won else "lost"
-        else:
-            trade["settlement_result"] = "won" if not yes_won else "lost"
-
-        trade["settlement_revenue_cents"] = s["revenue_cents"]
+    # Match fill metadata.
+    fill = fills.get(order_id) if order_id else None
+    fill_count = fill.get("fill_count") if fill else None
+    if fill_price_cents is not None and trade.get("fill_price_cents") != fill_price_cents:
+        trade["fill_price_cents"] = fill_price_cents
+        modified = True
+    if fill_price_cents is None and not has_exposure and trade.get("fill_price_cents") is not None:
+        trade["fill_price_cents"] = None
+        modified = True
+    if fill_count is not None and trade.get("fill_count") != fill_count:
+        trade["fill_count"] = fill_count
+        modified = True
+    if fill_count is None and not has_exposure and trade.get("fill_count") is not None:
+        trade["fill_count"] = None
         modified = True
 
-    # Match fill price
-    if order_id and order_id in fills:
-        f = fills[order_id]
-        trade["fill_price_cents"] = f["fill_price_cents"]
-        modified = True
+    settlement_result = trade.get("settlement_result")
+    settlement_revenue_cents = trade.get("settlement_revenue_cents")
+    realized_edge = trade.get("realized_edge")
 
-    # Compute realized edge (in P(YES) frame to match model_prob convention)
-    if trade.get("settlement_result") and trade.get("model_prob") is not None:
-        fill_price = trade.get("fill_price_cents")
-        if fill_price is None:
-            fill_price = trade.get("price_cents")
-        if fill_price is None:
-            fill_price = 50
-        if side == "yes":
-            actual = 1.0 if trade["settlement_result"] == "won" else 0.0
-            implied = fill_price / 100.0
-        else:
-            actual = 0.0 if trade["settlement_result"] == "won" else 1.0
-            implied = 1.0 - fill_price / 100.0
-        trade["realized_edge"] = round(actual - implied, 4)
+    if ticker in settlements and has_exposure:
+        yes_won = settlements[ticker]["yes_won"]
+        settlement_result = settlement_result_for_trade(trade.get("side", "yes"), yes_won)
+        settlement_revenue_cents = settlement_payout_cents(settlement_result, contract_count)
+        realized_edge = realized_edge_for_trade(
+            trade,
+            settlement_result,
+            fill_price_cents=trade.get("fill_price_cents"),
+        )
+    elif not has_exposure:
+        settlement_result = None
+        settlement_revenue_cents = None
+        realized_edge = None
+
+    if trade.get("settlement_result") != settlement_result:
+        trade["settlement_result"] = settlement_result
+        modified = True
+    if trade.get("settlement_revenue_cents") != settlement_revenue_cents:
+        trade["settlement_revenue_cents"] = settlement_revenue_cents
+        modified = True
+    if trade.get("realized_edge") != realized_edge:
+        trade["realized_edge"] = realized_edge
         modified = True
 
     return modified
@@ -186,20 +197,22 @@ def reconcile_all(dry_run=False):
         file_modified = 0
         for trade in trades:
             if _annotate_trade(trade, settlements, fills):
-                try:
-                    if trade.get("order_id") and trade.get("fill_price_cents") is not None:
-                        ledger.record_fill({
-                            "timestamp": trade.get("timestamp"),
-                            "ticker": trade.get("ticker"),
-                            "order_id": trade.get("order_id"),
-                            "fill_price_cents": trade.get("fill_price_cents"),
-                            "fill_count": trade.get("count"),
-                            "source_bot": trade.get("source_bot"),
-                        }, source_path=trade_file)
-                    if trade.get("settlement_result") is not None:
+                if not dry_run:
+                    try:
+                        if trade.get("order_id") and trade.get("fill_price_cents") is not None:
+                            fill_count = trade.get("fill_count") or trade.get("count")
+                            if fill_count:
+                                ledger.record_fill({
+                                    "timestamp": trade.get("timestamp"),
+                                    "ticker": trade.get("ticker"),
+                                    "order_id": trade.get("order_id"),
+                                    "fill_price_cents": trade.get("fill_price_cents"),
+                                    "fill_count": fill_count,
+                                    "source_bot": trade.get("source_bot"),
+                                }, source_path=trade_file)
                         ledger.record_settlement(trade, source_path=trade_file)
-                except Exception as e:
-                    log.warning("Failed to dual-write reconcile event for %s: %s", trade.get("ticker", "?"), e)
+                    except Exception as e:
+                        log.warning("Failed to dual-write reconcile event for %s: %s", trade.get("ticker", "?"), e)
                 file_modified += 1
             else:
                 total_skipped += 1
@@ -210,7 +223,7 @@ def reconcile_all(dry_run=False):
                 store.save(trades)
             total_annotated += file_modified
 
-    log.info("Reconciliation complete: %d annotated, %d skipped (already done or no match)",
+    log.info("Reconciliation complete: %d annotated, %d skipped (unchanged or no match)",
              total_annotated, total_skipped)
     if dry_run:
         log.info("DRY RUN — no files were modified")

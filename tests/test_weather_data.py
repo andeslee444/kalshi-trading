@@ -1341,6 +1341,39 @@ class TestBiasCorrector:
         assert alpha == 0.0
         assert meta["capped"] is False
 
+    def test_blend_live_bias_requires_min_confidence(self):
+        bc = self._make_corrector()
+        blended, hist_bias, alpha, meta = bc.blend_live_bias(
+            "MIA",
+            live_bias=-4.0,
+            live_confidence=0.4,
+            live_n=8,
+            ramp_n=8,
+            min_live_samples=2,
+            min_live_confidence=0.6,
+            max_abs_bias_f=10.0,
+        )
+        assert blended == pytest.approx(hist_bias)
+        assert alpha == 0.0
+        assert meta["low_confidence"] is True
+
+    def test_blend_live_bias_scales_alpha_by_confidence(self):
+        bc = self._make_corrector()
+        blended, hist_bias, alpha, meta = bc.blend_live_bias(
+            "MIA",
+            live_bias=4.0,
+            live_confidence=0.5,
+            live_n=4,
+            ramp_n=8,
+            min_live_samples=2,
+            max_abs_bias_f=10.0,
+        )
+        expected_hist = (8.9 + 7.0) / 2
+        assert hist_bias == pytest.approx(expected_hist)
+        assert alpha == pytest.approx(0.25)
+        assert blended == pytest.approx(0.25 * 4.0 + 0.75 * expected_hist)
+        assert meta["confidence_scale"] == pytest.approx(0.5)
+
     def test_residual_std_specific_model(self):
         bc = self._make_corrector()
         import math

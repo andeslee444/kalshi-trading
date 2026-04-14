@@ -36,6 +36,7 @@ from probability import (
     is_market_liquid, compute_limit_price,
 )
 from source_paths import resolve_bot_source_path
+from runtime_paths import resolve_data_dir
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -80,16 +81,16 @@ class Finding:
 # ═══════════════════════════════════════════════════════════════════════
 
 TRADE_FILES = [
-    {"label": "Weather Bot", "path": PROJECT_DIR / "data" / "kalshi-trades.json", "bot": "weather"},
-    {"label": "Strategy Trader", "path": PROJECT_DIR / "data" / "kalshi-strategy-trades.json", "bot": "strategy"},
-    {"label": "Entertainment Bot", "path": PROJECT_DIR / "data" / "kalshi-entertainment-trades.json", "bot": "entertainment"},
-    {"label": "BeatRelease Scanner", "path": PROJECT_DIR / "data" / "beatrelease-trades.json", "bot": "beatrelease"},
-    {"label": "Source Monitor", "path": PROJECT_DIR / "data" / "kalshi-monitor-trades.json", "bot": "source-monitor"},
-    {"label": "Position Monitor", "path": PROJECT_DIR / "data" / "kalshi-position-trades.json", "bot": "position-monitor"},
-    {"label": "Economics Bot", "path": PROJECT_DIR / "data" / "kalshi-economics-trades.json", "bot": "economics"},
-    {"label": "Crypto Bot", "path": PROJECT_DIR / "data" / "kalshi-crypto-trades.json", "bot": "crypto"},
-    {"label": "Cross-Platform Arb", "path": PROJECT_DIR / "data" / "kalshi-arb-trades.json", "bot": "arb"},
-    {"label": "Market Maker", "path": PROJECT_DIR / "data" / "kalshi-mm-trades.json", "bot": "mm"},
+    {"label": "Weather Bot", "path": DATA_DIR / "kalshi-trades.json", "bot": "weather"},
+    {"label": "Strategy Trader", "path": DATA_DIR / "kalshi-strategy-trades.json", "bot": "strategy"},
+    {"label": "Entertainment Bot", "path": DATA_DIR / "kalshi-entertainment-trades.json", "bot": "entertainment"},
+    {"label": "BeatRelease Scanner", "path": DATA_DIR / "beatrelease-trades.json", "bot": "beatrelease"},
+    {"label": "Source Monitor", "path": DATA_DIR / "kalshi-monitor-trades.json", "bot": "source-monitor"},
+    {"label": "Position Monitor", "path": DATA_DIR / "kalshi-position-trades.json", "bot": "position-monitor"},
+    {"label": "Economics Bot", "path": DATA_DIR / "kalshi-economics-trades.json", "bot": "economics"},
+    {"label": "Crypto Bot", "path": DATA_DIR / "kalshi-crypto-trades.json", "bot": "crypto"},
+    {"label": "Cross-Platform Arb", "path": DATA_DIR / "kalshi-arb-trades.json", "bot": "arb"},
+    {"label": "Market Maker", "path": DATA_DIR / "kalshi-mm-trades.json", "bot": "mm"},
 ]
 
 CONFIG_FILES = {
@@ -560,7 +561,7 @@ class AuditEngine:
         findings = []
 
         # 2.1: Check if backtest results exist
-        backtest_results = PROJECT_DIR / "data" / "backtest-results.json"
+        backtest_results = DATA_DIR / "backtest-results.json"
         if backtest_results.exists():
             data = load_json_safe(backtest_results)
             findings.append(Finding(
@@ -1942,3 +1943,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+DATA_DIR = resolve_data_dir(PROJECT_DIR)

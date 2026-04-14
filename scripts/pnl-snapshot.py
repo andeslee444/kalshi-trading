@@ -23,9 +23,11 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR / "src" / "kalshi"))
 
 from artifact_contracts import normalize_financial_snapshot
+from settlement_utils import resolved_contract_count
 from trade_files import TRADE_FILES as _CANONICAL_FILES
+from runtime_paths import resolve_data_dir
 
-DATA_DIR = PROJECT_DIR / "data"
+DATA_DIR = resolve_data_dir(PROJECT_DIR)
 DEPOSITS_PATH = DATA_DIR / "deposits.json"
 SNAPSHOT_PATH = DATA_DIR / "financial-snapshot.json"
 
@@ -99,12 +101,15 @@ def compute_unrealized_pnl(positions, fills):
     for f in fills:
         ticker = f.get("ticker", "")
         side = (f.get("side", "") or "").lower()
-        if side == "yes":
-            price_d = float(f.get("yes_price_dollars", "0") or f.get("yes_price", 0) or "0")
+        if side == "yes" and f.get("yes_price_dollars") not in (None, ""):
+            price_cents = round(float(f.get("yes_price_dollars")) * 100)
+        elif side != "yes" and f.get("no_price_dollars") not in (None, ""):
+            price_cents = round(float(f.get("no_price_dollars")) * 100)
+        elif side == "yes":
+            price_cents = _safe_int(f.get("yes_price", 0))
         else:
-            price_d = float(f.get("no_price_dollars", "0") or f.get("no_price", 0) or "0")
-        count = float(f.get("count_fp", "0") or f.get("count", 0) or "0")
-        price_cents = round(price_d * 100)
+            price_cents = _safe_int(f.get("no_price", 0))
+        count = float(f.get("count_fp")) if f.get("count_fp") not in (None, "") else float(f.get("count", 0) or 0)
         action = (f.get("action", "") or "").lower()
         if action == "buy":
             ticker_cost[ticker] += price_cents * int(count)
@@ -115,12 +120,14 @@ def compute_unrealized_pnl(positions, fills):
     total_unrealized = 0
 
     for p in positions:
-        pos_count = float(p.get("position_fp", "0") or p.get("position", 0) or "0")
+        pos_count = float(p.get("position_fp")) if p.get("position_fp") not in (None, "") else float(p.get("position", 0) or 0)
         if pos_count == 0:
             continue
         ticker = p.get("ticker", "")
-        exposure_d = float(p.get("market_exposure_dollars", "0") or p.get("market_exposure", 0) or "0")
-        current_value = round(exposure_d * 100)
+        if p.get("market_exposure_dollars") not in (None, ""):
+            current_value = round(float(p.get("market_exposure_dollars")) * 100)
+        else:
+            current_value = _safe_int(p.get("market_exposure", 0))
         cost = ticker_cost.get(ticker, 0)
         unrealized = current_value - cost
 
@@ -179,15 +186,15 @@ def verify_settlements(api_settlements, local_trades):
         api_pnl_by_ticker[ticker] = revenue - cost
 
     # Build local P&L by ticker from settlement_result + cost_cents + count.
-    # NOTE: Do NOT use settlement_revenue_cents — it has inconsistent semantics
-    # (reconcile-trades.py stores gross payout, backfill-settlements.py stores
-    # net profit). Instead, derive P&L from settlement outcome directly.
+    # NOTE: Do NOT use settlement_revenue_cents directly. New scripts write gross
+    # payout semantics consistently, but historical artifacts may still contain
+    # legacy net-profit values from older backfills.
     local_pnl_by_ticker = defaultdict(int)
     for t in local_buy_trades:
         ticker = t.get("ticker", "")
         result = t.get("settlement_result")
         if result is not None and ticker:
-            count = t.get("count", 1) or 1
+            count = resolved_contract_count(t) or 1
             cost = t.get("cost_cents", 0) or 0
             if result == "won":
                 local_pnl_by_ticker[ticker] += 100 * count - cost

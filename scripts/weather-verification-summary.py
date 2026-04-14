@@ -10,13 +10,14 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR / "src" / "kalshi"))
 
 from forecast_verifier import ForecastVerifier
+from runtime_paths import resolve_data_dir
 
 
 def main():
     parser = argparse.ArgumentParser(description="Weather verification actual-source summary")
     parser.add_argument(
         "--state-path",
-        default=str(PROJECT_DIR / "data" / "weather-verification.json"),
+        default=str(resolve_data_dir(PROJECT_DIR) / "weather-verification.json"),
         help="Path to weather-verification.json",
     )
     parser.add_argument(

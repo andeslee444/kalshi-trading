@@ -2,6 +2,8 @@
   "_comment": "City coordinates are NWS airport weather station locations (not city centers). Kalshi settles against these stations. NY uses KNYC (Central Park).",
   "maxTradeAmount": 30,
   "maxTradeAmountPct": 0.03,
+  "maxContractsPerTrade": 150,
+  "maxGrossPayoutCents": 15000,
   "maxDailyTrades": 10,
   "maxDailyLoss": 75,
   "maxDailyLossPct": 0.07,
@@ -50,8 +52,9 @@
     "max_api_calls_per_scan": 5
   },
   "biasCorrection": {
-    "liveMinSamples": 2,
-    "liveRampSamples": 8,
+    "liveMinSamples": 6,
+    "liveRampSamples": 20,
+    "liveMinConfidence": 0.6,
     "skewFullWeightSamples": 10,
     "historicalMaxAbsF": 6.0,
     "conflictGapF": 4.0,

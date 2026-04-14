@@ -302,6 +302,26 @@ def _nws_min_edge(running_high, threshold, hour, is_bracket):
         return 0.10
     return 0.15
 
+
+def _nws_bracket_guardrail_reason(city_hour, obs_age_minutes, bracket_cfg=None):
+    """Return the first active bracket guardrail reason, or None."""
+    cfg = bracket_cfg or {}
+    if not cfg.get("enabled", True):
+        return "brackets_disabled"
+
+    min_local_hour = cfg.get("minLocalHour")
+    if min_local_hour is not None and city_hour < int(min_local_hour):
+        return "bracket_too_early"
+
+    max_obs_age_minutes = cfg.get("maxObservationAgeMinutes")
+    if max_obs_age_minutes is not None:
+        if obs_age_minutes is None:
+            return "bracket_obs_unknown_age"
+        if obs_age_minutes > float(max_obs_age_minutes):
+            return "stale_bracket_obs"
+
+    return None
+
 # === Kalshi Market Helpers ===
 def get_markets_by_prefix(prefix, status="open"):
     """Get all open markets matching a ticker prefix."""
@@ -1268,6 +1288,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                 continue
 
             running_high = temp_data[city]["running_high_f"]
+            nws_cfg = config.get("sources", {}).get("nws", {})
+            nws_bracket_cfg = nws_cfg.get("brackets", {})
 
             # Validate threshold market consistency for this city
             threshold_signals = []
@@ -1317,6 +1339,30 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     is_bracket=is_bracket,
                 )
 
+                if is_bracket:
+                    guardrail_reason = _nws_bracket_guardrail_reason(
+                        city_hour,
+                        temp_data[city].get("obs_age_minutes"),
+                        nws_bracket_cfg,
+                    )
+                    if guardrail_reason:
+                        if ss:
+                            ss.skip(guardrail_reason)
+                        _log_source_monitor_decision(
+                            ticker,
+                            "skip",
+                            "skipped",
+                            guardrail_reason,
+                            price_cents=m.get("yes_ask") or m.get("no_ask"),
+                            confidence=round(selected_confidence, 4),
+                            running_high=round(running_high, 1),
+                            city=city,
+                            threshold=threshold,
+                            hour=city_hour,
+                            **research_fields,
+                        )
+                        continue
+
                 yes_ask = m.get("yes_ask", 0)
                 no_ask = m.get("no_ask", 0)
                 yes_bid = m.get("yes_bid", 0)
@@ -1347,6 +1393,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     # Buy YES (raw edge, fees handled in Kelly)
                     edge = prob - yes_ask / 100
                     min_edge = _nws_min_edge(running_high, threshold, city_hour, is_bracket)
+                    if is_bracket:
+                        min_edge = max(min_edge, float(nws_bracket_cfg.get("minEdge", 0.20)))
                     if edge <= min_edge:
                         if ss:
                             ss.skip("low_edge")
@@ -1415,6 +1463,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     no_prob = 1.0 - prob
                     edge = no_prob - no_ask / 100
                     min_edge = _nws_min_edge(running_high, threshold, city_hour, is_bracket)
+                    if is_bracket:
+                        min_edge = max(min_edge, float(nws_bracket_cfg.get("minEdge", 0.20)))
                     if edge <= min_edge:
                         if ss:
                             ss.skip("low_edge")
@@ -1529,6 +1579,8 @@ def build_app(project_dir=None):
         "maxDailyTrades": loaded_config["maxDailyTrades"],
         "maxDailyLoss": loaded_config["maxDailyLoss"],
         "maxDailyLossPct": loaded_config.get("maxDailyLossPct"),
+        "maxContractsPerTrade": loaded_config.get("maxContractsPerTrade"),
+        "maxGrossPayoutCents": loaded_config.get("maxGrossPayoutCents"),
     }, logger=logger, order_monitor=order_monitor_obj, bot_name="source-monitor")
     opportunity_log_obj = OpportunityLog(
         project_dir / "data" / "opportunity-log.json",

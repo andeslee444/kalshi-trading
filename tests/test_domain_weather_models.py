@@ -48,8 +48,16 @@ def test_compute_adaptive_ensemble_weights_prefers_lower_brier_direct_module():
     assert weights["gfs"] > weights["ecmwf"] > weights["icon"]
 
 
-def test_nws_probability_tightens_later_in_day_direct_module():
-    morning = nws_probability(88.0, 86.0, "T", 10)
-    afternoon = nws_probability(88.0, 86.0, "T", 17)
+def test_nws_probability_falls_later_in_day_when_threshold_not_reached_direct_module():
+    morning = nws_probability(86.0, 87.0, "T", 10)
+    afternoon = nws_probability(86.0, 87.0, "T", 17)
 
-    assert afternoon > morning
+    assert afternoon < morning
+
+
+def test_nws_probability_is_deterministic_once_threshold_crossed_direct_module():
+    assert nws_probability(86.1, 86.0, "T", 8) == 1.0
+
+
+def test_nws_bracket_probability_is_zero_once_upper_bound_crossed_direct_module():
+    assert nws_probability(87.0, 86.0, "B", 8) == 0.0
