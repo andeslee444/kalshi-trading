@@ -131,6 +131,19 @@ def _resolve_optional_project_path(path_str, project_dir=None):
     return Path(project_dir or PROJECT_DIR) / path
 
 
+# Cities where Kalshi uses KXHIGHT{city} series ticker instead of KXHIGH{city}.
+# The original 8 cities (AUS, CHI, DEN, LAX, MIA, NY, PHIL) use KXHIGH{city}.
+# Expanded cities added ~Apr 2026 use KXHIGHT{city} (HOU migrated from non-T to T-prefix).
+_T_PREFIX_CITIES = {"ATL", "BOS", "DAL", "DC", "HOU", "LV", "MIN", "NOLA", "OKC", "PHX", "SATX", "SEA", "SFO"}
+
+
+def _weather_series_ticker(city_code):
+    """Return the Kalshi series ticker for a weather city."""
+    if city_code in _T_PREFIX_CITIES:
+        return f"KXHIGHT{city_code}"
+    return f"KXHIGH{city_code}"
+
+
 def get_weather_markets(cache_ttl=600):
     """Fetch weather markets directly by city series.
 
@@ -148,7 +161,7 @@ def get_weather_markets(cache_ttl=600):
     series_failures = 0
 
     for city_code in CITIES:
-        series_ticker = f"KXHIGH{city_code}"
+        series_ticker = _weather_series_ticker(city_code)
         cursor = None
         while True:
             path = f"/markets?series_ticker={series_ticker}&status=open&limit=1000"

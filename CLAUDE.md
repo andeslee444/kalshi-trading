@@ -150,7 +150,7 @@ Tests cover pure functions — no API calls or credentials required.
 
 Key fields in the snapshot:
 - `account.nav_cents` — Current net asset value (balance + open positions)
-- `realized_pnl.total_cents` — Authoritative realized P&L from API settlements (`revenue - yes_total_cost - no_total_cost`)
+- `realized_pnl.total_cents` — Authoritative realized P&L from API settlements (`revenue - yes_total_cost_dollars - no_total_cost_dollars`)
 - `realized_pnl.by_bot` — Per-bot P&L, wins, losses, fees, win rate
 - `realized_pnl.by_day` — Daily P&L breakdown
 - `balance_check` — **Ground truth P&L** derived from `NAV - deposits`. Use this for true total P&L and true unrealized P&L (the `unrealized_pnl` section is unreliable because Kalshi's `market_exposure` returns cost basis, not current market value)
@@ -159,7 +159,7 @@ Key fields in the snapshot:
 - `verification.status` — "ok", "warnings", or "errors" (cross-check results)
 - `deposits.roi_pct` — ROI based on true total P&L (NAV - deposits) / deposits
 
-**Kalshi API P&L gotcha:** The API's `revenue` field is **gross payout** (cost recovery + profit), NOT net profit. Always use `revenue - yes_total_cost - no_total_cost` for actual P&L. The `fee_cost` field is dollars as a string (e.g., `"0.04"`), not cents.
+**Kalshi API P&L gotcha:** The API's `revenue` field is **gross payout** (cost recovery + profit), NOT net profit. Always use `revenue - yes_total_cost_dollars - no_total_cost_dollars` for actual P&L. **Critical:** Kalshi renamed settlement/position/fill fields from cent-integers to dollar-strings (e.g., `yes_total_cost` → `yes_total_cost_dollars`, `position` → `position_fp`, `yes_price` → `yes_price_dollars`). Always use the `_dollars`/`_fp` variants with `float()` conversion — the legacy cent-integer fields are gone. Reading a missing legacy field silently returns 0, which causes costs to vanish, P&L to be overstated, and win rate to appear 100%. The `fee_cost` field is also dollars as a string (e.g., `"0.04"`), not cents.
 
 To track deposits/withdrawals for ROI, maintain `data/deposits.json`:
 ```json

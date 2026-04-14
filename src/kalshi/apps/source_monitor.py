@@ -14,7 +14,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from app_bootstrap import AppContext, install_app_context
 from event_ledger import get_event_ledger
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested, normalize_markets
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, quarter_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, nws_sigma_for_hour
 from research.opportunity_log import OpportunityLog
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
@@ -306,6 +306,66 @@ def _nws_min_edge(running_high, threshold, hour, is_bracket):
 def get_markets_by_prefix(prefix, status="open"):
     """Get all open markets matching a ticker prefix."""
     return client.get_all_markets(prefix=prefix, status=status)
+
+
+# Cities where Kalshi uses KXHIGHT{city} series ticker instead of KXHIGH{city}.
+_T_PREFIX_CITIES = {"ATL", "BOS", "DAL", "DC", "HOU", "LV", "MIN", "NOLA", "OKC", "PHX", "SATX", "SEA", "SFO"}
+
+
+def _weather_series_ticker(city_code):
+    """Return the Kalshi series ticker for a weather city."""
+    if city_code in _T_PREFIX_CITIES:
+        return f"KXHIGHT{city_code}"
+    return f"KXHIGH{city_code}"
+
+
+def get_nws_weather_markets():
+    """Fetch KXHIGH weather markets by series_ticker per configured NWS city.
+
+    Querying by series_ticker goes directly to the right markets without
+    paginating through all 55k+ open markets on production. Falls back to
+    prefix scan only if every series query fails.
+    """
+    stations = config.get("sources", {}).get("nws", {}).get("stations", {})
+    if not stations:
+        log.warning("No NWS stations configured; falling back to prefix scan")
+        return get_markets_by_prefix("KXHIGH")
+
+    markets = []
+    seen = set()
+    series_failures = 0
+
+    for city_code in stations:
+        series_ticker = _weather_series_ticker(city_code)
+        cursor = None
+        while True:
+            path = f"/markets?series_ticker={series_ticker}&status=open&limit=1000"
+            if cursor:
+                path += f"&cursor={cursor}"
+            try:
+                data = client.get(path)
+            except Exception as e:
+                series_failures += 1
+                log.warning("NWS market fetch failed for %s: %s", series_ticker, e)
+                break
+
+            batch = normalize_markets(data.get("markets", []))
+            for market in batch:
+                ticker = market.get("ticker")
+                if ticker and ticker not in seen:
+                    seen.add(ticker)
+                    markets.append(market)
+
+            cursor = data.get("cursor")
+            if not cursor or not batch:
+                break
+
+    if not markets and series_failures:
+        log.warning("Series-based NWS market fetch returned no markets; falling back to prefix scan")
+        return get_markets_by_prefix("KXHIGH")
+
+    return markets
+
 
 # ============================================================
 # SOURCE 1: HITS Daily Double (Album Sales)
@@ -1160,7 +1220,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
         if prefetched_markets is not None:
             markets = prefetched_markets.get("weather", [])
         else:
-            markets = get_markets_by_prefix("KXHIGH")
+            markets = get_nws_weather_markets()
         if not markets:
             log.info(f"  No open KXHIGH markets found")
             return
@@ -1282,7 +1342,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                 else:
                     margin = 0  # bracket
 
-                if prob > 0.5 and yes_ask and yes_ask < 99:
+                nws_disable_yes = config.get("sources", {}).get("nws", {}).get("disableYes", False)
+                if prob > 0.5 and yes_ask and yes_ask < 99 and not nws_disable_yes:
                     # Buy YES (raw edge, fees handled in Kelly)
                     edge = prob - yes_ask / 100
                     min_edge = _nws_min_edge(running_high, threshold, city_hour, is_bracket)
@@ -1545,7 +1606,7 @@ def main():
             _check_with_retry(scan_boxoffice, "boxoffice", prefetched, ss)
             sources_checked.append("boxoffice")
         if config["sources"]["nws"]["enabled"]:
-            prefetched["weather"] = get_markets_by_prefix("KXHIGH")
+            prefetched["weather"] = get_nws_weather_markets()
             _check_with_retry(check_nws, "nws", prefetched, ss)
             sources_checked.append("nws")
         ss.finalize()
@@ -1592,7 +1653,7 @@ def main():
                         box_markets.extend(get_markets_by_prefix(prefix))
                     prefetched["boxoffice"] = box_markets
                 if need_nws:
-                    prefetched["weather"] = get_markets_by_prefix("KXHIGH")
+                    prefetched["weather"] = get_nws_weather_markets()
 
             sources_this_cycle = []
 

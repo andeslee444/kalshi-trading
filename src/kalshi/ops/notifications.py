@@ -59,7 +59,7 @@ def notify_whatsapp(
         return False
     try:
         result = subprocess_module.run(
-            ["openclaw", "message", "send", "--to", resolved_phone,
+            ["openclaw", "message", "send", "--target", resolved_phone,
              "--message", message, "--channel", "whatsapp"],
             capture_output=True,
             text=True,
