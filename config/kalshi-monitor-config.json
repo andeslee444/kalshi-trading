@@ -1,9 +1,11 @@
 {
-  "maxTradeAmount": 50,
-  "maxTradeAmountPct": 0.05,
-  "maxDailyTrades": 12,
-  "maxDailyLoss": 150,
-  "maxDailyLossPct": 0.02,
+  "maxTradeAmount": 100,
+  "maxTradeAmountPct": 0.10,
+  "maxDailyTrades": 24,
+  "maxDailyLoss": 300,
+  "maxDailyLossPct": 0.04,
+  "maxContractsPerTrade": 100,
+  "maxGrossPayoutCents": 10000,
   "sources": {
     "hdd": {
       "enabled": false,
@@ -42,6 +44,7 @@
     },
     "nws": {
       "enabled": true,
+      "disableYes": true,
       "cityMinEdgeAdders": {
         "CHI": 0.05,
         "LAX": 0.05
@@ -52,9 +55,18 @@
       "highConfidenceDailyLossMinHour": 17,
       "stations": {
         "AUS": "KAUS",
+        "CHI": "KMDW",
+        "DAL": "KDFW",
         "DEN": "KDEN",
         "MIA": "KMIA",
+        "PHX": "KPHX",
         "PHIL": "KPHL"
+      },
+      "brackets": {
+        "enabled": true,
+        "minLocalHour": 13,
+        "maxObservationAgeMinutes": 30,
+        "minEdge": 0.25
       },
       "intervalMinutes": 10
     }

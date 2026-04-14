@@ -20,6 +20,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from event_ledger import get_event_ledger
+from settlement_utils import compute_trade_pnl_cents
 
 log = logging.getLogger("pnl-attribution")
 
@@ -52,29 +53,7 @@ def _compute_pnl_cents(trade):
 
     Returns (pnl_cents, is_settled) tuple.
     """
-    settlement = trade.get("settlement_result")
-    if settlement is None:
-        return 0, False
-
-    cost = trade.get("cost_cents", 0) or 0
-    fill_count = trade.get("fill_count")
-    if fill_count in (None, ""):
-        fill_count = trade.get("count", 0) or 0
-    else:
-        try:
-            fill_count = int(fill_count)
-        except (TypeError, ValueError):
-            fill_count = trade.get("count", 0) or 0
-    revenue = trade.get("settlement_revenue_cents")
-
-    if settlement in ("won", "yes", True, 1):
-        return (100 * fill_count) - cost, True
-    elif settlement in ("lost", "no", False, 0):
-        return -cost, True
-    if revenue is not None:
-        return revenue - cost, True
-
-    return 0, False
+    return compute_trade_pnl_cents(trade)
 
 
 def _classify_market_type(ticker):

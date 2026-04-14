@@ -12,6 +12,7 @@ from pathlib import Path
 from artifact_contracts import normalize_health_state, normalize_health_summary
 from bot_registry import ALWAYS_DISABLED_BOT_IDS, BOT_CONFIG_KEY_MAP, BOT_HEALTH_KEY_MAP
 from risk.kill_switch import per_bot_halt_path
+from runtime_paths import resolve_data_dir
 from storage import atomic_write_json
 
 PROJECT_DIR = Path(__file__).resolve().parents[3]
@@ -31,7 +32,7 @@ BOT_SOURCE_MAP = {
     "beatrelease": ["beatrelease"],
 }
 
-HEALTH_STATE_PATH = PROJECT_DIR / "data" / "health-state.json"
+HEALTH_STATE_PATH = resolve_data_dir(PROJECT_DIR) / "health-state.json"
 
 _log = logging.getLogger("health-monitor")
 

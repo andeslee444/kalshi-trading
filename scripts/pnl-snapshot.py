@@ -14,6 +14,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,9 +24,11 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR / "src" / "kalshi"))
 
 from artifact_contracts import normalize_financial_snapshot
+from settlement_utils import resolved_contract_count
 from trade_files import TRADE_FILES as _CANONICAL_FILES
+from runtime_paths import resolve_data_dir
 
-DATA_DIR = PROJECT_DIR / "data"
+DATA_DIR = resolve_data_dir(PROJECT_DIR)
 DEPOSITS_PATH = DATA_DIR / "deposits.json"
 SNAPSHOT_PATH = DATA_DIR / "financial-snapshot.json"
 UNATTRIBUTED_WEATHER_BOT = "unattributed-weather"
@@ -47,6 +50,19 @@ BOT_REPORTING_NOTES = {
 }
 
 
+def _get_with_retries(client, path, *, attempts=4, base_sleep_seconds=0.5):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return client.get(path)
+        except Exception as exc:
+            last_error = exc
+            if attempt == attempts:
+                raise
+            time.sleep(base_sleep_seconds * attempt)
+    raise last_error
+
+
 # ─── Pure computation functions (no I/O, fully testable) ───
 
 def compute_realized_pnl(settlements):
@@ -65,8 +81,8 @@ def compute_realized_pnl(settlements):
 
     for s in settlements:
         revenue = _safe_int(s.get("revenue", 0))
-        yes_cost = _safe_int(s.get("yes_total_cost", 0))
-        no_cost = _safe_int(s.get("no_total_cost", 0))
+        yes_cost = _cost_cents(s, "yes")
+        no_cost = _cost_cents(s, "no")
         profit = revenue - yes_cost - no_cost
 
         # Fee: Kalshi returns dollars as string (e.g. "0.04")
@@ -161,6 +177,9 @@ def _weather_city_from_ticker(ticker):
     if not ticker.startswith("KXHIGH"):
         return None
     suffix = ticker[len("KXHIGH"):].split("-", 1)[0]
+    t_series_cities = {"ATL", "BOS", "DAL", "DC", "HOU", "LV", "MIN", "NOLA", "OKC", "PHX", "SATX", "SEA", "SFO"}
+    if suffix.startswith("T") and suffix[1:] in t_series_cities:
+        return suffix[1:]
     return suffix or None
 
 
@@ -223,11 +242,6 @@ def _finalize_local_reconciliation_stats(group):
             and stats.get("unmatched_executed_buy_orders_without_fills", 0) == 0
             and stats.get("api_fills_without_local_order", 0) == 0
         )
-        # Weather-family bots can still use the local joined basis once every
-        # executed-and-settled canonical order is covered. They carry a known
-        # tail of older demo/manual/orphan KXHIGH fills that should remain
-        # visible in reconciliation stats, but should not override the
-        # canonical local weather logs.
         relaxed_weather_family_basis = bool(
             bot in {"weather", "source-monitor"}
             and executed_settled > 0
@@ -250,7 +264,7 @@ def compute_realized_pnl_by_bot_api(settlements, local_trades, demo_weather_refs
     for settlement in settlements:
         ticker = settlement.get("ticker", "") or settlement.get("market_ticker", "")
         revenue = _safe_int(settlement.get("revenue", 0))
-        cost = _safe_int(settlement.get("yes_total_cost", 0)) + _safe_int(settlement.get("no_total_cost", 0))
+        cost = _cost_cents(settlement, "yes") + _cost_cents(settlement, "no")
         profit = revenue - cost
         fee = _safe_api_fee_cents(settlement.get("fee_cost"))
         bot = ticker_to_bot.get(
@@ -457,28 +471,39 @@ def compute_unrealized_pnl(positions, fills):
     for f in fills:
         ticker = f.get("ticker", "")
         side = (f.get("side", "") or "").lower()
-        price = _fill_price_cents(f, side)
-        count = _fill_count(f)
+        if side == "yes" and f.get("yes_price_dollars") not in (None, ""):
+            price_cents = round(float(f.get("yes_price_dollars")) * 100)
+        elif side != "yes" and f.get("no_price_dollars") not in (None, ""):
+            price_cents = round(float(f.get("no_price_dollars")) * 100)
+        elif side == "yes":
+            price_cents = _safe_int(f.get("yes_price", 0))
+        else:
+            price_cents = _safe_int(f.get("no_price", 0))
+        count = float(f.get("count_fp")) if f.get("count_fp") not in (None, "") else float(f.get("count", 0) or 0)
         action = (f.get("action", "") or "").lower()
         if action == "buy":
-            ticker_cost[ticker] += (price or 0) * count
+            ticker_cost[ticker] += price_cents * int(count)
         elif action == "sell":
-            ticker_cost[ticker] -= (price or 0) * count
+            ticker_cost[ticker] -= price_cents * int(count)
 
     result_positions = []
     total_unrealized = 0
 
     for p in positions:
-        if p.get("position", 0) == 0:
+        pos_count = float(p.get("position_fp")) if p.get("position_fp") not in (None, "") else float(p.get("position", 0) or 0)
+        if pos_count == 0:
             continue
         ticker = p.get("ticker", "")
-        current_value = p.get("market_exposure", 0)
+        if p.get("market_exposure_dollars") not in (None, ""):
+            current_value = round(float(p.get("market_exposure_dollars")) * 100)
+        else:
+            current_value = _safe_int(p.get("market_exposure", 0))
         cost = ticker_cost.get(ticker, 0)
         unrealized = current_value - cost
 
         result_positions.append({
             "ticker": ticker,
-            "position": p.get("position", 0),
+            "position": int(pos_count),
             "cost_cents": cost,
             "current_value_cents": current_value,
             "unrealized_cents": unrealized,
@@ -492,7 +517,7 @@ def compute_unrealized_pnl(positions, fills):
     }
 
 
-def verify_settlements(api_settlements, local_trades):
+def verify_settlements(api_settlements, local_trades, demo_weather_refs=None):
     """Cross-verify API settlements against local trade logs.
 
     Runs multiple checks and returns structured verification report.
@@ -506,19 +531,77 @@ def verify_settlements(api_settlements, local_trades):
                         if _is_buy_action(t.get("action"))]
     local_tickers = {t.get("ticker", "") for t in local_buy_trades
                      if t.get("ticker")}
+    api_settlement_by_ticker = {
+        (s.get("ticker", "") or s.get("market_ticker", "")): s
+        for s in api_settlements
+        if (s.get("ticker", "") or s.get("market_ticker", ""))
+    }
+    local_bots = {
+        str(t.get("source_bot") or _infer_bot(t.get("ticker", "")))
+        for t in local_buy_trades
+        if t.get("ticker")
+    }
+    first_local_trade_by_bot = {}
+    overall_first_local_trade = None
+    for trade in local_buy_trades:
+        timestamp = _parse_timestamp(trade.get("timestamp"))
+        if timestamp is None:
+            continue
+        bot = str(trade.get("source_bot") or _infer_bot(trade.get("ticker", "")))
+        current = first_local_trade_by_bot.get(bot)
+        if current is None or timestamp < current:
+            first_local_trade_by_bot[bot] = timestamp
+        if overall_first_local_trade is None or timestamp < overall_first_local_trade:
+            overall_first_local_trade = timestamp
+    unmatched_api = sorted(api_tickers - local_tickers)
+    unmatched_local = sorted(local_tickers - api_tickers)
+    unmatched_api_details = [
+        _classify_unmatched_api_settlement(
+            api_settlement_by_ticker.get(ticker, {"ticker": ticker}),
+            local_bots=local_bots,
+            first_local_trade_by_bot=first_local_trade_by_bot,
+            overall_first_local_trade=overall_first_local_trade,
+            demo_weather_refs=demo_weather_refs,
+        )
+        for ticker in unmatched_api
+    ]
+    actionable_unmatched_api = [
+        row["ticker"] for row in unmatched_api_details if row["status"] == "warning"
+    ]
+    informational_unmatched_api = [
+        row["ticker"] for row in unmatched_api_details if row["status"] != "warning"
+    ]
 
     # Check 1: Settlement count match
     api_count = len(api_tickers)
     local_settled_tickers = local_tickers & api_tickers
     local_count = len(local_settled_tickers)
     count_match = api_count == local_count
+    count_status = "ok"
+    count_detail = ""
+    if not count_match:
+        if actionable_unmatched_api:
+            count_status = "warning"
+            count_detail = (
+                f"{len(actionable_unmatched_api)} API settlements are missing a matching "
+                f"local trade despite local bot coverage"
+            )
+            if informational_unmatched_api:
+                count_detail += (
+                    f"; {len(informational_unmatched_api)} more are legacy/no-coverage rows"
+                )
+        else:
+            count_status = "info"
+            count_detail = (
+                f"{len(informational_unmatched_api)} API settlements are outside current "
+                f"local bot coverage or legacy weather history"
+            )
     checks.append({
         "check": "settlement_count_match",
         "api": api_count,
         "local": local_count,
-        "status": "ok" if count_match else "warning",
-        "detail": (f"{api_count - local_count} API settlements have no matching "
-                   f"local trade" if not count_match else ""),
+        "status": count_status,
+        "detail": count_detail,
     })
 
     # Check 2: P&L agreement per ticker
@@ -527,19 +610,19 @@ def verify_settlements(api_settlements, local_trades):
     for s in api_settlements:
         ticker = s.get("ticker", "") or s.get("market_ticker", "")
         revenue = _safe_int(s.get("revenue", 0))
-        cost = _safe_int(s.get("yes_total_cost", 0)) + _safe_int(s.get("no_total_cost", 0))
+        cost = _cost_cents(s, "yes") + _cost_cents(s, "no")
         api_pnl_by_ticker[ticker] = revenue - cost
 
     # Build local P&L by ticker from settlement_result + cost_cents + count.
-    # NOTE: Do NOT use settlement_revenue_cents — it has inconsistent semantics
-    # (reconcile-trades.py stores gross payout, backfill-settlements.py stores
-    # net profit). Instead, derive P&L from settlement outcome directly.
+    # NOTE: Do NOT use settlement_revenue_cents directly. New scripts write gross
+    # payout semantics consistently, but historical artifacts may still contain
+    # legacy net-profit values from older backfills.
     local_pnl_by_ticker = defaultdict(int)
     for t in local_buy_trades:
         ticker = t.get("ticker", "")
         result = t.get("settlement_result")
         if result is not None and ticker:
-            count = t.get("count", 1) or 1
+            count = resolved_contract_count(t) or 1
             cost = t.get("cost_cents", 0) or 0
             if result == "won":
                 local_pnl_by_ticker[ticker] += 100 * count - cost
@@ -561,13 +644,21 @@ def verify_settlements(api_settlements, local_trades):
     })
 
     # Check 3: Orphan detection
-    unmatched_api = sorted(api_tickers - local_tickers)
-    unmatched_local = sorted(local_tickers - api_tickers)
-
     checks.append({
         "check": "orphan_settlements",
         "count": len(unmatched_api),
-        "status": "ok" if not unmatched_api else "warning",
+        "actionable_count": len(actionable_unmatched_api),
+        "informational_count": len(informational_unmatched_api),
+        "status": (
+            "ok" if not unmatched_api else
+            "warning" if actionable_unmatched_api else
+            "info"
+        ),
+        "detail": (
+            f"{len(actionable_unmatched_api)} actionable, "
+            f"{len(informational_unmatched_api)} informational"
+            if unmatched_api else ""
+        ),
     })
     checks.append({
         "check": "orphan_local_trades",
@@ -589,6 +680,7 @@ def verify_settlements(api_settlements, local_trades):
         "status": overall,
         "checks": checks,
         "unmatched_api_settlements": unmatched_api,
+        "unmatched_api_settlement_details": unmatched_api_details,
         "unmatched_local_trades": unmatched_local,
     }
 
@@ -634,8 +726,13 @@ def build_snapshot(balance_cents, portfolio_value_cents, settlements, fills,
     """Assemble the complete financial snapshot from all data sources."""
     realized = compute_realized_pnl(settlements)
     unrealized = compute_unrealized_pnl(positions, fills)
-    verification = verify_settlements(settlements, local_trades)
+    verification = verify_settlements(
+        settlements,
+        local_trades,
+        demo_weather_refs=demo_weather_refs,
+    )
     deposits = load_deposits(deposits_path)
+
     by_bot_api = compute_realized_pnl_by_bot_api(
         settlements,
         local_trades,
@@ -758,21 +855,48 @@ def _build_balance_check(nav_cents, realized, deposits):
 def _infer_bot(ticker):
     """Best-effort bot attribution from ticker prefix."""
     t = (ticker or "").upper()
-    if t.startswith("KXHIGH"):
+    if t.startswith(("KXHIGH", "KXHIGHT")):
         return "weather"
     if t.startswith(("KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXXRP")):
         return "crypto"
     if t.startswith(("KXCPI", "KXGDP", "KXJOBS", "KXFED", "KXECONSTAT")):
         return "economics"
-    if t.startswith(("KXALBUM", "KX1ALBUM")):
+    if t.startswith(("KXALBUM", "KX1ALBUM", "KXFIRSTSUPERBOWLSONG", "KXSTARMERMENTION")):
         return "entertainment"
+    if t.startswith((
+        "KXAFCCLGAME",
+        "KXARGPREMDIVGAME",
+        "KXATPMATCH",
+        "KXDOTA2GAME",
+        "KXFACUPADVANCE",
+        "KXLALIGAGAME",
+        "KXMARMAD",
+        "KXMARMAD1SEED",
+        "KXNBA",
+        "KXNBAGAME",
+        "KXNBAALLSTARMVP",
+        "KXNBACELEBRITY3PT",
+        "KXNBAMVP",
+        "KXNCAABBGAME",
+        "KXNHL",
+        "KXPGATOUR",
+    )):
+        return "strategy"
     return "other"
+
+
+def _safe_int(val):
+    """Convert to int safely."""
+    try:
+        return int(round(float(val)))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _infer_unmatched_api_bot(ticker, *, order_id=None, demo_weather_refs=None):
     """Attribute API-only rows conservatively when no local order exists."""
     t = (ticker or "").upper()
-    if t.startswith("KXHIGH"):
+    if t.startswith(("KXHIGH", "KXHIGHT")):
         refs = demo_weather_refs or {}
         demo_tickers = refs.get("tickers", set())
         demo_order_ids = refs.get("order_ids", set())
@@ -782,12 +906,90 @@ def _infer_unmatched_api_bot(ticker, *, order_id=None, demo_weather_refs=None):
     return _infer_bot(ticker)
 
 
-def _safe_int(val):
-    """Convert to int safely."""
+def _parse_timestamp(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
     try:
-        return int(round(float(val)))
-    except (TypeError, ValueError):
-        return 0
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _classify_unmatched_api_settlement(
+    settlement,
+    *,
+    local_bots,
+    first_local_trade_by_bot=None,
+    overall_first_local_trade=None,
+    demo_weather_refs=None,
+):
+    ticker = settlement.get("ticker", "") or settlement.get("market_ticker", "")
+    bot = _infer_unmatched_api_bot(ticker, demo_weather_refs=demo_weather_refs)
+    settled_time = _parse_timestamp(settlement.get("settled_time"))
+    first_local_trade_by_bot = first_local_trade_by_bot or {}
+    if bot in {DEMO_WEATHER_HISTORY_BOT, UNATTRIBUTED_WEATHER_BOT}:
+        return {
+            "ticker": ticker,
+            "bot": bot,
+            "status": "info",
+            "reason": "legacy_weather_history_outside_canonical_trade_logs",
+        }
+    if bot not in local_bots and bot != "other":
+        return {
+            "ticker": ticker,
+            "bot": bot,
+            "status": "info",
+            "reason": "no_local_bot_coverage",
+        }
+    first_local_trade = first_local_trade_by_bot.get(bot)
+    if settled_time is not None and first_local_trade is not None and settled_time < first_local_trade:
+        return {
+            "ticker": ticker,
+            "bot": bot,
+            "status": "info",
+            "reason": "pre_local_bot_coverage",
+        }
+    if (
+        bot == "other"
+        and settled_time is not None
+        and overall_first_local_trade is not None
+        and settled_time < overall_first_local_trade
+    ):
+        return {
+            "ticker": ticker,
+            "bot": bot,
+            "status": "info",
+            "reason": "pre_local_trade_coverage",
+        }
+    return {
+        "ticker": ticker,
+        "bot": bot,
+        "status": "warning",
+        "reason": "missing_local_trade_match",
+    }
+
+
+def _cost_cents(settlement, side):
+    """Extract cost in cents from a settlement record.
+
+    Kalshi API v2 uses dollar-string fields (yes_total_cost_dollars,
+    no_total_cost_dollars) instead of cent-integer fields.  Fall back to
+    the legacy cent-integer field if the dollar field is missing.
+    """
+    dollar_key = f"{side}_total_cost_dollars"
+    cent_key = f"{side}_total_cost"
+    if dollar_key in settlement:
+        try:
+            return round(float(settlement[dollar_key]) * 100)
+        except (TypeError, ValueError):
+            return 0
+    return _safe_int(settlement.get(cent_key, 0))
 
 
 # ─── I/O functions (not tested in unit tests) ───
@@ -837,7 +1039,7 @@ def _load_demo_weather_refs():
         if not isinstance(row, dict):
             continue
         ticker = str(row.get("ticker", "")).upper()
-        if not ticker.startswith("KXHIGH"):
+        if _weather_city_from_ticker(ticker) is None:
             continue
         tickers.add(ticker)
         order_id = row.get("order_id")
@@ -856,7 +1058,7 @@ def _fetch_api_data():
     client = KalshiClient()
 
     # Balance (required — cannot produce snapshot without it)
-    balance_data = client.get("/portfolio/balance")
+    balance_data = _get_with_retries(client, "/portfolio/balance")
     balance_cents = balance_data.get("balance", 0)
     portfolio_value_cents = balance_data.get("portfolio_value", 0)
 
@@ -868,7 +1070,7 @@ def _fetch_api_data():
         if cursor:
             path += f"&cursor={cursor}"
         try:
-            data = client.get(path)
+            data = _get_with_retries(client, path)
         except Exception as e:
             print(f"  WARNING: settlement fetch failed: {e}")
             break
@@ -886,7 +1088,7 @@ def _fetch_api_data():
         if cursor:
             path += f"&cursor={cursor}"
         try:
-            data = client.get(path)
+            data = _get_with_retries(client, path)
         except Exception as e:
             print(f"  WARNING: fills fetch failed: {e}")
             break
@@ -898,9 +1100,9 @@ def _fetch_api_data():
 
     # Positions
     try:
-        pos_data = client.get("/portfolio/positions")
+        pos_data = _get_with_retries(client, "/portfolio/positions")
         positions = [p for p in pos_data.get("market_positions", [])
-                     if p.get("position", 0) != 0]
+                     if float(p.get("position_fp", "0") or p.get("position", 0) or "0") != 0]
     except Exception as e:
         print(f"  WARNING: positions fetch failed: {e}")
         positions = []
@@ -960,7 +1162,7 @@ def main():
         status = v["status"].upper()
         print(f"\nVerification: {status}")
         for c in v["checks"]:
-            icon = "+" if c["status"] == "ok" else "!" if c["status"] == "warning" else "x"
+            icon = "+" if c["status"] == "ok" else "!" if c["status"] == "warning" else "i"
             detail = f" -- {c.get('detail', '')}" if c.get("detail") else ""
             print(f"  {icon} {c['check']}{detail}")
 

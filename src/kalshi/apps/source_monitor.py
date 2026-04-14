@@ -14,7 +14,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from app_bootstrap import AppContext, install_app_context
 from event_ledger import get_event_ledger
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested, normalize_markets
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, quarter_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, nws_sigma_for_hour, MAX_SPREAD_FOR_ENTRY, MIN_LIQUIDITY_VOLUME
 from research.opportunity_log import OpportunityLog
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
@@ -344,12 +344,7 @@ def _nws_liquidity_status(market, min_volume=None, max_spread=None):
 
 def _nws_threshold_no_liquidity_override(liquidity_status, *, market, direction, side,
                                          edge, min_edge, observation_age_minutes=None):
-    """Allow a narrow NWS-only liquidity bypass for strong threshold NO trades.
-
-    The intent is to capture the best observed-weather threshold NO setups
-    without loosening the normal gate for brackets, YES-side entries, or
-    empty-book markets.
-    """
+    """Allow a narrow NWS-only liquidity bypass for strong threshold NO trades."""
     if liquidity_status is None:
         return False
     if liquidity_status == "empty_book":
@@ -366,12 +361,7 @@ def _nws_threshold_no_liquidity_override(liquidity_status, *, market, direction,
 
 
 def _nws_daily_loss_limit_override_cents(edge, confidence, hour, is_bracket):
-    """Return a narrow late-day NWS risk override for the best threshold setups.
-
-    This does not raise global bot risk limits. It only allows a modest
-    extension of source-monitor's daily loss limit for late same-day observed
-    temperature opportunities that already cleared the NWS-specific edge gate.
-    """
+    """Return a narrow late-day NWS risk override for the best threshold setups."""
     if is_bracket:
         return None
     nws_cfg = (((config or {}).get("sources") or {}).get("nws") or {})
@@ -410,10 +400,90 @@ def _nws_daily_loss_limit_override_cents(edge, confidence, hour, is_bracket):
     override_cents = int(round(base_limit_cents * (1.0 + min(float(buffer_pct), 2.0))))
     return min(50000, max(base_limit_cents, override_cents))
 
+
+def _nws_bracket_guardrail_reason(city_hour, obs_age_minutes, bracket_cfg=None):
+    """Return the first active bracket guardrail reason, or None."""
+    cfg = bracket_cfg or {}
+    if not cfg.get("enabled", True):
+        return "brackets_disabled"
+
+    min_local_hour = cfg.get("minLocalHour")
+    if min_local_hour is not None and city_hour < int(min_local_hour):
+        return "bracket_too_early"
+
+    max_obs_age_minutes = cfg.get("maxObservationAgeMinutes")
+    if max_obs_age_minutes is not None:
+        if obs_age_minutes is None:
+            return "bracket_obs_unknown_age"
+        if obs_age_minutes > float(max_obs_age_minutes):
+            return "stale_bracket_obs"
+
+    return None
+
 # === Kalshi Market Helpers ===
 def get_markets_by_prefix(prefix, status="open"):
     """Get all open markets matching a ticker prefix."""
     return client.get_all_markets(prefix=prefix, status=status)
+
+
+# Cities where Kalshi uses KXHIGHT{city} series ticker instead of KXHIGH{city}.
+_T_PREFIX_CITIES = {"ATL", "BOS", "DAL", "DC", "HOU", "LV", "MIN", "NOLA", "OKC", "PHX", "SATX", "SEA", "SFO"}
+
+
+def _weather_series_ticker(city_code):
+    """Return the Kalshi series ticker for a weather city."""
+    if city_code in _T_PREFIX_CITIES:
+        return f"KXHIGHT{city_code}"
+    return f"KXHIGH{city_code}"
+
+
+def get_nws_weather_markets():
+    """Fetch KXHIGH weather markets by series_ticker per configured NWS city.
+
+    Querying by series_ticker goes directly to the right markets without
+    paginating through all 55k+ open markets on production. Falls back to
+    prefix scan only if every series query fails.
+    """
+    stations = config.get("sources", {}).get("nws", {}).get("stations", {})
+    if not stations:
+        log.warning("No NWS stations configured; falling back to prefix scan")
+        return get_markets_by_prefix("KXHIGH")
+
+    markets = []
+    seen = set()
+    series_failures = 0
+
+    for city_code in stations:
+        series_ticker = _weather_series_ticker(city_code)
+        cursor = None
+        while True:
+            path = f"/markets?series_ticker={series_ticker}&status=open&limit=1000"
+            if cursor:
+                path += f"&cursor={cursor}"
+            try:
+                data = client.get(path)
+            except Exception as e:
+                series_failures += 1
+                log.warning("NWS market fetch failed for %s: %s", series_ticker, e)
+                break
+
+            batch = normalize_markets(data.get("markets", []))
+            for market in batch:
+                ticker = market.get("ticker")
+                if ticker and ticker not in seen:
+                    seen.add(ticker)
+                    markets.append(market)
+
+            cursor = data.get("cursor")
+            if not cursor or not batch:
+                break
+
+    if not markets and series_failures:
+        log.warning("Series-based NWS market fetch returned no markets; falling back to prefix scan")
+        return get_markets_by_prefix("KXHIGH")
+
+    return markets
+
 
 # ============================================================
 # SOURCE 1: HITS Daily Double (Album Sales)
@@ -1268,7 +1338,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
         if prefetched_markets is not None:
             markets = prefetched_markets.get("weather", [])
         else:
-            markets = get_markets_by_prefix("KXHIGH")
+            markets = get_nws_weather_markets()
         if not markets:
             log.info(f"  No open KXHIGH markets found")
             return
@@ -1316,6 +1386,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                 continue
 
             running_high = temp_data[city]["running_high_f"]
+            nws_cfg = config.get("sources", {}).get("nws", {})
+            nws_bracket_cfg = nws_cfg.get("brackets", {})
 
             # Validate threshold market consistency for this city
             threshold_signals = []
@@ -1344,7 +1416,6 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                 max_cost = config["maxTradeAmount"] * 100
                 is_bracket = (direction == "B")
 
-                nws_sigma = nws_sigma_for_hour(city_hour)
                 prob = nws_probability(running_high, threshold, direction, city_hour)
                 selected_confidence = prob if prob > 0.5 else 1.0 - prob
                 research_fields = _source_monitor_research_fields(
@@ -1352,7 +1423,6 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     observed_value=running_high,
                     threshold=threshold,
                     confidence=selected_confidence,
-                    sigma=nws_sigma,
                     source_name=temp_data[city].get("station"),
                     market_title=m.get("title", ""),
                     city=city,
@@ -1367,9 +1437,34 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     is_bracket=is_bracket,
                 )
 
+                if is_bracket:
+                    guardrail_reason = _nws_bracket_guardrail_reason(
+                        city_hour,
+                        temp_data[city].get("obs_age_minutes"),
+                        nws_bracket_cfg,
+                    )
+                    if guardrail_reason:
+                        if ss:
+                            ss.skip(guardrail_reason)
+                        _log_source_monitor_decision(
+                            ticker,
+                            "skip",
+                            "skipped",
+                            guardrail_reason,
+                            price_cents=m.get("yes_ask") or m.get("no_ask"),
+                            confidence=round(selected_confidence, 4),
+                            running_high=round(running_high, 1),
+                            city=city,
+                            threshold=threshold,
+                            hour=city_hour,
+                            **research_fields,
+                        )
+                        continue
+
                 yes_ask = m.get("yes_ask", 0)
                 no_ask = m.get("no_ask", 0)
                 yes_bid = m.get("yes_bid", 0)
+
                 liquidity_status = _nws_liquidity_status(m)
 
                 # Determine trade side and edge
@@ -1378,10 +1473,13 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                 else:
                     margin = 0  # bracket
 
-                if prob > 0.5 and yes_ask and yes_ask < 99:
+                nws_disable_yes = config.get("sources", {}).get("nws", {}).get("disableYes", False)
+                if prob > 0.5 and yes_ask and yes_ask < 99 and not nws_disable_yes:
                     # Buy YES (raw edge, fees handled in Kelly)
                     edge = prob - yes_ask / 100
                     min_edge = _nws_min_edge(running_high, threshold, city_hour, is_bracket, city=city)
+                    if is_bracket:
+                        min_edge = max(min_edge, float(nws_bracket_cfg.get("minEdge", 0.20)))
                     if edge <= min_edge:
                         if ss:
                             ss.skip("low_edge")
@@ -1474,6 +1572,8 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     no_prob = 1.0 - prob
                     edge = no_prob - no_ask / 100
                     min_edge = _nws_min_edge(running_high, threshold, city_hour, is_bracket, city=city)
+                    if is_bracket:
+                        min_edge = max(min_edge, float(nws_bracket_cfg.get("minEdge", 0.20)))
                     if edge <= min_edge:
                         if ss:
                             ss.skip("low_edge")
@@ -1624,6 +1724,8 @@ def build_app(project_dir=None):
         "maxDailyTrades": loaded_config["maxDailyTrades"],
         "maxDailyLoss": loaded_config["maxDailyLoss"],
         "maxDailyLossPct": loaded_config.get("maxDailyLossPct"),
+        "maxContractsPerTrade": loaded_config.get("maxContractsPerTrade"),
+        "maxGrossPayoutCents": loaded_config.get("maxGrossPayoutCents"),
     }, logger=logger, order_monitor=order_monitor_obj, bot_name="source-monitor")
     opportunity_log_obj = OpportunityLog(
         project_dir / "data" / "opportunity-log.json",
@@ -1701,7 +1803,7 @@ def main():
             _check_with_retry(scan_boxoffice, "boxoffice", prefetched, ss)
             sources_checked.append("boxoffice")
         if config["sources"]["nws"]["enabled"]:
-            prefetched["weather"] = get_markets_by_prefix("KXHIGH")
+            prefetched["weather"] = get_nws_weather_markets()
             _check_with_retry(check_nws, "nws", prefetched, ss)
             sources_checked.append("nws")
         ss.finalize()
@@ -1748,7 +1850,7 @@ def main():
                         box_markets.extend(get_markets_by_prefix(prefix))
                     prefetched["boxoffice"] = box_markets
                 if need_nws:
-                    prefetched["weather"] = get_markets_by_prefix("KXHIGH")
+                    prefetched["weather"] = get_nws_weather_markets()
 
             sources_this_cycle = []
 

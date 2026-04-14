@@ -11,10 +11,11 @@ from pathlib import Path
 from artifact_contracts import normalize_health_state
 from event_ledger import DEFAULT_LEDGER_PATH, EventLedger
 from ops.health_monitor import BOT_SOURCE_MAP, HEALTH_STATE_PATH
+from runtime_paths import resolve_data_dir
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[3]
-DEFAULT_SOURCE_CATALOG_PATH = PROJECT_DIR / "data" / "source-catalog.json"
+DEFAULT_SOURCE_CATALOG_PATH = resolve_data_dir(PROJECT_DIR) / "source-catalog.json"
 
 log = logging.getLogger("source-catalog")
 

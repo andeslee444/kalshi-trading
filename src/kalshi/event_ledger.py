@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import datetime as _dt
+import gzip
 import hashlib
 import json
 import logging
 import os
 import sqlite3
+import tempfile
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 
 from artifact_contracts import normalize_trade_attribution
+from runtime_paths import resolve_data_dir
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
-DEFAULT_LEDGER_PATH = PROJECT_DIR / "data" / "event-ledger.sqlite3"
+DEFAULT_LEDGER_PATH = resolve_data_dir(PROJECT_DIR) / "event-ledger.sqlite3"
+DEFAULT_ARCHIVE_ROOT = resolve_data_dir(PROJECT_DIR) / "archive" / "events"
 LEDGER_SCHEMA_VERSION = 1
 
 EVENT_TYPE_SOURCE_OBSERVATION = "source_observation"
@@ -30,6 +34,16 @@ EVENT_TYPE_POSITION_SNAPSHOT = "position_snapshot"
 EVENT_TYPE_SETTLEMENT = "settlement"
 EVENT_TYPE_VERIFICATION_RESULT = "verification_result"
 EVENT_TYPE_POST_TRADE_ATTRIBUTION = "post_trade_attribution"
+
+DEFAULT_RETENTION_DAYS = {
+    EVENT_TYPE_TRADE_DECISION: 1,
+    EVENT_TYPE_FORECAST_SNAPSHOT: 14,
+    EVENT_TYPE_MARKET_SNAPSHOT: 14,
+    EVENT_TYPE_SOURCE_OBSERVATION: 30,
+    EVENT_TYPE_POSITION_SNAPSHOT: 30,
+    EVENT_TYPE_BUDGET_DECISION: 90,
+}
+ARCHIVABLE_EVENT_TYPES = frozenset(DEFAULT_RETENTION_DAYS)
 
 _log = logging.getLogger("event-ledger")
 
@@ -74,6 +88,15 @@ def _parse_timestamp(ts):
 
 def _iso_or_none(dt):
     return dt.isoformat() if dt is not None else None
+
+
+def _parse_event_date(value):
+    if not value:
+        return None
+    try:
+        return _dt.date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
 
 
 def _trade_event_key(trade, source_path=None):
@@ -165,8 +188,12 @@ def _coerce_int(value):
 class EventLedger:
     """SQLite-backed canonical ledger with dual-write helpers and legacy views."""
 
-    def __init__(self, path=None, logger=None):
+    def __init__(self, path=None, logger=None, archive_root=None, enable_archive_reads=True):
         self.path = Path(path or os.environ.get("KALSHI_LEDGER_PATH") or DEFAULT_LEDGER_PATH)
+        self.archive_root = Path(
+            archive_root or os.environ.get("KALSHI_LEDGER_ARCHIVE_ROOT") or DEFAULT_ARCHIVE_ROOT
+        )
+        self.enable_archive_reads = bool(enable_archive_reads)
         self.log = logger or _log
 
     def _connect(self):
@@ -185,6 +212,281 @@ class EventLedger:
             yield conn
         finally:
             conn.close()
+
+    @staticmethod
+    def _row_sort_key(row):
+        return (
+            row.get("event_time") or "",
+            row.get("event_id") or "",
+        )
+
+    def _archive_partition_dir(self, event_type, event_date):
+        return self.archive_root / event_type / f"date={event_date}"
+
+    def _archive_partition_data_path(self, event_type, event_date):
+        return self._archive_partition_dir(event_type, event_date) / "events.jsonl.gz"
+
+    def _archive_partition_manifest_path(self, event_type, event_date):
+        return self._archive_partition_dir(event_type, event_date) / "manifest.json"
+
+    @staticmethod
+    def _hot_row_to_archive_record(row):
+        payload = json.loads(row["payload_json"])
+        event_date = row["event_date"] or _event_date(row["event_time"])
+        return {
+            "event_id": row["event_id"],
+            "event_type": row["event_type"],
+            "event_time": row["event_time"],
+            "event_date": event_date,
+            "bot_name": row["bot_name"],
+            "ticker": row["ticker"],
+            "order_id": row["order_id"],
+            "source_artifact": row["source_artifact"],
+            "source_path": row["source_path"],
+            "legacy_key": row["legacy_key"],
+            "payload": payload,
+            "payload_hash": row["payload_hash"],
+        }
+
+    @staticmethod
+    def _archive_record_to_payload(record):
+        if "payload" in record:
+            return dict(record["payload"])
+        payload_json = record.get("payload_json")
+        if payload_json is not None:
+            return json.loads(payload_json)
+        return {}
+
+    @classmethod
+    def _dedupe_event_rows(cls, rows):
+        deduped = {}
+        for row in sorted(rows, key=cls._row_sort_key):
+            event_id = row.get("event_id")
+            if not event_id:
+                continue
+            deduped[event_id] = row
+        return list(deduped.values())
+
+    @classmethod
+    def _archive_source_summary(cls, rows):
+        summary = {}
+        for row in rows:
+            source_path = row.get("source_path")
+            if not source_path:
+                continue
+            entry = summary.setdefault(
+                source_path,
+                {"count": 0, "min_event_time": None, "max_event_time": None},
+            )
+            entry["count"] += 1
+            event_time = row.get("event_time")
+            if event_time and (entry["min_event_time"] is None or event_time < entry["min_event_time"]):
+                entry["min_event_time"] = event_time
+            if event_time and (entry["max_event_time"] is None or event_time > entry["max_event_time"]):
+                entry["max_event_time"] = event_time
+        return summary
+
+    @classmethod
+    def _build_archive_manifest(cls, event_type, event_date, rows):
+        ordered_rows = sorted(rows, key=cls._row_sort_key)
+        return {
+            "event_type": event_type,
+            "event_date": event_date,
+            "record_count": len(ordered_rows),
+            "first_event_time": ordered_rows[0]["event_time"] if ordered_rows else None,
+            "last_event_time": ordered_rows[-1]["event_time"] if ordered_rows else None,
+            "record_hash": _record_hash(ordered_rows),
+            "source_path_summary": cls._archive_source_summary(ordered_rows),
+            "updated_at": _utc_now_iso(),
+        }
+
+    @staticmethod
+    def _atomic_write_gzip_jsonl(path, rows):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        os.close(fd)
+        try:
+            with gzip.open(tmp_path, "wt", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(_json_dumps(row))
+                    handle.write("\n")
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _atomic_write_json(path, data):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as handle:
+                json.dump(data, handle, indent=2, sort_keys=True)
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    @classmethod
+    def _archive_record_matches_filters(cls, record, *, source_path=None, start=None, end=None):
+        if source_path is not None and record.get("source_path") != _safe_path(source_path):
+            return False
+        event_dt = _parse_timestamp(record.get("event_time"))
+        if start is not None and event_dt is not None and event_dt < start:
+            return False
+        if end is not None and event_dt is not None and event_dt > end:
+            return False
+        if (start is not None or end is not None) and event_dt is None:
+            return False
+        return True
+
+    def _iter_archive_partitions(self, event_type, *, start=None, end=None):
+        if not self.enable_archive_reads or event_type not in ARCHIVABLE_EVENT_TYPES:
+            return []
+        root = self.archive_root / event_type
+        if not root.exists():
+            return []
+        start_date = start.date() if isinstance(start, _dt.datetime) else None
+        end_date = end.date() if isinstance(end, _dt.datetime) else None
+        partitions = []
+        for partition_dir in sorted(root.glob("date=*")):
+            event_date = _parse_event_date(partition_dir.name.split("=", 1)[-1])
+            if event_date is None:
+                continue
+            if start_date is not None and event_date < start_date:
+                continue
+            if end_date is not None and event_date > end_date:
+                continue
+            partitions.append((event_date.isoformat(), partition_dir))
+        return partitions
+
+    def _load_archive_manifest(self, event_type, event_date):
+        path = self._archive_partition_manifest_path(event_type, event_date)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text())
+            return data if isinstance(data, dict) else None
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Failed to read archive manifest {path}: {exc}") from exc
+
+    def _load_archive_records(self, event_type, event_date):
+        path = self._archive_partition_data_path(event_type, event_date)
+        if not path.exists():
+            return []
+        records = []
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    if isinstance(record, dict):
+                        records.append(record)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Failed to read archive partition {path}: {exc}") from exc
+        return records
+
+    def _fetch_archive_rows(self, event_type, *, source_path=None, start=None, end=None):
+        rows = []
+        for event_date, _ in self._iter_archive_partitions(event_type, start=start, end=end):
+            for record in self._load_archive_records(event_type, event_date):
+                if self._archive_record_matches_filters(
+                    record,
+                    source_path=source_path,
+                    start=start,
+                    end=end,
+                ):
+                    rows.append(record)
+        rows.sort(key=self._row_sort_key)
+        return rows
+
+    def _fetch_event_rows(self, event_type, *, source_path=None, start=None, end=None):
+        normalized_start = _parse_timestamp(start) if isinstance(start, str) else start
+        normalized_end = _parse_timestamp(end) if isinstance(end, str) else end
+        archive_rows = self._fetch_archive_rows(
+            event_type,
+            source_path=source_path,
+            start=normalized_start,
+            end=normalized_end,
+        )
+        hot_rows = self._fetch_hot_rows(
+            event_type,
+            source_path=source_path,
+            start=normalized_start,
+            end=normalized_end,
+        )
+        return self._dedupe_event_rows([*archive_rows, *hot_rows])
+
+    def _fetch_hot_rows(self, event_type, *, source_path=None, start=None, end=None):
+        self.ensure_schema()
+        query = """
+            SELECT event_id, event_type, event_time, event_date, bot_name, ticker,
+                   order_id, source_artifact, source_path, legacy_key,
+                   payload_json, payload_hash
+            FROM events
+            WHERE event_type = ?
+        """
+        params = [event_type]
+        if source_path is not None:
+            query += " AND source_path = ?"
+            params.append(_safe_path(source_path))
+        if start is not None:
+            query += " AND event_time >= ?"
+            params.append(_iso_or_none(start) if not isinstance(start, str) else start)
+        if end is not None:
+            query += " AND event_time <= ?"
+            params.append(_iso_or_none(end) if not isinstance(end, str) else end)
+        query += " ORDER BY event_time ASC, event_id ASC"
+        with self._connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._hot_row_to_archive_record(row) for row in rows]
+
+    def _partition_fully_within_window(self, manifest, *, start=None, end=None, source_path=None):
+        if not manifest:
+            return False
+        if source_path is not None:
+            summary = manifest.get("source_path_summary", {}).get(_safe_path(source_path))
+            if not summary:
+                return False
+            min_event_time = _parse_timestamp(summary.get("min_event_time"))
+            max_event_time = _parse_timestamp(summary.get("max_event_time"))
+        else:
+            min_event_time = _parse_timestamp(manifest.get("first_event_time"))
+            max_event_time = _parse_timestamp(manifest.get("last_event_time"))
+        if min_event_time is None or max_event_time is None:
+            return False
+        if start is not None and min_event_time < start:
+            return False
+        if end is not None and max_event_time > end:
+            return False
+        return True
+
+    def _merge_archive_partition(self, event_type, event_date, new_rows):
+        existing_rows = self._load_archive_records(event_type, event_date)
+        merged = {row["event_id"]: row for row in existing_rows if row.get("event_id")}
+        for row in new_rows:
+            merged[row["event_id"]] = dict(row)
+        merged_rows = sorted(merged.values(), key=self._row_sort_key)
+        manifest = self._build_archive_manifest(event_type, event_date, merged_rows)
+        self._atomic_write_gzip_jsonl(
+            self._archive_partition_data_path(event_type, event_date),
+            merged_rows,
+        )
+        self._atomic_write_json(
+            self._archive_partition_manifest_path(event_type, event_date),
+            manifest,
+        )
+        return manifest
 
     def ensure_schema(self):
         with self._connection() as conn:
@@ -214,6 +516,8 @@ class EventLedger:
 
                 CREATE INDEX IF NOT EXISTS idx_events_type_time
                     ON events(event_type, event_time);
+                CREATE INDEX IF NOT EXISTS idx_events_type_date_time
+                    ON events(event_type, event_date, event_time);
                 CREATE INDEX IF NOT EXISTS idx_events_source
                     ON events(source_path, event_type, event_time);
                 CREATE INDEX IF NOT EXISTS idx_events_ticker
@@ -514,91 +818,232 @@ class EventLedger:
             legacy_key=event_id,
         )
 
-    def _fetch_event_payloads(self, event_type, *, source_path=None, start=None, end=None):
+    def archive_event_type(
+        self,
+        event_type,
+        *,
+        cutoff_time=None,
+        retention_days=None,
+        now=None,
+        dry_run=False,
+        max_event_dates=None,
+    ):
+        if event_type not in ARCHIVABLE_EVENT_TYPES:
+            raise ValueError(f"{event_type} is not configured for archive/prune")
+        if cutoff_time is None:
+            days = DEFAULT_RETENTION_DAYS[event_type] if retention_days is None else int(retention_days)
+            now_dt = now or _dt.datetime.now(_dt.timezone.utc)
+            if now_dt.tzinfo is None:
+                now_dt = now_dt.replace(tzinfo=_dt.timezone.utc)
+            cutoff_dt = now_dt - _dt.timedelta(days=days)
+            cutoff_time = cutoff_dt.isoformat()
+        elif isinstance(cutoff_time, _dt.datetime):
+            cutoff_dt = cutoff_time.astimezone(_dt.timezone.utc)
+            cutoff_time = cutoff_dt.isoformat()
+        else:
+            cutoff_dt = _parse_timestamp(cutoff_time)
         self.ensure_schema()
-        query = """
-            SELECT payload_json, event_time, source_path
-            FROM events
-            WHERE event_type = ?
-        """
-        params = [event_type]
-        if source_path is not None:
-            query += " AND source_path = ?"
-            params.append(_safe_path(source_path))
-        if start is not None:
-            query += " AND event_time >= ?"
-            params.append(_iso_or_none(start) if not isinstance(start, str) else start)
-        if end is not None:
-            query += " AND event_time <= ?"
-            params.append(_iso_or_none(end) if not isinstance(end, str) else end)
-        query += " ORDER BY event_time ASC, event_id ASC"
         with self._connection() as conn:
-            rows = conn.execute(query, params).fetchall()
-        return [json.loads(row["payload_json"]) for row in rows]
+            grouped_rows = conn.execute(
+                """
+                SELECT event_date, COUNT(*) AS count
+                FROM events
+                WHERE event_type = ?
+                  AND event_time < ?
+                  AND event_date IS NOT NULL
+                GROUP BY event_date
+                ORDER BY event_date ASC
+                """,
+                (event_type, cutoff_time),
+            ).fetchall()
+        selected_dates = [row["event_date"] for row in grouped_rows]
+        if max_event_dates is not None:
+            selected_dates = selected_dates[: max(0, int(max_event_dates))]
+        candidate_rows_by_date = {
+            row["event_date"]: int(row["count"] or 0)
+            for row in grouped_rows
+            if row["event_date"] in selected_dates
+        }
+        summary = {
+            "generated_at": _utc_now_iso(),
+            "ledger_path": str(self.path),
+            "archive_root": str(self.archive_root),
+            "event_type": event_type,
+            "cutoff_time": cutoff_time,
+            "dry_run": dry_run,
+            "candidate_rows": sum(candidate_rows_by_date.values()),
+            "candidate_event_dates": selected_dates,
+            "candidate_rows_by_event_date": candidate_rows_by_date,
+            "archived_rows": 0,
+            "archived_event_dates": [],
+            "partition_manifests": {},
+        }
+        if dry_run or not selected_dates:
+            return summary
 
-    def _count_events(self, event_type, *, source_path=None, start=None, end=None):
-        self.ensure_schema()
-        query = """
-            SELECT COUNT(*) AS count
-            FROM events
-            WHERE event_type = ?
-        """
-        params = [event_type]
-        if source_path is not None:
-            query += " AND source_path = ?"
-            params.append(_safe_path(source_path))
-        if start is not None:
-            query += " AND event_time >= ?"
-            params.append(_iso_or_none(start) if not isinstance(start, str) else start)
-        if end is not None:
-            query += " AND event_time <= ?"
-            params.append(_iso_or_none(end) if not isinstance(end, str) else end)
-        with self._connection() as conn:
-            row = conn.execute(query, params).fetchone()
-        return int(row["count"] or 0)
-
-    def _summarize_events_by_source(self, event_type, source_paths):
-        self.ensure_schema()
-        normalized_paths = [_safe_path(path) for path in source_paths if path is not None]
-        if not normalized_paths:
-            return {}
-        placeholders = ",".join("?" for _ in normalized_paths)
-        query = f"""
-            SELECT source_path,
-                   COUNT(*) AS count,
-                   MIN(event_time) AS min_event_time,
-                   MAX(event_time) AS max_event_time
-            FROM events
-            WHERE event_type = ?
-              AND source_path IN ({placeholders})
-            GROUP BY source_path
-        """
-        params = [event_type, *normalized_paths]
-        with self._connection() as conn:
-            rows = conn.execute(query, params).fetchall()
-        summary = {}
-        for row in rows:
-            summary[row["source_path"]] = {
-                "count": int(row["count"] or 0),
-                "min_event_time": _parse_timestamp(row["min_event_time"]),
-                "max_event_time": _parse_timestamp(row["max_event_time"]),
+        for event_date in selected_dates:
+            with self._connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT event_id, event_type, event_time, event_date, bot_name, ticker,
+                           order_id, source_artifact, source_path, legacy_key,
+                           payload_json, payload_hash
+                    FROM events
+                    WHERE event_type = ?
+                      AND event_time < ?
+                      AND event_date = ?
+                    ORDER BY event_time ASC, event_id ASC
+                    """,
+                    (event_type, cutoff_time, event_date),
+                ).fetchall()
+            partition_rows = [self._hot_row_to_archive_record(row) for row in rows]
+            manifest = self._merge_archive_partition(event_type, event_date, partition_rows)
+            with self._connection() as conn:
+                deleted = conn.execute(
+                    """
+                    DELETE FROM events
+                    WHERE event_type = ?
+                      AND event_time < ?
+                      AND event_date = ?
+                    """,
+                    (event_type, cutoff_time, event_date),
+                ).rowcount
+                conn.commit()
+            if deleted != len(partition_rows):
+                raise RuntimeError(
+                    "Archived partition prune mismatch for "
+                    f"{event_type} {event_date}: archived {len(partition_rows)} rows "
+                    f"but deleted {deleted}"
+                )
+            summary["archived_rows"] += len(partition_rows)
+            summary["archived_event_dates"].append(event_date)
+            summary["partition_manifests"][event_date] = {
+                "path": str(self._archive_partition_data_path(event_type, event_date)),
+                "manifest_path": str(self._archive_partition_manifest_path(event_type, event_date)),
+                "record_count": manifest.get("record_count", 0),
+                "record_hash": manifest.get("record_hash"),
             }
         return summary
 
-    def _fetch_event_window(self, event_type, *, source_path=None):
+    def apply_retention_policy(
+        self,
+        *,
+        event_types=None,
+        retention_days=None,
+        now=None,
+        dry_run=False,
+        max_event_dates=None,
+    ):
+        configured_days = dict(DEFAULT_RETENTION_DAYS)
+        if retention_days:
+            configured_days.update({key: int(value) for key, value in retention_days.items()})
+        selected_types = list(event_types or configured_days.keys())
+        results = []
+        for event_type in selected_types:
+            if event_type not in ARCHIVABLE_EVENT_TYPES:
+                continue
+            results.append(
+                self.archive_event_type(
+                    event_type,
+                    retention_days=configured_days[event_type],
+                    now=now,
+                    dry_run=dry_run,
+                    max_event_dates=max_event_dates,
+                )
+            )
+        return {
+            "generated_at": _utc_now_iso(),
+            "ledger_path": str(self.path),
+            "archive_root": str(self.archive_root),
+            "dry_run": dry_run,
+            "results": results,
+        }
+
+    def compact_hot_ledger(self):
         self.ensure_schema()
-        query = """
-            SELECT MIN(event_time) AS min_event_time, MAX(event_time) AS max_event_time
-            FROM events
-            WHERE event_type = ?
-        """
-        params = [event_type]
-        if source_path is not None:
-            query += " AND source_path = ?"
-            params.append(_safe_path(source_path))
         with self._connection() as conn:
-            row = conn.execute(query, params).fetchone()
-        return _parse_timestamp(row["min_event_time"]), _parse_timestamp(row["max_event_time"])
+            conn.execute("VACUUM")
+
+    def _fetch_event_payloads(self, event_type, *, source_path=None, start=None, end=None):
+        rows = self._fetch_event_rows(
+            event_type,
+            source_path=source_path,
+            start=start,
+            end=end,
+        )
+        return [self._archive_record_to_payload(row) for row in rows]
+
+    def _count_events(self, event_type, *, source_path=None, start=None, end=None):
+        if event_type not in ARCHIVABLE_EVENT_TYPES or not self.enable_archive_reads:
+            self.ensure_schema()
+            query = """
+                SELECT COUNT(*) AS count
+                FROM events
+                WHERE event_type = ?
+            """
+            params = [event_type]
+            normalized_start = _parse_timestamp(start) if isinstance(start, str) else start
+            normalized_end = _parse_timestamp(end) if isinstance(end, str) else end
+            if source_path is not None:
+                query += " AND source_path = ?"
+                params.append(_safe_path(source_path))
+            if normalized_start is not None:
+                query += " AND event_time >= ?"
+                params.append(_iso_or_none(normalized_start))
+            if normalized_end is not None:
+                query += " AND event_time <= ?"
+                params.append(_iso_or_none(normalized_end))
+            with self._connection() as conn:
+                row = conn.execute(query, params).fetchone()
+            return int(row["count"] or 0)
+        return len(
+            self._fetch_event_rows(
+                event_type,
+                source_path=source_path,
+                start=start,
+                end=end,
+            )
+        )
+
+    def _summarize_events_by_source(self, event_type, source_paths):
+        normalized_paths = [_safe_path(path) for path in source_paths if path is not None]
+        if not normalized_paths:
+            return {}
+        rows = self._fetch_event_rows(event_type)
+        summary = {}
+        for row in rows:
+            source_path = row.get("source_path")
+            if source_path not in normalized_paths:
+                continue
+            current = summary.setdefault(
+                source_path,
+                {"count": 0, "min_event_time": None, "max_event_time": None},
+            )
+            current["count"] += 1
+            event_time = _parse_timestamp(row.get("event_time"))
+            if event_time is not None and (
+                current["min_event_time"] is None or event_time < current["min_event_time"]
+            ):
+                current["min_event_time"] = event_time
+            if event_time is not None and (
+                current["max_event_time"] is None or event_time > current["max_event_time"]
+            ):
+                current["max_event_time"] = event_time
+        return summary
+
+    def _fetch_event_window(self, event_type, *, source_path=None):
+        rows = self._fetch_event_rows(event_type, source_path=source_path)
+        timestamps = [
+            _parse_timestamp(row.get("event_time"))
+            for row in rows
+            if row.get("event_time") is not None
+        ]
+        timestamps = [dt for dt in timestamps if dt is not None]
+        if not timestamps:
+            return None, None
+        min_time = min(timestamps)
+        max_time = max(timestamps)
+        return min_time, max_time
 
     def get_trade_records(self, source_path=None):
         orders = self._fetch_event_payloads(EVENT_TYPE_ORDER_SUBMITTED, source_path=source_path)
@@ -1356,12 +1801,20 @@ class EventLedger:
         return row
 
 
-def get_event_ledger(path=None, logger=None):
-    return EventLedger(path=path, logger=logger)
+def get_event_ledger(path=None, logger=None, archive_root=None, enable_archive_reads=True):
+    return EventLedger(
+        path=path,
+        logger=logger,
+        archive_root=archive_root,
+        enable_archive_reads=enable_archive_reads,
+    )
 
 
 __all__ = [
+    "ARCHIVABLE_EVENT_TYPES",
+    "DEFAULT_ARCHIVE_ROOT",
     "DEFAULT_LEDGER_PATH",
+    "DEFAULT_RETENTION_DAYS",
     "EVENT_TYPE_BUDGET_DECISION",
     "EVENT_TYPE_FILL",
     "EVENT_TYPE_FORECAST_SNAPSHOT",

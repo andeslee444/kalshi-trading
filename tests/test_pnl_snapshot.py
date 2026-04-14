@@ -557,6 +557,65 @@ class TestVerifySettlements:
         )
         assert "KXORPHAN-123" in result["unmatched_api_settlements"]
 
+    def test_unmatched_settlement_without_local_bot_coverage_is_informational(self):
+        extra = _make_settlement(ticker="KXALBUMSALES-ARI-280000", revenue=100,
+                                 yes_total_cost=50, no_total_cost=0)
+        result = verify_settlements(
+            SAMPLE_SETTLEMENTS + [extra],
+            SAMPLE_LOCAL_TRADES,
+        )
+        settlement_check = next(c for c in result["checks"]
+                                if c["check"] == "settlement_count_match")
+        orphan_check = next(c for c in result["checks"]
+                            if c["check"] == "orphan_settlements")
+        extra_detail = next(
+            row for row in result["unmatched_api_settlement_details"]
+            if row["ticker"] == "KXALBUMSALES-ARI-280000"
+        )
+
+        assert settlement_check["status"] == "info"
+        assert orphan_check["status"] == "info"
+        assert extra_detail["bot"] == "entertainment"
+        assert extra_detail["reason"] == "no_local_bot_coverage"
+
+    def test_unmatched_settlement_before_local_bot_coverage_is_informational(self):
+        extra = _make_settlement(
+            ticker="KXAFCCLGAME-26FEB16SHJNAS-SHJ",
+            revenue=100,
+            yes_total_cost=50,
+            no_total_cost=0,
+            settled_time="2026-02-16T10:00:00Z",
+        )
+        local = SAMPLE_LOCAL_TRADES + [{
+            "ticker": "KXNBA-26-BOS",
+            "source_bot": "strategy",
+            "side": "yes",
+            "price_cents": 50,
+            "count": 1,
+            "cost_cents": 50,
+            "order_id": "strategy-1",
+            "action": "buy",
+            "settlement_result": None,
+            "settlement_revenue_cents": None,
+            "timestamp": "2026-02-18T00:00:00",
+            "status": "filled",
+            "fill_count": 1,
+        }]
+        result = verify_settlements(
+            SAMPLE_SETTLEMENTS + [extra],
+            local,
+        )
+        settlement_check = next(c for c in result["checks"]
+                                if c["check"] == "settlement_count_match")
+        extra_detail = next(
+            row for row in result["unmatched_api_settlement_details"]
+            if row["ticker"] == "KXAFCCLGAME-26FEB16SHJNAS-SHJ"
+        )
+
+        assert settlement_check["status"] == "info"
+        assert extra_detail["bot"] == "strategy"
+        assert extra_detail["reason"] == "pre_local_bot_coverage"
+
     def test_orphan_local_trade(self):
         """Local trade has no matching API settlement."""
         extra = _make_local_trade(ticker="KXLOCAL-999", order_id="ord-99")
@@ -1129,6 +1188,12 @@ class TestInferBot:
 
     def test_entertainment_albumsales(self):
         assert _infer_bot("KXALBUMSALES-LUC-15000") == "entertainment"
+
+    def test_entertainment_superbowl_song(self):
+        assert _infer_bot("KXFIRSTSUPERBOWLSONG-26FEB09-CHA") == "entertainment"
+
+    def test_strategy_market_family(self):
+        assert _infer_bot("KXAFCCLGAME-26FEB16SHJNAS-SHJ") == "strategy"
 
     def test_other(self):
         assert _infer_bot("KXSPORTS-NCAAM") == "other"
