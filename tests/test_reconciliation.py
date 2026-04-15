@@ -14,6 +14,7 @@ import textwrap
 from pathlib import Path
 
 from settlement_utils import (
+    allocate_integer_total,
     realized_edge_for_trade,
     settlement_payout_cents,
     settlement_result_for_trade,
@@ -392,3 +393,14 @@ class TestAnnotateTrade:
         _annotate_trade(trade, {"T": {"yes_won": True, "revenue_cents": 65}}, fills)
         assert trade["fill_price_cents"] == 35
         assert trade["realized_edge"] == 0.65  # 1.0 - 0.35
+
+
+class TestAllocateIntegerTotal:
+    def test_allocations_sum_to_total(self):
+        assert sum(allocate_integer_total(11, [3, 2, 1])) == 11
+
+    def test_largest_remainder_rounding(self):
+        assert allocate_integer_total(5, [2, 1]) == [3, 2]
+
+    def test_zero_weights_even_split(self):
+        assert allocate_integer_total(5, [0, 0]) == [3, 2]

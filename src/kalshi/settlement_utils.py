@@ -22,6 +22,42 @@ def _coerce_nonnegative_int(value):
     return coerced if coerced > 0 else 0
 
 
+def allocate_integer_total(total, weights):
+    """Allocate an integer total across non-negative weights.
+
+    Uses largest-remainder rounding and guarantees the allocations sum to total.
+    """
+    total = _coerce_nonnegative_int(total)
+    normalized = []
+    for weight in weights:
+        try:
+            normalized.append(max(float(weight or 0), 0.0))
+        except (TypeError, ValueError):
+            normalized.append(0.0)
+
+    if total <= 0 or not normalized:
+        return [0] * len(normalized)
+
+    weight_sum = sum(normalized)
+    if weight_sum <= 0:
+        base = total // len(normalized)
+        remainder = total % len(normalized)
+        return [base + (1 if i < remainder else 0) for i in range(len(normalized))]
+
+    raw = [total * weight / weight_sum for weight in normalized]
+    floors = [int(value) for value in raw]
+    remainder = total - sum(floors)
+    if remainder > 0:
+        ranked = sorted(
+            range(len(raw)),
+            key=lambda idx: (raw[idx] - floors[idx], normalized[idx], -idx),
+            reverse=True,
+        )
+        for idx in ranked[:remainder]:
+            floors[idx] += 1
+    return floors
+
+
 def is_winning_settlement(settlement_result):
     return settlement_result in ("won", "yes", True, 1)
 

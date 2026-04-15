@@ -27,6 +27,7 @@ if _SRC_DIR not in sys.path:
 from event_ledger import get_event_ledger
 from kalshi_auth import KalshiClient, setup_logging
 from settlement_utils import (
+    allocate_integer_total,
     realized_edge_for_trade,
     settlement_payout_cents,
     settlement_result_for_trade,
@@ -131,6 +132,14 @@ def _fetch_all_settlements(client):
                     "revenue_cents": s.get("revenue", 0),
                     "yes_won": s.get("market_result", "") == "yes",
                     "settled_time": s.get("settled_time", ""),
+                    "yes_count": _fill_count({"count_fp": s.get("yes_count_fp"), "count": s.get("yes_count")}),
+                    "no_count": _fill_count({"count_fp": s.get("no_count_fp"), "count": s.get("no_count")}),
+                    "yes_total_cost_cents": _dollars_to_cents(s.get("yes_total_cost_dollars"))
+                    if s.get("yes_total_cost_dollars") not in (None, "")
+                    else _safe_int(s.get("yes_total_cost", 0)),
+                    "no_total_cost_cents": _dollars_to_cents(s.get("no_total_cost_dollars"))
+                    if s.get("no_total_cost_dollars") not in (None, "")
+                    else _safe_int(s.get("no_total_cost", 0)),
                 }
         cursor = data.get("cursor")
         if not cursor or not data.get("settlements"):
@@ -243,6 +252,109 @@ def _annotate_trade(trade, settlements, fills):
     return modified
 
 
+def _apply_authoritative_settlement_totals(group, settlement, side):
+    target_count = settlement.get(f"{side}_count", 0) or 0
+    target_cost_cents = settlement.get(f"{side}_total_cost_cents", 0) or 0
+    if target_count <= 0:
+        return set()
+
+    exact_rows = []
+    unresolved_rows = []
+    for entry in group:
+        fill = entry["fill"]
+        if fill and (fill.get("fill_count") or 0) > 0:
+            exact_rows.append(entry)
+        else:
+            unresolved_rows.append(entry)
+
+    fixed_count = sum((entry["fill"] or {}).get("fill_count", 0) or 0 for entry in exact_rows)
+    fixed_cost = sum((entry["fill"] or {}).get("fill_cost_cents", 0) or 0 for entry in exact_rows)
+    if fixed_count > target_count or fixed_cost > target_cost_cents or not unresolved_rows:
+        return set()
+
+    remaining_count = target_count - fixed_count
+    remaining_cost = target_cost_cents - fixed_cost
+    if remaining_count < len(unresolved_rows):
+        return set()
+
+    if len(unresolved_rows) == 1:
+        count_allocations = [remaining_count]
+    else:
+        extra_counts = allocate_integer_total(
+            remaining_count - len(unresolved_rows),
+            [max(entry["base_count"], 1) for entry in unresolved_rows],
+        )
+        count_allocations = [1 + value for value in extra_counts]
+
+    cost_weights = []
+    for entry, count in zip(unresolved_rows, count_allocations):
+        price = entry["price_cents"]
+        cost_weights.append(max(price, 1) * max(count, 0))
+    cost_allocations = allocate_integer_total(remaining_cost, cost_weights)
+
+    modified_trades = set()
+    for entry, count_value, cost_value in zip(unresolved_rows, count_allocations, cost_allocations):
+        trade = entry["trade"]
+        fill_price_cents = int(round(cost_value / count_value)) if count_value > 0 else None
+        settlement_result = settlement_result_for_trade(side, settlement["yes_won"])
+        settlement_revenue_cents = settlement_payout_cents(settlement_result, count_value)
+        realized_edge = realized_edge_for_trade(
+            trade,
+            settlement_result,
+            fill_price_cents=fill_price_cents,
+        )
+
+        if trade.get("fill_count") != count_value:
+            trade["fill_count"] = count_value
+            modified_trades.add(id(trade))
+        if trade.get("cost_cents") != cost_value:
+            trade["cost_cents"] = cost_value
+            modified_trades.add(id(trade))
+        if trade.get("fill_price_cents") != fill_price_cents:
+            trade["fill_price_cents"] = fill_price_cents
+            modified_trades.add(id(trade))
+        if trade.get("settlement_result") != settlement_result:
+            trade["settlement_result"] = settlement_result
+            modified_trades.add(id(trade))
+        if trade.get("settlement_revenue_cents") != settlement_revenue_cents:
+            trade["settlement_revenue_cents"] = settlement_revenue_cents
+            modified_trades.add(id(trade))
+        if trade.get("realized_edge") != realized_edge:
+            trade["realized_edge"] = realized_edge
+            modified_trades.add(id(trade))
+    return modified_trades
+
+
+def _normalize_settled_groups(all_file_trades, settlements, fills):
+    groups = {}
+    for trade_file, _store, trades in all_file_trades:
+        for trade in trades:
+            if trade.get("action", "buy") != "buy":
+                continue
+            ticker = trade.get("ticker", "")
+            if ticker not in settlements:
+                continue
+            side = str(trade.get("side", "yes") or "yes").lower()
+            if side not in ("yes", "no"):
+                continue
+            fill = fills.get(trade.get("order_id")) if trade.get("order_id") else None
+            has_exposure, contract_count, fill_price_cents = trade_has_filled_exposure(trade, fills=fills)
+            if not has_exposure:
+                continue
+            groups.setdefault((ticker, side), []).append({
+                "trade": trade,
+                "trade_file": trade_file,
+                "fill": fill,
+                "base_count": contract_count or _safe_int(trade.get("count")) or 1,
+                "price_cents": fill_price_cents or trade.get("fill_price_cents") or trade.get("price_cents") or 50,
+            })
+
+    modified_trades = set()
+    for (ticker, side), group in groups.items():
+        modified_trades.update(_apply_authoritative_settlement_totals(group, settlements[ticker], side))
+    return modified_trades
+
+
 def reconcile_all(dry_run=False):
     """Walk all trade files, match to API settlements/fills, annotate records."""
     client = KalshiClient()
@@ -252,6 +364,8 @@ def reconcile_all(dry_run=False):
     fills = _fetch_all_fills(client)
     log.info("  %d settlements, %d fills fetched", len(settlements), len(fills))
 
+    all_file_trades = []
+    modified_trade_ids = set()
     total_annotated = 0
     total_skipped = 0
 
@@ -263,12 +377,35 @@ def reconcile_all(dry_run=False):
         trades = store.load()
         if not trades:
             continue
+        all_file_trades.append((trade_file, store, trades))
 
-        file_modified = 0
+    for _trade_file, _store, trades in all_file_trades:
         for trade in trades:
             if _annotate_trade(trade, settlements, fills):
-                if not dry_run:
-                    try:
+                modified_trade_ids.add(id(trade))
+                total_annotated += 1
+            else:
+                total_skipped += 1
+
+    normalized = _normalize_settled_groups(all_file_trades, settlements, fills)
+    if normalized:
+        modified_trade_ids.update(normalized)
+        log.info(
+            "  normalized %d settled rows from authoritative settlement side totals",
+            len(normalized),
+        )
+        total_annotated += len(normalized)
+
+    for trade_file, store, trades in all_file_trades:
+        file_modified = sum(1 for trade in trades if id(trade) in modified_trade_ids)
+
+        if file_modified > 0:
+            log.info("  %s: %d/%d records annotated", trade_file.name, file_modified, len(trades))
+            if not dry_run:
+                try:
+                    for trade in trades:
+                        if trade.get("action", "buy") != "buy":
+                            continue
                         if trade.get("order_id") and trade.get("fill_price_cents") is not None:
                             fill_count = trade.get("fill_count") or trade.get("count")
                             if fill_count:
@@ -280,18 +417,11 @@ def reconcile_all(dry_run=False):
                                     "fill_count": fill_count,
                                     "source_bot": trade.get("source_bot"),
                                 }, source_path=trade_file)
-                        ledger.record_settlement(trade, source_path=trade_file)
-                    except Exception as e:
-                        log.warning("Failed to dual-write reconcile event for %s: %s", trade.get("ticker", "?"), e)
-                file_modified += 1
-            else:
-                total_skipped += 1
-
-        if file_modified > 0:
-            log.info("  %s: %d/%d records annotated", trade_file.name, file_modified, len(trades))
-            if not dry_run:
+                        if trade.get("settlement_result") is not None:
+                            ledger.record_settlement(trade, source_path=trade_file)
+                except Exception as e:
+                    log.warning("Failed to dual-write reconcile events for %s: %s", trade_file.name, e)
                 store.save(trades)
-            total_annotated += file_modified
 
     log.info("Reconciliation complete: %d annotated, %d skipped (unchanged or no match)",
              total_annotated, total_skipped)

@@ -30,6 +30,7 @@ from pnl_snapshot import (
     _build_balance_check,
     _infer_bot,
     _safe_int,
+    _ticker_family,
 )
 
 
@@ -270,6 +271,7 @@ class TestVerifySettlements:
         result = verify_settlements(
             SAMPLE_SETTLEMENTS + [extra],
             local,
+            local_artifact_tickers={t["ticker"] for t in local} | {extra["ticker"]},
         )
         settlement_check = next(c for c in result["checks"]
                                 if c["check"] == "settlement_count_match")
@@ -280,7 +282,72 @@ class TestVerifySettlements:
 
         assert settlement_check["status"] == "info"
         assert extra_detail["bot"] == "strategy"
-        assert extra_detail["reason"] == "pre_local_bot_coverage"
+        assert extra_detail["reason"] == "no_local_family_coverage"
+
+    def test_unmatched_settlement_without_local_family_coverage_is_informational(self):
+        extra = _make_settlement(
+            ticker="KXAFCCLGAME-26FEB16SHJNAS-SHJ",
+            revenue=100,
+            yes_total_cost=50,
+            no_total_cost=0,
+            settled_time="2026-03-01T10:00:00Z",
+        )
+        local = SAMPLE_LOCAL_TRADES + [{
+            "ticker": "KXNBAGAME-26MAR02BOSMIL-MIL",
+            "source_bot": "strategy",
+            "side": "yes",
+            "price_cents": 50,
+            "count": 1,
+            "cost_cents": 50,
+            "order_id": "strategy-2",
+            "action": "buy",
+            "settlement_result": None,
+            "settlement_revenue_cents": None,
+            "timestamp": "2026-02-18T00:00:00",
+            "status": "filled",
+            "fill_count": 1,
+        }]
+        result = verify_settlements(
+            SAMPLE_SETTLEMENTS + [extra],
+            local,
+            local_artifact_tickers={t["ticker"] for t in local} | {extra["ticker"]},
+        )
+        extra_detail = next(
+            row for row in result["unmatched_api_settlement_details"]
+            if row["ticker"] == "KXAFCCLGAME-26FEB16SHJNAS-SHJ"
+        )
+
+        assert extra_detail["reason"] == "no_local_family_coverage"
+
+    def test_unmatched_settlement_without_local_artifact_match_is_informational(self):
+        extra = _make_settlement(
+            ticker="KXNBAGAME-26APR10MIAATL-MIA",
+            revenue=100,
+            yes_total_cost=40,
+            no_total_cost=0,
+            settled_time="2026-04-10T18:00:00Z",
+        )
+        local = [
+            _make_local_trade(
+                ticker="KXNBAGAME-26APR10MILBOS-BOS",
+                source_bot="strategy",
+                order_id="ord-strategy-1",
+            ),
+        ]
+        result = verify_settlements(
+            SAMPLE_SETTLEMENTS + [extra],
+            local,
+            local_artifact_tickers={t["ticker"] for t in local},
+        )
+        settlement_check = next(c for c in result["checks"]
+                                if c["check"] == "settlement_count_match")
+        extra_detail = next(
+            row for row in result["unmatched_api_settlement_details"]
+            if row["ticker"] == "KXNBAGAME-26APR10MIAATL-MIA"
+        )
+
+        assert settlement_check["status"] == "info"
+        assert extra_detail["reason"] == "no_local_artifact_match"
 
     def test_orphan_local_trade(self):
         """Local trade has no matching API settlement."""
@@ -307,6 +374,101 @@ class TestVerifySettlements:
                          if c["check"] == "pnl_agreement")
         assert pnl_check["status"] == "ok"
         assert pnl_check["delta_cents"] == 0
+
+    def test_pnl_agreement_excludes_ambiguous_side_overlap_rows(self):
+        local = [
+            _make_local_trade(
+                ticker="KXHIGHHOU-26MAR03-T75",
+                cost_cents=200,
+                count=4,
+                settlement_result="won",
+                order_id="ord-1",
+            ),
+            _make_local_trade(
+                ticker="KXHIGHCHI-26APR10-T50",
+                cost_cents=480,
+                count=10,
+                settlement_result="lost",
+                order_id="ord-2",
+            ),
+        ]
+        ambiguous = _make_settlement(
+            ticker="KXHIGHCHI-26APR10-T50",
+            revenue=0,
+            yes_total_cost=895,
+            no_total_cost=1520,
+            market_result="yes",
+        )
+        ambiguous["yes_count_fp"] = "27.00"
+        ambiguous["no_count_fp"] = "152.00"
+
+        result = verify_settlements(
+            [
+                _make_settlement(
+                    ticker="KXHIGHHOU-26MAR03-T75",
+                    revenue=400,
+                    yes_total_cost=200,
+                    no_total_cost=0,
+                ),
+                ambiguous,
+            ],
+            local,
+        )
+        pnl_check = next(c for c in result["checks"]
+                         if c["check"] == "pnl_agreement")
+        assert pnl_check["status"] == "info"
+        assert pnl_check["delta_cents"] == 0
+        assert pnl_check["tickers_compared"] == 1
+        assert pnl_check["excluded_ambiguous_tickers"] == ["KXHIGHCHI-26APR10-T50"]
+
+    def test_pnl_agreement_excludes_incomplete_local_coverage_rows(self):
+        local = [
+            _make_local_trade(
+                ticker="KXHIGHHOU-26MAR03-T75",
+                cost_cents=200,
+                count=4,
+                settlement_result="won",
+                order_id="ord-1",
+            ),
+            _make_local_trade(
+                ticker="KXHIGHMIA-26APR10-T76",
+                source_bot="source-monitor",
+                side="yes",
+                cost_cents=1632,
+                count=51,
+                fill_count=51,
+                settlement_result="lost",
+                order_id="ord-2",
+            ),
+        ]
+        incomplete = _make_settlement(
+            ticker="KXHIGHMIA-26APR10-T76",
+            revenue=0,
+            yes_total_cost=1968,
+            no_total_cost=0,
+            market_result="no",
+        )
+        incomplete["yes_count_fp"] = "63.00"
+        incomplete["no_count_fp"] = "0.00"
+
+        result = verify_settlements(
+            [
+                _make_settlement(
+                    ticker="KXHIGHHOU-26MAR03-T75",
+                    revenue=400,
+                    yes_total_cost=200,
+                    no_total_cost=0,
+                ),
+                incomplete,
+            ],
+            local,
+        )
+        pnl_check = next(c for c in result["checks"]
+                         if c["check"] == "pnl_agreement")
+        assert pnl_check["status"] == "info"
+        assert pnl_check["delta_cents"] == 0
+        assert pnl_check["tickers_compared"] == 1
+        assert pnl_check["excluded_coverage_mismatch_tickers"] == ["KXHIGHMIA-26APR10-T76"]
 
     def test_pnl_agreement_losing_trade(self):
         """Lost trade: local P&L = -cost matches API P&L = 0 - cost."""
@@ -632,3 +794,11 @@ class TestSafeInt:
 
     def test_bad_string(self):
         assert _safe_int("abc") == 0
+
+
+class TestTickerFamily:
+    def test_extracts_date_prefixed_family(self):
+        assert _ticker_family("KXAFCCLGAME-26FEB16SHJNAS-SHJ") == "KXAFCCLGAME"
+
+    def test_extracts_simple_family(self):
+        assert _ticker_family("KXALBUMSALES-LUC-15000") == "KXALBUMSALES"

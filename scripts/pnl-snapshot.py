@@ -24,6 +24,7 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR / "src" / "kalshi"))
 
 from artifact_contracts import normalize_financial_snapshot
+from bot_registry import DECISION_FILE_SPECS as _DECISION_FILE_SPECS
 from settlement_utils import resolved_contract_count
 from trade_files import TRADE_FILES as _CANONICAL_FILES
 from runtime_paths import resolve_data_dir
@@ -128,6 +129,13 @@ def _safe_fee_cents(value):
         return int(round(float(value or 0)))
     except (TypeError, ValueError):
         return 0
+
+
+def _safe_float(value):
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _safe_api_fee_cents(value):
@@ -517,7 +525,12 @@ def compute_unrealized_pnl(positions, fills):
     }
 
 
-def verify_settlements(api_settlements, local_trades, demo_weather_refs=None):
+def verify_settlements(
+    api_settlements,
+    local_trades,
+    demo_weather_refs=None,
+    local_artifact_tickers=None,
+):
     """Cross-verify API settlements against local trade logs.
 
     Runs multiple checks and returns structured verification report.
@@ -531,6 +544,12 @@ def verify_settlements(api_settlements, local_trades, demo_weather_refs=None):
                         if _is_buy_action(t.get("action"))]
     local_tickers = {t.get("ticker", "") for t in local_buy_trades
                      if t.get("ticker")}
+    local_artifact_tickers = {
+        str(ticker).upper()
+        for ticker in (local_artifact_tickers or local_tickers)
+        if ticker
+    }
+    local_families = {_ticker_family(t.get("ticker", "")) for t in local_buy_trades if t.get("ticker")}
     api_settlement_by_ticker = {
         (s.get("ticker", "") or s.get("market_ticker", "")): s
         for s in api_settlements
@@ -559,6 +578,8 @@ def verify_settlements(api_settlements, local_trades, demo_weather_refs=None):
         _classify_unmatched_api_settlement(
             api_settlement_by_ticker.get(ticker, {"ticker": ticker}),
             local_bots=local_bots,
+            local_families=local_families,
+            local_artifact_tickers=local_artifact_tickers,
             first_local_trade_by_bot=first_local_trade_by_bot,
             overall_first_local_trade=overall_first_local_trade,
             demo_weather_refs=demo_weather_refs,
@@ -604,44 +625,96 @@ def verify_settlements(api_settlements, local_trades, demo_weather_refs=None):
         "detail": count_detail,
     })
 
-    # Check 2: P&L agreement per ticker
-    # Build API P&L by ticker
-    api_pnl_by_ticker = {}
-    for s in api_settlements:
-        ticker = s.get("ticker", "") or s.get("market_ticker", "")
-        revenue = _safe_int(s.get("revenue", 0))
-        cost = _cost_cents(s, "yes") + _cost_cents(s, "no")
-        api_pnl_by_ticker[ticker] = revenue - cost
-
     # Build local P&L by ticker from settlement_result + cost_cents + count.
     # NOTE: Do NOT use settlement_revenue_cents directly. New scripts write gross
     # payout semantics consistently, but historical artifacts may still contain
     # legacy net-profit values from older backfills.
     local_pnl_by_ticker = defaultdict(int)
+    local_settlement_coverage = defaultdict(lambda: {
+        "yes_count": 0,
+        "no_count": 0,
+        "yes_cost_cents": 0,
+        "no_cost_cents": 0,
+        "unknown_side_rows": 0,
+    })
     for t in local_buy_trades:
         ticker = t.get("ticker", "")
         result = t.get("settlement_result")
         if result is not None and ticker:
             count = resolved_contract_count(t) or 1
             cost = t.get("cost_cents", 0) or 0
+            side = str(t.get("side", "") or "").lower()
+            coverage = local_settlement_coverage[ticker]
+            if side in ("yes", "no"):
+                coverage[f"{side}_count"] += count
+                coverage[f"{side}_cost_cents"] += cost
+            else:
+                coverage["unknown_side_rows"] += 1
             if result == "won":
                 local_pnl_by_ticker[ticker] += 100 * count - cost
             elif result == "lost":
                 local_pnl_by_ticker[ticker] += -cost
+
+    # Check 2: P&L agreement per ticker
+    # Build API P&L by ticker. Exclude settlements that report both sides or
+    # whose authoritative settlement totals do not match local filled exposure.
+    api_pnl_by_ticker = {}
+    ambiguous_api_pnl_tickers = set()
+    coverage_mismatch_tickers = set()
+    for s in api_settlements:
+        ticker = s.get("ticker", "") or s.get("market_ticker", "")
+        if _settlement_side_count(s, "yes") > 0 and _settlement_side_count(s, "no") > 0:
+            ambiguous_api_pnl_tickers.add(ticker)
+            continue
+        if (
+            ticker in local_pnl_by_ticker
+            and not _has_comparable_local_settlement_coverage(
+                s,
+                local_settlement_coverage.get(ticker),
+            )
+        ):
+            coverage_mismatch_tickers.add(ticker)
+            continue
+        revenue = _safe_int(s.get("revenue", 0))
+        cost = _cost_cents(s, "yes") + _cost_cents(s, "no")
+        api_pnl_by_ticker[ticker] = revenue - cost
 
     # Compare where both exist
     common_tickers = set(api_pnl_by_ticker) & set(local_pnl_by_ticker)
     total_api_pnl = sum(api_pnl_by_ticker.get(t, 0) for t in common_tickers)
     total_local_pnl = sum(local_pnl_by_ticker.get(t, 0) for t in common_tickers)
     delta = abs(total_api_pnl - total_local_pnl)
-    checks.append({
+    pnl_status = "ok" if delta == 0 else "warning"
+    pnl_detail = ""
+    if ambiguous_api_pnl_tickers or coverage_mismatch_tickers:
+        excluded_parts = []
+        if ambiguous_api_pnl_tickers:
+            excluded_parts.append(
+                f"{len(ambiguous_api_pnl_tickers)} API settlements with both yes/no side totals"
+            )
+        if coverage_mismatch_tickers:
+            excluded_parts.append(
+                f"{len(coverage_mismatch_tickers)} tickers with incomplete local exposure coverage"
+            )
+        pnl_detail = f"Excluded {', '.join(excluded_parts)} from comparable P&L checks"
+        if delta == 0:
+            pnl_status = "info"
+        else:
+            pnl_detail += f"; remaining comparable rows still differ by {delta} cents"
+    pnl_check = {
         "check": "pnl_agreement",
         "api_cents": total_api_pnl,
         "local_cents": total_local_pnl,
         "delta_cents": delta,
         "tickers_compared": len(common_tickers),
-        "status": "ok" if delta == 0 else "warning",
-    })
+        "status": pnl_status,
+        "detail": pnl_detail,
+    }
+    if ambiguous_api_pnl_tickers:
+        pnl_check["excluded_ambiguous_tickers"] = sorted(ambiguous_api_pnl_tickers)
+    if coverage_mismatch_tickers:
+        pnl_check["excluded_coverage_mismatch_tickers"] = sorted(coverage_mismatch_tickers)
+    checks.append(pnl_check)
 
     # Check 3: Orphan detection
     checks.append({
@@ -730,6 +803,7 @@ def build_snapshot(balance_cents, portfolio_value_cents, settlements, fills,
         settlements,
         local_trades,
         demo_weather_refs=demo_weather_refs,
+        local_artifact_tickers=_load_local_artifact_tickers(local_trades),
     )
     deposits = load_deposits(deposits_path)
 
@@ -885,6 +959,18 @@ def _infer_bot(ticker):
     return "other"
 
 
+def _ticker_family(ticker):
+    t = (ticker or "").upper()
+    if not t:
+        return ""
+    parts = t.split("-")
+    if len(parts) <= 1:
+        return t
+    if len(parts) >= 2 and parts[1].startswith("26"):
+        return parts[0]
+    return parts[0]
+
+
 def _safe_int(val):
     """Convert to int safely."""
     try:
@@ -925,13 +1011,18 @@ def _classify_unmatched_api_settlement(
     settlement,
     *,
     local_bots,
+    local_families=None,
+    local_artifact_tickers=None,
     first_local_trade_by_bot=None,
     overall_first_local_trade=None,
     demo_weather_refs=None,
 ):
     ticker = settlement.get("ticker", "") or settlement.get("market_ticker", "")
+    ticker_upper = str(ticker).upper()
     bot = _infer_unmatched_api_bot(ticker, demo_weather_refs=demo_weather_refs)
     settled_time = _parse_timestamp(settlement.get("settled_time"))
+    local_families = local_families or set()
+    local_artifact_tickers = local_artifact_tickers or set()
     first_local_trade_by_bot = first_local_trade_by_bot or {}
     if bot in {DEMO_WEATHER_HISTORY_BOT, UNATTRIBUTED_WEATHER_BOT}:
         return {
@@ -946,6 +1037,20 @@ def _classify_unmatched_api_settlement(
             "bot": bot,
             "status": "info",
             "reason": "no_local_bot_coverage",
+        }
+    if ticker_upper not in local_artifact_tickers:
+        return {
+            "ticker": ticker,
+            "bot": bot,
+            "status": "info",
+            "reason": "no_local_artifact_match",
+        }
+    if _ticker_family(ticker) not in local_families:
+        return {
+            "ticker": ticker,
+            "bot": bot,
+            "status": "info",
+            "reason": "no_local_family_coverage",
         }
     first_local_trade = first_local_trade_by_bot.get(bot)
     if settled_time is not None and first_local_trade is not None and settled_time < first_local_trade:
@@ -990,6 +1095,32 @@ def _cost_cents(settlement, side):
         except (TypeError, ValueError):
             return 0
     return _safe_int(settlement.get(cent_key, 0))
+
+
+def _settlement_side_count(settlement, side):
+    for key in (f"{side}_count_fp", f"{side}_count"):
+        if settlement.get(key) not in (None, ""):
+            return _safe_float(settlement.get(key))
+    return 0.0
+
+
+def _settlement_has_side_count_field(settlement, side):
+    return any(settlement.get(key) not in (None, "") for key in (f"{side}_count_fp", f"{side}_count"))
+
+
+def _has_comparable_local_settlement_coverage(settlement, local_coverage, *, cost_tolerance_cents=1):
+    if not local_coverage:
+        return False
+    if local_coverage.get("unknown_side_rows", 0) > 0:
+        return False
+    for side in ("yes", "no"):
+        if not _settlement_has_side_count_field(settlement, side):
+            continue
+        api_count = int(round(_settlement_side_count(settlement, side)))
+        local_count = local_coverage.get(f"{side}_count", 0)
+        if api_count != local_count:
+            return False
+    return True
 
 
 # ─── I/O functions (not tested in unit tests) ───
@@ -1046,6 +1177,33 @@ def _load_demo_weather_refs():
         if order_id:
             order_ids.add(str(order_id))
     return {"tickers": tickers, "order_ids": order_ids}
+
+
+def _load_local_artifact_tickers(local_trades=None):
+    tickers = set()
+    source_trades = local_trades if local_trades is not None else _load_local_trades()
+    for trade in source_trades:
+        ticker = str(trade.get("ticker", "")).upper()
+        if ticker:
+            tickers.add(ticker)
+
+    for spec in _DECISION_FILE_SPECS:
+        path = DATA_DIR / spec["filename"]
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text().strip() or "[]")
+        except (json.JSONDecodeError, OSError, ValueError):
+            continue
+        if not isinstance(payload, list):
+            continue
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            ticker = str(row.get("ticker", "")).upper()
+            if ticker:
+                tickers.add(ticker)
+    return tickers
 
 
 def _fetch_api_data():
