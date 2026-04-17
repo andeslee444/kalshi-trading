@@ -10,6 +10,7 @@ TestAnnotateTradeSourceSync.
 """
 
 import inspect
+import datetime
 import textwrap
 from pathlib import Path
 
@@ -81,6 +82,37 @@ def _annotate_trade(trade, settlements, fills):
         modified = True
 
     return modified
+
+
+def _parse_close_time(value):
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        close_dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if close_dt.tzinfo is None:
+        close_dt = close_dt.replace(tzinfo=datetime.timezone.utc)
+    return close_dt.astimezone(datetime.timezone.utc)
+
+
+def _should_prune_trade(trade, fills, now=None):
+    """Local copy of reconcile-trades.py::_should_prune_trade for testing."""
+    if trade.get("action", "buy") != "buy":
+        return False
+    if trade.get("settlement_result") is not None:
+        return False
+
+    has_exposure, _contract_count, _fill_price_cents = trade_has_filled_exposure(trade, fills=fills)
+    if has_exposure:
+        return False
+
+    close_dt = _parse_close_time(trade.get("market_close_time") or trade.get("close_time"))
+    if close_dt is None:
+        return False
+
+    now_utc = now or datetime.datetime.now(datetime.timezone.utc)
+    return close_dt < now_utc
 
 
 def _extract_function_source(filepath, func_name):
@@ -164,6 +196,39 @@ class TestAnnotateTradeSourceSync:
             + f"\nLocal lines ({len(local_logic)}):\n"
             + "\n".join(f"  {l}" for l in local_logic)
         )
+
+
+class TestShouldPruneTradeSourceSync:
+    def test_local_copy_matches_production(self):
+        prod_source = _extract_function_source(
+            _SCRIPTS_DIR / "reconcile-trades.py", "_should_prune_trade"
+        )
+        local_source = inspect.getsource(_should_prune_trade)
+
+        def _logic_lines(source_text):
+            lines = textwrap.dedent(source_text).strip().splitlines()
+            body = lines[1:]
+            result = []
+            in_docstring = False
+            for line in body:
+                stripped = line.strip()
+                if stripped.startswith('"""') or stripped.startswith("'''"):
+                    if in_docstring:
+                        in_docstring = False
+                        continue
+                    if stripped.count('"""') >= 2 or stripped.count("'''") >= 2:
+                        continue
+                    in_docstring = True
+                    continue
+                if in_docstring:
+                    continue
+                if stripped.startswith("#"):
+                    continue
+                if stripped:
+                    result.append(stripped)
+            return result
+
+        assert _logic_lines(prod_source) == _logic_lines(local_source)
 
 
 class TestAnnotateTrade:
@@ -363,3 +428,55 @@ class TestAnnotateTrade:
         _annotate_trade(trade, {"T": {"yes_won": True, "revenue_cents": 65}}, fills)
         assert trade["fill_price_cents"] == 35
         assert trade["realized_edge"] == 0.65  # 1.0 - 0.35
+
+
+class TestShouldPruneTrade:
+    def test_expired_unfilled_resting_order_is_pruned(self):
+        now = datetime.datetime(2026, 4, 17, 12, 0, tzinfo=datetime.timezone.utc)
+        trade = {
+            "ticker": "T",
+            "action": "buy",
+            "side": "yes",
+            "order_id": "resting-1",
+            "status": "resting",
+            "market_close_time": "2026-04-17T11:00:00Z",
+        }
+        assert _should_prune_trade(trade, {}, now=now) is True
+
+    def test_future_close_unfilled_order_is_not_pruned(self):
+        now = datetime.datetime(2026, 4, 17, 12, 0, tzinfo=datetime.timezone.utc)
+        trade = {
+            "ticker": "T",
+            "action": "buy",
+            "side": "yes",
+            "order_id": "resting-1",
+            "status": "resting",
+            "market_close_time": "2026-04-17T13:00:00Z",
+        }
+        assert _should_prune_trade(trade, {}, now=now) is False
+
+    def test_filled_exposure_is_not_pruned(self):
+        now = datetime.datetime(2026, 4, 17, 12, 0, tzinfo=datetime.timezone.utc)
+        trade = {
+            "ticker": "T",
+            "action": "buy",
+            "side": "yes",
+            "order_id": "fill-1",
+            "status": "resting",
+            "market_close_time": "2026-04-17T11:00:00Z",
+        }
+        fills = {"fill-1": {"fill_price_cents": 30, "fill_count": 1}}
+        assert _should_prune_trade(trade, fills, now=now) is False
+
+    def test_settled_trade_is_not_pruned(self):
+        now = datetime.datetime(2026, 4, 17, 12, 0, tzinfo=datetime.timezone.utc)
+        trade = {
+            "ticker": "T",
+            "action": "buy",
+            "side": "yes",
+            "order_id": "resting-1",
+            "status": "resting",
+            "market_close_time": "2026-04-17T11:00:00Z",
+            "settlement_result": "won",
+        }
+        assert _should_prune_trade(trade, {}, now=now) is False

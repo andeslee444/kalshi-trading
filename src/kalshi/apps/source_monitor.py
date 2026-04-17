@@ -14,7 +14,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from app_bootstrap import AppContext, install_app_context
 from event_ledger import get_event_ledger
-from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested, normalize_markets
+from kalshi_auth import KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging, PROJECT_DIR, fetch_parallel, retry_request, TradeManager, trim_trade_log, build_market_snapshot, CITY_TIMEZONES, _local_today, round_half_up, HealthCheckMonitor, OrderMonitor, ScanSummary, is_shutdown_requested, normalize_markets, notify_whatsapp
 from probability import info_arb_probability, album_data_sigma, boxoffice_data_sigma, nws_probability, quarter_kelly, compute_limit_price, kalshi_fee_cents, is_market_liquid, nws_sigma_for_hour
 from research.opportunity_log import OpportunityLog
 from ticker_utils import parse_weather_ticker as parse_temp_ticker
@@ -345,6 +345,52 @@ def _nws_trade_mode(nws_cfg=None):
     if cfg.get("disableYes", False):
         return "no-only"
     return "both"
+
+
+def _alert_unexpected_nws_trade(ticker, side, direction, *, price_cents=None, count=None,
+                                running_high=None, threshold=None):
+    """Alert on unexpected live NWS exposure.
+
+    Any placed NWS YES trade or any placed NWS bracket trade is treated as drift.
+    """
+    side_key = str(side or "").lower()
+    direction_key = str(direction or "").upper()
+    if side_key != "yes" and direction_key != "B":
+        return False
+
+    market_type = "bracket" if direction_key == "B" else "threshold"
+    alert_key = f"source-monitor:nws-drift:{side_key}:{market_type}"
+    if health is not None and hasattr(health, "should_send_alert"):
+        if not health.should_send_alert(alert_key):
+            return False
+
+    details = []
+    if price_cents is not None:
+        details.append(f"price={price_cents}c")
+    if count is not None:
+        details.append(f"count={count}")
+    if running_high is not None:
+        details.append(f"running_high={running_high}")
+    if threshold is not None:
+        details.append(f"threshold={threshold}")
+
+    message = (
+        f"SOURCE-MONITOR DRIFT: placed unexpected NWS {side_key.upper()} "
+        f"{market_type} trade on {ticker}"
+    )
+    if details:
+        message = f"{message} ({', '.join(details)})"
+
+    log.critical(message)
+    ok = False
+    try:
+        ok = bool(notify_whatsapp(message, logger=log))
+    except Exception as exc:
+        log.error("Failed to send NWS drift alert for %s: %s", ticker, exc)
+
+    if ok and health is not None and hasattr(health, "record_alert_sent"):
+        health.record_alert_sent(alert_key)
+    return ok
 
 # === Kalshi Market Helpers ===
 def get_markets_by_prefix(prefix, status="open"):
@@ -1508,6 +1554,15 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             **research_fields,
                         )
                         allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)
+                        _alert_unexpected_nws_trade(
+                            ticker,
+                            "yes",
+                            direction,
+                            price_cents=price,
+                            count=count,
+                            running_high=round(running_high, 1),
+                            threshold=threshold,
+                        )
 
                 elif prob <= 0.5 and no_ask and no_ask < 99:
                     # Buy NO (raw edge, fees handled in Kelly)
@@ -1578,6 +1633,15 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                             **research_fields,
                         )
                         allocator.record_trade("source-monitor", ticker, result.get("cost_cents", risk), edge=edge)
+                        _alert_unexpected_nws_trade(
+                            ticker,
+                            "no",
+                            direction,
+                            price_cents=price,
+                            count=count,
+                            running_high=round(running_high, 1),
+                            threshold=threshold,
+                        )
 
     except Exception as e:
         log.error("  NWS market matching failed: %s", e, exc_info=True)

@@ -925,3 +925,47 @@ class TestNWSTradeMetadata:
 
         assert not sm.trade_manager.place_order.called
         ss.skip.assert_called_with("side_disabled")
+
+
+class TestNWSTradeDriftAlerts:
+    def test_yes_trade_alerts_and_records_cooldown(self):
+        sm = _load_source_monitor()
+        sm.log = MagicMock()
+        sm.notify_whatsapp = MagicMock(return_value=True)
+        sm.health = MagicMock()
+        sm.health.should_send_alert.return_value = True
+
+        alerted = sm._alert_unexpected_nws_trade(
+            "KXHIGHNY-26APR17-T80",
+            "yes",
+            "T",
+            price_cents=20,
+            count=5,
+            running_high=81.0,
+            threshold=80.0,
+        )
+
+        assert alerted is True
+        sm.notify_whatsapp.assert_called_once()
+        sm.health.record_alert_sent.assert_called_once_with(
+            "source-monitor:nws-drift:yes:threshold"
+        )
+
+    def test_threshold_no_trade_does_not_alert(self):
+        sm = _load_source_monitor()
+        sm.log = MagicMock()
+        sm.notify_whatsapp = MagicMock(return_value=True)
+        sm.health = MagicMock()
+
+        alerted = sm._alert_unexpected_nws_trade(
+            "KXHIGHNY-26APR17-T80",
+            "no",
+            "T",
+            price_cents=20,
+            count=5,
+            running_high=79.0,
+            threshold=80.0,
+        )
+
+        assert alerted is False
+        assert not sm.notify_whatsapp.called

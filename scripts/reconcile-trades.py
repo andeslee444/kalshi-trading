@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import sys
 from pathlib import Path
 
@@ -173,6 +174,37 @@ def _annotate_trade(trade, settlements, fills):
     return modified
 
 
+def _parse_close_time(value):
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        close_dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if close_dt.tzinfo is None:
+        close_dt = close_dt.replace(tzinfo=datetime.timezone.utc)
+    return close_dt.astimezone(datetime.timezone.utc)
+
+
+def _should_prune_trade(trade, fills, now=None):
+    """Drop expired rows that never became filled exposure."""
+    if trade.get("action", "buy") != "buy":
+        return False
+    if trade.get("settlement_result") is not None:
+        return False
+
+    has_exposure, _contract_count, _fill_price_cents = trade_has_filled_exposure(trade, fills=fills)
+    if has_exposure:
+        return False
+
+    close_dt = _parse_close_time(trade.get("market_close_time") or trade.get("close_time"))
+    if close_dt is None:
+        return False
+
+    now_utc = now or datetime.datetime.now(datetime.timezone.utc)
+    return close_dt < now_utc
+
+
 def reconcile_all(dry_run=False):
     """Walk all trade files, match to API settlements/fills, annotate records."""
     client = KalshiClient()
@@ -183,7 +215,9 @@ def reconcile_all(dry_run=False):
     log.info("  %d settlements, %d fills fetched", len(settlements), len(fills))
 
     total_annotated = 0
+    total_pruned = 0
     total_skipped = 0
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
 
     for trade_file in TRADE_FILES:
         if not trade_file.exists():
@@ -195,8 +229,18 @@ def reconcile_all(dry_run=False):
             continue
 
         file_modified = 0
+        file_pruned = 0
+        kept_trades = []
         for trade in trades:
-            if _annotate_trade(trade, settlements, fills):
+            modified = _annotate_trade(trade, settlements, fills)
+
+            if _should_prune_trade(trade, fills, now=now_utc):
+                file_pruned += 1
+                total_pruned += 1
+                continue
+
+            kept_trades.append(trade)
+            if modified:
                 if not dry_run:
                     try:
                         if trade.get("order_id") and trade.get("fill_price_cents") is not None:
@@ -217,14 +261,24 @@ def reconcile_all(dry_run=False):
             else:
                 total_skipped += 1
 
-        if file_modified > 0:
-            log.info("  %s: %d/%d records annotated", trade_file.name, file_modified, len(trades))
+        if file_modified > 0 or file_pruned > 0:
+            log.info(
+                "  %s: %d/%d records annotated, %d expired unfilled rows pruned",
+                trade_file.name,
+                file_modified,
+                len(trades),
+                file_pruned,
+            )
             if not dry_run:
-                store.save(trades)
+                store.save(kept_trades)
             total_annotated += file_modified
 
-    log.info("Reconciliation complete: %d annotated, %d skipped (unchanged or no match)",
-             total_annotated, total_skipped)
+    log.info(
+        "Reconciliation complete: %d annotated, %d pruned, %d skipped (unchanged or no match)",
+        total_annotated,
+        total_pruned,
+        total_skipped,
+    )
     if dry_run:
         log.info("DRY RUN — no files were modified")
 
