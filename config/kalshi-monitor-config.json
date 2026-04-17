@@ -24,6 +24,8 @@
     },
     "nws": {
       "enabled": true,
+      "tradeMode": "no-only",
+      "disableYes": true,
       "stations": {
         "MIA": "KMIA",
         "LAX": "KLAX",

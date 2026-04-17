@@ -327,6 +327,25 @@ def _nws_bracket_guardrail_reason(city_hour, obs_age_minutes, bracket_cfg=None):
 
     return None
 
+
+def _nws_trade_mode(nws_cfg=None):
+    """Normalize NWS side gating config.
+
+    Supported modes:
+      - both
+      - no-only
+      - yes-only
+
+    `disableYes: true` remains a backward-compatible alias for `no-only`.
+    """
+    cfg = nws_cfg or {}
+    mode = str(cfg.get("tradeMode") or "").strip().lower()
+    if mode in {"both", "no-only", "yes-only"}:
+        return mode
+    if cfg.get("disableYes", False):
+        return "no-only"
+    return "both"
+
 # === Kalshi Market Helpers ===
 def get_markets_by_prefix(prefix, status="open"):
     """Get all open markets matching a ticker prefix."""
@@ -1295,6 +1314,9 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
             running_high = temp_data[city]["running_high_f"]
             nws_cfg = config.get("sources", {}).get("nws", {})
             nws_bracket_cfg = nws_cfg.get("brackets", {})
+            nws_trade_mode = _nws_trade_mode(nws_cfg)
+            allow_yes = nws_trade_mode in {"both", "yes-only"}
+            allow_no = nws_trade_mode in {"both", "no-only"}
 
             # Validate threshold market consistency for this city
             threshold_signals = []
@@ -1393,8 +1415,32 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                 else:
                     margin = 0  # bracket
 
-                nws_disable_yes = config.get("sources", {}).get("nws", {}).get("disableYes", False)
-                if prob > 0.5 and yes_ask and yes_ask < 99 and not nws_disable_yes:
+                if prob > 0.5 and yes_ask and yes_ask < 99 and not allow_yes:
+                    if ss:
+                        ss.skip("side_disabled")
+                    _log_source_monitor_decision(
+                        ticker, "yes", "skipped", f"side_disabled:{nws_trade_mode}",
+                        price_cents=yes_ask, confidence=round(prob, 4),
+                        running_high=round(running_high, 1), city=city,
+                        threshold=threshold, hour=city_hour,
+                        **research_fields,
+                    )
+                    continue
+
+                if prob <= 0.5 and no_ask and no_ask < 99 and not allow_no:
+                    no_prob = 1.0 - prob
+                    if ss:
+                        ss.skip("side_disabled")
+                    _log_source_monitor_decision(
+                        ticker, "no", "skipped", f"side_disabled:{nws_trade_mode}",
+                        price_cents=no_ask, confidence=round(no_prob, 4),
+                        running_high=round(running_high, 1), city=city,
+                        threshold=threshold, hour=city_hour,
+                        **research_fields,
+                    )
+                    continue
+
+                if prob > 0.5 and yes_ask and yes_ask < 99:
                     # Buy YES (raw edge, fees handled in Kelly)
                     edge = prob - yes_ask / 100
                     min_edge = _nws_min_edge(running_high, threshold, city_hour, is_bracket)

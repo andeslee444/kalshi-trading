@@ -867,3 +867,61 @@ class TestNWSTradeMetadata:
 
         assert sm.trade_manager.place_order.called
         assert sm.trade_manager.place_order.call_args.kwargs["model_prob"] == pytest.approx(0.80)
+
+    def test_nws_trade_mode_no_only_skips_yes_side(self):
+        sm = _load_source_monitor()
+
+        class FixedDateTime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                base = datetime.datetime(2026, 4, 17, 18, 0, tzinfo=datetime.timezone.utc)
+                return base.astimezone(tz) if tz is not None else base.replace(tzinfo=None)
+
+        market = {
+            "ticker": "KXHIGHNY-26APR17-T80",
+            "title": "New York high above 80F",
+            "yes_bid": 80,
+            "yes_ask": 20,
+            "no_ask": 85,
+            "volume": 100,
+            "close_time": "2026-04-18T00:00:00Z",
+        }
+        temp_data = {
+            "NY": {
+                "running_high_f": 81.0,
+                "temp_f": 81.0,
+                "station": "KNYC",
+                "timestamp": "2026-04-17T17:55:00+00:00",
+                "obs_age_minutes": 5.0,
+                "obs_count": 12,
+            }
+        }
+
+        sm.config = {
+            "maxTradeAmount": 25,
+            "sources": {
+                "nws": {
+                    "enabled": True,
+                    "tradeMode": "no-only",
+                    "brackets": {},
+                }
+            },
+        }
+        sm.log = MagicMock()
+        sm._local_today = MagicMock(return_value="2026-04-17")
+        sm.parse_temp_ticker = MagicMock(
+            return_value={"city": "NY", "date": "2026-04-17", "direction": "T", "threshold": 80.0}
+        )
+        sm.is_market_liquid = MagicMock(return_value=True)
+        sm.nws_probability = MagicMock(return_value=0.80)
+        sm.trade_manager = MagicMock()
+
+        ss = MagicMock()
+        ss.markets_evaluated = 0
+        ss.trades_placed = 0
+
+        with patch.object(sm.datetime, "datetime", FixedDateTime):
+            sm.match_nws_to_markets(temp_data, prefetched_markets={"weather": [market]}, ss=ss)
+
+        assert not sm.trade_manager.place_order.called
+        ss.skip.assert_called_with("side_disabled")

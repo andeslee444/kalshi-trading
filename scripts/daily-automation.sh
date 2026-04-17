@@ -65,7 +65,11 @@ echo "$(date): Running daily report..." >> "$LOG_FILE"
 # Step 5: Legacy iMessage report disabled; daily report above already routes to WhatsApp
 echo "$(date): Skipping legacy iMessage report; WhatsApp-only notifications enabled." >> "$LOG_FILE"
 
-# Step 6: Run daily backtest with drift detection
+# Step 6: Save attribution snapshot, including source-monitor NWS city/hour/price slices
+echo "$(date): Saving attribution report..." >> "$LOG_FILE"
+/opt/homebrew/bin/python3.11 scripts/daily-attribution.py --save >> "$LOG_FILE" 2>&1 || true
+
+# Step 7: Run daily backtest with drift detection
 echo "$(date): Running daily backtest..." >> "$LOG_FILE"
 /opt/homebrew/bin/python3.11 scripts/daily-backtest.py >> "$LOG_FILE" 2>&1 || true
 
