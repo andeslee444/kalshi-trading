@@ -9,6 +9,10 @@
   "maxDailyLossPct": 0.07,
   "scanIntervalMinutes": 30,
   "edgeThreshold": 0.06,
+  "yieldSameDayToObservedWeather": true,
+  "cityEdgeThresholds": {
+    "NY": 0.5
+  },
   "cities": {
     "MIA": { "lat": 25.7959, "lon": -80.2870, "name": "Miami" },
     "LAX": { "lat": 33.9425, "lon": -118.4081, "name": "Los Angeles" },
@@ -31,7 +35,7 @@
     "OKC": { "lat": 35.3931, "lon": -97.6007, "name": "Oklahoma City" },
     "SATX": { "lat": 29.5337, "lon": -98.4698, "name": "San Antonio" }
   },
-  "disableWeatherYes": false,
+  "disableWeatherYes": true,
   "ensemble": {
     "enabled": true,
     "models": ["gfs", "ecmwf", "icon", "nbm", "aifs", "graphcast"],

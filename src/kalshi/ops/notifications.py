@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -25,6 +26,16 @@ _WEBHOOK_COOLDOWN_SECONDS = 1800
 
 _imessage_rate_limiter = _alert_rate_limiter
 _IMESSAGE_COOLDOWN_SECONDS = 1800
+
+_STALE_HEARTBEAT_RE = re.compile(r"last heartbeat \d+min ago")
+_CONSECUTIVE_ERRORS_RE = re.compile(r"\(\d+\s+consecutive errors\)")
+
+
+def _notification_rate_limit_key(message: str) -> str:
+    """Collapse volatile counters so one incident respects cooldowns."""
+    key = _STALE_HEARTBEAT_RE.sub("last heartbeat <age>min ago", message)
+    key = _CONSECUTIVE_ERRORS_RE.sub("(<n> consecutive errors)", key)
+    return key[:160]
 
 
 def _resolve_notification_phone(project_dir, env):
@@ -98,7 +109,7 @@ def notify_webhook(
     log = logger or _log
     environ = os.environ if env is None else env
 
-    prefix = message[:80]
+    prefix = _notification_rate_limit_key(message)
     now = time_func()
     last_sent = _webhook_rate_limiter.get(prefix, 0)
     if now - last_sent < _WEBHOOK_COOLDOWN_SECONDS:
@@ -169,7 +180,7 @@ def notify_imessage(
     if not _resolve_notification_phone(project_dir, environ):
         return False
 
-    prefix = message[:80]
+    prefix = _notification_rate_limit_key(message)
     now = time_func()
     if now - _imessage_rate_limiter.get(prefix, 0) < _IMESSAGE_COOLDOWN_SECONDS:
         return False

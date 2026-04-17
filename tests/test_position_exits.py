@@ -552,6 +552,39 @@ class TestComputeCurrentProbability:
         source = inspect.getsource(_mod._compute_current_probability)
         assert "kalshi-economics-trades-decisions.json" in source
 
+    def test_fetch_nws_running_high_keeps_tenth_degree_precision(self):
+        """Exit re-pricing should use the same tenth-degree running high as entry."""
+        response = MagicMock()
+        response.json.return_value = {
+            "features": [
+                {"properties": {"temperature": {"value": 22.0}}},
+            ]
+        }
+        with patch.dict(_mod.NWS_STATIONS, {"MIA": "KMIA"}, clear=True):
+            with patch.object(_mod, "retry_request", return_value=response):
+                running_high = _mod._fetch_nws_running_high("MIA")
+        assert running_high == 71.6
+
+    def test_source_monitor_uses_decimal_running_high_for_model_shift(self):
+        """Source-monitor exits should preserve decimal NWS inputs end-to-end."""
+        parsed = {
+            "city": "MIA",
+            "date": "2026-02-20",
+            "direction": "T",
+            "threshold": 73.0,
+        }
+        with patch.object(_mod, "parse_temp_ticker", return_value=parsed):
+            with patch.object(_mod, "_fetch_nws_running_high", return_value=71.6):
+                with patch.object(_mod, "nws_probability", return_value=0.20) as mock_prob:
+                    prob, reason = _mod._compute_current_probability(
+                        "KXHIGHMIA-26FEB20-T73",
+                        "source-monitor",
+                        "no",
+                    )
+        assert prob == 0.80
+        assert reason == "NWS MIA high 71.6F, model prob=20%"
+        assert mock_prob.call_args[0][:3] == (71.6, 73.0, "T")
+
 
 # ===================================================================
 # evaluate_trailing_stop tests (with illiquidity protection and arming)

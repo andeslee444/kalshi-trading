@@ -587,12 +587,26 @@ class TestNWSObservationFreshness:
 
 
 class TestNWSBracketGuardrails:
+    def test_bracket_guardrail_requires_settlement_parity_opt_in(self):
+        sm = _load_source_monitor()
+        reason = sm._nws_bracket_guardrail_reason(
+            14,
+            15,
+            {"enabled": True, "minLocalHour": 13, "maxObservationAgeMinutes": 30},
+        )
+        assert reason == "bracket_settlement_mismatch"
+
     def test_bracket_guardrail_rejects_early_local_hour(self):
         sm = _load_source_monitor()
         reason = sm._nws_bracket_guardrail_reason(
             11,
             5,
-            {"enabled": True, "minLocalHour": 13, "maxObservationAgeMinutes": 30},
+            {
+                "enabled": True,
+                "settlementParityConfirmed": True,
+                "minLocalHour": 13,
+                "maxObservationAgeMinutes": 30,
+            },
         )
         assert reason == "bracket_too_early"
 
@@ -601,7 +615,12 @@ class TestNWSBracketGuardrails:
         reason = sm._nws_bracket_guardrail_reason(
             14,
             45,
-            {"enabled": True, "minLocalHour": 13, "maxObservationAgeMinutes": 30},
+            {
+                "enabled": True,
+                "settlementParityConfirmed": True,
+                "minLocalHour": 13,
+                "maxObservationAgeMinutes": 30,
+            },
         )
         assert reason == "stale_bracket_obs"
 
@@ -610,7 +629,12 @@ class TestNWSBracketGuardrails:
         reason = sm._nws_bracket_guardrail_reason(
             14,
             15,
-            {"enabled": True, "minLocalHour": 13, "maxObservationAgeMinutes": 30},
+            {
+                "enabled": True,
+                "settlementParityConfirmed": True,
+                "minLocalHour": 13,
+                "maxObservationAgeMinutes": 30,
+            },
         )
         assert reason is None
 
@@ -775,3 +799,71 @@ class TestScanMetrics:
         """METRICS_PATH should point to data/source-monitor-metrics.json."""
         sm = _load_source_monitor()
         assert sm.METRICS_PATH.name == "source-monitor-metrics.json"
+
+
+class TestNWSTradeMetadata:
+    def test_nws_no_trade_stores_no_side_probability(self):
+        sm = _load_source_monitor()
+
+        class FixedDateTime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                base = datetime.datetime(2026, 4, 17, 18, 0, tzinfo=datetime.timezone.utc)
+                return base.astimezone(tz) if tz is not None else base.replace(tzinfo=None)
+
+        market = {
+            "ticker": "KXHIGHNY-26APR17-T80",
+            "title": "New York high above 80F",
+            "yes_bid": 80,
+            "yes_ask": 85,
+            "no_ask": 20,
+            "volume": 100,
+            "close_time": "2026-04-18T00:00:00Z",
+        }
+        temp_data = {
+            "NY": {
+                "running_high_f": 70.0,
+                "temp_f": 70.0,
+                "station": "KNYC",
+                "timestamp": "2026-04-17T17:55:00+00:00",
+                "obs_age_minutes": 5.0,
+                "obs_count": 12,
+            }
+        }
+
+        sm.config = {
+            "maxTradeAmount": 25,
+            "sources": {
+                "nws": {
+                    "enabled": True,
+                    "disableYes": False,
+                    "brackets": {},
+                }
+            },
+        }
+        sm.log = MagicMock()
+        sm._local_today = MagicMock(return_value="2026-04-17")
+        sm.parse_temp_ticker = MagicMock(
+            return_value={"city": "NY", "date": "2026-04-17", "direction": "T", "threshold": 80.0}
+        )
+        sm.is_market_liquid = MagicMock(return_value=True)
+        sm.nws_probability = MagicMock(return_value=0.20)
+        sm.kalshi_fee_cents = MagicMock(return_value=1.0)
+        sm.quarter_kelly = MagicMock(return_value=(5, 100, {"kelly_fraction": 0.1, "bankroll_used": 1000}))
+        sm.build_market_snapshot = MagicMock(return_value={"yes_bid": 80, "yes_ask": 85})
+
+        budget = MagicMock(approved=True, max_cost_cents=1000, bankroll_cents=100000, reason=None)
+        sm.allocator = MagicMock()
+        sm.allocator.request_budget.return_value = budget
+        sm.trade_manager = MagicMock()
+        sm.trade_manager.place_order.return_value = {"cost_cents": 100}
+
+        ss = MagicMock()
+        ss.markets_evaluated = 0
+        ss.trades_placed = 0
+
+        with patch.object(sm.datetime, "datetime", FixedDateTime):
+            sm.match_nws_to_markets(temp_data, prefetched_markets={"weather": [market]}, ss=ss)
+
+        assert sm.trade_manager.place_order.called
+        assert sm.trade_manager.place_order.call_args.kwargs["model_prob"] == pytest.approx(0.80)

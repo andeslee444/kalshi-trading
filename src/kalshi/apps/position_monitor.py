@@ -20,7 +20,7 @@ from event_ledger import get_event_ledger
 from kalshi_auth import (
     KalshiClient, setup_unbuffered, setup_signal_handlers, setup_logging,
     PROJECT_DIR, TradeManager, trim_trade_log, CITY_TIMEZONES, _local_today,
-    round_half_up, retry_request, fetch_parallel, HealthCheckMonitor,
+    retry_request, fetch_parallel, HealthCheckMonitor,
     load_trades, _atomic_write_json, ScanSummary,
     notify_whatsapp, is_shutdown_requested,
 )
@@ -442,7 +442,8 @@ def _fetch_nws_running_high(city_code):
     """Fetch today's running high temperature from NWS for a city.
 
     Uses CITY_TIMEZONES for timezone-correct observation window.
-    Returns running high in Fahrenheit (int), or None on failure.
+    Returns running high in Fahrenheit to the nearest tenth, matching
+    source-monitor entry pricing inputs.
     """
     station_id = NWS_STATIONS.get(city_code)
     if not station_id:
@@ -467,7 +468,7 @@ def _fetch_nws_running_high(city_code):
         for f in features:
             t = f.get("properties", {}).get("temperature", {}).get("value")
             if t is not None:
-                temps.append(round_half_up(t * 9/5 + 32))
+                temps.append(round(t * 9/5 + 32, 1))
         if temps:
             return max(temps)
     except Exception as e:

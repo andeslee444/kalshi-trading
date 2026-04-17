@@ -237,6 +237,7 @@ class HealthCheckMonitor:
         self._save()
 
     def is_source_open(self, source):
+        self._load()
         data = self._state.get("sources", {}).get(source, {})
         if data.get("error_count", 0) < self.source_breaker_threshold:
             return False
@@ -252,10 +253,18 @@ class HealthCheckMonitor:
             return False
         return True
 
-    def record_bot_heartbeat(self, bot):
-        self._state["bots"][bot] = {"last_heartbeat": self._utc_now_iso()}
+    def update_bot_state(self, bot, **fields):
+        bot_state = self._state["bots"].get(bot, {})
+        if not isinstance(bot_state, dict):
+            bot_state = {}
+        bot_state.update(fields)
+        self._state["bots"][bot] = bot_state
         self._dirty_bots.add(bot)
         self._save()
+        return dict(bot_state)
+
+    def record_bot_heartbeat(self, bot):
+        self.update_bot_state(bot, last_heartbeat=self._utc_now_iso())
 
     def should_send_alert(self, alert_key):
         if alert_key not in self._alerts_sent:
@@ -267,6 +276,9 @@ class HealthCheckMonitor:
         self._alerts_sent[alert_key] = datetime.datetime.now(datetime.timezone.utc)
 
     def get_summary(self):
+        # Long-running bots share this state file; refresh before evaluating
+        # peer heartbeats or source status so summaries don't drift stale.
+        self._load()
         summary = {"sources": {}, "bots": {}, "overall": "healthy"}
 
         issues = 0
@@ -316,6 +328,9 @@ class HealthCheckMonitor:
         return normalize_health_summary(summary)
 
     def check_health(self, staleness_minutes=None):
+        # Long-running bots share this state file; refresh before evaluating
+        # peer heartbeats or source status so alerts reflect current state.
+        self._load()
         stale_min = staleness_minutes or self.staleness_minutes
         now = datetime.datetime.now(datetime.timezone.utc)
         issues = []
@@ -356,6 +371,7 @@ class HealthCheckMonitor:
         return issues
 
     def check_per_bot_halts(self):
+        self._load()
         now = time.time()
         status = {}
         sources = self._state.get("sources", {})

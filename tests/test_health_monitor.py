@@ -65,8 +65,7 @@ class TestBotHeartbeat:
         hm = self._make_monitor(tmp_path, staleness_minutes=30)
         # Manually set an old heartbeat
         old_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=60)).isoformat()
-        hm._state["bots"]["weather"] = {"last_heartbeat": old_time}
-        hm._save()
+        hm.update_bot_state("weather", last_heartbeat=old_time)
 
         issues = hm.check_health()
         stale_issues = [i for i in issues if "stale" in i and "weather" in i]
@@ -95,6 +94,20 @@ class TestBotHeartbeat:
         assert any("bot/weather stale" in issue for issue in issues)
         assert not any("bot/hdd-monitor stale" in issue for issue in issues)
         assert not any("bot/cross-platform-arb stale" in issue for issue in issues)
+
+    def test_check_health_refreshes_shared_state_before_staleness_eval(self, tmp_path):
+        state_path = tmp_path / "health-state.json"
+        old_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=90)).isoformat()
+
+        writer = HealthCheckMonitor(state_path=str(state_path), staleness_minutes=30)
+        writer.update_bot_state("weather", last_heartbeat=old_time)
+
+        reader = HealthCheckMonitor(state_path=str(state_path), staleness_minutes=30)
+        writer.record_bot_heartbeat("weather")
+
+        issues = reader.check_health()
+
+        assert not any("bot/weather stale" in issue for issue in issues)
 
 
 class TestSourceTracking:
@@ -373,6 +386,20 @@ class TestHealthSummary:
         summary = mon.get_summary()
         assert summary["overall"] in ("degraded", "critical")
 
+    def test_summary_refreshes_shared_state_before_reporting_bots(self, tmp_path):
+        state_path = tmp_path / "health-state.json"
+        old_time = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=90)).isoformat()
+
+        writer = HealthCheckMonitor(state_path=str(state_path), staleness_minutes=30)
+        writer.update_bot_state("weather", last_heartbeat=old_time)
+
+        reader = HealthCheckMonitor(state_path=str(state_path), staleness_minutes=30)
+        writer.record_bot_heartbeat("weather")
+
+        summary = reader.get_summary()
+
+        assert summary["bots"]["weather"]["status"] == "ok"
+
 
 class TestIsSourceOpen:
     """Test source circuit breaker via is_source_open."""
@@ -394,12 +421,14 @@ class TestIsSourceOpen:
         assert mon.is_source_open("open-meteo") is True
 
     def test_resets_after_cooldown(self, tmp_path):
-        mon = self._make_monitor(tmp_path, source_breaker_threshold=3, source_breaker_cooldown_seconds=1)
+        mon = self._make_monitor(tmp_path, source_breaker_threshold=3, source_breaker_cooldown_seconds=60)
         for _ in range(3):
             mon.record_source_error("coinbase", "err")
         assert mon.is_source_open("coinbase") is True
         # Simulate cooldown elapsed by backdating opened_at
-        mon._state["sources"]["coinbase"]["opened_at"] = time.time() - 2
+        mon._state["sources"]["coinbase"]["opened_at"] = time.time() - 120
+        mon._dirty_sources.add("coinbase")
+        mon._save()
         assert mon.is_source_open("coinbase") is False
         # After reset, error_count should be 0 (half-open)
         assert mon._state["sources"]["coinbase"]["error_count"] == 0

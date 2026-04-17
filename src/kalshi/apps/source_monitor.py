@@ -308,6 +308,11 @@ def _nws_bracket_guardrail_reason(city_hour, obs_age_minutes, bracket_cfg=None):
     cfg = bracket_cfg or {}
     if not cfg.get("enabled", True):
         return "brackets_disabled"
+    # Raw station observations and final NWS CLI settlement highs do not
+    # currently have proven bracket-level parity in production. Require an
+    # explicit opt-in before allowing observation-driven bracket trades.
+    if not cfg.get("settlementParityConfirmed", False):
+        return "bracket_settlement_mismatch"
 
     min_local_hour = cfg.get("minLocalHour")
     if min_local_hour is not None and city_hour < int(min_local_hour):
@@ -1506,7 +1511,7 @@ def match_nws_to_markets(temp_data, prefetched_markets=None, ss=None):
                     log.info(f"    NO at {price}c | Edge: ~{edge*100:.0f}% | Prob NO: {no_prob*100:.0f}%")
                     result = trade_manager.place_order(ticker, "no", price, count, reasoning,
                                                         market_snapshot=build_market_snapshot(yes_bid=yes_bid, yes_ask=yes_ask),
-                                                        model_prob=round(prob, 4), raw_edge=round(edge, 4),
+                                                        model_prob=round(no_prob, 4), raw_edge=round(edge, 4),
                                                         fee_cents=round(fee, 2), sizing_method="quarter_kelly",
                                                         market_close_time=m.get("close_time"),
                                                         kelly_fraction=kelly_details.get("kelly_fraction"),
